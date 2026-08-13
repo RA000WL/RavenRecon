@@ -23,7 +23,7 @@ They are not the architecture.
 
 ## Planned architecture
 
-The following describes the target architecture. Not all components exist in v0.1.
+The following describes the target architecture. Not all components exist yet.
 
 ```text
 CLI
@@ -64,36 +64,35 @@ Reports
 
 ## Asset model
 
-Future domain objects may include:
+The asset model (implemented in `internal/asset`) provides normalized types
+for reconnaissance data:
 
-* Program
 * Domain
 * Host
 * IP
-* Service
 * Port
+* Service
 * URL
 * Endpoint
 * JavaScript
-* Technology
-* Secret
-* Finding
 
-Relationships should be explicit.
+Deferred to later phases: Technology, SecretCandidate, Finding.
 
-Example:
+Every implemented asset has:
 
-```text
-Domain
-  |
-  +--> Host
-         |
-         +--> Service
-                |
-                +--> URL
-                       |
-                       +--> JavaScript
-```
+* a canonical, normalized representation
+* a deterministic, namespaced identity for deduplication
+* provenance (source, discovery time, optional reference and confidence)
+* deterministic merge primitives that refuse to merge distinct assets
+* JSON serialization
+
+Identity values are namespaced by asset kind (`domain:example.com` vs
+`host:example.com`), so different asset kinds can never collide.
+
+Relationships are represented by the typed `Relationship` primitive
+(Host -> IP, IP -> Port, Port -> Service, Host -> URL, URL -> Endpoint,
+URL -> JavaScript). This phase provides the representation only; the graph
+store, traversal, and correlation engine are planned for a later phase.
 
 ## Pipeline requirements
 
@@ -195,13 +194,20 @@ Do not add:
 * automated exploitation
 * automatic vulnerability submission
 
-## v0.1 boundary
+## v0.2 boundary
 
-v0.1 contains only:
+Implemented:
 
 * CLI foundation
 * configuration defaults
 * version metadata
 * basic tests
+* normalized asset model (see "Asset model" above)
 
-Do not implement discovery engines during v0.1.
+Planned, not yet implemented:
+
+* runtime scheduler and worker pool
+* discovery engines (DNS, HTTP, TLS, URL, JS)
+* cache and resume
+* asset store, graph, and correlation engine
+* reporting and terminal UI

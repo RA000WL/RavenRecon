@@ -20,6 +20,6 @@ func Default() Config {
 		Concurrency: 10,
 		Timeout:     10 * time.Second,
 		Rate:        5,
-		UserAgent:   "RavenRecon/0.1",
+		UserAgent:   "RavenRecon/0.2.0",
 	}
 }

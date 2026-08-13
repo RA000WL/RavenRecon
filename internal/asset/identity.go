@@ -1,0 +1,35 @@
+package asset
+
+// Kind identifies the asset type and namespaces identity values so that
+// different asset kinds can never collide on the same key.
+type Kind string
+
+// Asset kinds currently implemented.
+const (
+	KindDomain     Kind = "domain"
+	KindHost       Kind = "host"
+	KindIP         Kind = "ip"
+	KindPort       Kind = "port"
+	KindService    Kind = "service"
+	KindURL        Kind = "url"
+	KindEndpoint   Kind = "endpoint"
+	KindJavaScript Kind = "javascript"
+)
+
+// Identity is a namespaced, deterministic asset key used for deduplication.
+//
+// The Kind namespaces the Value, so for example the domain and host for
+// "example.com" are different assets with different identities.
+type Identity struct {
+	Kind  Kind   `json:"kind"`
+	Value string `json:"value"`
+}
+
+// String returns the canonical "kind:value" representation.
+func (i Identity) String() string { return string(i.Kind) + ":" + i.Value }
+
+// Equal reports whether two identities are identical.
+func (i Identity) Equal(o Identity) bool { return i == o }
+
+// IsZero reports whether the identity is unset.
+func (i Identity) IsZero() bool { return i.Kind == "" }

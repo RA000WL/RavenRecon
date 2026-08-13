@@ -4,11 +4,27 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v0.1.0 — Foundation**
+**v0.2.0 — Asset Model**
 
-RavenRecon is currently establishing its core engineering foundation.
+RavenRecon has a normalized asset model (`internal/asset`) and is
+establishing its core engineering foundation.
 
 This release intentionally does not implement reconnaissance engines yet.
+
+## Asset model
+
+The asset model provides typed, canonical representations of reconnaissance
+data:
+
+- Domain, Host, IP, Port, Service
+- URL, Endpoint, JavaScript
+
+Every asset has a deterministic, namespaced identity for deduplication,
+records provenance ("where did this come from?"), supports deterministic
+merging, and serializes to JSON. See `ARCHITECTURE.md` for details.
+
+Deferred to later phases: Technology, SecretCandidate, Finding, the asset
+store/graph, and the correlation engine.
 
 ## Current commands
 

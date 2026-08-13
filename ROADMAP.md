@@ -1,8 +1,17 @@
 # RavenRecon Roadmap
 
+The roadmap is intentionally incremental.
+
+Each milestone must be stable before the next major subsystem is added.
+
+Implementation order is fixed by the phase instructions; milestones are
+numbered to match the order work actually happens.
+
+---
+
 ## v0.1 — Foundation
 
-Status: current
+Status: complete
 
 - [x] Go module
 - [x] CLI
@@ -15,7 +24,41 @@ Status: current
 - [x] agent instructions
 - [x] architecture documentation
 
-## v0.2 — Runtime Engine
+---
+
+## v0.2 — Asset Model
+
+Status: complete
+
+- [x] Domain model
+- [x] Host model
+- [x] IP model
+- [x] Port model
+- [x] Service model
+- [x] URL model
+- [x] Endpoint model
+- [x] JavaScript model (minimal)
+- [x] normalized representations
+- [x] namespaced deterministic identity
+- [x] provenance
+- [x] deterministic merge primitives
+- [x] relationship primitive
+- [x] JSON serialization
+- [x] normalization tests
+- [x] identity/deduplication tests
+- [x] serialization tests
+- [ ] persistent asset store
+- [ ] correlation engine
+- [ ] asset graph storage/traversal
+
+Deferred: Technology, SecretCandidate, Finding (introduced with the phases
+that consume them).
+
+---
+
+## v0.3 — Runtime Engine
+
+Status: next
 
 - [ ] Context-aware scheduler
 - [ ] Bounded worker pool
@@ -28,16 +71,9 @@ Status: current
 - [ ] Concurrency tests
 - [ ] Race tests
 
-## v0.3 — Asset Graph
+No reconnaissance tools should be implemented in this milestone.
 
-- [ ] Domain model
-- [ ] Host model
-- [ ] IP model
-- [ ] Service model
-- [ ] URL model
-- [ ] Relationships
-- [ ] Deduplication
-- [ ] Serialization
+---
 
 ## v0.4 — Cache and Resume
 
@@ -46,6 +82,8 @@ Status: current
 - [ ] Resume support
 - [ ] Cache invalidation
 - [ ] Deterministic cache keys
+
+---
 
 ## v0.5 — Passive Discovery
 
@@ -64,6 +102,8 @@ Requirements:
 - [ ] parser tests
 - [ ] integration fixtures
 
+---
+
 ## v0.6 — DNS / HTTP
 
 - [ ] DNS pipeline
@@ -72,6 +112,8 @@ Requirements:
 - [ ] HTTP metadata normalization
 - [ ] technology detection
 
+---
+
 ## v0.7 — URL Intelligence
 
 - [ ] Historical URLs
@@ -79,6 +121,8 @@ Requirements:
 - [ ] parameter extraction
 - [ ] deduplication
 - [ ] endpoint classification
+
+---
 
 ## v0.8 — JavaScript Intelligence
 
@@ -89,6 +133,8 @@ Requirements:
 - [ ] secret candidate detection
 - [ ] third-party library identification
 
+---
+
 ## v0.9 — Prioritization
 
 - [ ] asset scoring
@@ -96,6 +142,8 @@ Requirements:
 - [ ] API/admin classification
 - [ ] confidence scoring
 - [ ] interesting-asset ranking
+
+---
 
 ## v0.10 — Reporting
 
@@ -106,6 +154,8 @@ Requirements:
 - [ ] run summaries
 - [ ] error summaries
 
+---
+
 ## v0.11 — Terminal UI
 
 - [ ] live progress
@@ -114,6 +164,8 @@ Requirements:
 - [ ] ETA
 - [ ] errors
 - [ ] interesting assets
+
+---
 
 ## v1.0 — Production Foundation
 
@@ -124,6 +176,8 @@ Requirements:
 - [ ] compatibility policy
 - [ ] release automation
 - [ ] documentation
+
+---
 
 ## Future
 

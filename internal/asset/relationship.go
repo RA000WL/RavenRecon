@@ -1,0 +1,65 @@
+package asset
+
+import (
+	"fmt"
+	"strings"
+)
+
+// RelationshipKind identifies the semantic meaning of a Relationship edge.
+type RelationshipKind string
+
+// Relationship kinds mirror the hierarchy recon stages are expected to produce.
+// They are generic and do not reference specific tools or binaries.
+const (
+	// RelationshipHostToIP links a resolved host to its address (Host -> IP).
+	RelationshipHostToIP RelationshipKind = "host_to_ip"
+	// RelationshipIPToPort links a listening address to a port (IP -> Port).
+	RelationshipIPToPort RelationshipKind = "ip_to_port"
+	// RelationshipPortToService links a port to a service identified on it
+	// (Port -> Service).
+	RelationshipPortToService RelationshipKind = "port_to_service"
+	// RelationshipHostToURL links a host to a URL served on it (Host -> URL).
+	RelationshipHostToURL RelationshipKind = "host_to_url"
+	// RelationshipURLToEndpoint links a base URL to an endpoint derived from it
+	// (URL -> Endpoint).
+	RelationshipURLToEndpoint RelationshipKind = "url_to_endpoint"
+	// RelationshipURLToJavaScript links a page URL to a script resource it
+	// references (URL -> JavaScript).
+	RelationshipURLToJavaScript RelationshipKind = "url_to_javascript"
+)
+
+// Relationship is a typed, directed edge between two asset identities.
+//
+// It is the primitive a future correlation engine uses to build the asset
+// graph. This phase provides the representation only — no graph storage or
+// traversal.
+type Relationship struct {
+	// From is the identity of the source asset.
+	From Identity `json:"from"`
+
+	// Kind describes the edge semantics.
+	Kind RelationshipKind `json:"kind"`
+
+	// To is the identity of the destination asset.
+	To Identity `json:"to"`
+}
+
+// NewRelationship validates and builds a Relationship.
+func NewRelationship(from Identity, kind RelationshipKind, to Identity) (Relationship, error) {
+	if from.IsZero() {
+		return Relationship{}, fmt.Errorf("relationship source must not be zero")
+	}
+	if strings.TrimSpace(string(kind)) == "" {
+		return Relationship{}, fmt.Errorf("relationship kind must not be empty")
+	}
+	if to.IsZero() {
+		return Relationship{}, fmt.Errorf("relationship destination must not be zero")
+	}
+	return Relationship{From: from, Kind: kind, To: to}, nil
+}
+
+// ID returns a deterministic identity, so the same directed edge added twice
+// deduplicates while the reverse or differently-kind edge stays distinct.
+func (r Relationship) ID() string {
+	return r.From.String() + string(r.Kind) + "\x00" + r.To.String()
+}
