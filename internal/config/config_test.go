@@ -42,3 +42,23 @@ func TestDefaultCache(t *testing.T) {
 		t.Fatalf("cache TTL must default to disabled (0), got %s", cfg.Cache.TTL)
 	}
 }
+
+func TestDefaultDiscovery(t *testing.T) {
+	cfg := Default()
+
+	if len(cfg.Discovery.Sources) != 0 {
+		t.Fatalf("discovery sources must default to empty (all built-in), got %v", cfg.Discovery.Sources)
+	}
+	if len(cfg.Discovery.Bin) != 0 {
+		t.Fatalf("discovery bin overrides must default to empty (PATH lookup), got %v", cfg.Discovery.Bin)
+	}
+	if cfg.Discovery.Timeout != 0 {
+		t.Fatalf("discovery timeout must default to 0 (defer to global/stage default), got %s", cfg.Discovery.Timeout)
+	}
+	if cfg.Discovery.DetectTimeout != 0 {
+		t.Fatalf("discovery detect timeout must default to 0 (stage default), got %s", cfg.Discovery.DetectTimeout)
+	}
+	if cfg.Discovery.MaxOutputSize != 0 {
+		t.Fatalf("discovery max output size must default to 0 (stage default), got %d", cfg.Discovery.MaxOutputSize)
+	}
+}

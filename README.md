@@ -4,14 +4,17 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v0.2.0 — Asset Model + Cache Foundation**
+**v0.5.0 — Passive Discovery**
 
-RavenRecon has a normalized asset model (`internal/asset`) and a persistent,
-filesystem-backed cache and resume foundation (`internal/cache`). The runtime
-engine (roadmap v0.3) is deferred; the cache infrastructure ships first per
-the phase sequencing.
+RavenRecon has a normalized asset model (`internal/asset`), a persistent,
+filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
+cancellable, rate-limited runtime engine (`internal/runtime`), and its first
+consumer: passive subdomain discovery (`internal/discovery`) with adapters
+for subfinder, assetfinder, and amass (passive mode only).
 
-This release intentionally does not implement reconnaissance engines yet.
+This release intentionally does not implement active engines yet: DNS, HTTP,
+TLS, URL intelligence, JavaScript analysis, crawling, and secret scanning are
+later roadmap milestones.
 
 ## Asset model
 
@@ -53,10 +56,66 @@ interrupted scans:
 
 Cache configuration lives in `internal/config` (`CacheConfig`: `Enabled`,
 `Dir`, `TTL`). The default cache directory is
-`os.UserCacheDir()/ravenrecon`, and the cache is **disabled by default**. No
-CLI cache flags are wired yet — the existing CLI parses commands rather than
-flags, and no runtime command consumes the cache. Flag wiring arrives with
-the runtime engine milestone.
+`os.UserCacheDir()/ravenrecon`, and the cache is **disabled by default**. The
+`discover` command reads and writes the cache only when it is enabled in
+configuration; `--no-cache` forces it off for a single run.
+
+## Passive discovery
+
+`ravenrecon discover <domain>` runs passive subdomain enumeration through
+installed external tools:
+
+```text
+subfinder -d <domain> -silent
+assetfinder <domain>
+amass enum -passive -d <domain>
+```
+
+Only passive modes are ever invoked; no active enumeration, brute force, or
+intel modes are reachable from RavenRecon. Output is normalized through the
+Phase 2 asset model, deduplicated by identity, and merged across sources with
+provenance (source + discovery time). Each source reports its detection
+state — `[OK]`, `[WARN]`, or `[MISSING]` with a reason — and its outcome
+(completed / partial / failed / cancelled / skipped). Tool detection
+distinguishes executable existence, execution, version, and capability; a
+broken version flag never reports an installed tool as missing. Every tool
+invocation is bounded (timeout, cancellation, capped stdout/stderr capture).
+A Ctrl-C/SIGTERM mid-run cancels gracefully — the partial report is still
+printed, the exit code is 1, and a second signal force-exits immediately.
+
+Run with cache (when enabled in configuration):
+
+```bash
+ravenrecon discover example.com
+ravenrecon discover example.com --sources subfinder,amass
+ravenrecon discover example.com --no-cache
+```
+
+Results are cached per source with keys covering the operation, the canonical
+target identity, the passive mode, and the tool name/version; only completed,
+unexpired entries are reused. The `doctor` command reports the same per-source
+detection states. See `ARCHITECTURE.md` ("Passive discovery") for details,
+partial-result semantics, and known limitations.
+
+## Runtime engine
+
+A bounded, cancellable, rate-limited job execution engine lives in
+`internal/runtime` (roadmap v0.3):
+
+- Exactly `Concurrency` worker goroutines run jobs inline; the pool never
+  creates a goroutine per job, so the parallelism is exactly bounded.
+- A bounded submission queue applies backpressure: `Submit` blocks while full
+  and the queue never grows without bound.
+- A single central, standard-library token-bucket limiter (`Rate`/`Burst`)
+  gates every job start, regardless of concurrency.
+- Every job's lifecycle — started, completed, failed, cancelled, timed-out —
+  is delivered to subscribers through bounded, lossless event channels.
+  Cancellation is always reported as cancelled, never as failure or success.
+- `Shutdown` drains queued and in-flight work gracefully, with a forced path
+  when the drain context is cancelled.
+- The engine is generic and cache-independent by design: consumer stages
+  (passive discovery, v0.5) compose "cache-before-execute" around runtime
+  jobs. See `ARCHITECTURE.md` ("Runtime engine").
 
 ## Current commands
 
@@ -77,6 +136,16 @@ Run environment diagnostics:
 ```bash
 go run ./cmd/ravenrecon doctor
 ```
+
+Run passive subdomain discovery:
+
+```bash
+go run ./cmd/ravenrecon discover example.com
+go run ./cmd/ravenrecon discover example.com --sources subfinder,amass
+```
+
+`discover` options (after the domain): `--sources <a,b>` restricts the
+sources, `--no-cache` disables the cache for the run.
 
 Build:
 

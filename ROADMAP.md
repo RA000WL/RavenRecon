@@ -58,21 +58,27 @@ that consume them).
 
 ## v0.3 — Runtime Engine
 
-Status: deferred — the cache foundation (v0.4) ships first per phase
-sequencing; no runtime/scheduler code exists in this repository yet.
+Status: complete
 
-- [ ] Context-aware scheduler
-- [ ] Bounded worker pool
-- [ ] Configurable concurrency
-- [ ] Central rate limiter
-- [ ] Graceful shutdown
-- [ ] Progress events
-- [ ] Structured errors
-- [ ] Cancellation tests
-- [ ] Concurrency tests
-- [ ] Race tests
+Implemented in `internal/runtime` as a generic, cache-independent runtime
+engine: bounded worker pool, central token-bucket rate limiter, cancellation,
+graceful/forced shutdown, and lossless event subscriptions. It is generic
+infrastructure and deliberately does not import `internal/cache`; its
+consumer (passive discovery, v0.5, the next milestone) composes
+"cache-before-execute" around runtime jobs.
 
-No reconnaissance tools should be implemented in this milestone.
+- [x] Context-aware scheduler
+- [x] Bounded worker pool
+- [x] Configurable concurrency
+- [x] Central rate limiter
+- [x] Graceful shutdown
+- [x] Progress events
+- [x] Structured errors
+- [x] Cancellation tests
+- [x] Concurrency tests
+- [x] Race tests
+
+No reconnaissance tools are implemented in this milestone.
 
 ---
 
@@ -95,20 +101,37 @@ Details, semantics, and known limitations: see `ARCHITECTURE.md`
 
 ## v0.5 — Passive Discovery
 
+Status: complete
+
+Implemented in `internal/discovery`: three external-tool adapters (subfinder,
+assetfinder, amass passive mode) orchestrated through the v0.3 runtime engine
+with Phase 3 cache-before-execute composition and Phase 2 asset
+normalization/deduplication, plus the `ravenrecon discover` CLI command, the
+doctor's per-source detection section, and the `Discovery` configuration
+section.
+
 Initial adapters:
 
-- [ ] subfinder
-- [ ] assetfinder
-- [ ] amass
+- [x] subfinder
+- [x] assetfinder
+- [x] amass
 
 Requirements:
 
-- [ ] normalized output
-- [ ] timeout
-- [ ] cancellation
-- [ ] tool detection
-- [ ] parser tests
-- [ ] integration fixtures
+- [x] normalized output
+- [x] timeout
+- [x] cancellation
+- [x] tool detection
+- [x] parser tests
+- [x] integration fixtures
+- [x] passive-only invocations with asserted argv
+- [x] bounded output capture
+- [x] provenance and cross-source merge
+- [x] cache-before-execute with statused records
+- [x] discover CLI command and doctor detection section
+
+Details, semantics, and known limitations: see `ARCHITECTURE.md`
+("Passive discovery").
 
 ---
 
