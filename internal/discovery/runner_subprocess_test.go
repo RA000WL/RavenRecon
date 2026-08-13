@@ -60,11 +60,11 @@ func assertPromptReturn(t *testing.T, start time.Time, bound time.Duration, what
 // descendant holding the captured pipe write-ends and exec.Cmd.Wait blocks in
 // awaitGoroutines forever; the worker would be stuck and the pool shutdown
 // could never complete. With the fix the whole group is killed and Run
-// returns a context error promptly (deadline plus the short grace period).
-// The descendant's pid is captured through $RAVEN_PIDFILE and probed after
-// Run returns: the group kill must have actually reaped it — the bounded
-// grace path alone (which returns an error even when the descendant
-// survives) must not be able to pass this test.
+// returns a context error promptly after the deadline fires. The descendant's
+// pid is captured through $RAVEN_PIDFILE and probed after Run returns: the
+// group kill must have actually reaped it — a runner that only bounded the
+// wait (returning an error even when the descendant survives) must not be
+// able to pass this test.
 func TestExecRunnerCancelledKillsDescendant(t *testing.T) {
 	skipOnWindows(t)
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
@@ -87,21 +87,26 @@ wait`)
 	assertDescendantReaped(t, pidFile)
 }
 
-// TestExecRunnerEscapedDescendantBoundedByGrace exercises the waitGrace
-// bound: a descendant that ESCAPES the process group (setsid) while holding
-// the captured pipes cannot be killed by the group kill, so Cmd.Wait can
-// never finish. The runner must return the structured cancellation error
-// after waitGrace instead of hanging the caller. The escaped `sleep` process
-// is transient by design — the whole point is that nothing can kill it — so
-// it exits on its own (after at most `descendantLife`) and the test leaves
-// only a short-lived orphan behind.
-func TestExecRunnerEscapedDescendantBoundedByGrace(t *testing.T) {
+// TestExecRunnerEscapedDescendantCannotPinRun exercises the self-owned-pipe
+// teardown: a descendant that ESCAPES the process group (setsid) while
+// holding the captured pipes cannot be killed by the group kill, yet Run
+// must still return promptly with the structured cancellation error. The
+// pipes are the runner's own (see pipeCopies): the read ends are force-closed
+// and the copy goroutines joined before Cmd.Wait is awaited, so an escaped
+// pipe-holder can no longer pin Cmd.Wait or Run. The waitGrace bound now
+// covers only the residual case of a child that cannot be killed at all (an
+// unkillable D-state process) and does not fire here. The escaped `sleep`
+// process is transient by design — the whole point is that nothing can kill
+// it — so it exits on its own (after at most 10 s) and the test leaves only
+// a short-lived orphan behind.
+func TestExecRunnerEscapedDescendantCannotPinRun(t *testing.T) {
 	skipOnWindows(t)
 	if _, err := exec.LookPath("setsid"); err != nil {
 		t.Skip("setsid (util-linux) not available")
 	}
-	// The descendant must outlive the deadline (1s) plus waitGrace (2s) by
-	// a wide margin so the grace path deterministically fires first.
+	// The descendant must outlive the 1 s deadline by a wide margin so the
+	// cancellation path deterministically fires while it still holds the
+	// pipes.
 	script := writePosixScript(t, `setsid sleep 10 &
 wait`)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -117,28 +122,27 @@ wait`)
 	}
 }
 
-// TestExecRunnerEscapedDescendantGracePathRace is the limitedBuffer data race
-// regression test: a descendant that ESCAPES the process group (setsid) while
-// holding the captured pipes AND KEEPS WRITING cannot be killed by the group
-// kill, so os/exec's internal pipe-copy goroutine stays alive past the
-// waitGrace return and keeps writing into the capture buffers while Run reads
-// the result. limitedBuffer must be mutex-guarded (Write, bytes, and the
-// truncation flag) so those concurrent writer writes cannot race the caller's
-// reads; without the mutex this test fails under -race with a limitedBuffer
-// data race. The mutex is also the fix that matters on Windows — where only
-// the direct child can be killed, so any wrapper-spawned pipe-holding child
-// that keeps writing makes the same race reachable — hence the mutex comment
-// in runner.go; this test skips there because setsid and POSIX shell write
-// loops do not exist.
+// TestExecRunnerEscapedDescendantWriterBoundsCapture pins the capture
+// bounds under a hostile writer: a descendant that ESCAPES the process group
+// (setsid) while holding the captured pipes AND KEEPS WRITING cannot be
+// killed by the group kill, yet Run must return promptly with the
+// cancellation mapped to context.DeadlineExceeded and a final, capped
+// snapshot of the output. The capture buffers are quiescent when Run reads
+// them — the runner's own pipe teardown force-closes the read ends and joins
+// the copy goroutines before Cmd.Wait is awaited — so the limitedBuffer
+// mutex (see runner.go) is defense-in-depth rather than the pre-fix
+// data-race guard; running this test under -race proves that quiescence. On
+// the old os/exec-internal-pipe design, the same scenario left a pipe-copy
+// goroutine writing into the buffers while Run read them (the race this
+// regression originally pinned), which is why the mutex exists.
 //
-// The escaped descendant is bounded by its own lifetime (a ~6s write loop,
-// one 2-byte write per 10ms) so nothing needs to kill it: the 1s deadline
-// plus the 2s waitGrace lands ~3s in, well inside the loop, so the grace
-// path deterministically fires while the descendant is actively writing, and
-// the orphan exits on its own afterwards. A small capture cap forces the
-// truncation flag to be written on every subsequent write, which is what
-// makes the pre-fix race deterministic.
-func TestExecRunnerEscapedDescendantGracePathRace(t *testing.T) {
+// The escaped descendant is bounded by its own lifetime (a ~6 s write loop,
+// one 2-byte write per 10 ms) so nothing needs to kill it: the 1 s deadline
+// lands well inside the loop, while the descendant is actively writing, and
+// the orphan exits on its own afterwards (its next write hits a pipe with no
+// readers). A small capture cap forces the truncation flag to be written on
+// every subsequent write, pinning the truncation behavior.
+func TestExecRunnerEscapedDescendantWriterBoundsCapture(t *testing.T) {
 	skipOnWindows(t)
 	if _, err := exec.LookPath("setsid"); err != nil {
 		t.Skip("setsid (util-linux) not available")

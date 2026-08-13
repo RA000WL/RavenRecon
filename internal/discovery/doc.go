@@ -54,17 +54,23 @@
 // digits, hyphens, and dots, and never starts with a hyphen). Every
 // execution supports context cancellation — on unix the child's whole
 // process group is killed, so a wrapper script or PATH shim that spawned a
-// descendant holding the output pipes cannot keep Cmd.Wait blocked on pipe
-// EOF, and the post-kill drain is bounded by a short grace period after
-// which the runner returns a structured cancellation error instead of
-// hanging; on Windows only the direct child is killed and the grace bound
-// alone prevents the caller hang — per-job deadlines, structured errors for
-// missing executables and non-zero exits, and bounded output: stdout and
-// stderr are captured through size-limited readers (DefaultMaxOutput per
-// stream) and oversize streams are truncated and diagnosed, never buffered
-// without bound. A child killed because its context was cancelled or timed
-// out is always classified by the context error (cancelled, never a clean
-// exit-code failure).
+// descendant holding the output pipes has that descendant terminated with
+// the group (unless it escaped into its own session with setsid). The
+// captured streams flow through pipes the runner owns itself (os.Pipe plus
+// its own copy goroutines; see pipeCopies in runner.go), whose read ends are
+// force-closed and copy goroutines joined before Run returns on every path,
+// so even an escaped pipe-holder can pin no goroutine, file descriptor, or
+// capture buffer past Run's return. On Windows only the direct child is
+// killed; a wrapper-spawned descendant may itself outlive a cancelled run,
+// but it can pin no runner resource and Run never blocks on it. A short wait
+// bound (waitGrace) covers the single residual case of a child that cannot
+// be killed at all (an unkillable D-state process) — per-job deadlines,
+// structured errors for missing executables and non-zero exits, and bounded
+// output: stdout and stderr are captured through size-limited readers
+// (DefaultMaxOutput per stream) and oversize streams are truncated and
+// diagnosed, never buffered without bound. A child killed because its
+// context was cancelled or timed out is always classified by the context
+// error (cancelled, never a clean exit-code failure).
 //
 // # Parsing, normalization, and deduplication
 //

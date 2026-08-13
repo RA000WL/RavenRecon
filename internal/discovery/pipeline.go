@@ -402,17 +402,28 @@ func resolveSourceNames(sel []string) ([]string, error) {
 	return out, nil
 }
 
-// runSource is one cache-before-execute job body: derive the Phase 3 key,
-// return the stored result on a usable hit, otherwise execute the adapter,
-// classify, and store a statused record. A record that fails decodeStored is
-// never served as a hit: it is deleted (best-effort) and the job falls
-// through to a fresh execution, so the canonical result of this run replaces
-// the stale record (self-healing).
+// runSource is one cache-before-execute job body: for known-version tools,
+// derive the Phase 3 key, return the stored result on a usable hit, otherwise
+// execute the adapter, classify, and store a statused record. A record that
+// fails decodeStored is never served as a hit: it is deleted (best-effort)
+// and the job falls through to a fresh execution, so the canonical result of
+// this run replaces the stale record (self-healing). Tools with an unknown
+// version (det.Version == "") are never cached at all — no key, no Get, no
+// Put — and execute fresh on every run (see the policy note at the cache
+// gate below).
 func runSource(ctx context.Context, target asset.Domain, src Source, det Detection, cfg Config) SourceResult {
 	res := SourceResult{Source: src.Name(), Detection: det, Version: det.Version, Status: OutCompleted}
 	var key cache.Key
 	haveKey := false
-	if cfg.Cache != nil {
+	if cfg.Cache != nil && det.Version != "" {
+		// Cache policy: a tool whose version is unknown (det.Version == "")
+		// is NON-CACHEABLE. An unknown version cannot be distinguished from
+		// any other unknown version, so a ""-version key could serve one
+		// unknown-version tool state's results for another — silently
+		// returning stale results across an undetectable upgrade.
+		// Unknown-version runs therefore bypass the cache entirely: no key,
+		// no Get, no Put, and every run executes fresh. Versioned tools cache
+		// on the detected version; a version change misses and re-executes.
 		k, err := cacheKey(target, src, det)
 		if err != nil {
 			res.Status = OutFailed
@@ -421,6 +432,15 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 		}
 		key, haveKey = k, true
 		out := cfg.Cache.Get(ctx, key)
+		// A non-hit Get that carries a diagnosis (StateError,
+		// StateCorrupt, StateSchemaIncompatible — Miss/Expired/Incomplete
+		// carry no Err) is a warning, never a failure: the run falls
+		// through to a fresh execution below and the cause is joined into
+		// res.Err so the renderer can surface it. No cache outcome can block
+		// or fail the discovery layer indefinitely.
+		if !out.IsHit() && out.Err != nil {
+			res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: cache get: %w", src.Name(), out.Err))
+		}
 		if out.IsHit() {
 			// Only a completed, unexpired record for the exact key is a hit.
 			// The cache never surfaces failed, cancelled, incomplete,

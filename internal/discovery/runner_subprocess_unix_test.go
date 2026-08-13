@@ -10,6 +10,15 @@ import (
 	"testing"
 )
 
+// probePidAlive reports whether a process with the given pid exists
+// (kill(pid, 0)), without reaping anything. It is the patient probe used by
+// the resource-freeze hardening tests; a Windows stub exists so the shared
+// test files compile there (those tests skip before probing).
+func probePidAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
 // assertDescendantReaped reads the descendant pid written by the shell
 // scripts in these tests and fails unless that process is gone. It proves
 // the process-group kill actually reaped the pipe-holding descendant: a

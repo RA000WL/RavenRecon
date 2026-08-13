@@ -21,6 +21,12 @@ import (
 // other invocation modes (or any option that changes the results' meaning)
 // MUST extend this map; timings, rate limits, and other non-semantic settings
 // must never enter the key.
+//
+// Callers must invoke cacheKey only for known-version tools: by policy (see
+// runSource) an unknown version (det.Version == "") makes the tool
+// NON-CACHEABLE, and it must never be keyed, read, or written under a
+// ""-version identity, which could not be distinguished from any other
+// unknown version.
 func cacheKey(target asset.Domain, src Source, det Detection) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,

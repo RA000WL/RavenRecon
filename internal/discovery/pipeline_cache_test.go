@@ -36,8 +36,11 @@ func keyFor(t *testing.T, target asset.Domain, srcName, version string) cache.Ke
 }
 
 // TestRunCacheMissThenHit verifies cache-before-execute: the first run
-// executes every source and stores completed records; the second run with an
-// identical key serves hits without executing the tools again.
+// executes every source and stores completed records for the versioned tools;
+// the second run with an identical key serves hits for those without
+// executing them again. assetfinder has no version flag (unknown version),
+// so under the unknown-version policy it is never cached and re-executes on
+// every run.
 func TestRunCacheMissThenHit(t *testing.T) {
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, newFakeLookup())
@@ -50,7 +53,7 @@ func TestRunCacheMissThenHit(t *testing.T) {
 		t.Fatalf("first run executes = %d, want 3", got)
 	}
 
-	// Every source stored a completed record.
+	// Every versioned source stored a completed record.
 	det := rep1.Results[0].Detection
 	k := keyFor(t, target, "subfinder", det.Version)
 	out := c.Get(context.Background(), k)
@@ -69,22 +72,34 @@ func TestRunCacheMissThenHit(t *testing.T) {
 	if out.Record.Tool.Name != "subfinder" || out.Record.Tool.Version != "v2.6.3" {
 		t.Fatalf("record tool = %+v, want subfinder v2.6.3", out.Record.Tool)
 	}
+	// The unknown-version source must never have been stored.
+	if o := c.Get(context.Background(), keyFor(t, target, "assetfinder", "")); o.State != cache.StateMiss {
+		t.Fatalf("unknown-version assetfinder must never be cached, got state %s", o.State)
+	}
 
-	// Second run is served entirely from cache.
+	// Second run: subfinder and amass are served from cache; assetfinder
+	// (unknown version) re-executes.
 	execsBefore := r.discoverCallCount()
 	rep2 := mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execsBefore {
-		t.Fatalf("cache hits must not re-execute tools: executes %d -> %d", execsBefore, got)
+	if got := r.discoverCallCount(); got != execsBefore+1 {
+		t.Fatalf("cache hits must not re-execute versioned tools: executes %d -> %d (want exactly assetfinder to re-execute)", execsBefore, got)
 	}
 	for i := range rep2.Results {
-		if !rep2.Results[i].Cached {
-			t.Fatalf("%s result not served from cache", rep2.Results[i].Source)
-		}
-		if rep2.Results[i].Status != OutCompleted {
-			t.Fatalf("%s cached status = %s, want completed", rep2.Results[i].Source, rep2.Results[i].Status)
-		}
-		if len(rep1.Results[i].Hosts) != len(rep2.Results[i].Hosts) {
-			t.Fatalf("%s hosts changed across the cache hit: %d -> %d", rep2.Results[i].Source, len(rep1.Results[i].Hosts), len(rep2.Results[i].Hosts))
+		switch rep2.Results[i].Source {
+		case "subfinder", "amass":
+			if !rep2.Results[i].Cached {
+				t.Fatalf("%s result not served from cache", rep2.Results[i].Source)
+			}
+			if rep2.Results[i].Status != OutCompleted {
+				t.Fatalf("%s cached status = %s, want completed", rep2.Results[i].Source, rep2.Results[i].Status)
+			}
+			if len(rep1.Results[i].Hosts) != len(rep2.Results[i].Hosts) {
+				t.Fatalf("%s hosts changed across the cache hit: %d -> %d", rep2.Results[i].Source, len(rep1.Results[i].Hosts), len(rep2.Results[i].Hosts))
+			}
+		case "assetfinder":
+			if rep2.Results[i].Cached {
+				t.Fatal("an unknown-version source must never be served from cache")
+			}
 		}
 	}
 
@@ -95,8 +110,8 @@ func TestRunCacheMissThenHit(t *testing.T) {
 	}
 	cfg.Cache = c2
 	mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execsBefore {
-		t.Fatalf("records must persist per cache dir: executes %d -> %d", execsBefore, got)
+	if got := r.discoverCallCount(); got != execsBefore+2 {
+		t.Fatalf("records must persist per cache dir (assetfinder still re-executes): executes %d -> %d", execsBefore, got)
 	}
 }
 
@@ -146,11 +161,12 @@ func TestRunCachePartialStoredIncomplete(t *testing.T) {
 	if !bytes.Contains(out.Record.Data, []byte("api.example.com")) {
 		t.Fatalf("partial data must retain the discovered host: %s", out.Record.Data)
 	}
-	// A later run must re-execute (partial results are never hits).
+	// A later run must re-execute the partial source (and assetfinder, which
+	// is never cached); amass is served from cache.
 	execs := r.discoverCallCount()
 	mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execs+1 {
-		t.Fatalf("later run must re-execute the partial source: %d -> %d", execs, got)
+	if got := r.discoverCallCount(); got != execs+2 {
+		t.Fatalf("later run must re-execute the partial and unknown-version sources: %d -> %d", execs, got)
 	}
 }
 
@@ -217,8 +233,8 @@ func TestRunCacheFailedStored(t *testing.T) {
 	}
 	execs := r.discoverCallCount()
 	mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execs+1 {
-		t.Fatalf("later run must re-execute the failed source: %d -> %d", execs, got)
+	if got := r.discoverCallCount(); got != execs+2 {
+		t.Fatalf("later run must re-execute the failed source (and the never-cached assetfinder): %d -> %d", execs, got)
 	}
 }
 
@@ -241,8 +257,8 @@ func TestRunCacheEmptySuccessIsCompletedHit(t *testing.T) {
 	}
 	execs := r.discoverCallCount()
 	rep2 := mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execs {
-		t.Fatalf("empty completed result must be a hit: executes %d -> %d", execs, got)
+	if got := r.discoverCallCount(); got != execs+1 {
+		t.Fatalf("empty completed result must be a hit (only the never-cached assetfinder re-executes): executes %d -> %d", execs, got)
 	}
 	if !rep2.Results[0].Cached {
 		t.Fatal("empty result not served from cache")
@@ -458,13 +474,15 @@ func TestRunCacheRejectsTamperedRecordIdentity(t *testing.T) {
 	}
 }
 
-// recordingCache wraps a cache.Cache and counts Delete calls, so tests can
-// prove a deletion actually happened (not just that a later Put overwrote the
-// entry).
+// recordingCache wraps a cache.Cache and counts Delete and Put calls, so
+// tests can prove a deletion actually happened (not just that a later Put
+// overwrote the entry) and prove whether (and for which tool) stores
+// happened.
 type recordingCache struct {
 	cache.Cache
 	mu      sync.Mutex
 	deletes int
+	puts    map[string]int // per tool name, from Record.Tool.Name
 }
 
 func (c *recordingCache) Delete(ctx context.Context, key cache.Key) error {
@@ -474,10 +492,26 @@ func (c *recordingCache) Delete(ctx context.Context, key cache.Key) error {
 	return c.Cache.Delete(ctx, key)
 }
 
+func (c *recordingCache) Put(ctx context.Context, key cache.Key, record cache.Record) error {
+	c.mu.Lock()
+	if c.puts == nil {
+		c.puts = make(map[string]int)
+	}
+	c.puts[record.Tool.Name]++
+	c.mu.Unlock()
+	return c.Cache.Put(ctx, key, record)
+}
+
 func (c *recordingCache) deleteCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.deletes
+}
+
+func (c *recordingCache) putCountFor(tool string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.puts[tool]
 }
 
 // TestRunCacheTamperedRecordSelfHeals is the self-healing regression test for
@@ -590,9 +624,9 @@ func TestRunCacheTamperedRecordSelfHeals(t *testing.T) {
 			if res2.Status != OutCompleted || len(res2.Hosts) != 2 {
 				t.Fatalf("run 2 = %s with %d hosts, want completed with the canonical hosts", res2.Status, len(res2.Hosts))
 			}
-			if execCalls != 1 || r.discoverCallCount() != execsBefore+3 {
-				t.Fatalf("run 2 must not execute: subfinder executions = %d, discovery calls %d -> %d (want %d: each source exactly once)",
-					execCalls, execsBefore, r.discoverCallCount(), execsBefore+3)
+			if execCalls != 1 || r.discoverCallCount() != execsBefore+4 {
+				t.Fatalf("run 2 must not execute: subfinder executions = %d, discovery calls %d -> %d (want %d: each source once in run 1, plus the never-cached assetfinder in run 2)",
+					execCalls, execsBefore, r.discoverCallCount(), execsBefore+4)
 			}
 
 			// Run 3: still a hit; the healed record is stable.
@@ -627,10 +661,11 @@ func TestRunCachePutFailureSurfacesError(t *testing.T) {
 	if len(res.Hosts) != 2 {
 		t.Fatalf("hosts = %v, want the executed payload retained", names(res.Hosts))
 	}
-	// Every source attempted (and failed) its write; the loss of the error
-	// would have made the warning invisible.
-	if got := fc.putCount(); got != 3 {
-		t.Fatalf("cache puts attempted = %d, want 3", got)
+	// Every versioned source attempted (and failed) its write; the never-
+	// cached assetfinder (unknown version) must not attempt one. The loss of
+	// the error would have made the warning invisible.
+	if got := fc.putCount(); got != 2 {
+		t.Fatalf("cache puts attempted = %d, want 2 (subfinder + amass)", got)
 	}
 }
 
@@ -674,18 +709,22 @@ func TestRunCacheVersionChangeReexecutes(t *testing.T) {
 	if execCalls != 2 {
 		t.Fatalf("subfinder executions = %d, want 2", execCalls)
 	}
-	// Sources whose version did not change keep serving from cache.
-	for i := 1; i < 3; i++ {
-		if !rep2.Results[i].Cached {
-			t.Fatalf("%s must stay cached when its version is unchanged", rep2.Results[i].Source)
-		}
+	// amass's version did not change, so it keeps serving from cache; the
+	// never-cached assetfinder re-executes by policy.
+	if !rep2.Results[2].Cached {
+		t.Fatal("amass must stay cached when its version is unchanged")
+	}
+	if rep2.Results[1].Cached {
+		t.Fatal("the unknown-version assetfinder must never be served from cache")
 	}
 }
 
 // TestRunCacheUnknownVersionToKnownVersionReexecutes covers the "" vs
 // "v2.6.3" transition: a WARN detection (unrecognizable version output)
-// yields an empty version key; when the version flag starts working again
-// the key changes and the source re-executes.
+// yields an unknown version; when the version flag starts working again the
+// source re-executes. Under the unknown-version policy the WARN run must
+// store NOTHING (no ""-version record may ever be written), so the
+// transition is a clean miss rather than a key change.
 func TestRunCacheUnknownVersionToKnownVersionReexecutes(t *testing.T) {
 	versionCalls := 0
 	execCalls := 0
@@ -703,7 +742,7 @@ func TestRunCacheUnknownVersionToKnownVersionReexecutes(t *testing.T) {
 	}
 	r := newFakeRunner(t, script)
 	cfg := testConfig(r, newFakeLookup())
-	c := openTestCache(t)
+	c := &recordingCache{Cache: openTestCache(t)}
 	cfg.Cache = c
 	target := mustDomain(t, "example.com")
 
@@ -712,18 +751,35 @@ func TestRunCacheUnknownVersionToKnownVersionReexecutes(t *testing.T) {
 		t.Fatalf("run 1 detection = %s version %q, want warn with empty version",
 			rep1.Results[0].Detection.Status, rep1.Results[0].Version)
 	}
+	if got := c.putCountFor("subfinder"); got != 0 {
+		t.Fatalf("an unknown-version run must store nothing, got %d subfinder puts", got)
+	}
+	if got := c.deleteCount(); got != 0 {
+		t.Fatalf("an unknown-version run must delete nothing, got %d deletes", got)
+	}
 	execs := execCalls
 	rep2 := mustRun(t, target, cfg)
 	if rep2.Results[0].Version != "v2.6.3" {
 		t.Fatalf("run 2 version = %q, want v2.6.3", rep2.Results[0].Version)
 	}
 	if rep2.Results[0].Cached {
-		t.Fatal("the unknown-version record must not serve the known-version query")
+		t.Fatal("the unknown-version run must not serve the known-version query (nothing was ever stored)")
 	}
 	if execCalls != execs+1 {
 		t.Fatalf("run 2 must re-execute after the version transition: %d -> %d", execs, execCalls)
 	}
 	if len(rep2.Results[0].Hosts) != 2 {
 		t.Fatalf("run 2 hosts = %v, want the executed payload", names(rep2.Results[0].Hosts))
+	}
+	// The known-version record IS stored and serves a hit on the next run.
+	if got := c.putCountFor("subfinder"); got != 1 {
+		t.Fatalf("run 2 must store the known-version record, got %d subfinder puts", got)
+	}
+	rep3 := mustRun(t, target, cfg)
+	if !rep3.Results[0].Cached {
+		t.Fatal("run 3 must serve the known-version record as a hit")
+	}
+	if execCalls != execs+1 {
+		t.Fatalf("run 3 must not re-execute: executions %d", execCalls)
 	}
 }

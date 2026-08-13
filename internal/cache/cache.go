@@ -271,6 +271,10 @@ func (c *FS) Put(ctx context.Context, key Key, record Record) error {
 }
 
 // Delete removes the entry for key. Deleting a missing key is not an error.
+// The context is checked at entry only, before the path is derived: unlike
+// Put, Delete never re-checks ctx under the mutex, because its critical
+// section is a single fast os.Remove. A cancellation that fires while a
+// Delete is in flight therefore does not abort the removal.
 func (c *FS) Delete(ctx context.Context, key Key) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("cache delete %s: %w", key, err)
@@ -369,11 +373,15 @@ type entryRead struct {
 }
 
 // readEntry classifies the entry at path without mutating anything. The path
-// is never opened unless it is a regular file: opening a FIFO, device, or
-// similar special file directly can block indefinitely, and a directory must
-// never be treated as an entry. Non-regular files (including directories,
-// FIFOs, sockets, and symlinks) are classified as corrupt without being
-// opened, so the normal self-healing path removes them.
+// is never read unless it is verified a regular file TWICE: by the Lstat
+// pre-check (a cheap fast path for the common missing/regular cases) and again
+// by an fstat of the OPENED descriptor. The open itself uses platform-specific
+// no-follow/non-blocking flags (see openEntryRegular), so a regular file
+// swapped for a FIFO or symlink between the pre-check and the open classifies
+// as corrupt promptly instead of blocking a lock-free Get. Non-regular files
+// (including directories, FIFOs, sockets, and symlinks) are classified as
+// corrupt without ever being read, so the normal self-healing path removes
+// them.
 func (c *FS) readEntry(path string) entryRead {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -386,14 +394,32 @@ func (c *FS) readEntry(path string) entryRead {
 		return entryRead{state: entryCorrupt, err: fmt.Errorf("cache: entry %s is not a regular file", path)}
 	}
 
-	f, err := os.Open(path)
+	f, err := openEntryRegular(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return entryRead{state: entryMissing}
 		}
+		if isSpecialFileOpenError(err) {
+			// ELOOP (symlink rejected by O_NOFOLLOW) or ENXIO (unreadable
+			// special file): a fast, non-blocking corrupt classification,
+			// never a filesystem error.
+			return entryRead{state: entryCorrupt, err: fmt.Errorf("cache: entry %s is not a regular file: %w", path, err)}
+		}
 		return entryRead{state: entryError, err: fmt.Errorf("cache: open %s: %w", path, err)}
 	}
 	defer func() { _ = f.Close() }()
+
+	// Verify the OPENED descriptor, not the pre-checked path: the object may
+	// have been swapped between Lstat and Open. A non-regular opened
+	// descriptor (e.g. a FIFO opened non-blocking, which succeeds on unix) is
+	// never read.
+	fi, err = f.Stat()
+	if err != nil {
+		return entryRead{state: entryError, err: fmt.Errorf("cache: stat opened entry %s: %w", path, err)}
+	}
+	if !fi.Mode().IsRegular() {
+		return entryRead{state: entryCorrupt, err: fmt.Errorf("cache: entry %s is not a regular file", path)}
+	}
 
 	buf, err := io.ReadAll(io.LimitReader(f, MaxRecordSize+1))
 	if err != nil {

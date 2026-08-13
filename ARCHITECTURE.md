@@ -223,6 +223,14 @@ previous state), but it can never expose partially written content. Cache direct
 permissions. Entries are bounded by `MaxRecordSize` (16 MiB) on both write and
 read, so a runaway result cannot exhaust memory or disk through the cache.
 
+Entry reads carry a safe-open guarantee: the path is Lstat-pre-checked, then
+opened with platform-specific no-follow/non-blocking flags (on unix
+`O_NOFOLLOW|O_NONBLOCK`), and the OPENED descriptor is fstat-verified to be a
+regular file before any byte is read. A regular file swapped for a FIFO or
+symlink between the pre-check and the open therefore can never block a
+lock-free `Get` and can never be read: such objects classify as corrupt
+promptly and are removed by self-healing.
+
 ### Outcomes
 
 `Get` never returns an unusable entry as a valid result. Outcomes distinguish
@@ -361,12 +369,19 @@ normalized target is validated to contain only lowercase letters, digits,
 hyphens, and dots). Every execution honors context cancellation, pool
 deadlines, and bounded capture. On unix the child runs as the leader of its
 own process group and cancellation kills the whole group, so a wrapper script
-or PATH shim that spawned a descendant holding the output pipes cannot keep
-`Cmd.Wait` blocked on pipe EOF; the post-kill drain is additionally bounded
-by a 2 s grace period after which the runner returns a structured
-cancellation error instead of hanging. On Windows there are no POSIX process
-groups, so only the direct child is killed and the grace bound alone prevents
-the caller hang (the descendant may outlive the run). stdout and stderr are
+or PATH shim that spawned a descendant holding the output pipes has that
+descendant terminated with the group (unless it escaped into its own session
+with `setsid`). The captured streams flow through pipes the runner owns
+itself (`os.Pipe` plus its own copy goroutines; see `pipeCopies` in
+`runner.go`), whose read ends are force-closed and copy goroutines joined
+before `Run` returns on every path: even a descendant that escaped the
+process group while holding the write ends can pin no goroutine, file
+descriptor, or capture buffer past `Run`'s return. On Windows there are no
+POSIX process groups, so only the direct child is killed; a wrapper-spawned
+descendant may itself outlive a cancelled run, but it can pin no runner
+resource and `Run` never blocks on it. A short wait bound (`waitGrace`)
+covers the single residual case of a child that cannot be killed at all (an
+unkillable D-state process). stdout and stderr are
 collected through size-limited sinks (`DefaultMaxOutput` = 4 MiB per stream;
 never an unbounded `io.ReadAll`), overflow is truncated and diagnosed, a
 non-zero exit is a structured error (never a panic), and a child killed
@@ -459,6 +474,13 @@ entries are never treated as results: the cache surfaces them as distinct
 miss states, and a stale record can never be served for a different target
 or configuration.
 
+Tools whose version cannot be determined (`Version == ""` — assetfinder
+always, and any WARN detection with a broken version flag) are not cached at
+all: an unknown version cannot be distinguished from any other unknown
+version, so the pipeline builds no key, performs no Get and no Put, and the
+source executes fresh on every run. This guarantees an undetectable tool
+upgrade can never serve stale results.
+
 ### Partial result semantics
 
 - Non-zero exit with usable output: partial — the captured hosts are kept,
@@ -531,13 +553,15 @@ immediately with status 130 (128+SIGINT).
   (see "Runtime integration and rate limiting").
 - On Windows, cancellation kills only the direct child process (no POSIX
   process groups); a wrapper script that spawned a pipe-holding descendant
-  can therefore outlive a cancelled run, though the bounded post-kill drain
-  guarantees the CLI itself never hangs.
-- When detection is WARN (version unknown, e.g. a broken version flag),
-  cache keys cannot track tool upgrades: a completed hit may be served
-  across a silent tool upgrade while the version flag stays broken. Use
-  `--no-cache` (or leave the cache disabled) to force re-execution in that
-  situation.
+  can therefore outlive a cancelled run, though Run's own pipe teardown
+  guarantees the CLI never hangs and the descendant can pin no runner
+  goroutine, file descriptor, or capture buffer.
+- Tools whose version cannot be determined (assetfinder always; any WARN
+  detection with a broken version flag) are never cached: unknown-version
+  runs bypass the cache entirely — no read, no write — and execute fresh on
+  every run, so an undetectable upgrade can never serve stale results.
+  Versioned tools cache on the detected version (a detectable upgrade misses
+  and re-executes).
 
 ## Configuration precedence
 
