@@ -58,7 +58,8 @@ that consume them).
 
 ## v0.3 — Runtime Engine
 
-Status: next
+Status: deferred — the cache foundation (v0.4) ships first per phase
+sequencing; no runtime/scheduler code exists in this repository yet.
 
 - [ ] Context-aware scheduler
 - [ ] Bounded worker pool
@@ -77,11 +78,18 @@ No reconnaissance tools should be implemented in this milestone.
 
 ## v0.4 — Cache and Resume
 
-- [ ] Persistent cache
-- [ ] Cache schema versioning
-- [ ] Resume support
-- [ ] Cache invalidation
-- [ ] Deterministic cache keys
+Status: complete
+
+Implemented in `internal/cache` (persistent, filesystem-backed; no database):
+
+- [x] Persistent cache
+- [x] Cache schema versioning
+- [x] Resume support
+- [x] Cache invalidation
+- [x] Deterministic cache keys
+
+Details, semantics, and known limitations: see `ARCHITECTURE.md`
+("Cache and resume").
 
 ---
 

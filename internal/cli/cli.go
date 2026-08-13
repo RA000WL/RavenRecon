@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/config"
 	"github.com/RA000WL/RavenRecon/internal/version"
 )
@@ -77,6 +78,15 @@ func printVersion(w io.Writer) error {
 func runDoctor(w io.Writer) error {
 	cfg := config.Default()
 
+	cacheDir := cfg.Cache.Dir
+	if cacheDir == "" {
+		if d, err := cache.DefaultDir(); err == nil {
+			cacheDir = d
+		} else {
+			cacheDir = "(unavailable: " + err.Error() + ")"
+		}
+	}
+
 	_, err := fmt.Fprintf(
 		w,
 		`RavenRecon doctor
@@ -87,11 +97,18 @@ Configuration:
   Timeout:     %s
   Rate:        %.2f req/s
   User-Agent:  %s
+Cache:
+  Enabled:     %t
+  Directory:   %s
+  TTL:         %s (0 = no expiration)
 `,
 		cfg.Concurrency,
 		cfg.Timeout,
 		cfg.Rate,
 		cfg.UserAgent,
+		cfg.Cache.Enabled,
+		cacheDir,
+		cfg.Cache.TTL,
 	)
 
 	return err
