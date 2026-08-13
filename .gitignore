@@ -3,7 +3,7 @@
 /dist/
 /build/
 /ravenrecon
-
+.opencode
 # Runtime data
 .data/
 .cache/
