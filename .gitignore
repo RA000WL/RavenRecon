@@ -1,0 +1,37 @@
+# Binaries
+/bin/
+/dist/
+/build/
+ravenrecon
+
+# Runtime data
+.data/
+.cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage / profiling
+coverage.out
+coverage.html
+*.prof
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
