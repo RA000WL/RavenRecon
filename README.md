@@ -14,12 +14,15 @@ consumer: passive subdomain discovery (`internal/discovery`) with adapters
 for subfinder, assetfinder, and amass (passive mode only).
 
 Active infrastructure is landing incrementally: the DNS pipeline
-(`internal/dns`, roadmap v0.6 sub-milestone 5A) now exists as a
-library-level capability — resolving A/AAAA/CNAME records into typed, cached
-Phase 2 observations with host→address and host→CNAME relationships. It has
-no CLI command yet, and the remaining active engines (HTTP, TLS, URL
-intelligence, JavaScript analysis, crawling, and secret scanning) are still
-later roadmap milestones.
+(`internal/dns`, roadmap v0.6 sub-milestone 5A) and the HTTP probing
+pipeline (`internal/httpprobe`, sub-milestone 5B) now exist as library-level
+capabilities. DNS resolves A/AAAA/CNAME records into typed, cached Phase 2
+observations with host→address and host→CNAME relationships; HTTP probing
+attaches typed HTTP observations (status code, final URL, redirect chain,
+bounded headers, counted body size, TLS flag) to every host's http and
+https root targets. Neither has a CLI command yet; the remaining active
+engines (TLS metadata, URL intelligence, JavaScript analysis, crawling, and
+secret scanning) are still later roadmap milestones.
 
 ## Asset model
 
@@ -111,10 +114,25 @@ relationships, a bounded pool with a central query limiter, per-(host,
 record type) cache-before-execute, and hermetic tests (no public Internet).
 NXDOMAIN and legitimate empty answers are completed observations; truncated,
 failed, and cancelled types are never served as success. It is a library
-capability only — there is no `ravenrecon dns` command yet. HTTP (5B) and
-TLS (5C) are the remaining Active Infrastructure milestones. See
+capability only — there is no `ravenrecon dns` command yet. TLS metadata
+(5C) is the remaining Active Infrastructure milestone. See
 `ARCHITECTURE.md` ("DNS pipeline") for the full design and security
 considerations.
+
+## HTTP probing (library)
+
+`internal/httpprobe` (roadmap v0.6, sub-milestone 5B) probes discovered host
+assets at their two root targets — `http://host/` and `https://host/` — with
+typed, cached observations: final status code, final URL, bounded redirect
+chain, bounded final headers, counted body size, and the TLS-handshake
+flag. Connection refusals ("service absent") and TLS handshake failures
+("https not served") are completed negative observations; timeouts and DNS
+failures are failed probes; hard-cap hits are truncated-incomplete and
+never served from cache. Probing runs on a bounded pool with one central
+request limiter, per-target cache-before-execute, and hermetic tests
+(loopback servers, no public Internet). It is a library capability only —
+there is no `ravenrecon http` command yet. See `ARCHITECTURE.md` ("HTTP
+probing") for the full design and security considerations.
 
 ## Runtime engine
 

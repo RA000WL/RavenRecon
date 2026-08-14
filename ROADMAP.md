@@ -140,13 +140,16 @@ Details, semantics, and known limitations: see `ARCHITECTURE.md`
 DNS lands as sub-milestone 5A of Active Infrastructure: the `internal/dns`
 pipeline exists as a library capability — A/AAAA/CNAME resolution into
 typed, cached Phase 2 observations with host→address and host→CNAME
-relationships (see `ARCHITECTURE.md`, "DNS pipeline"). It has no CLI command
-yet; HTTP (5B) and TLS (5C) are still pending.
+relationships (see `ARCHITECTURE.md`, "DNS pipeline"). HTTP probing lands
+as sub-milestone 5B (`internal/httpprobe`, see `ARCHITECTURE.md`, "HTTP
+probing") and covers the HTTP metadata normalization work items; TLS
+metadata (5C) and technology detection remain pending. Neither pipeline has
+a CLI command yet.
 
 - [x] DNS pipeline
-- [ ] HTTP probing
+- [x] HTTP probing
 - [ ] TLS metadata
-- [ ] HTTP metadata normalization
+- [x] HTTP metadata normalization
 - [ ] technology detection
 
 ---

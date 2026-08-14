@@ -69,11 +69,14 @@ consumer — external-tool adapters with detection, bounded execution,
 parsing/normalization, provenance merging, and cache-before-execute (see
 "Passive discovery"). The cache is not part of the runtime: consumer stages
 compose "cache-before-execute" around runtime jobs (see "Runtime engine").
-The DNS pipeline (roadmap v0.6, sub-milestone 5A; `internal/dns`) exists as
-a library-level stage — A/AAAA/CNAME resolution into typed Phase 2
-observations with per-(host, type) caching and typed relationships (see
-"DNS pipeline"); it has no CLI command yet. The HTTP/URL/JS pipeline stages,
-asset graph, scoring, and reports do not exist yet.
+The DNS pipeline (roadmap v0.6, sub-milestone 5A; `internal/dns`) and the
+HTTP probing pipeline (roadmap v0.6, sub-milestone 5B; `internal/httpprobe`)
+exist as library-level stages — DNS: A/AAAA/CNAME resolution into typed
+Phase 2 observations with per-(host, type) caching and typed relationships
+(see "DNS pipeline"); HTTP: root-path GET probes of every host's http and
+https targets with typed, cached observations, bounded limits, and typed
+relationships (see "HTTP probing"); neither has a CLI command yet. The
+URL/JS pipeline stages, asset graph, scoring, and reports do not exist yet.
 
 ## Asset model
 
@@ -572,8 +575,8 @@ immediately with status 130 (128+SIGINT).
 implements the DNS resolution stage as a library capability: it resolves
 discovered host assets and attaches typed DNS observations to the Phase 2
 asset model. It is a pipeline stage, not a CLI command — there is no
-`ravenrecon dns` yet (HTTP 5B and TLS 5C are still pending; see
-`ROADMAP.md`).
+`ravenrecon dns` yet (HTTP probing has landed as 5B and TLS metadata 5C is
+still pending; see `ROADMAP.md`).
 
 ### Records and relationships
 
@@ -701,8 +704,8 @@ typed assets and relationships, and are never discarded.
 - DNS rebinding boundary: the pipeline makes resolution-time observations
   only. It never fetches content and never pins an address for later
   revalidation, so rebinding risk does not materialize here — it
-  materializes at the HTTP stage (5B), which will consume these
-  observations with its own policy.
+  materializes at the HTTP stage (5B), which consumes these observations
+  with its own policy (see "HTTP security considerations").
 - Malicious answer sizes: raw answer sets are capped at `MaxAnswersPerType`
   with truncated retention recorded `incomplete`, and cache records are
   bounded by the cache's `MaxRecordSize`; an oversized hostile response can
@@ -747,12 +750,280 @@ typed assets and relationships, and are never discarded.
   bounded.
 - The system resolver's own retries and server selection are not subject to
   RavenRecon's limiter (see "Concurrency and rate limiting").
-- Library capability only: no CLI command, and HTTP (5B) and TLS (5C) are
-  still pending.
+- Library capability only: no CLI command; TLS metadata (5C) is still
+  pending.
 - Answers come from the OS resolver with the OS resolver's trust model; no
   DNSSEC validation is performed or claimed.
 - All tests are hermetic: a fake resolver and a real filesystem-backed
   cache, never the public Internet (see `bench_test.go`).
+
+## HTTP probing
+
+`internal/httpprobe` (roadmap v0.6, sub-milestone 5B of Active
+Infrastructure) implements the HTTP probing stage as a library capability:
+it probes discovered host assets at their two root targets and attaches
+typed HTTP observations to the Phase 2 asset model. It is a pipeline stage,
+not a CLI command — there is no `ravenrecon http` yet (TLS metadata, 5C, is
+still pending; see `ROADMAP.md`).
+
+### Probe model
+
+Every host is probed at exactly two targets — `http://host/` and
+`https://host/` — with a GET on the root path (canonical Phase 2 form:
+default port removed, so the two probe targets of one host are the distinct
+identities `url:http://host` and `url:https://host`). The probe target URL
+is the probe's IDENTITY — the observed asset and the cache-key target — and
+it is never a dial address. Requests carry the canonical host (Host header,
+and SNI for https) while the transport resolves and dials, and the dial
+destination is deliberately a transport detail: the identity of the
+observation is independent of where the bytes went. This is the probe seam
+the tests and benchmarks use — a transport whose dial goes to a resolved
+loopback address for any destination. Honest statement: when the caller
+provides no resolved addresses, probing dials through the transport's own
+resolution; the caller-provided addresses (DNS-pipeline observations, keyed
+by canonical host name) are never dialed directly either — they only feed
+`ip -> port` relationship edges for ports observed open.
+
+### Observation model
+
+Each probe records a typed outcome, in a fixed classification order:
+
+- HTTP response received — `completed`, with any status code (404- and
+  500-class results are ordinary completed observations), the final URL,
+  the bounded redirect chain, the bounded sorted final headers, the counted
+  body size, and the TLS-handshake flag.
+- Connection refused — `completed`, `conn_refused`: the service is absent
+  on this port; a legitimate negative observation with no HTTP response.
+- TLS handshake failure (certificate verification, protocol mismatch, or a
+  non-TLS server on the https port) — `completed`, `tls`: https is not
+  served on this endpoint from RavenRecon's trust perspective.
+- Timeout (the per-request deadline, the per-job deadline, or a net-level
+  timeout, including DNS timeouts) — `failed`, `timeout`.
+- DNS resolution failure — `failed`, `dns`.
+- Anything else — `failed`, `other`.
+- Hard-cap hit (redirects, header bytes, header entries, body bytes) —
+  `truncated-incomplete`: the captured observation is incomplete by
+  definition and is never served from cache.
+
+Retention is bounded: at most MaxRedirects+1 redirect hops, at most
+MaxHeaders sorted header entries from a byte-capped header block, and a
+counted (never retained) body size capped at MaxBodyBytes. The TLS flag
+records whether an https probe completed its handshake, and it is set on
+EVERY terminal path: the final response, an out-of-scope redirect terminal,
+and a cap-exceeding redirect terminal each carry the handshake state of the
+response that ended the walk; http probes and failed handshakes record
+false.
+
+### Relationship mapping
+
+Each host result carries typed `asset.Relationship` edges through the
+existing kinds:
+
+- `host -> url` (`RelationshipHostToURL`) for served URLs (a probe completed
+  with an HTTP response);
+- `ip -> port` (`RelationshipIPToPort`) for ports observed open (served, or
+  TLS-proven listeners) — only when the caller provided the host's resolved
+  address;
+- `port -> service` (`RelationshipPortToService`) for confirmed services (a
+  probe completed with an HTTP response; a TLS failure proves a listener,
+  not a service);
+- `url -> endpoint` (`RelationshipURLToEndpoint`, GET on each probe target)
+  for the probe shapes of every executed job, regardless of outcome.
+
+Redirect-hop and final URLs are recorded in the observations only; the
+graph stays about the probed surface. Edges are deduplicated by edge
+identity and emitted sorted, deterministically.
+
+### Cache behavior
+
+Each probe target is cached under its own Phase 3 key composed of exactly
+the operation (`"http.probe"`) and the canonical Phase 2 URL identity of the
+target — nothing else. The request shape is fixed (GET, no body, a fixed
+RavenRecon user agent) and the redirect policy and caps are fixed
+constants, so there is no result-relevant configuration today; whatever
+configuration could matter in the future must enter the key, but timings,
+timeouts, concurrency, rate limits, and the transport (trust roots, dial
+routing) never do — exactly like the DNS pipeline. HTTP responses of any
+code and the two legitimate negative observations (`conn_refused`, `tls`)
+are stored `completed`; truncated probes are stored `incomplete` and never
+served; failed and cancelled probes are stored `failed`/`cancelled` and can
+never be served as success. A cache hit performs zero network requests
+(asserted in the benchmark harness). TTL semantics are the Phase 3 cache's
+own: records expire per the cache instance's configured TTL, and expired
+records are reported as misses.
+
+Before a stored record can be served as a hit it is re-validated
+(`decodeStoredProbe`): every URL re-parses canonically through the Phase 2
+asset model, the payload must match the probe's own target and scheme, the
+redirect chain must be internally consistent and agree with the final URL,
+the terminal status must be honest — including the rule that a terminal 3xx
+with a Location header and a followed chain is contradictory: a 3xx WITHOUT
+a Location (Go client semantics: terminal) is the only legitimate
+terminal-redirect completion — and outcome flags must not contradict each
+other. Records whose URLs carry credentials in their original form are
+refused. A record failing any check is deleted and recomputed in the same
+run (self-healing), never served.
+
+### Limits
+
+Per probe, fixed constants — deliberately not configuration:
+
+- `MaxRedirects` 10: in-scope redirect hops followed (the observed chain is
+  recorded at most 11 entries; the cap-exceeding hop is observed, never
+  requested);
+- `MaxHeaderBytes` 64 KiB: the response header block (enforced by the
+  production transport via `MaxResponseHeaderBytes`);
+- `MaxHeaders` 128: retained header entries;
+- `MaxBodyBytes` 1 MiB: counted body size (bytes counted only, never
+  retained);
+- `MaxConcurrentPerHost` 2: requests in flight per host (the per-host
+  politeness contract; the current single-job-per-host design stays at 1).
+
+Budget chain, strict and invariant: per-request 10 s
+(`Config.RequestTimeout`, the slowloris budget, on top of the transport's
+response-header timeout) ⊆ per-job 30 s (`DefaultConfig.Timeout`) ⊆
+shutdown drain gradient 15 s grace + 30 s force budget. Pool bounds default
+to exactly 8 workers and a bounded queue of 256.
+
+### Concurrency and rate limiting
+
+One bounded `runtime.Pool` per run owns all scheduling, with exactly one
+job per input host: `Concurrency` workers (default 8), a bounded queue
+(default 256), and a per-job deadline (default 30 s) covering the
+central-limiter waits and the requests themselves. Each job performs its
+two probes sequentially and honors cancellation: once the job context is
+done, no further request is issued and every un-attempted target is
+recorded cancelled.
+
+The pool's job-start rate limiting is deliberately disabled; instead one
+central token-bucket limiter (the runtime engine's `Limiter`; default 20
+requests/second, burst 1) gates every OUTBOUND REQUEST's dispatch, after
+the cache check — including each followed redirect hop — so the aggregate
+request dispatch rate is bounded regardless of concurrency. Rate-limiting
+honesty: the limiter is dispatch-pacing only. It paces RavenRecon's own
+request dispatch and nothing else — it does not and cannot throttle the
+transport's connection handling, TCP behavior, or resolver-internal traffic
+— and RavenRecon never claims to control what it does not enforce.
+Per-host politeness is additionally bounded by `MaxConcurrentPerHost`: a
+RavenRecon-side contract only — with one job per host probing its two
+targets sequentially, at most 1 request per host is in flight (the
+per-host-concurrency test pins the cap; the server itself may of course
+accept connections from other hosts).
+
+Cancellation is classified per probe: a probe cancelled before dispatch
+and a probe cancelled while in flight are both recorded cancelled, a host
+whose job never started keeps its initialized cancelled status, and once
+the job context is done no further request is issued. In-flight requests
+are cancelled promptly by the stdlib transport when their context is
+cancelled. Shutdown budgets bound the overall drain: the drain context is
+the per-job timeout plus a 15 s grace (30 s force budget when per-job
+deadlines are disabled), so the budget chain request ⊆ job ⊆ shutdown
+holds by construction and a stalled server can delay a run only within
+those bounds.
+
+### Partial result semantics
+
+A host's overall status is derived from its per-probe outcomes in fixed
+priority order (see `classifyHost` in `observe.go`):
+
+1. any cancelled probe -> `cancelled` (run teardown; never success)
+2. any truncated probe -> `incomplete` (the captured observation is
+   incomplete by definition)
+3. failed with at least one completed probe -> `incomplete` (partial)
+4. every probe failed -> `failed`
+5. otherwise (all probes completed, including the legitimate negative
+   observations) -> `completed`
+
+The successful parts of a partial result are always retained: an http probe
+that completed while the https probe failed keeps its status code, final
+URL, headers, body size, typed assets, and edges — successes are never
+discarded (pinned by
+`TestProbePartialHTTPOKHTTPSFailNeverDiscardsSuccess`).
+
+### Scope boundary
+
+`Probe` accepts an explicit host list plus the run's declared target
+domain. Every input hostname is re-validated canonically through the Phase
+2 asset model and must be the target domain itself or a subdomain of it;
+anything non-canonical (raw input, uppercase, trailing dots, IP literals,
+hand-built structs) or out-of-domain rejects the WHOLE list before a single
+request is issued. Redirects are followed ONLY into the target domain: an
+in-scope Location is normalized through `asset.ParseURL` and may be
+followed (up to MaxRedirects hops), while an out-of-scope Location —
+including any IP literal, which is never in scope — is recorded as a
+canonicalized display string and NEVER requested. The package is a
+boundary, not an arbitrary-scanning feature, and redirect handling cannot
+be abused to chase probing outside the declared domain or to rebind to
+arbitrary addresses.
+
+### HTTP security considerations
+
+- SSRF boundary: requests are issued only to validated in-scope hosts,
+  from asset-derived canonical URLs; redirect targets outside the target
+  domain are observed-not-requested, so a hostile or compromised in-scope
+  server can never redirect probing onto arbitrary hosts or addresses.
+- DNS rebinding: the identity-vs-dial seam keeps observations independent
+  of dialing, and redirects into IP literals are never in scope — a
+  redirect can never rebind the walk. On dialing, honest statement:
+  RavenRecon does NOT pin dial addresses itself — probing dials through the
+  configured transport's own resolution whether or not the caller provided
+  resolved addresses (the provided addresses are observations that feed
+  `ip -> port` edges). The seam is what would allow a future stage to pin
+  the observed addresses at dial time without changing the observations;
+  today, in the transport-resolves-when-absent case, the dial follows the
+  DNS view at probe time.
+- Slowloris/hang budget chain: every request is bounded by the per-request
+  deadline (10 s default) on top of the transport's response-header
+  timeout, inside the per-job deadline (30 s default), inside the bounded
+  shutdown drain (15 s grace + 30 s force) — a stalled server can delay a
+  run only within those bounds, never wedge it.
+- Header bombs, huge bodies, redirect loops: the response-header block is
+  byte-capped (64 KiB) and entry-capped (128), the body is counted only and
+  capped (1 MiB), and the redirect chain is capped (10); any cap hit marks
+  the probe truncated-incomplete — never completed, and never served from
+  cache.
+- TLS trust: the production transport uses Go's default certificate
+  verification; RavenRecon never sets `InsecureSkipVerify` and never
+  disables chain or hostname checks. Certificate metadata extraction is the
+  TLS milestone (5C) and is out of scope here.
+- Cache poisoning: stored records are re-validated through the Phase 2
+  asset model and cross-checked against their own key before they can be
+  served (`decodeStoredProbe`); tampered or contradictory records are
+  deleted and recomputed, never served. Trust = the network the probe
+  observed + the caller's resolver; there is no separate cache trust
+  domain.
+- Identity collisions: every observation enters the asset model only
+  through the Phase 2 normalizers — probe targets, final URLs, and followed
+  hops are canonical identities, and the scheme is part of the URL
+  identity, so the http and https probes of one host can never collide.
+  Credentials in a hostile Location are redacted at the observation
+  boundary — the single construction point where Location-derived strings
+  become asset URLs — so userinfo can never reach the report, the cache, or
+  errors.
+
+### Known limitations
+
+- Default ports and root path only: probing covers `http://host/` and
+  `https://host/`; non-default ports, non-root paths, and crawling are not
+  supported.
+- No title or body content, and no technology detection: bodies are
+  counted, never retained; technology detection is a later roadmap
+  milestone.
+- Stale-IP caveat: the caller-provided resolved-address map attaches at
+  most one address per host, the DNS pipeline's multi-address closure is
+  not yet wired to probing, and probing never dials those addresses — it
+  dials through the transport's own resolution — so the observed `ip ->
+  port` edges describe the DNS-time addresses, which may be stale by probe
+  time.
+- Redirect following is in-scope-only by design: out-of-scope targets are
+  observed as display strings and never requested (see "Scope boundary").
+- Single-job-per-host: each job runs its two probes sequentially, so one
+  stalled probe can consume the host's job deadline (documented in
+  `doc.go`).
+- Library capability only: no CLI command, and TLS metadata (5C) is still
+  pending.
+- All tests are hermetic: loopback HTTP/TLS servers and a real
+  filesystem-backed cache, never the public Internet (see `bench_test.go`).
 
 ## Configuration precedence
 
@@ -807,10 +1078,16 @@ Implemented:
   relationships, per-(host, type) cache-before-execute with statused
   records, a bounded pool with a central query limiter, per-type
   cancellation classification, and hermetic tests
+* HTTP probing (see "HTTP probing" above; roadmap v0.6 sub-milestone 5B):
+  library-level root-path GET probes of every host's http and https targets
+  with typed Phase 2 observations and relationships, per-target
+  cache-before-execute with statused records, a bounded pool with a central
+  per-request limiter, per-probe cancellation classification, bounded
+  limits, and hermetic tests
 
 Planned, not yet implemented:
 
-* discovery engines beyond passive subdomain enumeration and DNS (HTTP, TLS,
-  URL, JS)
+* discovery engines beyond passive subdomain enumeration, DNS, and HTTP
+  probing (TLS, URL, JS)
 * asset store, graph, and correlation engine
 * reporting and terminal UI
