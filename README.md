@@ -4,7 +4,8 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v0.5.0 — Passive Discovery**
+**v0.5.0 — Passive Discovery** (DNS pipeline landed as Active
+Infrastructure sub-milestone 5A)
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -12,8 +13,12 @@ cancellable, rate-limited runtime engine (`internal/runtime`), and its first
 consumer: passive subdomain discovery (`internal/discovery`) with adapters
 for subfinder, assetfinder, and amass (passive mode only).
 
-This release intentionally does not implement active engines yet: DNS, HTTP,
-TLS, URL intelligence, JavaScript analysis, crawling, and secret scanning are
+Active infrastructure is landing incrementally: the DNS pipeline
+(`internal/dns`, roadmap v0.6 sub-milestone 5A) now exists as a
+library-level capability — resolving A/AAAA/CNAME records into typed, cached
+Phase 2 observations with host→address and host→CNAME relationships. It has
+no CLI command yet, and the remaining active engines (HTTP, TLS, URL
+intelligence, JavaScript analysis, crawling, and secret scanning) are still
 later roadmap milestones.
 
 ## Asset model
@@ -96,6 +101,20 @@ target identity, the passive mode, and the tool name/version; only completed,
 unexpired entries are reused. The `doctor` command reports the same per-source
 detection states. See `ARCHITECTURE.md` ("Passive discovery") for details,
 partial-result semantics, and known limitations.
+
+## DNS pipeline (library)
+
+`internal/dns` (roadmap v0.6, sub-milestone 5A) resolves host assets into
+typed, cached DNS observations: A, AAAA, and CNAME records normalized
+through the Phase 2 asset model, with typed host→address and host→CNAME
+relationships, a bounded pool with a central query limiter, per-(host,
+record type) cache-before-execute, and hermetic tests (no public Internet).
+NXDOMAIN and legitimate empty answers are completed observations; truncated,
+failed, and cancelled types are never served as success. It is a library
+capability only — there is no `ravenrecon dns` command yet. HTTP (5B) and
+TLS (5C) are the remaining Active Infrastructure milestones. See
+`ARCHITECTURE.md` ("DNS pipeline") for the full design and security
+considerations.
 
 ## Runtime engine
 

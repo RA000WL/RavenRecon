@@ -69,8 +69,11 @@ consumer — external-tool adapters with detection, bounded execution,
 parsing/normalization, provenance merging, and cache-before-execute (see
 "Passive discovery"). The cache is not part of the runtime: consumer stages
 compose "cache-before-execute" around runtime jobs (see "Runtime engine").
-The DNS/HTTP/URL/JS pipeline stages, asset graph, scoring, and reports do not
-exist yet.
+The DNS pipeline (roadmap v0.6, sub-milestone 5A; `internal/dns`) exists as
+a library-level stage — A/AAAA/CNAME resolution into typed Phase 2
+observations with per-(host, type) caching and typed relationships (see
+"DNS pipeline"); it has no CLI command yet. The HTTP/URL/JS pipeline stages,
+asset graph, scoring, and reports do not exist yet.
 
 ## Asset model
 
@@ -563,6 +566,194 @@ immediately with status 130 (128+SIGINT).
   Versioned tools cache on the detected version (a detectable upgrade misses
   and re-executes).
 
+## DNS pipeline
+
+`internal/dns` (roadmap v0.6, sub-milestone 5A of Active Infrastructure)
+implements the DNS resolution stage as a library capability: it resolves
+discovered host assets and attaches typed DNS observations to the Phase 2
+asset model. It is a pipeline stage, not a CLI command — there is no
+`ravenrecon dns` yet (HTTP 5B and TLS 5C are still pending; see
+`ROADMAP.md`).
+
+### Records and relationships
+
+Exactly three record families are supported: A, AAAA, and CNAME. Every
+observation is normalized through the Phase 2 asset model — `asset.IP` for
+addresses, `asset.Host` for CNAME targets — and every host result carries
+typed `asset.Relationship` edges: `host -> address`
+(`RelationshipHostToIP`) and `host -> CNAME target`
+(`RelationshipHostToCNAME`). CNAME queries use the stdlib's `LookupCNAME`,
+which follows the chain to the final canonical target. When a host's CNAME
+query completes with a target, the direct target's A and AAAA records are
+resolved at depth exactly 1, so the canonical target becomes a first-class
+host asset with its own address edges; no deeper recursion ever happens, so
+CNAME loops are impossible by construction (see "Known limitations" for the
+multi-hop flattening trade-off). Relationships are deduplicated by edge
+identity and emitted sorted, deterministically.
+
+### Scope boundary
+
+`Resolve` accepts an explicit host list plus the run's declared target
+domain. Every input hostname is re-validated canonically through the Phase 2
+asset model and must be the target domain itself or a subdomain of it;
+anything non-canonical (raw input, uppercase, trailing dots, IP literals,
+hand-built structs) or out-of-domain is rejected before a single query is
+issued. A queried host's CNAME target is a DNS observation and may
+legitimately point outside the target domain (cross-domain CNAMEs are
+observed, never chased beyond depth 1). The package is a boundary, not an
+arbitrary-scanning feature.
+
+### Concurrency and rate limiting
+
+One bounded `runtime.Pool` per run owns all scheduling, with exactly one job
+per input host: `Concurrency` workers (default 8), a bounded queue (default
+256), and a per-job deadline (default 30 s) covering the rate-limit waits
+and the queries themselves. Each job performs its bounded per-type queries
+sequentially and honors cancellation: once the job context is done, no
+further query is issued and every un-attempted type is recorded cancelled.
+
+The pool's job-start rate limiting is deliberately disabled; instead one
+central token-bucket limiter (the runtime engine's `Limiter`; default 20
+queries/second, burst 1) gates every outbound query's DISPATCH: each
+cache-missing query waits for a token before the resolver is called, so the
+aggregate query dispatch rate is bounded regardless of concurrency.
+Rate-limiting honesty: the limiter controls only RavenRecon's own dispatch
+pacing. It does not and cannot throttle traffic the system resolver sends —
+the resolver performs its own server selection, retries, and nameserver
+rotation per `/etc/resolv.conf`, and RavenRecon never claims to control any
+of that and never fakes per-request limits it does not enforce.
+
+### Caching
+
+Each (host, record type) pair is cached under its own Phase 3 key composed
+of exactly the operation (`"dns.resolve"`), the canonical Phase 2 host
+identity, and the record type — nothing else: timings, timeouts,
+concurrency, and rate limits never enter a key, and the fixed answer cap is
+deliberately not configuration (a cap change never invalidates an entry,
+and truncated entries are never served under any cap).
+Partial results are naturally per-type: an A hit with a fresh AAAA miss is
+normal, never all-or-nothing. Record statuses mirror the Phase 4
+conventions: positive answers, legitimate empty answers (NODATA-style), and
+NXDOMAIN observations are all stored `completed`; truncated answer sets are
+stored `incomplete` and never served as hits; failed, timed-out, and
+cancelled types are stored `failed`/`cancelled` and can never be served as
+success. A cache hit performs zero DNS requests (asserted in the benchmark
+harness). TTL semantics are the Phase 3 cache's own: records expire per the
+cache instance's configured TTL and expired records are reported as misses.
+
+### Limits
+
+- `MaxAnswersPerType` (64, fixed constant): per-type answer retention is
+  deduplicated by Phase 2 identity, sorted, and capped; oversized sets are
+  retained truncated and reported/stored `incomplete` — never completed.
+- CNAME depth is ≤ 1 by construction: only the direct target's A/AAAA are
+  resolved, exactly once, with no recursion.
+- Per-job deadline: 30 s by default (`DefaultConfig.Timeout`), covering the
+  central limiter wait and the queries.
+- Pool bounds: exactly `Concurrency` workers (default 8) and a bounded
+  queue (default 256); no goroutine per host, query, or answer.
+- Retention is bounded: answers are retained only as normalized
+  `netip.Addr`/string values with bounded counts and per-type caps, and
+  cache records are bounded by the cache's own `MaxRecordSize`.
+
+### Cancellation
+
+Cancellation is classified per type: a query cancelled before dispatch is
+recorded cancelled without issuing a request; a query cancelled while in
+flight is recorded cancelled (the surfaced stdlib-shaped error, a
+`*net.DNSError` wrapping the context error, is classified through
+`classifyQueryError`, which checks context errors before resolver flags);
+a host whose job never started keeps its initialized cancelled status (see
+"Partial result semantics").
+
+Stdlib known limitation (verified against the Go 1.26 pure-Go resolver
+source): the resolver does not abort an in-flight UDP query when its context
+is cancelled — the in-flight read fails only at the per-attempt deadline
+(resolv.conf timeout × attempts), so the query may return as late as that
+deadline, and the surfaced error then carries `IsTimeout|IsTemporary` with
+no reachable context error (classified `ErrTimeout`, the honest
+classification for the query the resolver actually performed). RavenRecon's
+own code issues no further queries once its context is done, and the pool
+shutdown budgets bound the overall drain: the drain context is the per-job
+timeout plus a 15 s grace (30 s force budget when per-job deadlines are
+disabled), which comfortably covers the default resolv.conf ≈ 5 s × 2
+attempts plus a possible TCP retry. Cancellation of an in-flight query is
+therefore not prompt, only bounded.
+
+### Partial result semantics
+
+A host's overall status is derived from its per-type outcomes in fixed
+priority order (see `classifyHost` in `run.go`):
+
+1. any cancelled type -> `cancelled` (run teardown; never success)
+2. any truncated retention -> `incomplete`
+3. any timed-out type -> `incomplete`
+4. failed with at least one completed type -> `incomplete` (partial)
+5. every attempted type failed -> `failed`
+6. otherwise (all types completed, including NXDOMAIN and legitimate empty
+   answers) -> `completed`
+
+The successful parts of a partial result are always retained, with their
+typed assets and relationships, and are never discarded.
+
+### DNS security considerations
+
+- DNS rebinding boundary: the pipeline makes resolution-time observations
+  only. It never fetches content and never pins an address for later
+  revalidation, so rebinding risk does not materialize here — it
+  materializes at the HTTP stage (5B), which will consume these
+  observations with its own policy.
+- Malicious answer sizes: raw answer sets are capped at `MaxAnswersPerType`
+  with truncated retention recorded `incomplete`, and cache records are
+  bounded by the cache's `MaxRecordSize`; an oversized hostile response can
+  never exhaust memory or disk and can never be served as a completed
+  result.
+- CNAME loops: impossible by construction — the CNAME chain is followed
+  once by the stdlib's `LookupCNAME`, and the pipeline recurses to depth at
+  most 1 (the direct target's A/AAAA only).
+- Resolver exhaustion: query dispatch is bounded by the pool's exact
+  concurrency (default 8) and the central limiter (default 20 q/s), and
+  every job has a per-job deadline (default 30 s); a hostile or failing
+  resolver can delay a run only within those bounds.
+- Cancellation leaks: the pool's `Shutdown` is the join point — it drains
+  queued and in-flight jobs with bounded budgets and returns only after
+  every pool-owned goroutine has terminated; leak tests
+  (`TestResolveNoGoroutineLeakAfterShutdown`,
+  `TestResolveNoGoroutineLeakAfterCancellation`) pin this behavior.
+- Cache poisoning: the cache stores exactly the answers the resolver
+  observed, keyed by host + record type + configuration. There is no
+  resolver authentication, no DNSSEC validation, and no upstream trust: the
+  trust model is "trust the OS resolver" — the same trust the system's own
+  applications place in it. Stored answers are re-validated through the
+  Phase 2 asset model before they can be served as hits
+  (`decodeStoredType`), and records whose identity fields contradict their
+  key are deleted and recomputed, so a corrupt or tampered record can never
+  produce bogus assets.
+- Identity collisions: every observation enters the asset model only
+  through the Phase 2 normalizers — `asset.NewIP` unmaps IPv4-mapped IPv6
+  addresses, so `::ffff:192.0.2.1` and `192.0.2.1` deduplicate to one
+  identity — and identities are namespaced by kind, so a hostname can never
+  collide with an address.
+
+### Known limitations
+
+- Multi-hop CNAME chains are flattened: `LookupCNAME` follows the chain to
+  the final canonical target, so intermediate hops are not observed and the
+  relationship is `host -> final-target` (a multi-hop chain loses its
+  intermediate edges).
+- The stdlib pure-Go resolver completes an in-flight query at its own
+  per-attempt deadline before returning on cancellation (see
+  "Cancellation"); cancellation of an in-flight query is not prompt, only
+  bounded.
+- The system resolver's own retries and server selection are not subject to
+  RavenRecon's limiter (see "Concurrency and rate limiting").
+- Library capability only: no CLI command, and HTTP (5B) and TLS (5C) are
+  still pending.
+- Answers come from the OS resolver with the OS resolver's trust model; no
+  DNSSEC validation is performed or claimed.
+- All tests are hermetic: a fake resolver and a real filesystem-backed
+  cache, never the public Internet (see `bench_test.go`).
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -611,10 +802,15 @@ Implemented:
   execution, passive-only invocations, Phase 2 normalization/dedup and
   provenance merging, cache-before-execute with statused records, the
   `discover` CLI command, and the doctor's per-source detection section
+* DNS pipeline (see "DNS pipeline" above; roadmap v0.6 sub-milestone 5A):
+  library-level A/AAAA/CNAME resolution with typed Phase 2 observations and
+  relationships, per-(host, type) cache-before-execute with statused
+  records, a bounded pool with a central query limiter, per-type
+  cancellation classification, and hermetic tests
 
 Planned, not yet implemented:
 
-* discovery engines beyond passive subdomain enumeration (DNS, HTTP, TLS,
+* discovery engines beyond passive subdomain enumeration and DNS (HTTP, TLS,
   URL, JS)
 * asset store, graph, and correlation engine
 * reporting and terminal UI

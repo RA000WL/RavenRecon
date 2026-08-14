@@ -13,6 +13,11 @@ type RelationshipKind string
 const (
 	// RelationshipHostToIP links a resolved host to its address (Host -> IP).
 	RelationshipHostToIP RelationshipKind = "host_to_ip"
+	// RelationshipHostToCNAME links a host to the canonical target of its
+	// CNAME record (Host -> Host). The target is the final canonical name as
+	// observed by the resolver; see the DNS pipeline's documented multi-hop
+	// flattening limitation.
+	RelationshipHostToCNAME RelationshipKind = "host_to_cname"
 	// RelationshipIPToPort links a listening address to a port (IP -> Port).
 	RelationshipIPToPort RelationshipKind = "ip_to_port"
 	// RelationshipPortToService links a port to a service identified on it

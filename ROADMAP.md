@@ -135,9 +135,15 @@ Details, semantics, and known limitations: see `ARCHITECTURE.md`
 
 ---
 
-## v0.6 — DNS / HTTP
+## v0.6 — Active Infrastructure
 
-- [ ] DNS pipeline
+DNS lands as sub-milestone 5A of Active Infrastructure: the `internal/dns`
+pipeline exists as a library capability — A/AAAA/CNAME resolution into
+typed, cached Phase 2 observations with host→address and host→CNAME
+relationships (see `ARCHITECTURE.md`, "DNS pipeline"). It has no CLI command
+yet; HTTP (5B) and TLS (5C) are still pending.
+
+- [x] DNS pipeline
 - [ ] HTTP probing
 - [ ] TLS metadata
 - [ ] HTTP metadata normalization
