@@ -26,8 +26,13 @@ func NewHost(name string, p Provenance) (Host, error) {
 	return Host{Name: canonical, Original: name, Prov: p}, nil
 }
 
-// Identity returns the deterministic identity used for deduplication.
+// Identity returns the deterministic identity used for deduplication. A
+// zero Host (no name) has a zero identity, so callers can distinguish "no
+// host asset" from a named host via Identity().IsZero.
 func (h Host) Identity() Identity {
+	if h.Name == "" {
+		return Identity{}
+	}
 	return Identity{Kind: KindHost, Value: h.Name}
 }
 

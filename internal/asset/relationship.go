@@ -37,6 +37,18 @@ const (
 	// RelationshipEndpointToParameter links an endpoint to a parameter
 	// observed in it (Endpoint -> Parameter).
 	RelationshipEndpointToParameter RelationshipKind = "endpoint_to_parameter"
+	// RelationshipHostToTechnology links a host to a technology observed on
+	// it (Host -> Technology).
+	RelationshipHostToTechnology RelationshipKind = "host_to_technology"
+	// RelationshipURLToTechnology links a URL to a technology observed on it
+	// (URL -> Technology).
+	RelationshipURLToTechnology RelationshipKind = "url_to_technology"
+	// RelationshipEndpointToTechnology links an endpoint to a technology
+	// observed on it (Endpoint -> Technology).
+	RelationshipEndpointToTechnology RelationshipKind = "endpoint_to_technology"
+	// RelationshipTechnologyToEvidence links a technology to the evidence
+	// observation that supported its detection (Technology -> Evidence).
+	RelationshipTechnologyToEvidence RelationshipKind = "technology_to_evidence"
 )
 
 // Relationship is a typed, directed edge between two asset identities.

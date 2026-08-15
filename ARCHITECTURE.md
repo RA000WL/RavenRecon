@@ -1241,6 +1241,190 @@ in the report, and warnings joined on the returned error.
 - All tests are hermetic: synthetic input and a real filesystem-backed
   cache, never the public Internet.
 
+## Technology detection
+
+Technology detection (roadmap v0.6's final open bullet, phase 6.5;
+`internal/techintel`) is a library-level engine with no CLI command yet: it
+consumes typed observations — response headers, body, cookies, TLS
+metadata, DNS metadata, endpoint paths — and produces typed Phase 2
+technology assets, evidence records, and asset-graph edges against the
+data-only fingerprint database (`internal/techintel/fingerprints`). The
+engine never fetches and never executes JavaScript: a caller composes an
+Observation from its own probes (HTTP probing 5B, TLS metadata 5C, DNS
+resolution 5A) and feeds it to Ingest. It mirrors the urlintel pipeline
+shape: Config/DefaultConfig, an ObservationSource seam (with
+SliceObservationSource for tests and static input), one bounded
+runtime.Pool, cache-before-execute, merge-at-emit, bounded diagnostics,
+cancellation with honest statuses, and a deterministic report.
+
+### Model
+
+`asset.Technology` is identified by category/name ("framework/react") —
+version is an OBSERVED attribute, never part of the identity, and
+`asset.MergeTechnologies` prefers the non-empty version deterministically
+(later observation wins exact ties). `asset.Evidence` is identified by
+method/indicator/value/source: the stored value is capped at 256 bytes by
+a rune-safe truncation ("…" marker; the identity covers exactly the stored
+bytes, so two observations differing only past the bound are the same
+evidence), and the source component is the identity of the asset the
+observation came from — the same indicator matched on two different hosts
+is two evidence records, never one merged record that drops attribution.
+
+### Fingerprint database
+
+`internal/techintel/fingerprints` is DATA ONLY: structured definitions in
+category tables plus the compile-once compiler. The production database
+holds 145 fingerprints with 296 indicators across all 21 categories.
+Indicator kinds are tiered — TierSpoofable (headers, cookies, DNS CNAMEs:
+any operator can emit them) vs TierStructural (HTML markers, script/CSS
+paths, endpoints, TLS certificate fields) — and the tier is derived from
+the kind, never stored per entry, so data cannot mislabel it.
+`SchemaVersion = 1` enters every detection cache key: bumping it
+invalidates every cached result by construction (cache schema versioning
+mirrors `internal/cache`). `Load()` validates every entry and compiles
+every regular expression exactly once; the engine NEVER compiles its own
+regexes and consumes the DB only through the compile-once accessors
+(`MatchRe`/`VersionRe`). Extension is a data-only change: add a table entry
+(name, category, indicators, optional version spec) and `Load` validates
+it — duplicate names across tables and malformed entries fail the load.
+
+### Confidence
+
+Score = 1 − ∏(1 − wᵢ) over INDEPENDENT indicator matches; independence is
+exactly: distinct indicator kinds OR distinct match slots (same
+kind+slot collapses to the max weight). Thresholds: ≥0.8 High, ≥0.5
+Medium, ≥0.2 Low, else Unknown — Unknown detections are still reported.
+Caps: a spoofable-only detection (no structural indicator) is pinned at
+0.59, so it can never exceed Medium; High requires at least one structural
+indicator; a lone weak indicator (weight < 0.35) never exceeds Low. The
+per-technology version comes from the highest-weight version-bearing
+matched indicator (ties: first in DB order), applied to the matched value
+as observed. Equal-score merges resolve by the deterministic tie-break
+chain: a version-bearing contributor outranks a version-less one, then the
+earliest ObservedAt, then the lowest source name, then the version-bearing
+indicator's flat DB ordinal (persisted in cache records, so cache-served
+contributors tie-break identically to fresh ones), then the lowest version
+string, then the level — a total order, so merge order never matters.
+
+### Analyzers
+
+One corpus extraction per observation (one HTML pass, one lowercase body
+copy, cookie parsing bounded at maxObservationCookies entries), then every
+fingerprint indicator matches against its kind's slots: header
+(case-insensitive substring of the "Name: value" line), cookie (name or
+value), html_regex / html_substring (body; substring evidence values are
+byte-aligned back to the ORIGINAL body through per-rune case folding, so
+non-ASCII bodies never tear evidence values), meta_name, generator (regex
+on generator meta content), script_name / script_path, css_path,
+attribute (version from the attribute value), endpoint_path (the canonical
+URL path), tls_issuer / tls_cn / tls_alpn (the typed TLSInfo seam), the
+dns_cname CNAME chain (the typed DNSInfo seam), and sourcemap_path —
+extracted PRESENCE-ONLY from sourceMappingURL tokens; JavaScript is never
+executed. The cookie analyzer combines caller-provided cookies with
+Cookie/Set-Cookie header parsing: the FIRST Set-Cookie pair is the real
+cookie, later pairs are ingested only when they are REAL attributes (Path,
+Domain, Expires, Max-Age, SameSite, Secure, HttpOnly, Partitioned), and
+session flags (HttpOnly/Secure/SameSite) become evidence-only records
+(cookie_flag:* indicator keys) that fire no technology.
+
+### Cache integration
+
+Operation `tech.detect`. The key is the observation identity (the canonical
+URL identity, or the endpoint identity when attached) plus
+`fingerprints.SchemaVersion` plus the sources bitmask (sorted letters: b
+body, c cookies, d DNS, e endpoint, h headers, t TLS), so a body-ful and a
+headers-only observation of the same target are never served each other's
+results. A completed hit serves the stored result with ZERO analysis
+(pinned by the Metrics.Analyzed counter) and rebuilds the identical graph;
+on a hit the entry's StatusCode and FirstSeen/LastSeen come from the stored
+record, never from the observation, and the status code never enters keys.
+Timings, concurrency, and the fixed caps never enter keys either. Decode
+re-validation covers identity containment, mask equality, parallel-array
+lengths (levels, version ordinals), timestamp ordering, canonical
+technology and evidence identities, scores in [0,1], levels never stronger
+than the score allows, and the method-possible guard (a body-less record
+can never carry HTML-derived evidence — the truncated-as-completed tamper
+class); a rejected record is deleted and recomputed in the same run, never
+served. Failed and cancelled observations are never stored as success.
+
+### Pipeline
+
+One bounded runtime.Pool owns all scheduling: exactly one job per
+observation, configurable Concurrency and bounded QueueSize (the reader
+blocks on a full queue — backpressure, never unbounded memory), optional
+per-job deadlines and job-start rate limiting. The reader validates and
+bounds each observation at the ingest boundary (malformed input is counted
+and the run continues; a hostile oversized URL never reaches the parser),
+pre-registers a cancelled placeholder per identity (so a forced shutdown's
+dropped jobs appear honestly as cancelled), and submits one bounded job.
+Each job: cache-before-execute -> analyze (cache miss) -> store the
+completed record -> merge into the entry accumulator -> optional Emit hook.
+Cancellation performs a bounded drain with honest cancelled statuses and
+never leaks workers; completed results are still persisted under a
+detached bounded store budget. Statuses: completed / cancelled / failed
+(entries) and malformed (counted on the Report, never an entry, never
+cached). Per-observation bounds: canonical URL 32 KiB (malformed beyond),
+body 1 MiB (truncated, Truncated flag), 128 header entries (malformed
+beyond), 256 cookies (analyzer cap, Overflow.Cookies), 128 technologies /
+512 indicators per observation (configurable caps with documented
+defaults, Overflow flags), bounded HTML candidate lists (scripts/css/metas
+128, attributes 256, sourcemaps 32, generators 16), and evidence values
+capped by `asset.NewEvidence`.
+
+### Relationships
+
+Every observation emits typed edges, deduplicated by edge identity and
+deterministic in technology order (score desc, name asc): host (hostname
+URLs only) -> technology, url -> technology, endpoint -> technology (when
+an endpoint is attached), and technology -> evidence for every retained
+match that fired the technology. Evidence records whose technology was
+dropped past the technology cap are still reported as observed evidence,
+but carry no technology edge.
+
+### Security considerations
+
+Spoofing is bounded by design: spoofable-only detections never exceed
+Medium, High requires a structural indicator, and isolated weak indicators
+stay at Low — a banner alone can never produce a High classification.
+Resource use is bounded end to end: observation caps, match caps, evidence
+value caps, HTML candidate caps, the bounded pool/queue, and bounded
+diagnostics. HTML scanning is naive by design (single-pass tag scanning,
+not a DOM parser): comment text and JavaScript string literals can
+false-fire script/attribute/meta indicators, honestly and reproducibly —
+but never beyond the caps, and never as a trusted classification. The
+engine never fetches (observations are caller-composed) and never executes
+JavaScript (source maps are presence-only). Cache poisoning is guarded by
+strict decode re-validation: tampered, corrupt, or contradictory records
+are deleted and recomputed in the same run, never served, and the schema
+version plus the sources mask enter every key.
+
+### Known limitations
+
+- HTML scanning is naive, by design: it walks raw markup ("<"...">" tag
+  scans, sourceMappingURL token presence) rather than parsing a document
+  tree. Comment text and JavaScript string literals can false-fire
+  script/attribute/meta indicators (for example a JS string containing
+  `src="/app.js"`), and quoted attribute values inside tags follow a
+  simple quote model. The scan is bounded and fully deterministic — false
+  positives are honest, reproducible observations — but it is not a DOM
+  parser.
+- Ingest's cancellation unwinds the reader, pool, and drain — but only if
+  the ObservationSource honors ctx: a caller source whose Next ignores
+  cancellation and blocks forever can wedge Ingest. This is a seam
+  contract: sources must return promptly (io.EOF, or an error) when ctx is
+  done, exactly as SliceObservationSource does.
+- Cache hits replay the stored record's StatusCode and
+  FirstSeen/LastSeen: they are never re-derived from the observation, a
+  zero-work hit does not advance LastSeen, and TTL expiry (when
+  configured) bounds how stale a served record can become.
+- The method-possible guard is deliberately permissive where a method can
+  arise from more than one observation family: cookie evidence is possible
+  under 'c' OR 'h' (the cookie analyzer parses Cookie/Set-Cookie headers
+  into cookie observations), and endpoint-derived evidence is possible
+  under ANY mask because every observation carries a canonical URL path.
+- All tests and benchmarks are hermetic: synthetic input and a real
+  filesystem-backed cache, never the public Internet.
+
 ## Configuration precedence
 
 Future configuration should follow:

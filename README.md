@@ -25,9 +25,16 @@ sub-milestone 6B) adds canonical-URL streaming with parameter extraction,
 endpoint classification, per-(URL, adapter) caching, and typed graph edges;
 historical-URL tool adapters for gau, waybackurls, and waymore followed in
 sub-milestone 6C (`internal/urlintel/adapt`, see "URL intelligence
-(library)" below). None of the pipelines has a CLI command yet; the
-remaining active engines (TLS metadata, JavaScript analysis, crawling,
-and secret scanning) are still later roadmap milestones.
+(library)" below). Technology detection (`internal/techintel`, phase 6.5)
+lands as a library capability: a fingerprint engine that recognizes
+frameworks, servers, CDNs, WAFs, clouds, authentication providers, CMSes,
+API technologies, build tools, and infrastructure from typed observations
+(headers, body, cookies, TLS/DNS metadata, endpoint paths), with
+confidence scoring, evidence records, and a 145-fingerprint database (see
+"Technology detection (library)" below). None of the pipelines has a CLI
+command yet; the remaining active engines (TLS metadata, JavaScript
+analysis, crawling, and secret scanning) are still later roadmap
+milestones.
 
 ## Asset model
 
@@ -36,12 +43,13 @@ data:
 
 - Domain, Host, IP, Port, Service
 - URL, Endpoint, JavaScript, Parameter
+- Technology, Evidence
 
 Every asset has a deterministic, namespaced identity for deduplication,
 records provenance ("where did this come from?"), supports deterministic
 merging, and serializes to JSON. See `ARCHITECTURE.md` for details.
 
-Deferred to later phases: Technology, SecretCandidate, Finding, the asset
+Deferred to later phases: SecretCandidate, Finding, the asset
 store/graph, and the correlation engine.
 
 ## Cache and resume
@@ -165,6 +173,31 @@ target never concatenated), captured output is capped per tool, and the
 tool name enters cache keys and provenance so the same URL seen via two
 tools merges into one report entry with unioned sources. See
 `ARCHITECTURE.md` ("URL intelligence") for the full design and security
+considerations.
+
+## Technology detection (library)
+
+`internal/techintel` (roadmap phase 6.5) fingerprints what a target runs —
+frameworks, servers, CDNs, WAFs, cloud platforms, authentication
+providers, CMSes, API technologies, build tools, and infrastructure —
+from typed observations: response headers, HTML body, cookies, TLS
+metadata, DNS CNAME chains, and endpoint paths. It never fetches and never
+executes JavaScript: a caller composes an observation from its own probes
+and feeds it to `Ingest`, which analyzes it against the compiled
+fingerprint database (`internal/techintel/fingerprints`, 145 fingerprints
+/ 296 indicators across 21 categories), scores every detection by weight
+(High/Medium/Low/Unknown, with spoofable-only caps and a structural
+requirement for High), and emits typed Technology and Evidence assets plus
+asset-graph edges (host/url/endpoint → technology, technology →
+evidence). Detections are cached per target under operation `tech.detect`
+with cache-before-execute — a cache hit serves the stored result with ZERO
+analysis — and observations merge deterministically at emit time, with
+honest completed/cancelled/failed/malformed statuses. Runs use a bounded
+pool with cancellation and bounded diagnostics, and all tests and
+benchmarks are hermetic (synthetic input and a real filesystem-backed
+cache). There is no `ravenrecon tech` CLI command yet — technology
+detection is a library capability only. See `ARCHITECTURE.md` ("Technology
+detection") for the full design, confidence model, and security
 considerations.
 
 ## Runtime engine

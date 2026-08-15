@@ -142,15 +142,19 @@ pipeline exists as a library capability — A/AAAA/CNAME resolution into
 typed, cached Phase 2 observations with host→address and host→CNAME
 relationships (see `ARCHITECTURE.md`, "DNS pipeline"). HTTP probing lands
 as sub-milestone 5B (`internal/httpprobe`, see `ARCHITECTURE.md`, "HTTP
-probing") and covers the HTTP metadata normalization work items; TLS
-metadata (5C) and technology detection remain pending. Neither pipeline has
-a CLI command yet.
+probing") and covers the HTTP metadata normalization work items. Technology
+detection lands as Phase 6.5 (`internal/techintel` — the technology and
+evidence asset models, the fingerprint database, and the detection engine;
+see `ARCHITECTURE.md`, "Technology detection"); TLS metadata (5C) remains
+the only open v0.6 item. None of the pipelines has a CLI command yet.
 
 - [x] DNS pipeline
 - [x] HTTP probing
 - [ ] TLS metadata
 - [x] HTTP metadata normalization
-- [ ] technology detection
+- [x] technology detection — landed as Phase 6.5 `internal/techintel`
+  (technology + evidence asset models, fingerprint database, detection
+  engine); TLS metadata (5C) stays pending
 
 ---
 
@@ -177,9 +181,47 @@ into the engine.
 Implemented as urlintel tool adapters: gau, waybackurls, and waymore;
 katana and paramspider are deferred as documented future work.
 
-Outstanding work: v0.6's TLS metadata (5C) and technology detection
-remain pending; the project version stays at 0.5.0, and the next version
-bump awaits v0.6 completion.
+Outstanding work: v0.6's TLS metadata (5C) remains pending; the project
+version stays at 0.5.0, and the next version bump awaits v0.6 completion.
+JavaScript intelligence (v0.8) has not begun.
+
+---
+
+## Phase 6.5 — Technology Intelligence
+
+Technology detection — v0.6's final open bullet — lands as phase 6.5:
+`internal/techintel` is a library-level detection engine that consumes
+typed observations (headers, body, cookies, TLS metadata, DNS metadata,
+endpoint paths) and produces typed technology assets, evidence records,
+and asset-graph edges against the compiled fingerprint database
+(`internal/techintel/fingerprints`, 145 fingerprints / 296 indicators
+across the 21 categories), with weight-based confidence scoring and Phase 3
+cache integration (operation `tech.detect`). It mirrors the urlintel
+pipeline shape: an observation source seam, a bounded runtime pool,
+cache-before-execute, merge-at-emit, bounded diagnostics, and cancellation
+with honest statuses. See `ARCHITECTURE.md` ("Technology detection"). There
+is no CLI command yet.
+
+- [x] technology asset model
+- [x] fingerprint engine
+- [x] header analyzer
+- [x] HTML fingerprinting
+- [x] cookie analyzer
+- [x] CDN detection
+- [x] WAF detection
+- [x] framework detection
+- [x] infrastructure detection
+- [x] authentication provider detection
+- [x] API technology detection
+- [x] cloud detection
+- [x] build tool detection
+- [x] confidence scoring
+- [x] cache integration
+- [x] technology relationships
+- [x] evidence model
+- [x] fingerprint database
+- [x] benchmarks
+- [x] documentation
 
 ---
 
