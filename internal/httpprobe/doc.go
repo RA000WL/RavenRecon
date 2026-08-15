@@ -40,8 +40,10 @@
 // port (ReasonConnRefused), and a TLS handshake failure — certificate
 // verification failure, protocol mismatch, or a non-TLS server on the https
 // port — proves https is not served on that endpoint from RavenRecon's
-// trust perspective (ReasonTLS). Certificate metadata extraction is the TLS
-// milestone (5C) and is out of scope here.
+// trust perspective (ReasonTLS). On a completed https handshake the probe
+// also captures typed TLS metadata — the leaf certificate as a Phase 2
+// asset plus the ALPN protocol, issuer DN, subject CN, and SAN DNS names
+// (sub-milestone 5C; see tls.go).
 //
 // # Concurrency and rate limiting
 //

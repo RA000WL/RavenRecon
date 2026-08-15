@@ -145,16 +145,22 @@ as sub-milestone 5B (`internal/httpprobe`, see `ARCHITECTURE.md`, "HTTP
 probing") and covers the HTTP metadata normalization work items. Technology
 detection lands as Phase 6.5 (`internal/techintel` — the technology and
 evidence asset models, the fingerprint database, and the detection engine;
-see `ARCHITECTURE.md`, "Technology detection"); TLS metadata (5C) remains
-the only open v0.6 item. None of the pipelines has a CLI command yet.
+see `ARCHITECTURE.md`, "Technology detection"); TLS metadata lands as
+sub-milestone 5C, an extension of `internal/httpprobe` (see below) — v0.6
+is complete. None of the pipelines has a CLI command yet.
 
 - [x] DNS pipeline
 - [x] HTTP probing
-- [ ] TLS metadata
+- [x] TLS metadata — landed as sub-milestone 5C, an extension of
+  `internal/httpprobe`: the https probe already performs the handshake, and
+  5C captures typed TLS metadata from it — the leaf certificate as a Phase 2
+  asset, plus ALPN / issuer / subject / DNS names mapped onto
+  `techintel.TLSInfo` (one dial, no duplicate connections; see
+  `ARCHITECTURE.md`, "HTTP probing", "TLS metadata (5C)")
 - [x] HTTP metadata normalization
 - [x] technology detection — landed as Phase 6.5 `internal/techintel`
   (technology + evidence asset models, fingerprint database, detection
-  engine); TLS metadata (5C) stays pending
+  engine)
 
 ---
 
@@ -181,15 +187,15 @@ into the engine.
 Implemented as urlintel tool adapters: gau, waybackurls, and waymore;
 katana and paramspider are deferred as documented future work.
 
-Outstanding work: v0.6's TLS metadata (5C) remains pending; the project
-version stays at 0.5.0, and the next version bump awaits v0.6 completion.
-JavaScript intelligence (v0.8) has not begun.
+Outstanding work: the project version stays at 0.5.0; the next version bump
+is a release decision. JavaScript intelligence (v0.8) has not begun.
 
 ---
 
 ## Phase 6.5 — Technology Intelligence
 
-Technology detection — v0.6's final open bullet — lands as phase 6.5:
+Technology detection — v0.6's active-infrastructure companion — lands as
+phase 6.5:
 `internal/techintel` is a library-level detection engine that consumes
 typed observations (headers, body, cookies, TLS metadata, DNS metadata,
 endpoint paths) and produces typed technology assets, evidence records,

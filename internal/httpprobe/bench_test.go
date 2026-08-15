@@ -259,3 +259,34 @@ func BenchmarkProbeColdConcurrency(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkCaptureTLS measures the 5C TLS metadata capture from a completed
+// handshake state: the pure derivation added by sub-milestone 5C (leaf
+// certificate asset + ALPN/issuer/subject/DNS names). The synthetic leaf
+// certificate and its handshake state are built ONCE outside the timed loop;
+// the benchmark measures capture only.
+func BenchmarkCaptureTLS(b *testing.B) {
+	cert, err := wildcardCert()
+	if err != nil {
+		b.Fatalf("wildcard cert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		b.Fatalf("parse leaf: %v", err)
+	}
+	cs := &tls.ConnectionState{
+		PeerCertificates:   []*x509.Certificate{leaf},
+		NegotiatedProtocol: "h2",
+	}
+	clk := wallClock{}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m, err := captureTLS(cs, clk)
+		if err != nil {
+			b.Fatalf("captureTLS: %v", err)
+		}
+		if m == nil || m.Certificate.Fingerprint == "" {
+			b.Fatal("captureTLS produced no certificate metadata")
+		}
+	}
+}

@@ -62,6 +62,12 @@ type storedProbe struct {
 	ResponseSize int64 `json:"response_size"`
 	// TLS reports that the https probe completed a TLS handshake.
 	TLS bool `json:"tls,omitempty"`
+	// TLSMeta is the stored typed TLS observation (5C): nil when the probe
+	// completed no handshake. It may only appear on a completed https probe
+	// with TLS=true, and it is re-validated field by field on decode
+	// (validateStoredTLS) — bounds, the completed-handshake consistency
+	// rules, and the embedded certificate asset through the Phase 2 model.
+	TLSMeta *TLSMetadata `json:"tls_meta,omitempty"`
 	// Truncated marks a probe that hit a hard cap; such records are stored
 	// StatusIncomplete and never served as hits.
 	Truncated bool `json:"truncated,omitempty"`
@@ -130,6 +136,16 @@ func decodeStoredProbe(raw json.RawMessage, target asset.URL, scheme string, dom
 		}
 	default: // failed / cancelled / redirect-cap reasons can never be stored completed
 		return s, fmt.Errorf("stored result has non-completed reason %q", s.FailureReason)
+	}
+	// The stored TLS observation must satisfy the completed-handshake
+	// consistency rules and the retention bounds (validateStoredTLS): TLS
+	// metadata may only appear on a completed https probe with TLS=true,
+	// every bounded field must be within its cap, and the embedded
+	// certificate asset — when present — must re-validate through the Phase
+	// 2 asset model. A payload failing any check refuses the whole record,
+	// which the caller deletes and recomputes (never served).
+	if err := validateStoredTLS(s.TLSMeta, s.Scheme, s.TLS); err != nil {
+		return s, err
 	}
 	if err := validateStoredURL(s.FinalURL, domain, "final url"); err != nil {
 		return s, err
@@ -297,6 +313,7 @@ func probeResultFromStored(s storedProbe, host asset.Host, target asset.URL, sch
 		Headers:       s.Headers,
 		ResponseSize:  s.ResponseSize,
 		TLS:           s.TLS,
+		TLSMeta:       s.TLSMeta,
 		FailureReason: s.FailureReason,
 	}
 }
@@ -375,6 +392,7 @@ func storeProbe(ctx context.Context, host asset.Host, target asset.URL, pr Probe
 		Headers:       pr.Headers,
 		ResponseSize:  pr.ResponseSize,
 		TLS:           pr.TLS,
+		TLSMeta:       pr.TLSMeta,
 		Truncated:     pr.Truncated,
 		FailureReason: pr.FailureReason,
 		Redirects:     pr.RedirectChain,

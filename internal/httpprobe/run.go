@@ -515,6 +515,7 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 	var reason FailureReason
 	truncated := false
 	probeErr := error(nil)
+	var tlsDiag error // the terminal iteration's TLS capture diagnostic (5C)
 
 	// The redirect walk: each iteration requests cur and decides whether to
 	// follow. The final response's headers and body are retained (bounded);
@@ -527,10 +528,14 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 			// during a token wait — after hops were followed — still
 			// carries the last targeted URL as its final URL and the
 			// observed hops, mirroring the round-trip error path below.
-			// TLS stays whatever classifyContextError leaves (false): the
-			// terminal path completed no handshake.
+			// The TLS flag and metadata must not carry over from a
+			// previously followed hop either: the terminal path completed
+			// no handshake, so both are cleared here (the round-trip error
+			// path below makes the same MEDIUM-5 reset).
 			pr.FinalURL = cur
 			pr.RedirectChain = hops
+			pr.TLS = false
+			pr.TLSMeta = nil
 			return pr
 		}
 
@@ -572,7 +577,10 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 			// is false on this terminal path — a completed conn_refused/tls
 			// observation with a stale true would contradict its own reason
 			// and be refused by decodeStoredProbe forever (see cache.go).
+			// The captured TLS metadata (5C) is cleared for the same
+			// reason: no handshake completed, so nothing was observed.
 			pr.TLS = false
+			pr.TLSMeta = nil
 			return pr
 		}
 
@@ -585,6 +593,21 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 		// its handshake reports TLS=true no matter how the walk ends, and
 		// the stored record carries the same value.
 		pr.TLS = tlsOK
+		// TLS metadata capture (5C): the leaf certificate of the handshake
+		// that ended on THIS response. Like the flag, the metadata is
+		// overwritten per iteration — a followed hop's handshake state can
+		// never leak into the terminal observation — and the terminal
+		// iteration's capture diagnostic (material drops, e.g. a chain
+		// deeper than the asset model cap) is joined into the probe's
+		// diagnostics only when this response ends the walk.
+		if tlsOK {
+			meta, cerr := captureTLS(resp.TLS, e.clock)
+			pr.TLSMeta = meta
+			tlsDiag = cerr
+		} else {
+			pr.TLSMeta = nil
+			tlsDiag = nil
+		}
 		loc := resp.Header.Get("Location")
 
 		if isRedirectCode(statusCode) && loc != "" {
@@ -630,7 +653,7 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 	pr.ResponseSize = size
 	pr.Truncated = truncated
 	pr.FailureReason = reason
-	pr.Err = probeErr
+	pr.Err = errors.Join(probeErr, tlsDiag)
 	if pr.Status == "" {
 		if truncated {
 			pr.Status = ProbeTruncated

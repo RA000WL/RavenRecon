@@ -17,6 +17,10 @@ const (
 	KindParameter  Kind = "parameter"
 	KindTechnology Kind = "technology"
 	KindEvidence   Kind = "evidence"
+	// KindTLSCertificate identifies a TLS leaf certificate by the lowercase
+	// hex SHA-256 fingerprint of its DER encoding; the same certificate
+	// observed on many hosts is one asset.
+	KindTLSCertificate Kind = "tls_certificate"
 )
 
 // Identity is a namespaced, deterministic asset key used for deduplication.

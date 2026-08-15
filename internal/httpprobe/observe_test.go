@@ -2,6 +2,7 @@ package httpprobe
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -202,17 +203,21 @@ func TestReportMergeHelpers(t *testing.T) {
 	p2 := mustPort(t, 443)
 	s1 := mustService(t, "http", p1)
 	ip := mustIP(t, "192.0.2.1")
+	certA := mustTLSCert(t, strings.Repeat("a", 64), "a.example.com")
+	certB := mustTLSCert(t, strings.Repeat("b", 64), "b.example.com")
 
 	rep := Report{Target: mustDomain(t, "example.com"), Results: []HostResult{
 		{
 			Host: h1, URLs: []asset.URL{u1}, Ports: []asset.Port{p1},
 			Services: []asset.Service{s1}, Endpoints: []asset.Endpoint{mustEndpoint(t, "GET", u1)},
-			IPs:           []asset.IP{ip},
-			Relationships: []asset.Relationship{mustRel(t, h1.Identity(), asset.RelationshipHostToURL, u1.Identity())},
+			IPs:             []asset.IP{ip},
+			TLSCertificates: []asset.TLSCertificate{certA},
+			Relationships:   []asset.Relationship{mustRel(t, h1.Identity(), asset.RelationshipHostToURL, u1.Identity())},
 		},
 		{
 			Host: h2, URLs: []asset.URL{u2}, Ports: []asset.Port{p1, p2},
 			Services: []asset.Service{s1}, Endpoints: []asset.Endpoint{mustEndpoint(t, "GET", u2)},
+			TLSCertificates: []asset.TLSCertificate{certB, certA}, // certA also observed on h2
 		},
 	}}
 
@@ -240,6 +245,119 @@ func TestReportMergeHelpers(t *testing.T) {
 	}
 	if got := len(rep.AllRelationships()); got != 1 {
 		t.Fatalf("AllRelationships = %d, want 1", got)
+	}
+	// TLSCertificates merge across hosts by fingerprint: certA observed on
+	// both hosts collapses into one asset, and the two distinct certs are
+	// sorted by fingerprint.
+	if got := len(rep.AllTLSCertificates()); got != 2 {
+		t.Fatalf("AllTLSCertificates = %d, want 2", got)
+	}
+	allCerts := rep.AllTLSCertificates()
+	requireEqualStrings(t, "all certificates", certFingerprints(allCerts),
+		[]string{strings.Repeat("a", 64), strings.Repeat("b", 64)})
+	if allCerts[0].Subject != "a.example.com" {
+		t.Fatalf("merged certificate subject = %q, want the merged observation", allCerts[0].Subject)
+	}
+}
+
+// TestAssembleTLSCertificates pins the 5C assembly: the leaf certificates
+// of completed https handshakes become host-level assets — deduplicated by
+// fingerprint, sorted — with host->tls_certificate and
+// port->tls_certificate edges, while http probes and metadata-only captures
+// contribute nothing.
+func TestAssembleTLSCertificates(t *testing.T) {
+	host := mustHost(t, "www.example.com")
+	clk := newFakeClock(fixedTime)
+	httpURL := mustProbeURL(t, host, "http", clk)
+	httpsURL := mustProbeURL(t, host, "https", clk)
+	fpB := strings.Repeat("b", 64)
+	fpA := strings.Repeat("a", 64)
+	certB := mustTLSCert(t, fpB, "b.example.com")
+	certA := mustTLSCert(t, fpA, "a.example.com")
+
+	probes := []ProbeResult{
+		// The http probe completed no handshake: no certificate, no edges.
+		{
+			Host: host, URL: httpURL, Scheme: "http", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpURL,
+		},
+		// A completed https handshake presenting certB, then one presenting
+		// certA, then a duplicate of certB (an artificial arrangement: one
+		// host result can hold them) — exercising the dedup and the sort.
+		{
+			Host: host, URL: httpsURL, Scheme: "https", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpsURL, TLS: true,
+			TLSMeta: &TLSMetadata{Certificate: certB},
+		},
+		{
+			Host: host, URL: httpsURL, Scheme: "https", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpsURL, TLS: true,
+			TLSMeta: &TLSMetadata{Certificate: certA},
+		},
+		{
+			Host: host, URL: httpsURL, Scheme: "https", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpsURL, TLS: true,
+			TLSMeta: &TLSMetadata{Certificate: certB},
+		},
+		// A metadata-only capture (zero certificate asset, e.g. a chain
+		// deeper than the model cap) contributes no certificate.
+		{
+			Host: host, URL: httpsURL, Scheme: "https", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpsURL, TLS: true,
+			TLSMeta: &TLSMetadata{Subject: "deep.example.com"},
+		},
+	}
+	hr := assemble(host, probes, &env{clock: clk})
+
+	// Deduplicated by fingerprint, sorted by identity.
+	requireEqualStrings(t, "certificates", certFingerprints(hr.TLSCertificates), []string{fpA, fpB})
+	if hr.TLSCertificates[0].Subject != "a.example.com" || hr.TLSCertificates[1].Subject != "b.example.com" {
+		t.Fatalf("certificates = %+v, want the merged observations", hr.TLSCertificates)
+	}
+	wantRels := []string{
+		"host:www.example.comhost_to_tls_certificate\x00tls_certificate:" + fpA,
+		"host:www.example.comhost_to_tls_certificate\x00tls_certificate:" + fpB,
+		"host:www.example.comhost_to_url\x00url:http://www.example.com/",
+		"host:www.example.comhost_to_url\x00url:https://www.example.com/",
+		"port:443/tcpport_to_service\x00service:443/tcp/https",
+		"port:443/tcpport_to_tls_certificate\x00tls_certificate:" + fpA,
+		"port:443/tcpport_to_tls_certificate\x00tls_certificate:" + fpB,
+		"port:80/tcpport_to_service\x00service:80/tcp/http",
+		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+	}
+	requireEqualStrings(t, "relationships", relationshipIDs(hr), wantRels)
+}
+
+// TestAssembleUncompletedProbeCarriesNoCertificate pins that a failed https
+// probe — completed without a handshake, or cancelled — contributes no
+// certificate asset: the certificate is a completed-handshake observation
+// only.
+func TestAssembleUncompletedProbeCarriesNoCertificate(t *testing.T) {
+	host := mustHost(t, "www.example.com")
+	clk := newFakeClock(fixedTime)
+	httpURL := mustProbeURL(t, host, "http", clk)
+	httpsURL := mustProbeURL(t, host, "https", clk)
+
+	probes := []ProbeResult{
+		{
+			Host: host, URL: httpURL, Scheme: "http", Status: ProbeCompleted,
+			Executed: true, StatusCode: 200, FinalURL: httpURL,
+		},
+		// A TLS failure proves a listener, not a handshake: no certificate.
+		{
+			Host: host, URL: httpsURL, Scheme: "https", Status: ProbeCompleted,
+			Executed: true, FailureReason: ReasonTLS, FinalURL: httpsURL,
+		},
+	}
+	hr := assemble(host, probes, &env{clock: clk})
+	if len(hr.TLSCertificates) != 0 {
+		t.Fatalf("certificates = %+v, want none (no completed handshake)", hr.TLSCertificates)
+	}
+	for _, r := range hr.Relationships {
+		if r.Kind == asset.RelationshipHostToTLSCertificate || r.Kind == asset.RelationshipPortToTLSCertificate {
+			t.Fatalf("unexpected certificate edge %q on a host with no completed handshake", r.ID())
+		}
 	}
 }
 
@@ -309,6 +427,33 @@ func mustRel(t *testing.T, from asset.Identity, kind asset.RelationshipKind, to 
 		t.Fatalf("NewRelationship: %v", err)
 	}
 	return r
+}
+
+// mustTLSCert builds a validated certificate asset with the given
+// fingerprint and subject CN (fixed provenance).
+func mustTLSCert(t *testing.T, fp, subject string) asset.TLSCertificate {
+	t.Helper()
+	c, err := asset.NewTLSCertificate(fp, asset.Provenance{Source: "http-probe", DiscoveredAt: fixedTime})
+	if err != nil {
+		t.Fatalf("NewTLSCertificate(%q): %v", fp, err)
+	}
+	c, err = asset.WithSubject(c, subject)
+	if err != nil {
+		t.Fatalf("WithSubject(%q): %v", subject, err)
+	}
+	c, err = asset.WithChainDepth(c, 1)
+	if err != nil {
+		t.Fatalf("WithChainDepth: %v", err)
+	}
+	return c
+}
+
+func certFingerprints(certs []asset.TLSCertificate) []string {
+	out := make([]string, 0, len(certs))
+	for _, c := range certs {
+		out = append(out, c.Fingerprint)
+	}
+	return out
 }
 
 func portNames(ports []asset.Port) []string {

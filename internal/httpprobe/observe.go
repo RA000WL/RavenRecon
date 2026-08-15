@@ -177,6 +177,20 @@ type ProbeResult struct {
 	// false for http probes.
 	TLS bool
 
+	// TLSMeta is the typed TLS observation of a completed https probe (the
+	// 5C metadata shape): the leaf certificate as a Phase 2 asset and the
+	// techintel.TLSInfo-shaped fields (ALPN / Issuer / Subject / DNSNames
+	// map field-for-field onto techintel.TLSInfo; see tls.go). It is nil
+	// when the probe completed no TLS handshake (http probes,
+	// conn_refused, tls-failure, timeouts, cancellation), and also nil when
+	// a completed handshake produced no captureable peer certificate (a
+	// defensive transport path; TLS remains true then). A truncated probe
+	// (redirect, header, or body cap) retains the terminal handshake's
+	// metadata here in the observation, but contributes no certificate
+	// asset or edges (see assemble) — its record is stored incomplete and
+	// never served from cache.
+	TLSMeta *TLSMetadata
+
 	// Truncated reports that the probe hit a hard cap (redirects, headers,
 	// or body). The observation is incomplete by definition and was stored
 	// incomplete — it can never be served from cache as a completed result.
@@ -243,6 +257,12 @@ type HostResult struct {
 	// 443 — only when a probe completed with an HTTP response),
 	// deduplicated by identity, sorted.
 	Services []asset.Service
+
+	// TLSCertificates are the leaf TLS certificates observed serving the
+	// host: one per https probe that completed a handshake whose leaf was
+	// representable in the Phase 2 model (the 5C observation),
+	// deduplicated by fingerprint, sorted by fingerprint.
+	TLSCertificates []asset.TLSCertificate
 
 	// Endpoints are the probe endpoints (GET on each probe target),
 	// deduplicated by identity, sorted. Endpoints describe the probed
@@ -323,6 +343,16 @@ func (r Report) AllEndpoints() []asset.Endpoint {
 		endpoints = append(endpoints, hr.Endpoints...)
 	}
 	return mergeEndpoints(endpoints)
+}
+
+// AllTLSCertificates merges every leaf TLS certificate asset observed
+// serving a host across the report (the 5C observations).
+func (r Report) AllTLSCertificates() []asset.TLSCertificate {
+	var certs []asset.TLSCertificate
+	for _, hr := range r.Results {
+		certs = append(certs, hr.TLSCertificates...)
+	}
+	return mergeTLSCertificates(certs)
 }
 
 // AllIPs merges every caller-provided resolved address asset across the
@@ -455,6 +485,28 @@ func mergeEndpoints(endpoints []asset.Endpoint) []asset.Endpoint {
 	return out
 }
 
+// mergeTLSCertificates deduplicates TLS certificate assets by Phase 2
+// identity (the fingerprint) using asset.MergeTLSCertificates; merge errors
+// are impossible for identity-equal observations and are skipped
+// defensively, keeping the first observation. The result is sorted by
+// identity, so it is deterministic.
+func mergeTLSCertificates(certs []asset.TLSCertificate) []asset.TLSCertificate {
+	byID := make(map[asset.Identity]int)
+	var out []asset.TLSCertificate
+	for _, c := range certs {
+		if idx, ok := byID[c.Identity()]; ok {
+			if m, err := asset.MergeTLSCertificates(out[idx], c); err == nil {
+				out[idx] = m
+			}
+			continue
+		}
+		byID[c.Identity()] = len(out)
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Identity().String() < out[j].Identity().String() })
+	return out
+}
+
 // sortRelationships orders relationships deterministically by identity.
 func sortRelationships(rs []asset.Relationship) []asset.Relationship {
 	sort.Slice(rs, func(i, j int) bool { return rs[i].ID() < rs[j].ID() })
@@ -537,6 +589,10 @@ func portForScheme(scheme string) *asset.Port {
 //   - port->service edges only for confirmed services (a probe completed
 //     with an HTTP response); a TLS failure proves a listener but not a
 //     service
+//   - host->tls_certificate and port->tls_certificate edges for every leaf
+//     certificate captured from a completed https handshake (the 5C
+//     observation); the certificate asset is collected on the host result
+//     alongside them
 //
 // Redirect-hop and final URLs are recorded in the observations only; the
 // graph stays about the probed surface (see the package documentation,
@@ -549,6 +605,7 @@ func assemble(host asset.Host, probes []ProbeResult, e *env) HostResult {
 	var ports []asset.Port
 	var services []asset.Service
 	var endpoints []asset.Endpoint
+	var certs []asset.TLSCertificate
 	var rels []asset.Relationship
 	relSet := make(map[string]bool)
 	addRel := func(from asset.Identity, kind asset.RelationshipKind, to asset.Identity) {
@@ -583,6 +640,23 @@ func assemble(host asset.Host, probes []ProbeResult, e *env) HostResult {
 		if served {
 			addRel(host.Identity(), asset.RelationshipHostToURL, pr.URL.Identity())
 		}
+		if pr.TLSMeta != nil && !pr.TLSMeta.Certificate.Identity().IsZero() {
+			// The 5C certificate asset: every leaf certificate of a
+			// completed https handshake representable in the Phase 2 model
+			// becomes a host-level asset with host->tls_certificate and
+			// port->tls_certificate edges. A completed handshake exists
+			// only on an https probe (validateStoredTLS enforces the same
+			// rule for stored records), so the port is the https probe's
+			// own port and is always among the open ports above. A
+			// metadata-only capture (chain deeper than the model cap)
+			// contributes no asset and no edges.
+			c := pr.TLSMeta.Certificate
+			certs = append(certs, c)
+			addRel(host.Identity(), asset.RelationshipHostToTLSCertificate, c.Identity())
+			if p := portForScheme(pr.Scheme); p != nil {
+				addRel(p.Identity(), asset.RelationshipPortToTLSCertificate, c.Identity())
+			}
+		}
 		if open {
 			if p := portForScheme(pr.Scheme); p != nil {
 				ports = append(ports, *p)
@@ -606,6 +680,7 @@ func assemble(host asset.Host, probes []ProbeResult, e *env) HostResult {
 	hr.Ports = mergePorts(ports)
 	hr.Services = mergeServices(services)
 	hr.Endpoints = mergeEndpoints(endpoints)
+	hr.TLSCertificates = mergeTLSCertificates(certs)
 	hr.IPs = mergeIPs(hr.IPs)
 	hr.Relationships = sortRelationships(rels)
 	hr.Status = classifyHost(probes)

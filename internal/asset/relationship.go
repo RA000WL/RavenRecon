@@ -49,6 +49,12 @@ const (
 	// RelationshipTechnologyToEvidence links a technology to the evidence
 	// observation that supported its detection (Technology -> Evidence).
 	RelationshipTechnologyToEvidence RelationshipKind = "technology_to_evidence"
+	// RelationshipHostToTLSCertificate links a host to the TLS certificate
+	// observed serving it (Host -> TLSCertificate).
+	RelationshipHostToTLSCertificate RelationshipKind = "host_to_tls_certificate"
+	// RelationshipPortToTLSCertificate links a port to the TLS certificate
+	// observed on it (Port -> TLSCertificate).
+	RelationshipPortToTLSCertificate RelationshipKind = "port_to_tls_certificate"
 )
 
 // Relationship is a typed, directed edge between two asset identities.

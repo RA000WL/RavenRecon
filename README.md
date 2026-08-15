@@ -19,7 +19,9 @@ pipeline (`internal/httpprobe`, sub-milestone 5B) now exist as library-level
 capabilities. DNS resolves A/AAAA/CNAME records into typed, cached Phase 2
 observations with host→address and host→CNAME relationships; HTTP probing
 attaches typed HTTP observations (status code, final URL, redirect chain,
-bounded headers, counted body size, TLS flag) to every host's http and
+bounded headers, counted body size, TLS flag, and — on completed https
+handshakes — typed TLS metadata: the leaf certificate as a Phase 2 asset
+plus ALPN/issuer/subject/SAN names) to every host's http and
 https root targets. URL intelligence (`internal/urlintel`, roadmap v0.7
 sub-milestone 6B) adds canonical-URL streaming with parameter extraction,
 endpoint classification, per-(URL, adapter) caching, and typed graph edges;
@@ -32,9 +34,8 @@ API technologies, build tools, and infrastructure from typed observations
 (headers, body, cookies, TLS/DNS metadata, endpoint paths), with
 confidence scoring, evidence records, and a 145-fingerprint database (see
 "Technology detection (library)" below). None of the pipelines has a CLI
-command yet; the remaining active engines (TLS metadata, JavaScript
-analysis, crawling, and secret scanning) are still later roadmap
-milestones.
+command yet; the remaining active engines (JavaScript analysis, crawling,
+and secret scanning) are still later roadmap milestones.
 
 ## Asset model
 
@@ -128,17 +129,22 @@ record type) cache-before-execute, and hermetic tests (no public Internet).
 NXDOMAIN and legitimate empty answers are completed observations; truncated,
 failed, and cancelled types are never served as success. It is a library
 capability only — there is no `ravenrecon dns` command yet. TLS metadata
-(5C) is the remaining Active Infrastructure milestone. See
+(5C) has landed as part of HTTP probing (see below). See
 `ARCHITECTURE.md` ("DNS pipeline") for the full design and security
 considerations.
 
 ## HTTP probing (library)
 
-`internal/httpprobe` (roadmap v0.6, sub-milestone 5B) probes discovered host
-assets at their two root targets — `http://host/` and `https://host/` — with
-typed, cached observations: final status code, final URL, bounded redirect
-chain, bounded final headers, counted body size, and the TLS-handshake
-flag. Connection refusals ("service absent") and TLS handshake failures
+`internal/httpprobe` (roadmap v0.6, sub-milestones 5B and 5C) probes
+discovered host assets at their two root targets — `http://host/` and
+`https://host/` — with typed, cached observations: final status code, final
+URL, bounded redirect chain, bounded final headers, counted body size, and
+the TLS-handshake flag. On a completed https handshake the probe also
+captures typed TLS metadata (5C) from the very handshake it performs — the
+leaf certificate as a Phase 2 asset (identified by its SHA-256 fingerprint)
+plus the ALPN protocol, issuer DN, subject CN, and SAN DNS names, mapped
+onto `techintel.TLSInfo`. Connection refusals ("service absent") and TLS
+handshake failures
 ("https not served") are completed negative observations; timeouts and DNS
 failures are failed probes; hard-cap hits are truncated-incomplete and
 never served from cache. Probing runs on a bounded pool with one central

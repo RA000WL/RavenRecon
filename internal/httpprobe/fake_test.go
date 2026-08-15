@@ -2,9 +2,14 @@ package httpprobe
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -168,6 +173,60 @@ func transportFor(t testing.TB, srv *httptest.Server) *http.Transport {
 		tlsConfig = &tls.Config{RootCAs: pool}
 	}
 	return newTestTransport(srv.Listener.Addr().String(), tlsConfig)
+}
+
+// leafCertForTest returns a fresh self-signed ECDSA leaf certificate valid
+// for www.example.com (so the probe seam's canonical Host header and SNI
+// verify), with a distinct key and serial per call — two calls produce two
+// certificates with distinct DER encodings and fingerprints, which is what
+// the redirect-leak test needs.
+func leafCertForTest(t testing.TB, cn string, serial int64) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		DNSNames:              []string{"www.example.com"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// startTLSWithCert starts an httptest TLS server presenting the given
+// certificate.
+func startTLSWithCert(t testing.TB, cert tls.Certificate, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// pathRouter routes requests by path to two transports: "/" to a, any other
+// path to b. It lets one probe walk a redirect between two different TLS
+// backends presenting different certificates.
+type pathRouter struct {
+	a, b http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+func (r pathRouter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path == "/" {
+		return r.a.RoundTrip(req)
+	}
+	return r.b.RoundTrip(req)
 }
 
 // countingServer wraps an httptest server with a request counter, a

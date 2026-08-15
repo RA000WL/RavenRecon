@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -520,4 +522,294 @@ func TestCacheTerminalRedirectWithoutLocationServed(t *testing.T) {
 	if got := cs.requestCount(); got != 2 {
 		t.Fatalf("second run requests = %d, want 2 (unchanged: zero requests on hits)", got)
 	}
+}
+
+// TestCacheTLSMetadataRoundTrip pins the 5C cache persistence end to end: a
+// completed https probe stores its TLS metadata, and a later run serves it
+// back byte-identical (fresh-vs-cached equality) with zero network requests.
+func TestCacheTLSMetadataRoundTrip(t *testing.T) {
+	cs := newTLSCountingServer(t, 204, "")
+	cfg := testConfig()
+	cfg.Cache = openTestCache(t, func() time.Time { return fixedTime }, 0)
+	cfg.Transport = schemeRouter{
+		httpRT:  newTestTransport(refusedLoopbackAddr(t), nil),
+		httpsRT: transportFor(t, cs.srv),
+	}
+	hosts := []asset.Host{mustHost(t, "www.example.com")}
+
+	rep1, err := Probe(context.Background(), mustDomain(t, "example.com"), hosts, nil, cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if got := cs.requestCount(); got != 1 {
+		t.Fatalf("first run requests = %d, want 1 (only the https probe reaches the TLS server)", got)
+	}
+	fresh := probeResultFor(hostByName(t, rep1, "www.example.com"), "https")
+	if fresh.TLSMeta == nil {
+		t.Fatal("fresh https probe captured no TLS metadata")
+	}
+
+	rep2, err := Probe(context.Background(), mustDomain(t, "example.com"), hosts, nil, cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if got := cs.requestCount(); got != 1 {
+		t.Fatalf("second run requests = %d, want 1 (unchanged: a cache hit performs zero requests)", got)
+	}
+	cached := probeResultFor(hostByName(t, rep2, "www.example.com"), "https")
+	if !cached.Cached {
+		t.Fatalf("second run https probe = %+v (want a cache hit)", cached)
+	}
+	if cached.TLSMeta == nil {
+		t.Fatal("cached https probe lost its TLS metadata")
+	}
+	if !reflect.DeepEqual(fresh.TLSMeta, cached.TLSMeta) {
+		t.Fatalf("cached TLS metadata differs from the fresh observation:\nfresh: %+v\ncached: %+v", fresh.TLSMeta, cached.TLSMeta)
+	}
+}
+
+// storedTLSPayload is a valid stored completed-https payload carrying TLS
+// metadata, used by the decode validation table below.
+func storedTLSPayload(t *testing.T, meta *TLSMetadata) storedProbe {
+	t.Helper()
+	target := mustParseURL(t, "https://www.example.com/")
+	return storedProbe{
+		Target: target.String(), Scheme: "https", StatusCode: 200,
+		FinalURL: target, TLS: true, TLSMeta: meta,
+	}
+}
+
+// validStoredTLSMeta returns a TLSMetadata whose embedded certificate asset
+// re-validates through the Phase 2 model.
+func validStoredTLSMeta(t *testing.T) *TLSMetadata {
+	t.Helper()
+	c, err := asset.NewTLSCertificate(strings.Repeat("a", 64),
+		asset.Provenance{Source: "http-probe", DiscoveredAt: fixedTime})
+	if err != nil {
+		t.Fatalf("NewTLSCertificate: %v", err)
+	}
+	c, err = asset.WithSubject(c, "www.example.com")
+	if err != nil {
+		t.Fatalf("WithSubject: %v", err)
+	}
+	c, err = asset.WithChainDepth(c, 1)
+	if err != nil {
+		t.Fatalf("WithChainDepth: %v", err)
+	}
+	return &TLSMetadata{
+		Certificate: c,
+		ALPN:        []string{"h2"},
+		Issuer:      "CN=Test CA",
+		Subject:     "www.example.com",
+		DNSNames:    []string{"www.example.com"},
+	}
+}
+
+// TestDecodeStoredTLSValidation pins the decode-side TLS validation
+// (validateStoredTLS) directly: metadata is only legal on a completed https
+// probe, every bounded field must be within its cap, and the embedded
+// certificate asset must re-validate through the Phase 2 model. A payload
+// failing any check refuses the whole record.
+func TestDecodeStoredTLSValidation(t *testing.T) {
+	domain := mustDomain(t, "example.com")
+	httpsTarget := mustParseURL(t, "https://www.example.com/")
+	httpTarget := mustParseURL(t, "http://www.example.com/")
+
+	cases := []struct {
+		name   string
+		st     storedProbe
+		target asset.URL
+		scheme string
+		wantOK bool
+	}{
+		{
+			name:   "valid completed https metadata",
+			st:     storedTLSPayload(t, validStoredTLSMeta(t)),
+			target: httpsTarget,
+			scheme: "https",
+			wantOK: true,
+		},
+		{
+			name: "metadata on an http probe",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.Scheme = "http"
+				s.TLS = false
+				return s
+			}(),
+			target: httpTarget,
+			scheme: "http",
+		},
+		{
+			name: "metadata without a completed handshake",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLS = false
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+		},
+		{
+			name: "oversized san entry",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLSMeta.DNSNames = []string{strings.Repeat("d", maxTLSMetadataDNSNameBytes+1)}
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+		},
+		{
+			name: "overlong alpn list",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLSMeta.ALPN = make([]string, maxTLSMetadataALPNEntries+1)
+				for i := range s.TLSMeta.ALPN {
+					s.TLSMeta.ALPN[i] = "h2"
+				}
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+		},
+		{
+			name: "alpn single entry accepted",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLSMeta.ALPN = []string{"h2"}
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+			wantOK: true,
+		},
+		{
+			name: "alpn multi-entry list",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLSMeta.ALPN = []string{"h2", "h3"}
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+		},
+		{
+			name: "bad fingerprint in embedded cert",
+			st: func() storedProbe {
+				s := storedTLSPayload(t, validStoredTLSMeta(t))
+				s.TLSMeta.Certificate.Fingerprint = "not-a-fingerprint"
+				return s
+			}(),
+			target: httpsTarget,
+			scheme: "https",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.st)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got, derr := decodeStoredProbe(data, tc.target, tc.scheme, domain)
+			if tc.wantOK {
+				if derr != nil {
+					t.Fatalf("decode rejected a valid payload: %v", derr)
+				}
+				if got.TLSMeta == nil || got.TLSMeta.Certificate.Fingerprint == "" {
+					t.Fatalf("decode lost the TLS metadata: %+v", got.TLSMeta)
+				}
+				return
+			}
+			if derr == nil {
+				t.Fatal("decode accepted a payload violating the TLS metadata rules")
+			}
+		})
+	}
+}
+
+// TestCacheTamperedTLSMetadataSelfHeals pins the 5C self-healing path end to
+// end: a tampered https record — TLS metadata outside the retention bounds
+// or an embedded certificate that no longer re-validates — is refused on
+// decode, deleted, and recomputed in the same run; the tampered observation
+// is never served and never wedges the probe.
+func TestCacheTamperedTLSMetadataSelfHeals(t *testing.T) {
+	cs := newTLSCountingServer(t, 200, "ok")
+	cfg := testConfig()
+	c := openTestCache(t, func() time.Time { return fixedTime }, 0)
+	cfg.Cache = c
+	cfg.Transport = schemeRouter{
+		httpRT:  newTestTransport(refusedLoopbackAddr(t), nil),
+		httpsRT: transportFor(t, cs.srv),
+	}
+	host := mustHost(t, "www.example.com")
+	hosts := []asset.Host{host}
+	domain := mustDomain(t, "example.com")
+
+	if _, err := Probe(context.Background(), domain, hosts, nil, cfg); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	key := probeKeyFor(t, host, "https")
+	out := c.Get(context.Background(), key)
+	if !out.IsHit() {
+		t.Fatalf("record state = %s, want hit", out.State)
+	}
+	var st storedProbe
+	if err := json.Unmarshal(out.Record.Data, &st); err != nil {
+		t.Fatalf("unmarshal stored payload: %v", err)
+	}
+	if st.TLSMeta == nil {
+		t.Fatal("stored https payload lost its TLS metadata")
+	}
+
+	tamperAndRerun := func(t *testing.T, name string, mutate func(*storedProbe)) {
+		t.Helper()
+		before := cs.requestCount()
+		var tampered storedProbe
+		if err := json.Unmarshal(out.Record.Data, &tampered); err != nil {
+			t.Fatalf("unmarshal stored payload: %v", err)
+		}
+		mutate(&tampered)
+		data, err := json.Marshal(tampered)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rec := *out.Record
+		rec.Data = data
+		rec.Status = cache.StatusCompleted
+		if err := c.Put(context.Background(), key, rec); err != nil {
+			t.Fatalf("Put tampered record: %v", err)
+		}
+
+		if _, err := Probe(context.Background(), domain, hosts, nil, cfg); err != nil {
+			t.Fatalf("Probe: %v", err)
+		}
+		// The tampered record was refused, deleted, and recomputed: the
+		// https probe re-executed exactly once (the http probe is a pure
+		// cache hit).
+		if got := cs.requestCount(); got != before+1 {
+			t.Fatalf("%s: requests = %d -> %d, want exactly the https probe re-executed", name, before, got)
+		}
+		fresh := c.Get(context.Background(), key)
+		if !fresh.IsHit() {
+			t.Fatalf("%s: healed record state = %s, want hit", name, fresh.State)
+		}
+		var healed storedProbe
+		if err := json.Unmarshal(fresh.Record.Data, &healed); err != nil {
+			t.Fatalf("%s: unmarshal healed payload: %v", name, err)
+		}
+		if healed.TLSMeta == nil {
+			t.Fatalf("%s: healed record lost its TLS metadata", name)
+		}
+	}
+
+	tamperAndRerun(t, "oversized san entry", func(sp *storedProbe) {
+		sp.TLSMeta.DNSNames = []string{strings.Repeat("d", maxTLSMetadataDNSNameBytes+1)}
+	})
+	tamperAndRerun(t, "bad fingerprint in embedded cert", func(sp *storedProbe) {
+		sp.TLSMeta.Certificate.Fingerprint = "zz"
+	})
+	tamperAndRerun(t, "metadata without a completed handshake", func(sp *storedProbe) {
+		sp.TLS = false
+	})
 }

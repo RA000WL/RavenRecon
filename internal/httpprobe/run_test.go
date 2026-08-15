@@ -2,6 +2,8 @@ package httpprobe
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +11,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1012,6 +1015,144 @@ func TestProbeRejectsNilContext(t *testing.T) {
 	cfg := testConfig()
 	if _, err := Probe(nil, mustDomain(t, "example.com"), nil, nil, cfg); err == nil {
 		t.Fatal("Probe accepted a nil context")
+	}
+}
+
+// TestProbeTLSMetadataCapture pins the 5C capture wiring: an https probe
+// that completes a real handshake carries typed TLS metadata whose
+// certificate fingerprint is the handshake's leaf; an http probe and a
+// failed-handshake https probe carry none.
+func TestProbeTLSMetadataCapture(t *testing.T) {
+	// A deterministic leaf: the custom certificate carries a subject CN, so
+	// the metadata fields are pinned exactly.
+	srv := startTLSWithCert(t, leafCertForTest(t, "a.example.com", 55),
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(204)
+		})
+	plain := newPlainResponder(t)
+
+	cfg := testConfig()
+	cfg.Transport = schemeRouter{
+		httpRT:  newTestTransport(plain.addr, nil),
+		httpsRT: transportFor(t, srv),
+	}
+	rep, err := Probe(context.Background(), mustDomain(t, "example.com"),
+		[]asset.Host{mustHost(t, "www.example.com")}, nil, cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	hr := hostByName(t, rep, "www.example.com")
+
+	// The http probe is served by the plain responder: completed HTTP, no
+	// handshake, no TLS metadata.
+	httpPr := probeResultFor(hr, "http")
+	if httpPr.Status != ProbeCompleted || httpPr.StatusCode != 400 {
+		t.Fatalf("http probe = %+v (want completed 400)", httpPr)
+	}
+	if httpPr.TLSMeta != nil {
+		t.Fatalf("http probe must not carry TLS metadata: %+v", httpPr.TLSMeta)
+	}
+
+	// The https probe completes a real handshake: TLS metadata with the
+	// handshake's leaf certificate.
+	httpsPr := probeResultFor(hr, "https")
+	if httpsPr.Status != ProbeCompleted || httpsPr.StatusCode != 204 || !httpsPr.TLS {
+		t.Fatalf("https probe = %+v (want completed 204 with TLS)", httpsPr)
+	}
+	if httpsPr.TLSMeta == nil {
+		t.Fatal("https probe completed a handshake but captured no TLS metadata")
+	}
+	sum := sha256.Sum256(srv.Certificate().Raw)
+	if want := hex.EncodeToString(sum[:]); httpsPr.TLSMeta.Certificate.Fingerprint != want {
+		t.Fatalf("captured fingerprint = %q, want %q (the handshake's leaf)", httpsPr.TLSMeta.Certificate.Fingerprint, want)
+	}
+	if httpsPr.TLSMeta.Certificate.ChainDepth != 1 || httpsPr.TLSMeta.Certificate.Prov.Source != "http-probe" {
+		t.Fatalf("certificate asset = %+v (want chain depth 1 with http-probe provenance)", httpsPr.TLSMeta.Certificate)
+	}
+	// The metadata fields are observed as the certificate carries them: the
+	// subject CN and the issuer DN of the deterministic leaf.
+	if httpsPr.TLSMeta.Subject != "a.example.com" || httpsPr.TLSMeta.Issuer != "CN=a.example.com" {
+		t.Fatalf("tls metadata subject/issuer = %q/%q, want %q/%q",
+			httpsPr.TLSMeta.Subject, httpsPr.TLSMeta.Issuer, "a.example.com", "CN=a.example.com")
+	}
+
+	// The tls-failure probe (a non-TLS responder on the https port)
+	// completes with ReasonTLS and captures nothing: no handshake, no
+	// metadata.
+	cfg2 := testConfig()
+	cfg2.Transport = schemeRouter{
+		httpRT:  transportFor(t, srv),
+		httpsRT: newTestTransport(plain.addr, nil),
+	}
+	rep2, err := Probe(context.Background(), mustDomain(t, "example.com"),
+		[]asset.Host{mustHost(t, "www.example.com")}, nil, cfg2)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	tlsFailPr := probeResultFor(hostByName(t, rep2, "www.example.com"), "https")
+	if tlsFailPr.Status != ProbeCompleted || tlsFailPr.FailureReason != ReasonTLS {
+		t.Fatalf("https probe = %+v (want completed tls failure)", tlsFailPr)
+	}
+	if tlsFailPr.TLSMeta != nil {
+		t.Fatalf("a failed handshake must not carry TLS metadata: %+v", tlsFailPr.TLSMeta)
+	}
+}
+
+// TestProbeTLSMetadataRedirectLeak is the redirect-leak regression (5C): a
+// walk that follows an in-scope hop whose handshake presented cert A and
+// ends on a terminal response served under cert B must reflect B ONLY — the
+// followed hop's certificate must never leak into the terminal observation.
+func TestProbeTLSMetadataRedirectLeak(t *testing.T) {
+	var nA, nB atomic.Int32
+	certA := leafCertForTest(t, "a.example.com", 101)
+	certB := leafCertForTest(t, "b.example.com", 202)
+	srvA := startTLSWithCert(t, certA, func(w http.ResponseWriter, r *http.Request) {
+		nA.Add(1)
+		w.Header().Set("Location", "/a")
+		w.WriteHeader(302)
+	})
+	srvB := startTLSWithCert(t, certB, func(w http.ResponseWriter, r *http.Request) {
+		nB.Add(1)
+		w.WriteHeader(200)
+		w.Write([]byte("final"))
+	})
+
+	cfg := testConfig()
+	cfg.Transport = schemeRouter{
+		httpRT:  newTestTransport(refusedLoopbackAddr(t), nil),
+		httpsRT: pathRouter{a: transportFor(t, srvA), b: transportFor(t, srvB)},
+	}
+	rep, err := Probe(context.Background(), mustDomain(t, "example.com"),
+		[]asset.Host{mustHost(t, "www.example.com")}, nil, cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	pr := probeResultFor(hostByName(t, rep, "www.example.com"), "https")
+	if pr.Status != ProbeCompleted || pr.StatusCode != 200 || !pr.TLS {
+		t.Fatalf("https probe = %+v (want completed 200 with TLS)", pr)
+	}
+	if len(pr.RedirectChain) != 1 || !pr.RedirectChain[0].InScope || !pr.RedirectChain[0].Followed ||
+		pr.RedirectChain[0].Target != "https://www.example.com/a" {
+		t.Fatalf("chain = %+v, want one followed in-scope hop to /a", pr.RedirectChain)
+	}
+	if nA.Load() != 1 || nB.Load() != 1 {
+		t.Fatalf("requests = %d/%d, want exactly 1 hop on each server", nA.Load(), nB.Load())
+	}
+	if pr.TLSMeta == nil {
+		t.Fatal("terminal https response captured no TLS metadata")
+	}
+	sumA := sha256.Sum256(certA.Certificate[0])
+	sumB := sha256.Sum256(certB.Certificate[0])
+	fpA := hex.EncodeToString(sumA[:])
+	fpB := hex.EncodeToString(sumB[:])
+	if fpA == fpB {
+		t.Fatal("test setup: the two leaf certificates must be distinct")
+	}
+	if got := pr.TLSMeta.Certificate.Fingerprint; got != fpB {
+		t.Fatalf("terminal TLS metadata fingerprint = %q, want the terminal handshake's %q (hop A's %q leaked)", got, fpB, fpA)
+	}
+	if pr.TLSMeta.Subject != "b.example.com" {
+		t.Fatalf("terminal subject = %q, want b.example.com (the terminal handshake)", pr.TLSMeta.Subject)
 	}
 }
 

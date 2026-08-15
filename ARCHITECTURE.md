@@ -583,8 +583,8 @@ immediately with status 130 (128+SIGINT).
 implements the DNS resolution stage as a library capability: it resolves
 discovered host assets and attaches typed DNS observations to the Phase 2
 asset model. It is a pipeline stage, not a CLI command — there is no
-`ravenrecon dns` yet (HTTP probing has landed as 5B and TLS metadata 5C is
-still pending; see `ROADMAP.md`).
+`ravenrecon dns` yet (HTTP probing has landed as 5B, with TLS metadata 5C
+captured as part of the probe; see `ROADMAP.md`).
 
 ### Records and relationships
 
@@ -758,8 +758,7 @@ typed assets and relationships, and are never discarded.
   bounded.
 - The system resolver's own retries and server selection are not subject to
   RavenRecon's limiter (see "Concurrency and rate limiting").
-- Library capability only: no CLI command; TLS metadata (5C) is still
-  pending.
+- Library capability only: no CLI command.
 - Answers come from the OS resolver with the OS resolver's trust model; no
   DNSSEC validation is performed or claimed.
 - All tests are hermetic: a fake resolver and a real filesystem-backed
@@ -767,12 +766,12 @@ typed assets and relationships, and are never discarded.
 
 ## HTTP probing
 
-`internal/httpprobe` (roadmap v0.6, sub-milestone 5B of Active
+`internal/httpprobe` (roadmap v0.6, sub-milestones 5B and 5C of Active
 Infrastructure) implements the HTTP probing stage as a library capability:
 it probes discovered host assets at their two root targets and attaches
-typed HTTP observations to the Phase 2 asset model. It is a pipeline stage,
-not a CLI command — there is no `ravenrecon http` yet (TLS metadata, 5C, is
-still pending; see `ROADMAP.md`).
+typed HTTP observations — including TLS metadata (5C) — to the Phase 2
+asset model. It is a pipeline stage, not a CLI command — there is no
+`ravenrecon http` yet.
 
 ### Probe model
 
@@ -822,6 +821,55 @@ and a cap-exceeding redirect terminal each carry the handshake state of the
 response that ended the walk; http probes and failed handshakes record
 false.
 
+### TLS metadata (5C)
+
+TLS metadata is captured as part of the https probe (sub-milestone 5C) —
+one dial, no duplicate connections: the handshake the probe already
+performs yields the leaf certificate, and the typed observation is attached
+to the probe result (`ProbeResult.TLSMeta`, a `TLSMetadata`; nil for probes
+that completed no handshake). What is captured:
+
+- the leaf certificate as a Phase 2 `asset.TLSCertificate` — identity: the
+  lowercase hex SHA-256 fingerprint of the DER encoding — with the observed
+  subject/issuer CNs, SAN DNS names, validity window, serial, algorithms,
+  key size (RSA modulus bits, ECDSA curve bits, Ed25519 256), self-signed
+  flag, and chain depth (1..8);
+- the techintel.TLSInfo-shaped fields — ALPN (the server's negotiated
+  protocol), issuer DN, subject CN, SAN DNS names — which map field for
+  field onto `techintel.TLSInfo`, so a caller composing a techintel
+  Observation from a completed https ProbeResult copies those four fields
+  into `Observation.TLS`.
+
+Retention bounds (fixed constants, never configuration; see `tls.go`): the
+ALPN list is capped at 32 entries of at most 64 bytes each; SAN DNS names at
+32 entries of at most 253 bytes each; issuer and subject strings at 256
+bytes of printable ASCII each; the chain at depth 8. Values outside the
+bounds are dropped field-by-field ("not observed"), NEVER truncated into
+misleading data. A chain deeper than the model's 1..8 cap is the ONE
+material drop: the certificate asset is suppressed with a diagnostic joined
+into the probe's errors, while the metadata fields and the handshake
+observation itself are never lost.
+
+Redirect-walk correctness: the metadata is captured per response and
+overwritten on every iteration, so a followed hop's handshake can never
+leak into the terminal observation — the terminal response's own handshake
+state is what the probe reports, including on a terminal out-of-scope or
+cap-exceeding redirect response — and the error paths (limiter wait,
+round-trip failure) clear both the TLS flag and the metadata. A truncated
+probe (a cap-exceeding redirect, header cap, or body cap) retains that
+terminal handshake's metadata in the observation but contributes no
+certificate asset or edges: assets and edges exist only for certs from
+COMPLETED probes, not merely completed handshakes, and the truncated
+record is stored incomplete and never served.
+
+Cache consistency: the metadata is stored with the completed record
+(`tls_meta` in the payload) and re-validated on decode before a hit is
+served (`validateStoredTLS`): metadata may appear only on a completed https
+probe with `TLS=true`, every bounded field must be within its cap, and the
+embedded certificate asset re-validates through the Phase 2 builders. A
+violating record is refused, deleted, and recomputed by the self-healing
+path — never served.
+
 ### Relationship mapping
 
 Each host result carries typed `asset.Relationship` edges through the
@@ -836,11 +884,22 @@ existing kinds:
   probe completed with an HTTP response; a TLS failure proves a listener,
   not a service);
 - `url -> endpoint` (`RelationshipURLToEndpoint`, GET on each probe target)
-  for the probe shapes of every executed job, regardless of outcome.
+  for the probe shapes of every executed job, regardless of outcome;
+- `host -> tls_certificate` (`RelationshipHostToTLSCertificate`) and
+  `port -> tls_certificate` (`RelationshipPortToTLSCertificate`) for every
+  leaf certificate captured from a completed https handshake (5C): the
+  certificate asset is collected on the host result
+  (`HostResult.TLSCertificates`) alongside the edges, and the report-level
+  `AllTLSCertificates` merges the same certificate observed on many hosts
+  into one asset by fingerprint.
 
 Redirect-hop and final URLs are recorded in the observations only; the
-graph stays about the probed surface. Edges are deduplicated by edge
-identity and emitted sorted, deterministically.
+graph stays about the probed surface. The same holds for port edges: a
+`port -> tls_certificate` edge names the probed port (443 for the https
+probe target) even when an in-scope redirect to a non-default https port
+was followed — hops are observation-only, mirroring the 5B `ip -> port` /
+`port -> service` convention. Edges are deduplicated by edge identity and
+emitted sorted, deterministically.
 
 ### Cache behavior
 
@@ -992,8 +1051,9 @@ arbitrary addresses.
   cache.
 - TLS trust: the production transport uses Go's default certificate
   verification; RavenRecon never sets `InsecureSkipVerify` and never
-  disables chain or hostname checks. Certificate metadata extraction is the
-  TLS milestone (5C) and is out of scope here.
+  disables chain or hostname checks. Certificate metadata (5C) is captured
+  AFTER verification, from the completed handshake; verification itself is
+  never relaxed.
 - Cache poisoning: stored records are re-validated through the Phase 2
   asset model and cross-checked against their own key before they can be
   served (`decodeStoredProbe`); tampered or contradictory records are
@@ -1028,8 +1088,7 @@ arbitrary addresses.
 - Single-job-per-host: each job runs its two probes sequentially, so one
   stalled probe can consume the host's job deadline (documented in
   `doc.go`).
-- Library capability only: no CLI command, and TLS metadata (5C) is still
-  pending.
+- Library capability only: no CLI command.
 - All tests are hermetic: loopback HTTP/TLS servers and a real
   filesystem-backed cache, never the public Internet (see `bench_test.go`).
 
