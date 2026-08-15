@@ -156,11 +156,30 @@ a CLI command yet.
 
 ## v0.7 — URL Intelligence
 
-- [ ] Historical URLs
-- [ ] URL normalization
-- [ ] parameter extraction
-- [ ] deduplication
-- [ ] endpoint classification
+URL intelligence lands as sub-milestone 6B of the pipeline stages: the
+`internal/urlintel` library exists as a capability — canonical-URL
+streaming into typed, cached Phase 2 observations with query-parameter
+extraction, GET endpoint classification, per-(URL, adapter) cache records,
+cross-adapter emit merging, and typed graph edges (see `ARCHITECTURE.md`,
+"URL intelligence"). The Phase 2 asset model gained the Parameter asset
+(identity = name within location, capped observed values) and the
+url→parameter and endpoint→parameter relationship kinds. There is no CLI
+command yet. Historical URLs land as sub-milestone 6C:
+`internal/urlintel/adapt` presents the external tools as line streams
+into the engine.
+
+- [x] Historical URLs
+- [x] URL normalization
+- [x] parameter extraction
+- [x] deduplication
+- [x] endpoint classification
+
+Implemented as urlintel tool adapters: gau, waybackurls, and waymore;
+katana and paramspider are deferred as documented future work.
+
+Outstanding work: v0.6's TLS metadata (5C) and technology detection
+remain pending; the project version stays at 0.5.0, and the next version
+bump awaits v0.6 completion.
 
 ---
 

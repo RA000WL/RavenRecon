@@ -20,9 +20,14 @@ capabilities. DNS resolves A/AAAA/CNAME records into typed, cached Phase 2
 observations with host→address and host→CNAME relationships; HTTP probing
 attaches typed HTTP observations (status code, final URL, redirect chain,
 bounded headers, counted body size, TLS flag) to every host's http and
-https root targets. Neither has a CLI command yet; the remaining active
-engines (TLS metadata, URL intelligence, JavaScript analysis, crawling, and
-secret scanning) are still later roadmap milestones.
+https root targets. URL intelligence (`internal/urlintel`, roadmap v0.7
+sub-milestone 6B) adds canonical-URL streaming with parameter extraction,
+endpoint classification, per-(URL, adapter) caching, and typed graph edges;
+historical-URL tool adapters for gau, waybackurls, and waymore followed in
+sub-milestone 6C (`internal/urlintel/adapt`, see "URL intelligence
+(library)" below). None of the pipelines has a CLI command yet; the
+remaining active engines (TLS metadata, JavaScript analysis, crawling,
+and secret scanning) are still later roadmap milestones.
 
 ## Asset model
 
@@ -30,7 +35,7 @@ The asset model provides typed, canonical representations of reconnaissance
 data:
 
 - Domain, Host, IP, Port, Service
-- URL, Endpoint, JavaScript
+- URL, Endpoint, JavaScript, Parameter
 
 Every asset has a deterministic, namespaced identity for deduplication,
 records provenance ("where did this come from?"), supports deterministic
@@ -133,6 +138,34 @@ request limiter, per-target cache-before-execute, and hermetic tests
 (loopback servers, no public Internet). It is a library capability only —
 there is no `ravenrecon http` command yet. See `ARCHITECTURE.md` ("HTTP
 probing") for the full design and security considerations.
+
+## URL intelligence (library)
+
+`internal/urlintel` (roadmap v0.7, sub-milestone 6B) streams raw observed
+URLs through the Phase 2 asset model: each line is canonicalized (never
+trusted raw), classified as a GET endpoint, and mined for query parameters
+(names and values kept exactly as observed), then cached per (URL, adapter)
+with cache-before-execute. Observations merge at emit time across adapters
+into one deterministic report per canonical URL, and every entry carries
+typed graph edges (host → url, url → endpoint, url → parameter, endpoint →
+parameter). Runs use a bounded pool with optional job-start rate limiting,
+and all tests are hermetic (synthetic input and a real filesystem-backed
+cache). There is no `ravenrecon url` CLI command yet — URL intelligence is
+a library capability only.
+
+Historical-URL tool adapters (`internal/urlintel/adapt`, sub-milestone
+6C) present external commands as line streams into the engine: gau,
+waybackurls, and waymore (katana and paramspider are deferred as
+documented future work). The tools must be installed — detection is
+tool-specific (version probes where the tool supports them, existence-only
+where it does not), and absent tools are skipped honestly: a broken or
+garbled version probe never reports an installed tool as missing. Tool
+invocations are bounded and shell-free (args as separate argv values, the
+target never concatenated), captured output is capped per tool, and the
+tool name enters cache keys and provenance so the same URL seen via two
+tools merges into one report entry with unioned sources. See
+`ARCHITECTURE.md` ("URL intelligence") for the full design and security
+considerations.
 
 ## Runtime engine
 

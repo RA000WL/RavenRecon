@@ -31,6 +31,12 @@ const (
 	// RelationshipURLToJavaScript links a page URL to a script resource it
 	// references (URL -> JavaScript).
 	RelationshipURLToJavaScript RelationshipKind = "url_to_javascript"
+	// RelationshipURLToParameter links a URL to a parameter observed in it
+	// (URL -> Parameter).
+	RelationshipURLToParameter RelationshipKind = "url_to_parameter"
+	// RelationshipEndpointToParameter links an endpoint to a parameter
+	// observed in it (Endpoint -> Parameter).
+	RelationshipEndpointToParameter RelationshipKind = "endpoint_to_parameter"
 )
 
 // Relationship is a typed, directed edge between two asset identities.

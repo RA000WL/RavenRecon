@@ -137,3 +137,50 @@ func MergeJavaScripts(a, b JavaScript) (JavaScript, error) {
 	out.Prov = earliestProv(a.Prov, b.Prov)
 	return out, nil
 }
+
+// MergeParameters combines two observations of the same parameter.
+//
+// The value lists are unioned preserving a's order first, then b's new
+// values in first-seen order; values beyond maxParameterValues are dropped
+// (existing values are never evicted) and Truncated is set when either side
+// was truncated or the union exceeded the cap. FirstSeen is the earliest
+// and LastSeen the latest of the two observations; Sources are unioned in
+// order, deduplicated; provenance is the earliest observation's.
+func MergeParameters(a, b Parameter) (Parameter, error) {
+	if !a.Identity().Equal(b.Identity()) {
+		return Parameter{}, mergeMismatch(KindParameter, a.Identity(), b.Identity())
+	}
+	m := a
+	truncated := a.Truncated
+	seen := make(map[string]struct{}, len(a.ObservedValues)+len(b.ObservedValues))
+	for _, v := range a.ObservedValues {
+		seen[v] = struct{}{}
+	}
+	for _, v := range b.ObservedValues {
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		if len(m.ObservedValues) >= maxParameterValues {
+			truncated = true
+			continue
+		}
+		m.ObservedValues = append(m.ObservedValues, v)
+	}
+	if a.FirstSeen.IsZero() {
+		m.FirstSeen = b.FirstSeen
+	} else if !b.FirstSeen.IsZero() && b.FirstSeen.Before(a.FirstSeen) {
+		m.FirstSeen = b.FirstSeen
+	}
+	if b.LastSeen.After(a.LastSeen) {
+		m.LastSeen = b.LastSeen
+	}
+	for _, s := range b.Sources {
+		if !containsString(m.Sources, s) {
+			m.Sources = append(m.Sources, s)
+		}
+	}
+	m.Truncated = truncated || b.Truncated
+	m.Prov = earliestProv(a.Prov, b.Prov)
+	return m, nil
+}

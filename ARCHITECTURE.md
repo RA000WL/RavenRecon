@@ -75,8 +75,14 @@ exist as library-level stages — DNS: A/AAAA/CNAME resolution into typed
 Phase 2 observations with per-(host, type) caching and typed relationships
 (see "DNS pipeline"); HTTP: root-path GET probes of every host's http and
 https targets with typed, cached observations, bounded limits, and typed
-relationships (see "HTTP probing"); neither has a CLI command yet. The
-URL/JS pipeline stages, asset graph, scoring, and reports do not exist yet.
+relationships (see "HTTP probing"); neither has a CLI command yet. The URL
+intelligence pipeline (roadmap v0.7, sub-milestone 6B; `internal/urlintel`)
+is the next library-level stage — canonical-URL streaming with parameter
+extraction, endpoint classification, per-(URL, adapter) caching, and typed
+graph edges (see "URL intelligence"); its historical-URL tool adapters
+landed in sub-milestone 6C (`internal/urlintel/adapt`, see "URL
+intelligence — Historical-URL tool adapters"). The JS pipeline stages,
+asset graph, scoring, and reports do not exist yet.
 
 ## Asset model
 
@@ -91,6 +97,7 @@ for reconnaissance data:
 * URL
 * Endpoint
 * JavaScript
+* Parameter
 
 Deferred to later phases: Technology, SecretCandidate, Finding.
 
@@ -107,8 +114,9 @@ Identity values are namespaced by asset kind (`domain:example.com` vs
 
 Relationships are represented by the typed `Relationship` primitive
 (Host -> IP, IP -> Port, Port -> Service, Host -> URL, URL -> Endpoint,
-URL -> JavaScript). This phase provides the representation only; the graph
-store, traversal, and correlation engine are planned for a later phase.
+URL -> JavaScript, URL -> Parameter, Endpoint -> Parameter). This phase
+provides the representation only; the graph store, traversal, and
+correlation engine are planned for a later phase.
 
 ## Pipeline requirements
 
@@ -1025,6 +1033,214 @@ arbitrary addresses.
 - All tests are hermetic: loopback HTTP/TLS servers and a real
   filesystem-backed cache, never the public Internet (see `bench_test.go`).
 
+## URL intelligence
+
+The URL intelligence pipeline (roadmap v0.7, sub-milestone 6B;
+`internal/urlintel`) is a library-level stage with no CLI command yet: a
+streaming engine that canonicalizes raw observed URLs into Phase 2 assets,
+extracts query parameters and endpoints, caches per (URL, adapter), merges
+observations at emit time, and assembles the typed asset-graph edges. The
+source seam is the `LineSource` interface (`SliceSource` wraps a fixed
+slice for tests and static input); the historical-URL tool adapters
+(sub-milestone 6C, `internal/urlintel/adapt`) present external commands
+as LineSource streams and are documented under "Historical-URL tool
+adapters" below. There is no scope layer: urlintel accepts any canonical
+URL, and scope filtering is the caller's obligation.
+
+### Historical-URL tool adapters
+
+Historical-URL tool adapters (roadmap v0.7, sub-milestone 6C) live in
+`internal/urlintel/adapt`: external commands presented as
+`urlintel.LineSource` streams. They reuse the hardened execution layer of
+`internal/discovery` (Runner, Limits, Detection) — there is no second
+execution implementation — and each ingest runs with the tool name as the
+engine's adapter identity.
+
+#### Supported tools
+
+Three built-in tools, described as data (Tool descriptors; the pipeline
+never branches on tool names):
+
+```text
+gau:         gau <host>                  # positional target; -version probe
+waybackurls: waybackurls <host>          # positional target; existence-only
+waymore:     waymore -i <host> -mode U   # URL-only mode; --version probe
+```
+
+waymore runs in `-mode U` (URLs only): archived response downloading is
+never reachable from RavenRecon. katana and paramspider are deliberately
+deferred (documented future work): they are crawling / active-discovery
+tools with heavier invocation shapes, scheduling, and output formats — the
+three passive archive URL tools cover 6C's historical-URL scope.
+
+#### Detection semantics
+
+Detection is tool-specific, per the discovery layer's four-stage
+contract (existence, execution, version, capability). Version-probed
+tools (gau `-version`, waymore `--version`) run their probe through the
+runner and require a recognizable semver-like token in the bounded
+capture (stdout first, then stderr); a broken, unsupported, garbled, or
+timing-out probe is at worst a WARN, never a MISSING — existence and
+capability are separate concerns, and a correctly installed tool is never
+reported missing because its version flag misbehaved (AGENTS.md
+requirement). Existence-only tools (waybackurls) have no probe at all:
+executable lookup IS the detection, so no probe can misreport an
+installed tool. Each tool is detected once per run, sequentially, before
+any execution, bounded by the detection timeout (default 5 s).
+
+#### Execution safety
+
+Every invocation goes through the shared hardened runner:
+`exec.CommandContext` with arguments as separate argv values (never a
+shell, never string concatenation — the canonical target is passed as its
+own single argv element), bounded per-tool capture (`Limits.MaxOutput`,
+default 4 MiB per stream; overflow is truncated and honestly reported as
+partial), the per-detection timeout, and process-group kill on
+cancellation (unix) so a cancelled run leaves no child process behind (on
+Windows only the direct child is killed; no POSIX process groups). The
+adapt package contains no `os/exec` usage of its own beyond the `LookPath`
+seam, so there is exactly one execution path to harden.
+
+#### The adapter ≠ model boundary
+
+Adapters translate tool stdout into RAW lines on the `LineSource` seam:
+lines are trimmed (CRLF and surrounding whitespace stripped), blank lines
+are skipped, and everything else passes through unchanged. No parsing,
+normalization, or canonicalization happens inside an adapter: the
+canonical model — `asset.URL` / `asset.Parameter`, cache records, and
+merge-at-emit — lives entirely in `urlintel` / `asset`. Canonical-boundary
+rejection (non-URLs, oversized lines, control-character garbage) is the
+engine's Malformed accounting at the ingest boundary, never the adapter's,
+so garbage from a noisy tool is counted and reported, never fatal and
+never silently dropped. Tool output is never trusted as a URL until
+`asset.ParseURL` has canonicalized it.
+
+#### Adapter identity and cache keys
+
+The orchestration passes the tool name as the engine's adapter identity
+(`urlintel.Config.Adapter`), which enters the per-(URL, adapter) cache
+keys AND the provenance of every asset. The same URL observed by two
+tools is two cache records; the engine's accumulator merges them at emit
+time into ONE report entry with unioned sources in first-observation
+order — one URL seen via two adapters emits one merged report entry,
+never two. Callers must pass the same tool name across runs (the engine's
+key contract).
+
+#### Orchestration and outcomes
+
+`Run()` owns one bounded `runtime.Pool`: exactly one job per (tool,
+target), pool `Concurrency` bounds concurrent tool processes, the bounded
+queue applies backpressure, and job-start rate limiting paces job starts
+(tool-internal network traffic is the tool's own responsibility —
+RavenRecon never fakes per-request limits for external processes). Each
+job executes its tool through a `toolSource` and feeds
+`urlintel.IngestInto` with a small inner pool (`IngestWorkers` workers):
+the composite bound is Concurrency × IngestWorkers ingest workers plus
+Concurrency tool processes, all bounded. The outer per-job deadline
+bounds the tool execution AND the ingest of its lines; job-start pacing,
+timings, and concurrency never enter cache keys. Every slot reports an
+honest `ToolResult`: skipped (detection MISSING — never an error, never
+an execution attempt), completed (clean run, fully ingested), partial
+(non-zero exit with usable output, or stdout truncated at the capture
+cap), failed (no usable output), cancelled (run teardown), or timed-out
+(job deadline elapsed). A failing tool never aborts the run; errors and
+truncation are summarized per result, the run level keeps total Malformed
+on the merged report, and only non-fatal diagnostics and shutdown
+failures are joined on the returned error.
+
+### Pipeline
+
+One bounded `runtime.Pool` owns all scheduling: exactly one job per raw
+line, `Config.Concurrency` workers, a bounded submission queue (the reader
+blocks on a full queue — backpressure, never unbounded memory), optional
+per-job deadlines and job-start rate limiting. Raw strings exist only at
+the ingest boundary: a line is capped at 32 KiB, rejected as malformed
+(counted, reported, never cached, never fatal) when oversized or
+unparseable, then immediately canonicalized through `asset.ParseURL` —
+raw strings never travel beyond the parse stage. Each canonical URL is
+pre-registered as a cancelled entry before submission, so a job dropped by
+a forced shutdown still appears in the report with an honest status.
+
+### Extraction
+
+Every canonical URL classifies as exactly one endpoint: GET on the
+canonical URL, whose identity includes the query string. Query parameters
+are extracted from the canonical query only; names and values stay exactly
+as observed (escaped forms never unescape, so `a%20b`, `a+b`, and raw
+non-ASCII values remain distinct identities), repeated names merge within
+one URL, and value-less keys (`?flag`) are not representable in the Phase 2
+model and are skipped. The path and body parameter locations are reserved
+for future phases.
+
+### Records and relationships
+
+Cache records are stored per (canonical URL, adapter): the operation is
+`url.ingest`, the key target is the canonical URL identity, and the
+configuration carries the adapter identity and the result-relevant
+`ParseParameters` flag — so the same URL observed by two adapters is two
+records, and a run with parameter extraction disabled is never served a
+record written with it enabled. The accumulator merges at emit time keyed
+by canonical URL identity only: sources union in first-observation order,
+timestamps are min/max, parameters merge via `asset.MergeParameters`,
+endpoints and relationships deduplicate by identity. Each entry carries
+typed edges — host -> url, url -> endpoint, url -> parameter, and endpoint
+-> parameter — deduplicated by edge identity and emitted sorted; cached
+observations rebuild the identical graph (host and edges are not stored).
+
+### Limits
+
+The line cap (32 KiB), the per-URL parameter cap (256 distinct parameters,
+beyond which the entry is flagged `Overflow` but stays completed), and the
+Phase 2 per-parameter value cap (1024, flagged `Truncated` on the
+parameter) are fixed constants, deliberately not configuration, and never
+enter cache keys. Failed and cancelled observations are never cached: a
+second run re-works them.
+
+### Cancellation
+
+`context.Context` flows through everything. Cancelled mid-stream, the
+reader stops, submitted jobs are cancelled by the pool, pre-registered
+entries keep an honest cancelled status, completed observations are still
+persisted (with a detached, bounded store context), and the pool's bounded
+shutdown budgets bound the drain. Lines not yet read are never consumed
+and not represented. `IngestInto` returns only after every pool-owned
+goroutine has terminated.
+
+### Security considerations
+
+Hostile input is bounded end to end: raw lines before parsing, parameters
+per URL, values per parameter, sources per observation, and payload sizes
+at decode time. Stored records are never trusted: every cached payload is
+re-validated through the Phase 2 model (canonical forms, identity
+consistency with the queried URL and adapter, bounds re-checked), and a
+corrupt, tampered, or mismatched record is deleted and recomputed in the
+same run (self-healing), never served as a hit. Machine-readable output
+stays separate from diagnostics: run counters on `Metrics`, observations
+in the report, and warnings joined on the returned error.
+
+### Known limitations
+
+- GET-only classification: other HTTP methods are not observable in 6B
+  inputs (the Phase 2 model supports them).
+- Path/body parameter extraction is not performed (reserved by the Phase 2
+  model for future phases).
+- Value-less query keys are skipped: the Phase 2 Parameter model requires
+  a non-empty observed value.
+- Raw lines over 32 KiB are rejected as malformed, not truncated.
+- Cache keys include the adapter: callers must pass the same adapter name
+  for the same tool across runs.
+- katana and paramspider are deferred (documented future work): crawling /
+  active-discovery tools with heavier invocation shapes, scheduling, and
+  output formats (see "Historical-URL tool adapters").
+- The adapters are library-level only: there is no `ravenrecon url` CLI
+  command yet, and tool results are reported per (tool, target) while
+  malformed-line counts are run-level only.
+- Cache hits replay the stored record's FirstSeen/LastSeen: a zero-work hit
+  does not advance LastSeen, and TTL expiry (when configured) bounds how
+  stale a served record can become.
+- All tests are hermetic: synthetic input and a real filesystem-backed
+  cache, never the public Internet.
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -1084,10 +1300,15 @@ Implemented:
   cache-before-execute with statused records, a bounded pool with a central
   per-request limiter, per-probe cancellation classification, bounded
   limits, and hermetic tests
+* URL intelligence (see "URL intelligence" above; roadmap v0.7): a
+  library-level canonical-URL streaming engine with parameter extraction,
+  endpoint classification, per-(URL, adapter) caching, cross-adapter emit
+  merging, typed graph edges, and historical-URL tool adapters for gau,
+  waybackurls, and waymore (`internal/urlintel/adapt`)
 
 Planned, not yet implemented:
 
-* discovery engines beyond passive subdomain enumeration, DNS, and HTTP
-  probing (TLS, URL, JS)
+* discovery engines beyond passive subdomain enumeration, DNS, HTTP, and
+  URL intelligence (TLS, JS)
 * asset store, graph, and correlation engine
 * reporting and terminal UI

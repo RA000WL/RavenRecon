@@ -14,6 +14,7 @@ const (
 	KindURL        Kind = "url"
 	KindEndpoint   Kind = "endpoint"
 	KindJavaScript Kind = "javascript"
+	KindParameter  Kind = "parameter"
 )
 
 // Identity is a namespaced, deterministic asset key used for deduplication.
