@@ -70,6 +70,17 @@ const (
 	// RelationshipJavaScriptToTechnology links a script resource to a
 	// technology observed in it (JavaScript -> Technology).
 	RelationshipJavaScriptToTechnology RelationshipKind = "javascript_to_technology"
+	// RelationshipURLToSecretCandidate links a URL asset to a secret
+	// candidate observed in the content served at it (URL ->
+	// SecretCandidate). Phase 8: documents scanned by the secret
+	// intelligence engine that came from a canonical URL.
+	RelationshipURLToSecretCandidate RelationshipKind = "url_to_secret_candidate"
+	// RelationshipSecretCandidateToEvidence links a secret candidate to the
+	// evidence observation that supported its classification
+	// (SecretCandidate -> Evidence). Phase 8: the pattern match, entropy
+	// assessment, context signals, and correlation records behind a
+	// candidate.
+	RelationshipSecretCandidateToEvidence RelationshipKind = "secret_candidate_to_evidence"
 )
 
 // Relationship is a typed, directed edge between two asset identities.

@@ -20,6 +20,7 @@ It should help researchers discover, correlate, prioritize, and report attack su
 - `internal/urlintel`, `internal/urlintel/adapt` — URL intelligence and historical-URL adapters: gau, waybackurls, waymore (library only)
 - `internal/techintel`, `internal/techintel/fingerprints` — technology fingerprint engine and database (library only)
 - `internal/jsintel`, `internal/jsintel/adapt` — JavaScript intelligence engine: parser, fetch, pipeline, analyzers, and subjs/LinkFinder/SecretFinder adapters (library only)
+- `internal/secrentel`, `internal/secrentel/patterns` — Evidence & Secret Intelligence Engine: document seam, scan/correlation/confidence pipeline, offline verification queue, and the compile-once pattern database (library only)
 
 ## Common commands
 

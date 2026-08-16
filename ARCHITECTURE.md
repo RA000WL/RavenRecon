@@ -82,12 +82,20 @@ extraction, endpoint classification, per-(URL, adapter) caching, and typed
 graph edges (see "URL intelligence"); its historical-URL tool adapters
 landed in sub-milestone 6C (`internal/urlintel/adapt`, see "URL
 intelligence — Historical-URL tool adapters"). The JavaScript intelligence
-pipeline (roadmap v0.8, phase 7; `internal/jsintel`) is the latest
+pipeline (roadmap v0.8, phase 7; `internal/jsintel`) is a
 library-level stage — discovery seams, a bounded fetch engine, the
 stdlib-only parser, import expansion, source map detection, endpoint and
 secret-candidate extraction, JS technology detection, and two
 cache-before-execute operations (see "JavaScript intelligence"); it has no
-CLI command yet. The asset graph, scoring, and reports do not exist yet.
+CLI command yet. The secret intelligence pipeline (phase 8;
+`internal/secrentel`) is the latest library-level stage — the Evidence &
+Secret Intelligence Engine: bounded documents are scanned against a
+compile-once pattern database and every candidate is classified into a
+structured evidence model with entropy, context, multi-evidence
+correlation, confidence scoring, explicit false-positive suppression, a
+`secret.scan` cache-before-execute record, and an offline verification
+queue (see "Secret intelligence"); it has no CLI command yet. The asset
+graph, scoring, and reports do not exist yet.
 
 ## Asset model
 
@@ -104,7 +112,14 @@ for reconnaissance data:
 * JavaScript
 * Parameter
 
-Deferred to later phases: Technology, SecretCandidate, Finding.
+The technology asset landed with phase 6.5 (`asset.Technology`,
+`asset.Evidence`) and the secret candidate with phase 7
+(`asset.SecretCandidate`). Phase 8 extended the secret vocabulary to 35
+canonical types, added the `secret` detection method for evidence records,
+and added the `url -> secret_candidate` and `secret_candidate -> evidence`
+relationship kinds (see "Secret intelligence").
+
+Deferred to later phases: Finding.
 
 Every implemented asset has:
 
@@ -1695,6 +1710,231 @@ engine's own extraction covers this phase's scope.
 - All tests and benchmarks are hermetic: synthetic input, loopback
   servers, and a real filesystem-backed cache, never the public Internet.
 
+## Secret intelligence
+
+Secret intelligence (phase 8; `internal/secrentel`) is a library-level
+engine with no CLI command yet: the Evidence & Secret Intelligence Engine.
+It is deliberately NOT a "secret scanner" — it is an evidence engine. Every
+emitted candidate carries its canonical Phase 2 `asset.SecretCandidate`
+identity, the pattern fingerprints that matched, an entropy assessment,
+extracted context, multi-evidence correlation, and a confidence verdict
+composed of every contributing factor. Anonymous strings are never
+returned. Package layout: the core (`internal/secrentel`) owns the whole
+model — the document seam, the scan/correlation/confidence pipeline, cache
+records, and the report; `internal/secrentel/patterns` is the data-only,
+compile-once pattern database (mirroring `internal/techintel/fingerprints`).
+
+### Phase boundary
+
+Candidates are detected, NEVER verified: no network call, no cloud API
+validation, no AWS/GitHub/Stripe validation, no exploitation, no severity.
+The offline verification QUEUE records which candidates a future
+verification module should consume (medium confidence and above, unflagged,
+deterministically ordered); it executes nothing, contacts nothing, and is
+itself never cached — it is derived from the report's secrets at build
+time.
+
+### Document seam
+
+`Document` is the ingest seam (caller-composed; the engine never fetches):
+one of 11 kinds (js, sourcemap, html, json, env, config, yaml, xml,
+graphql, openapi, http), bounded content, an optional canonical URL, an
+optional source asset identity (a JavaScript asset identity from jsintel
+makes the candidates' source identity IDENTICAL to Phase 7's — the two
+phases deduplicate on one Phase 2 candidate), filename/repo/hostname
+hints, and optional technology names (techintel detections used as
+correlation signals). `prepareDocument` is the single normalization point:
+bounds are enforced there (content 2 MiB, filename 512 B, repo 512 B, 32
+technology hints, hostname validated through `asset.NewHost`), larger
+documents become an honest truncated prefix, and malformed input is
+rejected (counted, never fatal). The scan identity is a SHA-256 over every
+result-relevant input — kind, content digest, filename, URL identity,
+source asset, hostname, technology hints — so two documents whose scans
+differ can never collide on one accumulator entry or one cache key, and no
+raw content byte ever reaches a cache-key payload.
+
+### Pattern database
+
+`internal/secrentel/patterns` is DATA ONLY: 43 pattern fingerprints across
+the 35-type vocabulary plus a 22-provider correlation table (the fingerprint
+count is asserted by the patterns package test), with
+`SchemaVersion = 1` entering every scan cache key. Each pattern declares
+provider, type, family, regex, capture group, trailing-material extension
+(PEM key blocks), strength, length bounds, an offline structural validator
+(JWT header/alg shape, hex, base64, UUID, mixed-alnum), an entropy rule
+(minimum Shannon and class-normalized entropy), negative indicators,
+positive indicators, and context hints. Families are contract: `structured`
+(strong prefix/marker shapes, High eligible), `contextual`
+(assignment-shaped matches — the variable name is part of the match —
+Medium/High only with entropy support), `generic` (random base64 under a
+generic name — capped at Low: "random base64" alone is never more than a
+weak signal), and `public` (public keys, definitionally not secrets,
+capped at Low). `Load()` validates every entry and compiles every regular
+expression exactly once; the engine never compiles its own regexes.
+
+ANCHORS are the database's performance contract: contextual and generic
+families REQUIRE lowercase literal anchors (necessary substrings of any
+match, e.g. `aws_secret_access_key` → "secret"). Case-insensitive regexes
+cannot use RE2's literal-prefix fast path — a measured ~1000x per-pattern
+penalty — so the scanner lowercases the document once and gates every
+anchored pattern behind a substring check. Anchor-free content skips the
+case-insensitive families entirely; measured scan throughput improved
+~40x (1.2 → ~47 MB/s on a 512 KiB anchor-free bundle). Two structured
+patterns carry optional anchors for the same reason (alternation or class
+prefixes: `sk|rk _live_`, the Discord token's leading class).
+
+### Scan pipeline
+
+One bounded `runtime.Pool` owns all scheduling (mirroring techintel): one
+job per document, cache-before-execute (operation `secret.scan`), bounded
+per-pattern matches (64), per-document candidates (64, overflow counted),
+evidence per candidate (8), and a per-document entropy memo (4096 values —
+minified bundles repeat values constantly). The scan: pattern matching →
+per-match validation (length bounds, negative indicators, structural
+validators, false-positive VALUE classification, entropy rules) → dedup by
+(type, value) with pattern-ID accumulation → cross-family duplicate
+removal (contextual duplicates of structured matches and generic
+duplicates of either are dropped: the specific classification wins) →
+context extraction → correlation → confidence → canonical assets, evidence
+records, and graph edges. RE2 has no catastrophic backtracking by
+construction; every bound is a fixed constant that never enters cache keys.
+
+### Entropy, context, correlation
+
+The entropy engine is a pure observation (it NEVER classifies alone):
+byte-level Shannon entropy, character-class detection (hex, base64url,
+base64, alnum, other), class-normalized randomness, UUID and JWT shape
+recognition, and length weighting (values under 32 bytes are progressively
+weaker evidence). A pattern's entropy rule is a gate — values below the
+minimum are DROPPED (counted) — and satisfied rules contribute one
+confidence factor.
+
+The context engine extracts the surrounding evidence of each match from a
+±256-byte window: the assignment variable name or JSON key (backward scan,
+separator-normalized so camelCase matches snake_case hints), comment
+containment (//, #, unclosed /* */), nearby positive indicators, and
+whether a pattern hint or the provider name appears in the name (the
+strong context signal). Line/column locations come from a bounded line
+index (65,536 tracked lines; matches beyond report line 0 — honest, never
+unbounded).
+
+Correlation accumulates evidence: provider ENDPOINTS observed in the
+document (the 22-provider table: s3.amazonaws.com next to an AWS key),
+provider TECHNOLOGIES (caller-provided techintel detections), same-provider
+sibling PAIRS (AWS access key + AWS secret key → both boosted and
+cross-linked), and cross-document REPEATS (the same (type, value) observed
+under two source identities — each keeps its own candidate identity;
+attribution is never merged away — widens the observation count and links
+the siblings). Evidence must accumulate; a lone random base64 blob gains
+none of these factors.
+
+### Confidence model
+
+Score = 1 − ∏(1 − wᵢ) over the recorded factors (pattern strength always;
+entropy 0.35/0.15; context 0.4 strong / 0.15 weak; technology 0.25;
+endpoint 0.3; pair 0.45; repeat 0.2 — the pair/repeat factors are appended
+to the stored factor list and recomputed through the same pure function, so
+cache-served and fresh candidates score identically). Caps, in order:
+documentation/test context → 0.45 (Low); generic family → 0.45; public
+family → 0.35; a structured match with ZERO supporting factors → 0.59.
+Thresholds: ≥0.8 High, ≥0.5 Medium, ≥0.2 Low, else Unknown. Level gates:
+High requires at least TWO non-pattern factors (never one signal);
+Medium requires at least one. Thresholds, weights, and caps are fixed
+constants — the confidence model is a documented contract, not
+configuration.
+
+### False-positive reduction
+
+Two explicit layers. VALUE suppression — the candidate is NOT emitted
+(counted with a reason): providers' documented EXAMPLE values (matched
+case-sensitively so `db.example.com` hostnames in real connection strings
+survive), placeholder/dummy/lorem markers, uniform filler runs, and short
+plain words. CONTEXT capping — the candidate IS emitted but capped at Low:
+test/spec/example/docs/mock/fixture/tutorial markers in the filename or URL
+path (a test file can still contain a real secret — the observation is
+honest, the confidence is not). Additionally: entropy rules drop prose;
+cross-family duplicate removal drops re-classified values; Stripe test keys
+(`sk_test_`) are deliberately not matched at all.
+
+### Cache integration
+
+Operation `secret.scan`, keyed on the scan identity plus the pattern schema
+version, the engine analysis version, and the result-relevant metadata the
+identity does not already cover. A completed hit serves the stored scan
+with ZERO analysis (pinned by the Metrics.Scanned counter) and rebuilds the
+identical graph from the stored edge source and evidence links. Truncated
+documents are stored `StatusIncomplete` and NEVER served as hits — their
+prefix candidates still report for the run (the AGENTS.md rule: truncated
+results are never completed and never served from cache). Decode
+re-validation covers the envelope, payload version, kind, timestamps,
+counts within caps, canonical candidate assets (round-trip through the
+asset constructor), families, levels never stronger than the score allows
+and re-gated from the stored factor list (High needs two non-pattern
+factors, Medium one — a stored level the factors could never produce is
+tampering or a bug), factor weights in [0,1], confidence caps re-derived
+from the stored candidate's own type/family/FP flags (a score above the cap
+the current engine could produce — or a url_type_cap marker absent where
+the type is capped, or present where it is not — is tampering or a bug),
+the stored score equal to the score recomposed from the stored factors
+through the same pure functions (a factor list that contradicts its own
+score is tampering or a bug), canonical
+evidence, evidence links, and edge-kind
+consistency with the document; a rejected record is deleted and recomputed
+in the same run (self-healing). Failed and cancelled documents are never
+stored. Cache hits replay stored FirstSeen/LastSeen; the verification queue
+is never cached.
+
+### Statuses, limits, and determinism
+
+Entry statuses: completed / incomplete (truncated prefix) / cancelled /
+failed, plus run-level malformed counting. Fixed limits: content 2 MiB,
+64 candidates per document, 64 matches per pattern, 8 evidence records per
+candidate, 4 nearby indicators, ±256-byte context windows, 65,536 tracked
+lines, 4096-entry entropy memo, 512 queue entries (overflow counted), 32
+run diagnostics. Reports are fully deterministic: secrets by score
+desc then candidate ID, evidence and relationships by identity, the queue
+in priority order — two identical runs produce identical reports (pinned
+by test), and a cache-served run produces the identical report modulo the
+Cached flag.
+
+### Security considerations
+
+- Regex DoS: RE2 (Go's regexp) has no catastrophic backtracking by
+  construction; every pattern is compile-once and data-validated; matches
+  and candidates are hard-capped per pattern and per document.
+- Resource abuse: documents are bounded at ingest (2 MiB); the line index,
+  entropy memo, context windows, evidence, and diagnostics are all bounded;
+  the pool bounds concurrency with backpressure (verified leak-free under
+  cancellation by test).
+- Cache poisoning: strict decode re-validation (see "Cache integration") —
+  tampered, corrupt, or contradictory records are deleted and recomputed,
+  never served; the truncated-as-completed tamper class is rejected
+  explicitly.
+- Secret handling: values are bounded to the asset layer's 512-byte stored
+  form; error strings and diagnostics never echo secret values; cache keys
+  carry content digests, never raw bytes.
+- Verification boundary: nothing is ever validated online; the queue is
+  bookkeeping for a future phase, and no severity is ever claimed.
+
+### Known limitations
+
+- Library capability only: no CLI command.
+- Candidates are detected, never verified; the queue is not execution.
+- Assignment-shaped (contextual) patterns depend on the variable name
+  appearing in the same statement; minified single-letter names still match
+  but carry only weak context.
+- The anchor gate trades a bounded amount of recall for speed: a Discord
+  bot token in a document containing neither "discord" nor a bot-token
+  name anywhere is not scanned for (documented, deliberate).
+- Source-map documents are scanned as JSON-shaped content; dedicated
+  source-map semantics (sourcesContent walking) is future work.
+- Context extraction is lexical (backward scans), not a parser; quoted-key
+  forms like `config["apiKey"]` yield no name.
+- Cache hits replay stored FirstSeen/LastSeen; TTL expiry (when
+  configured) bounds staleness.
+- All tests and benchmarks are hermetic: synthetic input and a real
+  filesystem-backed cache, never the public Internet.
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -1767,6 +2007,15 @@ Implemented:
   extraction, JS technology detection, `js.fetch`/`js.analyze`
   cache-before-execute records, and tool adapters for subjs, LinkFinder,
   and SecretFinder (`internal/jsintel/adapt`)
+* secret intelligence (see "Secret intelligence" above, phase 8): a
+  library-level Evidence & Secret Intelligence Engine over bounded
+  documents with the extended 35-type Phase 2 secret vocabulary, the
+  `secret` evidence method, `url -> secret_candidate` and
+  `secret_candidate -> evidence` relationship kinds, the compile-once
+  anchored pattern database, entropy/context/correlation/confidence
+  engines, explicit false-positive suppression, a `secret.scan`
+  cache-before-execute record with strict decode re-validation, and an
+  offline verification queue (`internal/secrentel`)
 
 Planned, not yet implemented:
 

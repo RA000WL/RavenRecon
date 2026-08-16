@@ -287,10 +287,10 @@ func TestSecretCandidateIdentityEncoding(t *testing.T) {
 }
 
 func TestSecretTypeEnum(t *testing.T) {
-	// All 9 known values are valid and canonical lowercase, and
+	// All 35 known values are valid and canonical lowercase, and
 	// ParseSecretType round-trips each one.
-	if n := len(KnownSecretTypes()); n != 9 {
-		t.Fatalf("KnownSecretTypes has %d entries, want 9", n)
+	if n := len(KnownSecretTypes()); n != 35 {
+		t.Fatalf("KnownSecretTypes has %d entries, want 35", n)
 	}
 	for _, typ := range KnownSecretTypes() {
 		if !typ.Valid() {
@@ -344,7 +344,7 @@ func TestKnownSecretTypesSortedAndFresh(t *testing.T) {
 	if reflect.DeepEqual(mutated, again) {
 		t.Error("KnownSecretTypes must return a fresh copy per call")
 	}
-	if again[0] != SecretTypeAWS || again[len(again)-1] != SecretTypeStripe {
+	if again[0] != SecretTypeAnthropic || again[len(again)-1] != SecretTypeWebhookURL {
 		t.Errorf("KnownSecretTypes order changed: %v", again)
 	}
 }

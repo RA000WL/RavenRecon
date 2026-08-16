@@ -34,17 +34,91 @@ const (
 	SecretTypePrivateKey SecretType = "private_key"
 	// SecretTypeGeneric: candidates that matched no specific pattern.
 	SecretTypeGeneric SecretType = "generic"
+
+	// Phase 8 (secret intelligence) extensions. The values are the canonical
+	// lowercase provider/type forms; the Phase 7 values above are frozen and
+	// never renamed, so Phase 7 identities stay stable.
+
+	// SecretTypeAzure: Microsoft Azure key and connection candidates.
+	SecretTypeAzure SecretType = "azure"
+	// SecretTypeGitLab: GitLab token candidates.
+	SecretTypeGitLab SecretType = "gitlab"
+	// SecretTypeTwilio: Twilio key and token candidates.
+	SecretTypeTwilio SecretType = "twilio"
+	// SecretTypeSlack: Slack token candidates.
+	SecretTypeSlack SecretType = "slack"
+	// SecretTypeDiscord: Discord token and webhook candidates.
+	SecretTypeDiscord SecretType = "discord"
+	// SecretTypeOpenAI: OpenAI API key candidates.
+	SecretTypeOpenAI SecretType = "openai"
+	// SecretTypeAnthropic: Anthropic API key candidates.
+	SecretTypeAnthropic SecretType = "anthropic"
+	// SecretTypeRSAPrivateKey: RSA private key block candidates (BEGIN RSA
+	// PRIVATE KEY).
+	SecretTypeRSAPrivateKey SecretType = "rsa_private_key"
+	// SecretTypeSSHPrivateKey: OpenSSH private key block candidates (BEGIN
+	// OPENSSH PRIVATE KEY).
+	SecretTypeSSHPrivateKey SecretType = "ssh_private_key"
+	// SecretTypePublicKey: public key candidates (PEM PUBLIC KEY blocks and
+	// ssh-rsa/ssh-ed25519 authorization key forms).
+	SecretTypePublicKey SecretType = "public_key"
+	// SecretTypeOAuth: OAuth refresh/access token candidates with known
+	// provider prefixes.
+	SecretTypeOAuth SecretType = "oauth"
+	// SecretTypeAPIKey: structured generic API key candidates (fixed charset
+	// and length with a provider-shaped context).
+	SecretTypeAPIKey SecretType = "api_key"
+	// SecretTypeDatabaseURL: connection-string candidates for SQL databases.
+	SecretTypeDatabaseURL SecretType = "database_url"
+	// SecretTypeRedisURL: redis:// connection-string candidates.
+	SecretTypeRedisURL SecretType = "redis_url"
+	// SecretTypeMongoDBURL: mongodb:// connection-string candidates.
+	SecretTypeMongoDBURL SecretType = "mongodb_url"
+	// SecretTypePostgreSQLURL: postgres:// connection-string candidates.
+	SecretTypePostgreSQLURL SecretType = "postgres_url"
+	// SecretTypeMySQLURL: mysql:// connection-string candidates.
+	SecretTypeMySQLURL SecretType = "mysql_url"
+	// SecretTypeWebhookURL: webhook endpoint candidates (Slack, Discord, and
+	// generic webhook services).
+	SecretTypeWebhookURL SecretType = "webhook_url"
+	// SecretTypeSMTP: SMTP credential candidates (smtp:// URLs with embedded
+	// userinfo).
+	SecretTypeSMTP SecretType = "smtp"
+	// SecretTypeS3: S3 bucket URL candidates.
+	SecretTypeS3 SecretType = "s3"
+	// SecretTypeCloudflare: Cloudflare token candidates.
+	SecretTypeCloudflare SecretType = "cloudflare"
+	// SecretTypeDigitalOcean: DigitalOcean token candidates.
+	SecretTypeDigitalOcean SecretType = "digitalocean"
+	// SecretTypeVercel: Vercel token candidates.
+	SecretTypeVercel SecretType = "vercel"
+	// SecretTypeNetlify: Netlify token candidates.
+	SecretTypeNetlify SecretType = "netlify"
+	// SecretTypeRailway: Railway token candidates.
+	SecretTypeRailway SecretType = "railway"
+	// SecretTypeCustomToken: caller-defined/custom-deployment token shapes
+	// (site-specific prefixes discovered through configuration, not matched by
+	// the built-in database).
+	SecretTypeCustomToken SecretType = "custom_token"
 )
 
 // String returns the canonical lowercase type value.
 func (t SecretType) String() string { return string(t) }
 
-// Valid reports whether t is one of the 9 known secret types.
+// Valid reports whether t is one of the 35 known secret types.
 func (t SecretType) Valid() bool {
 	switch t {
 	case SecretTypeJWT, SecretTypeAWS, SecretTypeGoogle, SecretTypeFirebase,
 		SecretTypeStripe, SecretTypeGitHub, SecretTypeBearer,
-		SecretTypePrivateKey, SecretTypeGeneric:
+		SecretTypePrivateKey, SecretTypeGeneric,
+		SecretTypeAzure, SecretTypeGitLab, SecretTypeTwilio, SecretTypeSlack,
+		SecretTypeDiscord, SecretTypeOpenAI, SecretTypeAnthropic,
+		SecretTypeRSAPrivateKey, SecretTypeSSHPrivateKey, SecretTypePublicKey,
+		SecretTypeOAuth, SecretTypeAPIKey, SecretTypeDatabaseURL,
+		SecretTypeRedisURL, SecretTypeMongoDBURL, SecretTypePostgreSQLURL,
+		SecretTypeMySQLURL, SecretTypeWebhookURL, SecretTypeSMTP, SecretTypeS3,
+		SecretTypeCloudflare, SecretTypeDigitalOcean, SecretTypeVercel,
+		SecretTypeNetlify, SecretTypeRailway, SecretTypeCustomToken:
 		return true
 	}
 	return false
@@ -64,9 +138,17 @@ func ParseSecretType(s string) (SecretType, error) {
 // returned slice is a fresh copy; callers may mutate it freely.
 func KnownSecretTypes() []SecretType {
 	return []SecretType{
-		SecretTypeAWS, SecretTypeBearer, SecretTypeFirebase, SecretTypeGeneric,
-		SecretTypeGitHub, SecretTypeGoogle, SecretTypeJWT, SecretTypePrivateKey,
-		SecretTypeStripe,
+		SecretTypeAnthropic, SecretTypeAPIKey, SecretTypeAWS, SecretTypeAzure,
+		SecretTypeBearer, SecretTypeCloudflare, SecretTypeCustomToken,
+		SecretTypeDatabaseURL, SecretTypeDigitalOcean, SecretTypeDiscord,
+		SecretTypeFirebase, SecretTypeGeneric, SecretTypeGitHub,
+		SecretTypeGitLab, SecretTypeGoogle, SecretTypeJWT, SecretTypeMongoDBURL,
+		SecretTypeMySQLURL, SecretTypeNetlify, SecretTypeOAuth, SecretTypeOpenAI,
+		SecretTypePostgreSQLURL, SecretTypePrivateKey, SecretTypePublicKey,
+		SecretTypeRailway, SecretTypeRedisURL, SecretTypeRSAPrivateKey,
+		SecretTypeS3, SecretTypeSlack, SecretTypeSMTP, SecretTypeSSHPrivateKey,
+		SecretTypeStripe, SecretTypeTwilio, SecretTypeVercel,
+		SecretTypeWebhookURL,
 	}
 }
 

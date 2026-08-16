@@ -41,6 +41,10 @@ const (
 	// MethodJS marks evidence observed from JavaScript content markers
 	// (patterns inside a script body).
 	MethodJS DetectionMethod = "js"
+	// MethodSecret marks evidence observed by the secret pattern engine
+	// (Phase 8): pattern matches, entropy assessments, context signals, and
+	// correlation records behind one secret candidate.
+	MethodSecret DetectionMethod = "secret"
 )
 
 // String returns the canonical lowercase method value.
@@ -51,7 +55,7 @@ func (m DetectionMethod) Valid() bool {
 	switch m {
 	case MethodHeader, MethodCookie, MethodHTML, MethodGenerator, MethodMeta,
 		MethodScript, MethodCSS, MethodAttribute, MethodEndpoint, MethodTLS,
-		MethodDNS, MethodSourceMap, MethodJS:
+		MethodDNS, MethodSourceMap, MethodJS, MethodSecret:
 		return true
 	}
 	return false
@@ -72,7 +76,7 @@ func KnownMethods() []DetectionMethod {
 	return []DetectionMethod{
 		MethodAttribute, MethodCookie, MethodCSS, MethodDNS, MethodEndpoint,
 		MethodGenerator, MethodHeader, MethodHTML, MethodJS, MethodMeta,
-		MethodScript, MethodSourceMap, MethodTLS,
+		MethodScript, MethodSecret, MethodSourceMap, MethodTLS,
 	}
 }
 

@@ -188,7 +188,8 @@ Implemented as urlintel tool adapters: gau, waybackurls, and waymore;
 katana and paramspider are deferred as documented future work.
 
 Outstanding work: the project version stays at 0.5.0; the next version bump
-is a release decision. JavaScript intelligence (v0.8) is complete.
+is a release decision. JavaScript intelligence (v0.8) is complete; secret
+intelligence (Phase 8) is complete.
 
 ---
 
@@ -260,6 +261,48 @@ adapter — the engine's own extraction replaces it; consistent with the
 urlintel katana deferral) and source-map content parsing (references are
 detected and normalized now; parsing the map content lands with a future
 phase).
+
+---
+
+## Phase 8 — Secret Intelligence
+
+Secret intelligence lands as Phase 8: `internal/secrentel` is the Evidence
+& Secret Intelligence Engine — deliberately an evidence engine, not a
+"secret scanner". Bounded documents (JavaScript, source maps, HTML, JSON,
+environment files, configuration, YAML, XML, GraphQL, OpenAPI, HTTP
+responses) are scanned against the compile-once, anchor-gated pattern
+database (`internal/secrentel/patterns`, 43 fingerprints across the
+35-type vocabulary extended in the Phase 2 asset model; the count is
+asserted by the patterns package test), and every
+candidate is classified into a structured evidence model: pattern
+fingerprints, entropy assessment, extracted context, multi-evidence
+correlation (provider endpoints, sibling pairs, cross-document repeats),
+and a multi-factor confidence score with explicit false-positive
+suppression (documented example values suppressed; documentation/test
+contexts capped at Low; entropy alone never classifies). A `secret.scan`
+cache-before-execute record with strict decode re-validation covers
+rescans; an offline verification queue (never cached, never executed)
+records what the future verification phase should consume. See
+`ARCHITECTURE.md`, "Secret intelligence". There is no CLI command yet.
+
+Status: complete
+
+- [x] secret asset model (35-type vocabulary extension)
+- [x] evidence model (secret evidence method + candidate→evidence edges)
+- [x] pattern engine and fingerprint database (compile-once, anchored)
+- [x] entropy engine (Shannon, classes, UUID/JWT, length weighting)
+- [x] context engine (variables, JSON keys, comments, nearby indicators)
+- [x] multi-evidence correlation (endpoints, technologies, pairs, repeats)
+- [x] confidence scoring (factor-composed, capped, gated)
+- [x] false-positive reduction (value suppression + context capping)
+- [x] cache integration (`secret.scan`, truncated-never-served)
+- [x] runtime reuse (bounded pool, cancellation, streaming)
+- [x] verification queue (offline only)
+- [x] tests, race tests, and benchmarks
+
+Deferred as documented future work: online secret verification (the
+explicit Phase 9 boundary — nothing in Phase 8 contacts any provider) and
+dedicated source-map semantics.
 
 ---
 

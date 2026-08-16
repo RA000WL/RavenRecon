@@ -37,9 +37,18 @@ confidence scoring, evidence records, and a 145-fingerprint database (see
 (`internal/jsintel`, roadmap v0.8, phase 7) adds the JavaScript Intelligence
 Engine as a library capability: script URLs discovered from raw lines, HTML
 observations, and external tool adapters are fetched, parsed, and analyzed
-into typed Phase 2 assets with two cache-before-execute operations. None of
-the pipelines has a CLI command yet; the remaining active engines (crawling
-and secret-candidate verification) are still later roadmap milestones.
+into typed Phase 2 assets with two cache-before-execute operations. Secret
+intelligence (`internal/secrentel`, phase 8) adds the Evidence & Secret
+Intelligence Engine: bounded documents (JavaScript, source maps, HTML, JSON,
+environment files, configuration, YAML, XML, GraphQL, OpenAPI, HTTP
+responses) are scanned against a compiled pattern database and every
+candidate is classified into a structured evidence model — pattern
+fingerprints, entropy assessment, extracted context, multi-evidence
+correlation, and a multi-factor confidence score with explicit
+false-positive suppression — plus an offline verification queue for a later
+verification phase. None of the pipelines has a CLI command yet; the
+remaining active engines (crawling and secret verification) are still later
+roadmap milestones.
 
 The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
 
@@ -87,7 +96,7 @@ Every asset has a deterministic, namespaced identity for deduplication,
 records provenance ("where did this come from?"), supports deterministic
 merging, and serializes to JSON. See `ARCHITECTURE.md` for details.
 
-Deferred to later phases: SecretCandidate, Finding, the asset
+Deferred to later phases: Finding, the asset
 store/graph, and the correlation engine.
 
 ## Cache and resume
@@ -265,6 +274,40 @@ their executable/wrapper contract is documented in `ARCHITECTURE.md`. There
 is no `ravenrecon js` CLI command yet — JavaScript intelligence is a
 library capability only. See `ARCHITECTURE.md` ("JavaScript intelligence")
 for the full design, limits, and security considerations.
+
+## Secret intelligence (library)
+
+`internal/secrentel` (phase 8) is the Evidence & Secret Intelligence
+Engine — deliberately not a "secret scanner": every emitted candidate is a
+structured evidence tree, never an anonymous string. A typed `Document`
+seam (11 kinds: JavaScript, source maps, HTML, JSON, env files,
+configuration, YAML, XML, GraphQL, OpenAPI, HTTP responses; caller-composed,
+the engine never fetches) feeds one bounded `runtime.Pool` where every
+document runs cache-before-execute (operation `secret.scan`) → scan →
+correlate → score → merge-at-emit. Each result carries the canonical Phase 2
+`asset.SecretCandidate`, the matched pattern fingerprints, an entropy
+assessment (Shannon, character class, UUID/JWT shapes, length weighting),
+extracted context (variable/JSON-key names, comment containment, nearby
+provider indicators), correlation links (provider endpoints, same-provider
+sibling pairs, cross-document repeats), and a confidence verdict with every
+contributing factor recorded. The pattern database
+(`internal/secrentel/patterns`, 43 compiled fingerprints across 35 secret
+types — the count is asserted by the patterns package test) is data-only
+and compile-once, with required literal anchors that
+gate the case-insensitive families (a measured ~40× scan-speed
+improvement). False-positive reduction is a first-class stage: documented
+provider example values and placeholders are suppressed outright;
+documentation/test/sample contexts cap confidence at Low; entropy rules
+drop prose; contextual duplicates of structured matches are removed; and
+entropy alone can never classify a secret. An offline verification queue
+(medium-confidence and above, unflagged, deterministically ordered) records
+what a future verification phase should consume — nothing is ever verified
+online, and the queue itself is never cached. Truncated documents report
+their prefix candidates but are stored incomplete and never served from
+cache. There is no `ravenrecon secret` CLI command yet — secret
+intelligence is a library capability only. See `ARCHITECTURE.md` ("Secret
+intelligence") for the full design, the confidence model, and security
+considerations.
 
 ## Runtime engine
 
