@@ -46,9 +46,15 @@ candidate is classified into a structured evidence model — pattern
 fingerprints, entropy assessment, extracted context, multi-evidence
 correlation, and a multi-factor confidence score with explicit
 false-positive suppression — plus an offline verification queue for a later
-verification phase. None of the pipelines has a CLI command yet; the
-remaining active engines (crawling and secret verification) are still later
-roadmap milestones.
+verification phase. The priority engine (`internal/priority`, phase 9)
+adds the Attack Surface Intelligence Engine: canonical Phase 2 assets
+reduced to scoring signals are matched against two data-driven catalogs
+(53 indicators), every score is a fully explained factor list with
+evidence-tied reconnaissance recommendations, correlated into groups and
+evidence-tied attack-path hypotheses, and served through a bounded,
+cache-integrated engine stage (see "Priority engine (library)" below).
+None of the pipelines has a CLI command yet; the remaining active engines
+(crawling and secret verification) are still later roadmap milestones.
 
 The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
 
@@ -97,7 +103,8 @@ records provenance ("where did this come from?"), supports deterministic
 merging, and serializes to JSON. See `ARCHITECTURE.md` for details.
 
 Deferred to later phases: Finding, the asset
-store/graph, and the correlation engine.
+store/graph, and the graph correlation engine (the priority
+engine's identity-anchored Correlate, phase 9, is not that engine).
 
 ## Cache and resume
 
@@ -308,6 +315,78 @@ cache. There is no `ravenrecon secret` CLI command yet — secret
 intelligence is a library capability only. See `ARCHITECTURE.md` ("Secret
 intelligence") for the full design, the confidence model, and security
 considerations.
+
+## Priority engine (library)
+
+`internal/priority` (roadmap v0.9, phase 9) is the Attack Surface
+Intelligence Engine: it consumes canonical Phase 2 assets reduced to
+scoring signals and produces explainable, deterministic priorities for
+which surfaces deserve a researcher's attention first. It is explicitly
+NOT a vulnerability detector: no severity, no CVEs, no weakness claims —
+every score is an interestingness judgment whose every factor cites the
+canonical asset identity it was derived from, so every result audits back
+to observations.
+
+Signals and the scoring contract: two data-driven, compile-once catalogs
+(40 interestingness and 13 risk indicators — 53 entries, every one
+validated at load) match observed signals — endpoint/URL paths, host
+labels, technology names and categories (carrying the detection phase's
+own confidences), secret candidate types (carrying the secret engine's
+own confidences), parameter names, service names, ports, final-response
+headers, JavaScript bundle sizes, asset kinds, and endpoint classes. The
+overlap policy emits one factor per (category, field) group — the longest
+matching literal wins, literals beat regexes, ties break by indicator ID.
+Composition is the same combine math as the confidence engines:
+score = 1 − ∏(1 − w_g) over groups, where each group's weight is
+1 − ∏(1 − w_f) capped at 0.6 per indicator category and 0.5 for the
+confidence group; levels are gated (high needs score ≥ 0.8 and at least
+two independent indicator categories). Confidence is composed only from
+confidences the earlier phases actually recorded — never invented. Every
+indicator factor also carries a rendered reconnaissance recommendation
+(guidance language only), and the catalogs enforce compile-time template
+and byte bounds: each reason/recommendation template carries exactly one
+`%s` seam — its only percent sign (any other `%`, whether a second verb,
+`%q`, `%d`, or `%%`, fails the load, because the score-time render
+substitutes exactly one occurrence and any other percent would leak into
+the emitted factor raw; verbatim regex/size/kind texts must be
+percent-free) — and no rendered reason or recommendation can exceed its
+byte bound for any matched term.
+
+Correlation, attack paths, recommendations: `Correlate` groups scored
+surfaces under anchors derived exclusively through the Phase 2
+normalizers — URL/endpoint/JavaScript/source-map surfaces resolve to
+their canonical host, hosts and domains anchor at their first-label-
+dropped parent domain, IP literals at themselves, and anything that does
+not re-canonicalize forms an honest singleton group. Each group's
+aggregate score recomputes through the SAME combine math over the union
+of its members' factors (repeat evidence strengthens an aggregate up to
+the cap, never past it), with output bounded by fixed group/member caps
+whose cuts are both surfaced: a per-group `Truncated` flag for the
+member cap and `Correlate`'s boolean return for the group cap.
+`AttackPaths` derives evidence-tied reconnaissance hypotheses — ordered
+walks from a correlation root through correlated hosts and URLs to a
+final evidence attachment, every step citing the exact factor reason and
+evidence it came from; they are reading orders for a researcher, never
+exploitation chains. `Recommend` projects a surface's factor list into
+its recommendations — deterministic, evidence-tied, and preserved
+verbatim across cache round trips.
+
+Engine and cache semantics: the engine stage (`Score`) streams signals
+from a channel through a bounded worker pool, composing
+cache-before-execute around pool jobs per the architecture rule
+(cache lookup → score → store; the runtime pool itself stays
+cache-independent). Cache keys carry the operation `priority.score`, the
+priority schema version, a fingerprint of BOTH compiled catalogs (any
+catalog edit invalidates every cached score), and a digest of every
+score-material signal field; observation timestamps never enter keys.
+Every decoded record is strictly re-validated before use — the identity
+must re-parse canonically through the Phase 2 builders, the level must
+re-gate, every factor must re-validate (including the NaN guard), and
+the score must recompose exactly from its own factor list — a violating
+row is evicted and recomputed in the same run, never served. Outcomes
+follow the house vocabulary: a run with failures or cancellations is
+never `completed`. There is no `ravenrecon priority` command yet — the
+priority engine is a library capability only.
 
 ## Runtime engine
 

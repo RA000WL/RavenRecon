@@ -308,11 +308,52 @@ dedicated source-map semantics.
 
 ## v0.9 — Prioritization
 
-- [ ] asset scoring
-- [ ] technology-aware prioritization
-- [ ] API/admin classification
-- [ ] confidence scoring
-- [ ] interesting-asset ranking
+Status: Phase 9, Rounds 1, 2A, 2B, and 2C complete (library capability;
+no CLI command yet)
+
+Implemented in `internal/priority` — the Attack Surface Intelligence
+Engine. Round 1 landed the canonical model types (`Signal`,
+`SurfaceAsset`, `Factor`), the two compile-once data-driven catalogs (40
+interestingness + 13 risk indicators = 53 entries, all validated at
+load), and the pure scoring engine with its caps, gates, overlap policy,
+factor bound, tests, and benchmarks. Round 2A landed the intelligence
+layer: the compile-time rendered-reason/recommendation bound, type-level
+NaN hardening, deterministic `Correlate` grouping (anchors derived
+exclusively through the Phase 2 normalizers), evidence-tied
+`AttackPaths` (bounded, recon-hypothesis-only), and the recommendation
+catalog (every entry carries evidence-referencing reconnaissance
+guidance, rendered at score time onto the emitted factors). Round 2B
+landed the engine stage — bounded workers on the runtime pool,
+cache-before-execute composed around pool jobs (operation
+`priority.score`), catalog-digest cache keys, and strict decode
+re-validation with eviction — with cancellation, leak, determinism,
+tamper, and race tests plus 100k-asset benchmarks. Round 2C updated the
+documentation (README, ARCHITECTURE). A Round-2 gate pass then hardened
+the catalog template validation to a total percent rule (exactly one `%s`
+seam per term template — its only percent sign; any other `%` such as a
+second verb, `%q`, `%d`, or `%%` fails the load, closing holes where such
+templates compiled and leaked raw verbs into emitted factors; verbatim
+regex/size/kind texts must be percent-free), surfaced `Correlate`'s
+group-cap truncation through a boolean return (member cuts were already
+flagged per group), made the member tie-break a total order (final
+tie-break on the serialized surface, so duplicate-identity inputs order
+deterministically), deep-copied path-step evidence (steps never alias the
+factor's backing array), extended the emit-hook test to genuinely exercise
+the panic-containment branch (a canonical sentinel value trips the hook),
+and rejected empty-value identities in signal validation (a kind without
+a value is not a canonical asset). See `ARCHITECTURE.md` ("Priority
+engine") for the full design and known limitations.
+
+- [x] asset scoring
+- [x] technology-aware prioritization
+- [x] API/admin classification
+- [x] confidence scoring
+- [x] interesting-asset ranking
+
+Deferred to future rounds: CLI wiring (a `ravenrecon priority` command is
+NOT part of Phase 9's landed scope), the reporting phase that consumes
+groups, attack paths, and recommendations, and any correlation beyond
+identity-derived anchors (relationship traversal).
 
 ---
 

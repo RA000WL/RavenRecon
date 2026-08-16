@@ -94,8 +94,18 @@ compile-once pattern database and every candidate is classified into a
 structured evidence model with entropy, context, multi-evidence
 correlation, confidence scoring, explicit false-positive suppression, a
 `secret.scan` cache-before-execute record, and an offline verification
-queue (see "Secret intelligence"); it has no CLI command yet. The asset
-graph, scoring, and reports do not exist yet.
+queue (see "Secret intelligence"); it has no CLI command yet. The
+priority pipeline (phase 9; `internal/priority`) is the latest
+library-level stage — the Attack Surface Intelligence Engine: canonical
+assets reduced to scoring signals are matched against two compile-once
+indicator catalogs, every score is a fully explained factor list carrying
+evidence and rendered reconnaissance recommendations, surfaces correlate
+into groups and evidence-tied attack-path hypotheses, and the engine
+stage composes cache-before-execute (operation `priority.score`) around
+bounded pool jobs with strict decode re-validation (see "Priority
+engine"); it has no CLI command yet. The asset graph store and reports do
+not exist yet; scoring exists only as the priority engine's library-level
+surface judgments.
 
 ## Asset model
 
@@ -136,7 +146,10 @@ Relationships are represented by the typed `Relationship` primitive
 (Host -> IP, IP -> Port, Port -> Service, Host -> URL, URL -> Endpoint,
 URL -> JavaScript, URL -> Parameter, Endpoint -> Parameter). This phase
 provides the representation only; the graph store, traversal, and
-correlation engine are planned for a later phase.
+correlation engine are planned for a later phase (the priority
+engine's identity-anchored `Correlate`, phase 9, is not that engine: it
+groups scored surfaces by identity-derived anchors without graph
+traversal).
 
 ## Pipeline requirements
 
@@ -1935,6 +1948,209 @@ Cached flag.
 - All tests and benchmarks are hermetic: synthetic input and a real
   filesystem-backed cache, never the public Internet.
 
+## Priority engine
+
+Priority intelligence (phase 9; `internal/priority`) is a library-level
+engine with no CLI command yet: the Attack Surface Intelligence Engine.
+It consumes canonical Phase 2 assets reduced to scoring signals —
+already normalized by the earlier phases — and produces explainable,
+deterministic priorities for which surfaces deserve a researcher's
+attention first. It is explicitly NOT a vulnerability detector: it never
+claims a weakness, never assigns severity, and never tests anything;
+every score is a ranked, fully explained interestingness judgment whose
+every factor cites the canonical asset identity it was derived from.
+
+### Layer and data flow
+
+```text
+signal channel
+  → reader (validate at ingest, pre-register cancelled placeholder)
+  → runtime.Pool (bounded workers, optional central job-start limiter)
+      → job: cache lookup → score → store      ← the consumer composes
+  → merge-at-emit accumulator (deterministic duplicate merge)
+  → Report (per-asset outcomes + aggregate outcome)
+```
+
+The layering follows the architecture rule exactly: `internal/runtime`
+never imports `internal/cache`; THIS consumer stage performs the
+cache-before-execute sequencing (lookup → score → store) around pool
+jobs, exactly like discovery, dns, httpprobe, urlintel, techintel,
+jsintel, and secrentel before it. The layer sits after the intelligence
+phases (it consumes their outputs as signals) and before a future
+reporting phase.
+
+### Catalogs and the scoring contract
+
+Two data-driven catalogs — interestingness (40 entries) and risk (13
+entries), 53 total — are validated and compiled once at load: unique
+lowercase IDs, weights in (0,1] with NaN rejected, exactly one matcher
+form per entry (literal terms, regex, a JavaScript size threshold, or a
+kind equality), and templated reason AND recommendation texts carrying
+EXACTLY ONE `%s` substitution seam each — their only percent sign: any
+other `%` (a second verb, `%q`, `%d`, `%%`, …) fails the load, because
+score-time rendering substitutes the matched term for exactly one
+occurrence and any other percent would leak into the emitted factor raw;
+verbatim regex/size/kind texts must be percent-free. The worst-case
+rendered length is bounded at compile time
+(`len(template) − len("%s") + maxTermBytes ≤ bound` for term entries,
+verbatim bounds for the rest) so no matched term can push an emitted
+factor past the model-side bound. Every entry carries a recommendation
+that references its evidence type — the production-table test rejects
+generic boilerplate — and the guidance language is reconnaissance only
+(inventory, verify, record; never an exploitation instruction).
+
+Signals carry only data the earlier phases actually emit: paths, host
+labels, technology names/categories with the detection phase's own
+confidences, secret candidate types with the secret engine's own
+confidences, parameter names, service names, ports, bounded
+final-response headers, JavaScript bundle sizes, asset kinds, and
+endpoint classes. The confidence sub-score is composed ONLY from those
+recorded confidences plus the cross-source observation count — never
+invented. The overlap policy emits one factor per (category, field)
+group: the longest matching literal term wins, literals beat
+regex/size/kind matches, ties break by indicator ID. NaN is hardened at
+the type level — `Factor.validate` rejects NaN weights, and the
+clamp/combine helpers are NaN-safe (NaN maps to zero contribution) — so
+a NaN can never become a score.
+
+Composition (the same combine math as the confidence engines):
+
+```text
+score   = 1 − ∏(1 − w_g)        over groups g
+w_g     = min(cap_g, 1 − ∏(1 − w_f))   over group g's factors f
+cap_g   = 0.6 per indicator category; 0.5 for the confidence group
+level   = gated: high ≥ 0.8 AND ≥ 2 indicator categories;
+          medium ≥ 0.5 AND ≥ 1; low ≥ 0.2; else unknown
+```
+
+The single composition point (`compose`) is shared by surface scoring,
+the correlation aggregate, and cache decode re-validation, so every
+consumer provably uses the same math.
+
+### Correlation, attack paths, recommendations
+
+`Correlate` groups scored surfaces deterministically. Grouping keys are
+derived exclusively through the Phase 2 normalizers — there is no second
+normalization: URL, endpoint, JavaScript, and source-map identities
+re-parse through `asset.ParseURL` (endpoints drop their `"METHOD "`
+prefix, the shape `asset.Endpoint` itself defines) to the canonical
+host; the host canonicalizes through `asset.NewHost` (or `asset.NewIP`
+for address literals); a name with three or more labels anchors at its
+first-label-dropped parent (re-validated through `asset.NewDomain`),
+shorter names at themselves; IP surfaces anchor at themselves; anything
+that does not re-canonicalize forms an honest singleton group at its own
+identity. A group's aggregate score recomputes through `compose` over
+the UNION of its retained members' factors — repeated indicators
+strengthen the aggregate up to the cap, never past it — and
+`SharedIndicators` is the intersection of the members' factor names.
+Output is bounded (1024 groups, 64 members per group) with every cut
+surfaced: `Group.Truncated` flags a per-group member cut, and
+`Correlate`'s boolean return flags the run-level group cut (a truncated
+result is never silently presented as complete). Groups sort by
+(score desc, anchor asc) and members by (score desc, identity asc,
+serialized surface asc) — total orders, so identical input produces
+bit-for-bit identical output.
+
+`AttackPaths` derives evidence-tied reconnaissance hypotheses from the
+groups: for each group with contributing members, an ordered walk — the
+correlation root (citing the member identities it groups), then one step
+per contributing member ordered container-first (domain → host →
+URL/endpoint/JavaScript/source map → other), each citing the member's
+highest-weight factor with its EXACT reason and a deep copy of its
+evidence references (steps never alias the factor's backing array). The last
+contributing step is the final evidence attachment. Bounds: 8 steps per
+path (truncation flagged), 32 paths per run, ranked by group score. An
+attack path is a reading order for a human researcher — a recon
+hypothesis, NEVER an exploitation chain, never a vulnerability claim;
+nothing about a path has been tested.
+
+Recommendations ride ON the factors: the winning catalog entry's
+template is rendered at score time with the matched term substituted,
+so the `%s` substitution contract holds exactly (the term exists only
+at match time) and the recommendation survives cache round trips
+verbatim as part of the serialized factor. `Recommend` is a pure
+projection of a surface's factor list — deterministic, evidence-tied,
+no catalogs, no clock, no I/O.
+
+### Cache integration
+
+One `priority.score` record per cacheable signal, cache-before-execute
+composed inside the engine stage. The key (`cache.NewKey`) contains:
+the operation; the cache schema version (by construction); the priority
+`SchemaVersion`; a combined FNV-1a digest of BOTH compiled catalogs
+rendered entry-by-entry — ANY catalog edit (weight, term, regex,
+threshold, kind, reason, recommendation) changes the digest and
+invalidates every cached score; and a SHA-256 fingerprint of every
+score-material signal field (identity, kind, path, host, endpoint
+class, parameters in given order, bundle size, technologies with
+confidences, secrets with confidences, port, service, headers,
+observation count). Observation timestamps (`FirstSeen`, `ScoredAt`)
+deliberately do NOT enter the key: they are echoed result metadata, not
+score inputs — including them would bust the cache on every distinct
+timestamp while producing bit-identical scores.
+
+Strict decode re-validation: EVERY decoded surface is re-validated
+before use — the envelope (completed status, operation, matching
+target, payload version), the identity (non-zero, equal to the signal's,
+kind mirror consistent, canonically parseable through the Phase 2
+builders for its kind), the level (known, and exactly the level the
+stored score and category count re-gate to), every factor
+(`Factor.validate`, including the NaN weight guard, within the factor
+bound, indicator factors carrying a bounded recommendation and
+confidence factors none), and the numbers (score, interestingness, and
+confidence finite in [0,1] and equal to `compose` re-run on the stored
+factor list). Any failure treats the record as a miss and EVICTS it;
+the engine recomputes and re-stores in the same run. The encode side
+mirrors the same gate (only surfaces that would re-validate are
+stored), and signals whose identities do not re-parse canonically
+bypass the cache entirely (no read, no write — mirroring discovery's
+unknown-tool rule) while still being scored, keeping the Round-1
+`ScoreSurface` contract unchanged.
+
+### Engine semantics
+
+The engine (`Score`) reads a signal channel (the receive selects on the
+run context, so a stalled producer cannot wedge a run), validates at
+ingest (invalid signals become per-asset failed results with structured
+errors — never panics), pre-registers a cancelled placeholder per valid
+signal (a job dropped by a forced shutdown still appears in the report
+with an honest status), and submits one bounded job per signal.
+Duplicate identities merge deterministically: completed beats failed
+beats cancelled; among completed results the higher score wins, ties by
+the smaller serialized surface — the kept result never depends on
+processing order. An optional emit hook fires per processed surface
+(fresh or cache-served) with panics contained: a panicking hook surfaces
+as one bounded run diagnostic while the asset itself stays completed.
+Shutdown drains with the
+shared bounded budgets; cancellation leaves no goroutines behind (pinned
+by leak tests under both normal and cancelled runs).
+
+Outcome vocabulary: per asset — completed (fresh or cache-served),
+failed (structured error attached), cancelled (work never executed); at
+run level, derived in fixed priority order — any cancelled →
+`cancelled`; failed alongside completed → `incomplete` (the vocabulary's
+"partial": successes kept and reported, the run not completed); all
+attempted failed → `failed`; otherwise `completed`. A warm cache hit
+serves the stored surface with ZERO scoring (asserted by the metrics
+and the warm-run bench).
+
+### Known limitations
+
+- Library capability only: no CLI command yet; the reporting phase that
+  would consume groups, paths, and recommendations is a later roadmap
+  milestone.
+- Correlation anchors derive from identity values alone (no
+  relationship traversal): surfaces whose host cannot be derived from
+  their identity form singleton groups.
+- Attack paths are hypotheses over recorded evidence only; they never
+  claim reachability, exploitability, or any tested behavior.
+- The catalog digest is an FNV-1a 64-bit fingerprint: collision-safe for
+  change detection by construction of the test (every field edit
+  changes it), though it is not a cryptographic commitment.
+- NaN-weighted records cannot exist on disk (encoding/json refuses
+  NaN); the decode-side NaN guard is defense in depth behind the cache
+  layer's own corrupt classification, and is pinned by unit tests.
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -2021,5 +2237,7 @@ Planned, not yet implemented:
 
 * discovery engines beyond passive subdomain enumeration, DNS, HTTP,
   URL intelligence, and JavaScript intelligence (TLS)
-* asset store, graph, and correlation engine
+* asset store, graph, and graph correlation engine (the priority
+  engine's identity-anchored Correlate is landed; relationship traversal
+  is not)
 * reporting and terminal UI
