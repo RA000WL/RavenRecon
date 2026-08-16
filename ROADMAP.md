@@ -188,7 +188,7 @@ Implemented as urlintel tool adapters: gau, waybackurls, and waymore;
 katana and paramspider are deferred as documented future work.
 
 Outstanding work: the project version stays at 0.5.0; the next version bump
-is a release decision. JavaScript intelligence (v0.8) has not begun.
+is a release decision. JavaScript intelligence (v0.8) is complete.
 
 ---
 
@@ -233,12 +233,33 @@ is no CLI command yet.
 
 ## v0.8 — JavaScript Intelligence
 
-- [ ] JS discovery
-- [ ] JS retrieval
-- [ ] endpoint extraction
-- [ ] source-map detection
-- [ ] secret candidate detection
-- [ ] third-party library identification
+JavaScript intelligence lands as Phase 7: `internal/jsintel` is a
+library-level engine that discovers script URLs from raw lines, HTML
+observations, and tool adapters (`internal/jsintel/adapt`), fetches them
+with bounded, honestly truncated content retention, parses them through the
+stdlib-only parser abstraction, and analyzes them into typed Phase 2 assets
+— JavaScript observations, an import graph with bounded expansion and
+third-party (bare-specifier) identification, source map detection,
+endpoint extraction, secret candidates (detection only, never
+verification), and JS technology detection — with `js.fetch` and
+`js.analyze` cache-before-execute records. See `ARCHITECTURE.md`,
+"JavaScript intelligence". There is no CLI command yet.
+
+Status: complete
+
+- [x] JS discovery
+- [x] JS retrieval
+- [x] endpoint extraction
+- [x] source-map detection
+- [x] secret candidate detection
+- [x] third-party library identification
+
+Implemented as jsintel tool adapters: subjs, LinkFinder, and SecretFinder.
+Deferred as documented future work: Katana's JS output (an optional
+adapter — the engine's own extraction replaces it; consistent with the
+urlintel katana deferral) and source-map content parsing (references are
+detected and normalized now; parsing the map content lands with a future
+phase).
 
 ---
 

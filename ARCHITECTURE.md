@@ -81,8 +81,13 @@ is the next library-level stage — canonical-URL streaming with parameter
 extraction, endpoint classification, per-(URL, adapter) caching, and typed
 graph edges (see "URL intelligence"); its historical-URL tool adapters
 landed in sub-milestone 6C (`internal/urlintel/adapt`, see "URL
-intelligence — Historical-URL tool adapters"). The JS pipeline stages,
-asset graph, scoring, and reports do not exist yet.
+intelligence — Historical-URL tool adapters"). The JavaScript intelligence
+pipeline (roadmap v0.8, phase 7; `internal/jsintel`) is the latest
+library-level stage — discovery seams, a bounded fetch engine, the
+stdlib-only parser, import expansion, source map detection, endpoint and
+secret-candidate extraction, JS technology detection, and two
+cache-before-execute operations (see "JavaScript intelligence"); it has no
+CLI command yet. The asset graph, scoring, and reports do not exist yet.
 
 ## Asset model
 
@@ -1484,6 +1489,212 @@ version plus the sources mask enter every key.
 - All tests and benchmarks are hermetic: synthetic input and a real
   filesystem-backed cache, never the public Internet.
 
+## JavaScript intelligence
+
+JavaScript intelligence (roadmap v0.8, phase 7; `internal/jsintel`) is a
+library-level engine with no CLI command yet: a typed Source seam feeds a
+bounded worker pool where every candidate script URL runs
+cache-before-execute fetch → classify → parse → extract → merge → emit →
+bounded import expansion. Package layout: the core (`internal/jsintel`)
+owns the whole model — normalization, fetch, parse, analysis, cache
+records, report; `internal/jsintel/adapt` only presents external commands
+as Source streams of raw lines. Adapters never parse, normalize, or
+canonicalize: the engine's line seam owns all of it.
+
+### Asset model
+
+Phase 2 gained three asset kinds and five relationship kinds. The
+JavaScript asset records the observation window (size, lowercase-hex
+SHA-256 content hash ≤ 64 chars, content type ≤ 128 bytes, ETag ≤ 256,
+discovery source ≤ 128, status ≤ 599, last-modified, final URL, host) with
+setter-enforced bounds and deterministic merging. The SecretCandidate is
+identified by (type, stored value, subject identity): the stored value is
+capped at 512 bytes by a rune-safe truncation ("…" marker), and the
+identity covers exactly the stored bytes, so two observations differing
+only past the bound are the same candidate. The SourceMap asset is a
+detected reference (canonical URL + provenance) — nothing more. Edges:
+`javascript_to_javascript`, `javascript_to_endpoint`,
+`javascript_to_secret_candidate`, `javascript_to_source_map`, and
+`javascript_to_technology`; per-marker evidence uses `MethodJS` ("js").
+
+### Discovery seams
+
+`Item` is the ingest seam with two forms. `ItemLine` carries one raw line
+(a URL, a relative reference resolved against `Config.Base`, a secretfinder
+progress line, or a secretfinder match line); `ItemHTML` carries a canonical
+page URL, response headers, and a body bounded to 1 MiB at ingest. HTML
+extraction is single-pass and tag-scanned (no DOM): script `src` attributes,
+`link` hrefs whose rel/as qualify (modulepreload, or preload/prefetch with
+as=script), Link response headers (≤ 32 entries × 4096 bytes), and the
+static/dynamic imports of inline src-less script bodies — resolved against
+the page URL. Every reference — lines, HTML, imports, source maps —
+resolves through the ONE shared resolver (`resolveRef`): absolute http(s),
+protocol-relative, root-relative, and `./`/`../` forms resolve with
+root-clamped dot-segment cleaning, query preserved, fragment stripped; bare
+specifiers (`react`, `@scope/pkg`) have no relative meaning and are never
+fetched.
+
+Line-secret ingestion (the D2 contract): a `"[ + ] URL: <u>"` progress line
+sets the seam's current URL context, and every following
+`"name\t->\tvalue"` match line becomes a typed candidate attributed to that
+URL — the name maps through the documented table in discover.go
+(google_api/google_api_key → google, json_web_token → jwt,
+amazon_aws_access_key_id/aws_access_key_id/aws_secret_access_key → aws,
+firebase/firebase_api_key → firebase, stripe/stripe_secret_key → stripe,
+github/github_token → github, private_key → private_key, bearer → bearer,
+anything else → generic) and the value is bounded to 4096 bytes, mirroring
+the parser's literal cap. Pending line-secrets accumulate per URL in a
+bounded map (32 URL contexts × 64 secrets each; every cap drop is counted
+Skipped, arrival-order and deterministic), and after the pool drains they
+are attached to their URL's entry with the URL's JavaScript identity as the
+candidate source — deduplicated against the content-derived candidates by
+candidate identity, so a match line and a literal with the same type and
+value are ONE candidate. Secret lines with no current URL context, and
+secrets of URLs never admitted (cap-dropped targets), are counted and
+dropped; SecretLines counts every raw match line, ingested or not.
+
+### Fetch engine
+
+One bounded GET per canonical URL: fixed user agent, no cookies or custom
+headers, ≤ 5 redirect hops (the cap-exceeding 3xx is the terminal
+completed observation), a per-attempt deadline (default 10 s) covering the
+whole walk, a 64 KiB header-block cap, and content retention streamed
+under `MaxJSBytes` (default 2 MiB, clamped to [64 KiB, 8 MiB]) with
+transparent gzip decompression (the stored content is the decompressed
+bytes). Truncation is honest: an oversized body — declared by
+Content-Length or discovered while streaming — retains NOTHING (a partial
+prefix would be a misleading observation); failed attempts retry
+immediately up to `Retries` (default 1, ≤ 3). Outcome classification
+mirrors httpprobe, including the completed negatives: response received →
+completed; connection refused → completed, `conn_refused`; TLS handshake
+failure → completed, `tls`; deadline/DNS → failed; cancellation →
+cancelled. The transport is a seam (nil = the bounded production
+transport: header cap, header timeout, direct-only); tests inject hermetic
+loopback transports.
+
+### Parser
+
+The parser abstraction is `type Parser interface { Parse(src []byte)
+(Parsed, error) }`; `NewParser` returns the single stdlib implementation —
+a hand-rolled tokenizer plus an extraction walk. It never builds an AST,
+never executes, never rewrites. Malformed JavaScript never fails Parse:
+the scanner recovers from unterminated strings/comments/templates/regexes
+(at EOL or EOF), stray bytes, and invalid UTF-8, counting each recovery on
+`Parsed.Malformed` while still extracting around the damage; the regex vs
+division ambiguity is resolved by a regex-allowed state keyed on the
+previous token. The only error is input over 8 MiB. Fixed bounds (they
+never enter cache keys): 1 Mi tokens, 8192 string/template literals, 4096
+bytes per retained literal value, 1024 imports, 1024 export names, 1024
+bytes per identifier, 4096 bytes per sourceMappingURL reference. Any cap
+hit marks `Parsed.Truncated` — an honest partial prefix, never a complete
+parse. Extracted observations: static and dynamic imports (unresolvable
+dynamic specifiers are honestly empty), exported names, literal VALUES
+with escapes decoded, and the LAST sourceMappingURL reference.
+
+### Import graph, source maps, endpoints, secrets, technologies
+
+Resolved imports become `javascript_to_javascript` edges AND expansion
+candidates at depth+1, bounded by `MaxImportDepth` (4) and the run's
+`MaxScripts` total (500); a URL is admitted at most once per run, so
+circular imports terminate. Edges are recorded even when the target was
+never fetched (depth/total caps): the graph is the honest observation.
+Bare specifiers deduplicate into the third-party library list, bounded by
+`MaxImportsPerFile` (256). Source maps are detected from the trailing
+`sourceMappingURL` comment and the `X-SourceMap` header, resolved against
+the file's own URL, and normalized as SourceMap assets — never fetched,
+never parsed (content parsing is deferred future work). Endpoint
+extraction walks the parsed literals: dynamic `${...}` templates are
+skipped, ws/wss absolutes classify "WS", and resolved references classify
+by path ("GQL" for graphql segments/extensions, "SSE" for events/stream/
+sse last segments, else "GET") — the class rides in the endpoint's Method
+field and is NEVER an observed HTTP method; different-host absolutes are
+additionally retained as URL assets (CDN/external observations). Secret
+extraction scans every literal against 8 families (JWT, AWS, Google,
+Firebase, Stripe, GitHub, bearer, private-key marker): CANDIDATES ONLY —
+no verification, no severity, no context — a deliberate boundary; a later
+phase verifies. Technology detection runs a fixed marker table (19
+specifications) over the raw content with techintel's confidence math
+(score = 1 − ∏(1 − wᵢ) over matched markers; ≥ 0.8 High, ≥ 0.5 Medium,
+else Low) and emits Technology assets plus per-marker `MethodJS` evidence.
+
+### Cache integration
+
+Two operations, both cache-before-execute. `js.fetch` keys on the
+operation and the canonical URL identity ONLY — the request shape is
+fixed, and timings, retries, caps, and concurrency never enter a key, so
+cap changes never invalidate entries (a lowered cap simply re-truncates on
+the re-fetch path; truncated records are stored incomplete and never
+served as hits). `js.analyze` keys on the operation, the URL identity, and
+the parser schema version plus the family mask ("1:eimst") — a record
+written by a different analysis contract is unreachable by construction.
+A fetch hit performs zero network requests and zero limiter waits; an
+analysis hit performs ZERO parses — the stored payload rebuilds a
+byte-identical entry through the same applyAnalysis. Both records are
+re-validated at decode (identity containment, content hash re-verified,
+bounds re-checked, statuses consistent); a tampered or corrupt record is
+deleted and recomputed in the same run (self-healing). Completed
+negatives are stored completed with their reason; failed and cancelled
+observations are never stored.
+
+### Pipeline, statuses, and limits
+
+One bounded `runtime.Pool` (8 workers, queue 256, per-job deadline 30 s
+default) owns all scheduling; the pool is NOT paced — every fetch already
+waits on the central token-bucket limiter inside Fetch, and pacing
+cache-hit jobs would double-limit. The reader normalizes items, admits
+candidates atomically (visited set + total cap), and pre-registers a
+cancelled placeholder per URL so a forced shutdown's dropped jobs appear
+honestly. Entry statuses: completed / incomplete (truncated fetch or
+truncated parse — the JS asset, when present, is still recorded) / failed
+/ cancelled; merge-at-emit unions sources (≤ 32), keeps min/max
+timestamps, deduplicates every payload list by identity, and applies the
+per-file caps. Fixed resource limits: per-run MaxScripts 500 and
+MaxImportDepth 4; per-file imports 256, source maps 8, HTML scripts 128,
+endpoints 64 (bounding the URL list too), secrets 32, technologies 32,
+evidence 64; endpoint candidates ≤ 1024 bytes; secret values ≤ 512 bytes
+(asset layer); line-secret contexts 32 URL contexts × 64 secrets each
+(engine-side, they never enter cache keys); diagnostics ≤ 32 per run;
+shutdown drain bounded by the
+job timeout + 15 s grace (30 s force).
+
+### Adapters
+
+`internal/jsintel/adapt` presents three ACTIVE tools as jsintel Sources
+(the tools fetch the target themselves; their traffic is their own
+responsibility, bounded only by the runner's limits): subjs (`subjs -c 1
+-t 15 -i <tmpfile>`; MIT; version-probed), LinkFinder (`linkfinder.py -i
+<target> -o cli`; MIT; existence-probed; requires jsbeautifier), and
+SecretFinder (`SecretFinder.py -i <target> -o cli`; GPL-3.0;
+existence-probed). The executable IS the script for the python pair — the
+documented install contract is a PATH wrapper with a shebang (or a
+symlink), or a per-run path override keyed by executable name; the
+adapter never resolves executables itself. Every output line becomes one
+`ItemLine`; lines over 32 KiB are skipped and counted; the engine's
+parseLine owns URL canonicalization, relative resolution, the "[ + ] URL:"
+progress form (which sets the per-URL line-secret context), and the
+"name -> value" secret-line form (typed ingestion against that context; see
+"Discovery seams"). A broken version
+probe is at worst a WARN — never a MISSING. Katana's JS output is
+deliberately deferred (consistent with the urlintel deferral): the
+engine's own extraction covers this phase's scope.
+
+### Known limitations
+
+- Library capability only: no `ravenrecon js` CLI command yet.
+- Secret candidates are detected, never verified; no severity is claimed.
+- Source map content is never fetched or parsed (detected references
+  only); parsing lands with a future phase.
+- LinkFinder HTML-escapes its output; the line seam does not yet unescape
+  entities (documented follow-up).
+- No content sniffing: JS classification is Content-Type or path based
+  (`.js`/`.mjs`/`.cjs`) — a `text/plain` body at `/app.js` IS a JS asset.
+- The engine's line seam has no line cap of its own; the 32 KiB cap lives
+  in the adapter.
+- Cache hits replay stored FirstSeen/LastSeen; TTL expiry (when
+  configured) bounds staleness.
+- All tests and benchmarks are hermetic: synthetic input, loopback
+  servers, and a real filesystem-backed cache, never the public Internet.
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -1548,10 +1759,18 @@ Implemented:
   endpoint classification, per-(URL, adapter) caching, cross-adapter emit
   merging, typed graph edges, and historical-URL tool adapters for gau,
   waybackurls, and waymore (`internal/urlintel/adapt`)
+* JavaScript intelligence (see "JavaScript intelligence" above; roadmap
+  v0.8, phase 7): a library-level discovery/fetch/parse/analysis engine
+  over script URLs with typed Phase 2 assets (JavaScript, SecretCandidate,
+  SourceMap), five `javascript_to_*` relationship kinds, bounded import
+  expansion with third-party identification, endpoint and secret-candidate
+  extraction, JS technology detection, `js.fetch`/`js.analyze`
+  cache-before-execute records, and tool adapters for subjs, LinkFinder,
+  and SecretFinder (`internal/jsintel/adapt`)
 
 Planned, not yet implemented:
 
-* discovery engines beyond passive subdomain enumeration, DNS, HTTP, and
-  URL intelligence (TLS, JS)
+* discovery engines beyond passive subdomain enumeration, DNS, HTTP,
+  URL intelligence, and JavaScript intelligence (TLS)
 * asset store, graph, and correlation engine
 * reporting and terminal UI

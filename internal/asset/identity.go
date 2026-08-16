@@ -21,6 +21,14 @@ const (
 	// hex SHA-256 fingerprint of its DER encoding; the same certificate
 	// observed on many hosts is one asset.
 	KindTLSCertificate Kind = "tls_certificate"
+	// KindSecretCandidate identifies a detected secret candidate observed in
+	// an asset. Phase 7 models candidates for DETECTION only: no
+	// verification, severity, or exploitation is represented.
+	KindSecretCandidate Kind = "secret_candidate"
+	// KindSourceMap identifies a source map asset observed at a URL. The
+	// model normalizes the observation; source map content is never parsed
+	// by the asset layer.
+	KindSourceMap Kind = "source_map"
 )
 
 // Identity is a namespaced, deterministic asset key used for deduplication.

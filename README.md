@@ -33,9 +33,46 @@ frameworks, servers, CDNs, WAFs, clouds, authentication providers, CMSes,
 API technologies, build tools, and infrastructure from typed observations
 (headers, body, cookies, TLS/DNS metadata, endpoint paths), with
 confidence scoring, evidence records, and a 145-fingerprint database (see
-"Technology detection (library)" below). None of the pipelines has a CLI
-command yet; the remaining active engines (JavaScript analysis, crawling,
-and secret scanning) are still later roadmap milestones.
+"Technology detection (library)" below). JavaScript intelligence
+(`internal/jsintel`, roadmap v0.8, phase 7) adds the JavaScript Intelligence
+Engine as a library capability: script URLs discovered from raw lines, HTML
+observations, and external tool adapters are fetched, parsed, and analyzed
+into typed Phase 2 assets with two cache-before-execute operations. None of
+the pipelines has a CLI command yet; the remaining active engines (crawling
+and secret-candidate verification) are still later roadmap milestones.
+
+The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
+
+- a canonical JavaScript asset model — size, content hash, content type,
+  ETag, last-modified, status, final URL, host — with typed
+  `javascript_to_*` edges;
+- discovery seams: raw lines (URLs, relative references resolved against a
+  base), full HTML observations (script `src`, qualifying `link`/Link
+  headers, inline-script imports), and tool adapters;
+- a bounded fetch engine: fixed request shape, bounded retries, bounded
+  redirect walks, streaming content limits with honest truncation (a
+  partial prefix is never retained), and transparent gzip decompression;
+- an error-tolerant, stdlib-only parser abstraction (a hand-rolled
+  tokenizer plus an extraction walk) with fixed, cache-stable bounds;
+- an import graph with bounded expansion — resolved imports become new
+  fetch candidates; bare specifiers (`react`, `@scope/pkg`) identify
+  third-party libraries;
+- source map detection and normalization (`sourceMappingURL` comments and
+  `X-SourceMap` headers become SourceMap assets — never fetched, never
+  parsed);
+- endpoint extraction (GET/WS/SSE/GQL classes carried in the Method field
+  — never an observed HTTP method) plus different-host URL observations;
+- secret candidate extraction across 8 families — candidates only, no
+  verification, no severity (the boundary is deliberate);
+- JavaScript technology detection from a marker table with a confidence
+  model consistent with `techintel`'s;
+- `js.fetch` and `js.analyze` cache records — per-URL fetch content and
+  per-URL analysis payloads, both cache-before-execute;
+- bounded limits throughout: per-run script, import-depth, per-file
+  import/map/endpoint/secret/technology/evidence caps;
+- adapters for subjs (MIT), LinkFinder (MIT), and SecretFinder (GPL-3.0) —
+  active tools that fetch the target themselves, installed on PATH or via
+  the documented wrapper / per-run path-override contract.
 
 ## Asset model
 
@@ -205,6 +242,29 @@ cache). There is no `ravenrecon tech` CLI command yet — technology
 detection is a library capability only. See `ARCHITECTURE.md` ("Technology
 detection") for the full design, confidence model, and security
 considerations.
+
+## JavaScript intelligence (library)
+
+`internal/jsintel` (roadmap v0.8, phase 7) is the JavaScript Intelligence
+Engine: a typed Source seam (raw lines, HTML page observations, tool
+adapters) feeds a bounded worker pool where every candidate URL runs
+cache-before-execute fetch → classify → parse → extract → merge → emit →
+bounded import expansion. Fetches retain bounded content with honest
+truncation (a partial prefix is never kept), follow redirects under fixed
+caps, and classify completed negatives (`conn_refused`, `tls`) as
+legitimate observations. The stdlib-only parser extracts imports, string
+literals, and source map references without ever building an AST or
+executing code; the analyzers turn those observations into endpoint
+candidates, secret candidates (detection only — never verification),
+technologies, and per-marker evidence. Two cache operations (`js.fetch`,
+`js.analyze`) make both the content and the analysis reusable — a warm run
+performs zero HTTP requests and zero parses. Tool adapters
+(`internal/jsintel/adapt`) present subjs, LinkFinder, and SecretFinder as
+line streams; the adapters are active (the tools fetch themselves), and
+their executable/wrapper contract is documented in `ARCHITECTURE.md`. There
+is no `ravenrecon js` CLI command yet — JavaScript intelligence is a
+library capability only. See `ARCHITECTURE.md` ("JavaScript intelligence")
+for the full design, limits, and security considerations.
 
 ## Runtime engine
 

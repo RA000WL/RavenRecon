@@ -50,3 +50,6 @@ func (e Endpoint) Identity() Identity {
 
 // ID returns the canonical identity string.
 func (e Endpoint) ID() string { return e.Identity().String() }
+
+// String returns the canonical identity value, e.g. "GET https://example.com/api".
+func (e Endpoint) String() string { return e.Identity().Value }
