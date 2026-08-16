@@ -55,6 +55,21 @@ const (
 	// RelationshipPortToTLSCertificate links a port to the TLS certificate
 	// observed on it (Port -> TLSCertificate).
 	RelationshipPortToTLSCertificate RelationshipKind = "port_to_tls_certificate"
+	// RelationshipJavaScriptToJavaScript links a script resource to another
+	// script resource it imports (JavaScript -> JavaScript).
+	RelationshipJavaScriptToJavaScript RelationshipKind = "javascript_to_javascript"
+	// RelationshipJavaScriptToEndpoint links a script resource to an endpoint
+	// candidate it references (JavaScript -> Endpoint).
+	RelationshipJavaScriptToEndpoint RelationshipKind = "javascript_to_endpoint"
+	// RelationshipJavaScriptToSecretCandidate links a script resource to a
+	// secret candidate observed in it (JavaScript -> SecretCandidate).
+	RelationshipJavaScriptToSecretCandidate RelationshipKind = "javascript_to_secret_candidate"
+	// RelationshipJavaScriptToSourceMap links a script resource to the source
+	// map observed for it (JavaScript -> SourceMap).
+	RelationshipJavaScriptToSourceMap RelationshipKind = "javascript_to_source_map"
+	// RelationshipJavaScriptToTechnology links a script resource to a
+	// technology observed in it (JavaScript -> Technology).
+	RelationshipJavaScriptToTechnology RelationshipKind = "javascript_to_technology"
 )
 
 // Relationship is a typed, directed edge between two asset identities.

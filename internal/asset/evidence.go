@@ -20,6 +20,7 @@ import (
 //	tls       <- tls_issuer, tls_cn, tls_alpn indicators
 //	dns       <- dns_cname indicators
 //	sourcemap <- sourcemap_path indicators
+//	js        <- JavaScript content markers
 //
 // The method is part of the evidence identity.
 type DetectionMethod string
@@ -37,6 +38,9 @@ const (
 	MethodTLS       DetectionMethod = "tls"
 	MethodDNS       DetectionMethod = "dns"
 	MethodSourceMap DetectionMethod = "sourcemap"
+	// MethodJS marks evidence observed from JavaScript content markers
+	// (patterns inside a script body).
+	MethodJS DetectionMethod = "js"
 )
 
 // String returns the canonical lowercase method value.
@@ -47,7 +51,7 @@ func (m DetectionMethod) Valid() bool {
 	switch m {
 	case MethodHeader, MethodCookie, MethodHTML, MethodGenerator, MethodMeta,
 		MethodScript, MethodCSS, MethodAttribute, MethodEndpoint, MethodTLS,
-		MethodDNS, MethodSourceMap:
+		MethodDNS, MethodSourceMap, MethodJS:
 		return true
 	}
 	return false
@@ -67,8 +71,8 @@ func ParseDetectionMethod(s string) (DetectionMethod, error) {
 func KnownMethods() []DetectionMethod {
 	return []DetectionMethod{
 		MethodAttribute, MethodCookie, MethodCSS, MethodDNS, MethodEndpoint,
-		MethodGenerator, MethodHeader, MethodHTML, MethodMeta, MethodScript,
-		MethodSourceMap, MethodTLS,
+		MethodGenerator, MethodHeader, MethodHTML, MethodJS, MethodMeta,
+		MethodScript, MethodSourceMap, MethodTLS,
 	}
 }
 

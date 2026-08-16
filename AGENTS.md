@@ -6,6 +6,32 @@ RavenRecon is a reliability-first reconnaissance framework for authorized bug bo
 
 It should help researchers discover, correlate, prioritize, and report attack surface without becoming an exploitation or credential-attack framework.
 
+## Repository layout
+
+- `cmd/ravenrecon/` — CLI entry point
+- `internal/cli` — command wiring; current commands: `version`, `doctor`, `discover <domain>`
+- `internal/config` — global configuration, including `CacheConfig` (cache disabled by default)
+- `internal/asset` — typed asset model; the only normalization point (`NewDomain`, `NewHost`, `ParseURL`, ...)
+- `internal/cache` — persistent filesystem cache; crash-safe writes, self-healing, schema-versioned keys
+- `internal/runtime` — bounded, cancellable, rate-limited worker pool; deliberately cache-independent
+- `internal/discovery` — passive subdomain discovery (subfinder, assetfinder, amass) and the shared hardened external-tool execution layer
+- `internal/dns` — DNS resolution pipeline (library only)
+- `internal/httpprobe` — HTTP probing with TLS metadata capture (library only)
+- `internal/urlintel`, `internal/urlintel/adapt` — URL intelligence and historical-URL adapters: gau, waybackurls, waymore (library only)
+- `internal/techintel`, `internal/techintel/fingerprints` — technology fingerprint engine and database (library only)
+- `internal/jsintel`, `internal/jsintel/adapt` — JavaScript intelligence engine: parser, fetch, pipeline, analyzers, and subjs/LinkFinder/SecretFinder adapters (library only)
+
+## Common commands
+
+```bash
+go build ./...                           # build everything
+go build -o ravenrecon ./cmd/ravenrecon  # build the CLI binary
+go run ./cmd/ravenrecon --help           # CLI help (version, doctor, discover)
+go test ./...                            # all tests
+go test ./internal/asset/...             # focused package tests
+gofmt -w $(find . -name '*.go' -type f)  # format
+```
+
 ## Before modifying code
 
 Always read:
@@ -30,6 +56,18 @@ If a task exposes a required architectural issue outside its scope:
 1. document it
 2. propose the change
 3. do not silently expand the implementation
+
+## Architecture boundaries
+
+- Layers: CLI → config → runtime pool → pipeline stages → asset model.
+- External tools are adapters behind interfaces (`discovery.Source`, `urlintel.LineSource`); core pipelines never branch on tool names.
+- `internal/runtime` never imports `internal/cache`: consumer stages compose "cache-before-execute" around pool jobs.
+- Every normalization goes through the Phase 2 asset builders in `internal/asset`; never write a second normalization of the same concept.
+- Most pipelines (dns, httpprobe, urlintel, techintel, jsintel) are library capabilities with no CLI command yet; do not add CLI wiring outside the milestone that calls for it.
+- Outcome vocabulary is fixed: completed / partial / failed / cancelled / incomplete. Truncated results are never `completed` and never served from cache.
+- All tests are hermetic: no public Internet, fake resolvers, loopback servers, synthetic input.
+- The project is stdlib-only (`go.mod` declares no dependencies); adding an external dependency is an architectural decision, not a convenience.
+- `README.md` and `ARCHITECTURE.md` document each landed phase in detail; update them together with the code when a milestone changes behavior.
 
 ## Core engineering rules
 

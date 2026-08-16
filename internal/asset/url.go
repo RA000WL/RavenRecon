@@ -94,6 +94,12 @@ func (u URL) Identity() Identity {
 	return Identity{Kind: KindURL, Value: u.canonicalString()}
 }
 
+// IsZero reports whether the URL asset is unset. The zero URL is never a
+// valid observation — ParseURL always yields a scheme and a canonical host —
+// so a zero URL reliably means "not observed" (for example a fetch's
+// FinalURL before any request was dispatched).
+func (u URL) IsZero() bool { return u == (URL{}) }
+
 // ID returns the canonical identity string.
 func (u URL) ID() string { return u.Identity().String() }
 
@@ -134,9 +140,11 @@ func validScheme(s string) bool {
 
 func isDefaultPort(scheme, port string) bool {
 	switch scheme {
-	case "http":
+	case "http", "ws":
+		// ws shares http's default port (RFC 6455 section 3).
 		return port == "80"
-	case "https":
+	case "https", "wss":
+		// wss shares https's default port (RFC 6455 section 3).
 		return port == "443"
 	}
 	return false
