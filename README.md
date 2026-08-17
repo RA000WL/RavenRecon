@@ -67,9 +67,24 @@ merged, identity-sorted, with statistics, run/error summaries, and a
 digest), and registered, validated reporters render it as deterministic
 JSON, CSV, Markdown, and self-contained HTML exports through atomic
 crash-safe file writes, with export validation before exposure and an
-optional render cache (see "Reporting framework (library)" below). None
+optional render cache (see "Reporting framework (library)" below). The
+eventing foundation (roadmap v1.2, phase 12) adds the canonical runtime
+event model and the concurrent, bounded, non-blocking event bus
+(`internal/event`) — typed, validated, clock-stamped events with sealed
+payloads, per-subscriber bounded buffers with drop counters, bus-assigned
+sequence order, the Observer instrumentation seam, and the Deriver/Deriving
+pool-job-boundary bridge (see "Eventing (library)" below). Terminal
+observability (`internal/tui`, roadmap v1.2) is the first bus consumer,
+as a library capability: a single-goroutine controller replays the
+canonical event stream into a live terminal frame — progress, worker
+dashboard, throughput and ETA, resource sampling, an interesting-asset
+feed, and a grouped error feed — plus one deterministic final summary
+frame, with every dynamic string sanitized at the boundary and every
+structure bounded (see "Terminal observability (library)" below). None
 of the pipelines has a CLI command yet; the remaining active engines
-(crawling and secret verification) are still later roadmap milestones.
+(crawling and secret verification) and the remaining v1.2 observability
+consumers (loggers and replays) are still later
+roadmap milestones.
 
 The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
 
@@ -519,6 +534,123 @@ re-validation — oversized renders are honestly never cached. Benchmarks
 cover the 100 / 1,000 / 10,000 / 100,000 asset targets. There is no
 `ravenrecon report` command yet — the framework is a library capability
 only. See `ARCHITECTURE.md` ("Reporting framework").
+
+## Eventing (library)
+
+`internal/event` (roadmap v1.2, phase 12) is the observability foundation:
+a canonical, typed runtime event model and a concurrent, bounded,
+non-blocking event bus. It is observer-only — data flows one way from
+instrumented code (the runtime pool, the cache, stage result bridges) to
+consumers (a future TUI, loggers, replays); no consumer can call an engine
+through it, and no engine mutates run state through it.
+
+The canonical event model: 27 typed `Kind` values (scan/worker/task
+lifecycle, cache hits and misses, asset/relationship/evidence/finding/
+recommendation observations, requests, rule executions, warnings, errors,
+progress, phase transitions, shutdown, run metadata, summaries), a
+bus-assigned strictly increasing `Sequence`, an injected-clock timestamp
+(zero-timestamp events are stamped by the bus clock), a `Severity`, bounded
+phase/category/identity/value context labels, and a sealed, typed `Payload`
+— never an anonymous map, every field a documented projection of a real
+Phase 2 / runtime / report / detect / priority field. Events validate at the
+bus boundary (invalid events are dropped and counted, never delivered, never
+sequenced) and bounded payload constructors (`NewWarning`, `NewError`,
+`NewTaskTerminal` family) truncate rune-safe with an explicit marker, so a
+well-behaved emitter never produces an event the bus must reject.
+
+The bus (`Bus`/`Subscriber`): publish never blocks the caller — every
+subscriber owns a bounded buffer, a full buffer drops the event for that
+subscriber and counts it (per subscriber and in the bus aggregate), and
+delivery is a non-blocking enqueue under the publish lock, so every
+subscriber receives events in bus-assignment order even under concurrent
+publish. Subscribers close explicitly (`Close`, idempotent, `Done` fires,
+buffers drain through `Next` before `ErrSubscriptionClosed`); `Bus.Close`
+closes all subscribers and drops — counted, unsequenced — later publishes.
+The `Observer` interface is the instrumentation seam (nil = off switch, zero
+behavior change; the Bus satisfies it, so instrumented code publishes
+straight into a bus), and the `Deriver`/`Deriving` bridge is the single
+pool-job-boundary construction point for derived events (asset discovered,
+finding created, ...): engines never emit them; a caller-provided `Deriver`
+converts `task_completed` results into canonical derived events at the
+boundary. All concurrency is bounded: no goroutine per event, no unbounded
+queue, race-tested, leak-tested, and benchmarked (~0.5 µs/publish with a
+draining consumer). The runtime pool is the first instrumented engine: an
+optional `Config.Observer`/`Config.Deriver` makes it emit canonical
+scan/worker/task lifecycle, phase-transition, honest-progress, and shutdown
+events with every payload field grounded in a real pool field (nil observer
+= zero behavior change). The cache is instrumented the same way
+(`internal/cache`, roadmap v1.2): `Open` accepts an optional
+`WithObserver` option, and when set, every `Get` publishes exactly one
+canonical `cache_hit`/`cache_miss` event carrying the real lookup outcome
+— the key digest, the `Outcome.State` label ("hit", "miss", "expired",
+"corrupt", "schema-incompatible", "incomplete", "error"), and
+`Outcome.IsHit()`, with the event kind consistent with the payload (the
+bus enforces it). A nil observer is the off switch (zero behavior change,
+a single nil check per lookup), emission never blocks a cache operation
+(publish is a non-blocking enqueue that drops and counts on a full
+subscriber buffer), and only `Get` emits — writes, deletes, clears, and
+maintenance walks publish nothing. See `ARCHITECTURE.md` ("Cache
+instrumentation"). The TUI controller is the first bus consumer (see
+"Terminal observability (library)" below); loggers and replays are the
+remaining v1.2 observability items, and there
+is still no CLI command wiring any of it. See
+`ARCHITECTURE.md` ("Event bus").
+
+## Terminal observability (library)
+
+`internal/tui` (roadmap v1.2) is the first consumer of the event bus: a
+library that renders a live, deterministic picture of a running scan from
+canonical events alone. It is observer-only — consuming and rendering
+never calls an engine, never mutates execution state, and cannot change
+what a run does; a frame is a pure function of the events consumed so far,
+the injected clock, and the resolved options.
+
+The `Controller` drives the loop over one `event.Subscriber`: `Run` is
+single-goroutine by contract (it owns the state, the replay history, and
+the writer for its whole lifetime and spawns nothing), selecting on
+events / refresh ticks / context cancellation / subscriber close. It
+returns when a `scan_stopped` event concludes the stream, the subscriber
+closes, or the context is cancelled — an already-cancelled context is
+detected before the loop starts and wins over any buffered events. Before
+returning, the controller drains whatever remains buffered (non-blocking),
+so the final frame reflects the whole stream, and writes exactly one final
+summary frame (`RenderFinal`) at the timestamp of the last consumed event.
+A failed or partial write (including EPIPE) disables rendering for the
+rest of the run while events keep flowing, the controller never panics,
+and the first write error is what `Run` returns.
+
+The `State` model projects the stream into the documented components:
+progress (phase, in-flight, completed/remaining/total — unknown totals
+render honestly, never a faked percentage), the worker dashboard
+(per-worker idle/waiting/running/stopped with current task and duration),
+fixed-window throughput rates (assets, urls, requests, js, rules,
+relationships, cache hits and misses over a 10 s window), an ETA
+estimator that is honest about unknown totals and zero rates, best-effort
+resource sampling on render ticks only (heap, goroutines, open file
+descriptors, queue depth, active workers), a rate-limited and
+deduplicated interesting-asset feed, a severity-ranked grouped error
+feed, and the final run summary — derived only from the consumed stream.
+A bounded replay history (`MaxEventHistory`, hard cap 4096) keeps the
+tail of the stream in sequence order, so a fresh `State` is
+reconstructible from it.
+
+Configuration flows through the existing `config.TUIConfig`:
+`OptionsFromConfig` normalizes zero fields to the documented defaults
+(250 ms refresh interval, 1024-event history, 10 events/s interesting
+rate), and `Color` renders only when it is exactly `"on"` — the caller
+resolves `"auto"` from its own terminal detection, and the library never
+probes the terminal, never enters raw mode, and never reads keys. Every
+dynamic string is sanitized at the controller boundary before it can
+reach a frame (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8 are
+stripped; the renderer adds only its own fixed color codes), and every
+structure is bounded (subscriber buffer, history ring, throughput sample
+rings, a 64-item interesting feed, a 32-group error feed, 200-byte
+lines, 64 KiB frames) with drop counters exposed on the components that
+drop — loss is measurable, never silent. The package is hermetic: no
+terminal probing, no public Internet, deterministic fake-clock tests
+with an injected resource sampler. There is no CLI command yet — the
+library is a capability for the eventual dashboard command. See
+`ARCHITECTURE.md` ("Terminal observability").
 
 ## Runtime engine
 

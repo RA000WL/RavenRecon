@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/RA000WL/RavenRecon/internal/event"
 )
 
 // ErrPoolClosed is returned by Submit and Subscribe once the pool has been
@@ -79,6 +82,23 @@ type Config struct {
 	// Nil means the wall clock; tests inject a fake clock for deterministic
 	// assertions.
 	Clock Clock
+
+	// Observer is the optional Phase 12 instrumentation sink (internal/event
+	// Observer; the Bus satisfies it). When non-nil, the pool emits
+	// canonical pool-boundary events: scan start/stop, worker start/stop,
+	// task submitted/started/running/terminal, phase transitions, progress,
+	// and shutdown (see observer.go for the exact field grounding). A nil
+	// observer (the default) means zero behavior change.
+	Observer event.Observer
+
+	// Deriver is the optional pool-job-boundary derivation bridge: when
+	// non-nil, the pool wraps Observer in event.Deriving, so the raw
+	// results of completed jobs are handed to the Deriver for conversion
+	// into derived canonical events (asset discovered, finding created,
+	// ...) after each task_completed event. Engines never emit those events
+	// themselves; a caller that does not want derived events leaves this
+	// nil.
+	Deriver event.Deriver
 }
 
 // Pool is a bounded, cancellable, rate-limited job execution engine. See the
@@ -113,6 +133,34 @@ type Pool struct {
 
 	subsMu sync.Mutex
 	subs   map[*Subscription]struct{}
+
+	// observer is the Phase 12 instrumentation sink (nil = off). It is the
+	// configured Observer wrapped in the Deriving bridge when a Deriver is
+	// present.
+	observer event.Observer
+
+	// submitted counts jobs successfully enqueued; terminated counts
+	// terminal events emitted. They back the pool's honest progress events.
+	submitted  atomic.Uint64
+	terminated atomic.Uint64
+
+	// progressMu serializes progress read-modify-emit and progressEmitted
+	// is the watermark of the last Completed value put on the wire. They
+	// enforce the progress wire contract (non-decreasing, never above the
+	// true termination count, final value exact): concurrent workers can
+	// terminate out of order relative to their progress emissions, and with
+	// only an atomic counter a worker that increments early and emits late
+	// could put a larger Completed before a smaller one (see emitProgress
+	// in observer.go for the clamp and its correctness argument).
+	progressMu      sync.Mutex
+	progressEmitted uint64
+
+	// phase is the pool's current lifecycle phase (an atomic.Value holding
+	// a string: "running" after NewPool, "draining" once Shutdown begins).
+	// Progress events carry it so the wire's Phase never regresses from
+	// "draining" back to a hardcoded "running" (see emitPhase/emitProgress
+	// in observer.go).
+	phase atomic.Value
 }
 
 // NewPool validates cfg and returns a running pool bound to ctx: exactly
@@ -165,11 +213,14 @@ func NewPool(ctx context.Context, cfg Config) (*Pool, error) {
 		abortCtx:    abortCtx,
 		cancelAbort: cancelAbort,
 		subs:        make(map[*Subscription]struct{}),
+		observer:    buildObserver(cfg),
 	}
+	p.emitScanStarted(cfg)
 	p.workers.Add(cfg.Concurrency)
 	for i := 0; i < cfg.Concurrency; i++ {
-		go p.workerLoop()
+		go p.workerLoop(i)
 	}
+	p.emitPhase("running")
 	return p, nil
 }
 
@@ -194,14 +245,31 @@ func (p *Pool) Submit(ctx context.Context, job Job) (JobID, error) {
 	}
 	defer p.submitters.Done()
 	job.ID = id
+	// The submission counter is incremented BEFORE the enqueue so that no
+	// worker can terminate an accepted job before the counter records its
+	// submission: the progress wire contract (Completed never exceeds
+	// Total; the final Total is exact) holds even when a worker picks up
+	// and completes a very fast job before the submitter resumes. The
+	// three rejection paths below compensate the counter, so it always
+	// equals the number of accepted jobs.
+	//
+	// The task_submitted EVENT is still emitted after the enqueue: the
+	// observer stream's ordering guarantee is per-worker lifecycle (started
+	// before running before terminal for one job), not a global wall-clock
+	// order between submit and start.
+	p.submitted.Add(1)
 	select {
 	case p.jobQueue <- job:
+		p.emitTaskSubmitted(job)
 		return id, nil
 	case <-ctx.Done():
+		p.submitted.Add(^uint64(0))
 		return id, fmt.Errorf("runtime: submit %d: %w", id, ctx.Err())
 	case <-p.stopAccept:
+		p.submitted.Add(^uint64(0))
 		return id, ErrPoolClosed
 	case <-p.abortCtx.Done():
+		p.submitted.Add(^uint64(0))
 		return id, ErrPoolClosed
 	}
 }
@@ -263,6 +331,8 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	close(p.stopAccept)
 	p.mu.Unlock()
 
+	p.emitPhase("draining")
+
 	var forceErr error
 
 	// Wait for in-flight Submits to finish enqueuing before closing the
@@ -290,8 +360,19 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 		forceErr = err
 	}
 
+	// The wire's final progress event: every submitter has resolved (the
+	// submittersDone wait above released blocked Submits and compensated
+	// their rejections) and every worker has terminated, so the counters
+	// read exact totals. Without it, a pending rejection compensation could
+	// land after the last worker-emitted progress event, leaving a final
+	// Total one above the true accepted count on the wire.
+	p.emitProgress()
+
 	// No more events can be emitted; release the subscribers.
 	p.closeSubscriptions()
+
+	p.emitShutdown(forceErr != nil, len(p.jobQueue))
+	p.emitScanStopped(forceErr != nil)
 	return forceErr
 }
 
@@ -322,10 +403,14 @@ func (p *Pool) wait(ctx context.Context, ch <-chan struct{}) error {
 // down (abort). On abort, queued jobs that were never picked up are dropped
 // without events; the Shutdown error already tells the caller the run was
 // aborted.
-func (p *Pool) workerLoop() {
+func (p *Pool) workerLoop(i int) {
 	defer p.workers.Done()
+	p.emitWorkerStarted(i)
+	state := event.WorkerCompleted
+	defer func() { p.emitWorkerStopped(i, state) }()
 	for {
 		if p.abortCtx.Err() != nil {
+			state = event.WorkerCancelled
 			return
 		}
 		select {
@@ -333,8 +418,9 @@ func (p *Pool) workerLoop() {
 			if !ok {
 				return
 			}
-			p.execute(job)
+			p.execute(i, job)
 		case <-p.abortCtx.Done():
+			state = event.WorkerCancelled
 			return
 		}
 	}
@@ -353,7 +439,7 @@ func (p *Pool) workerLoop() {
 //
 // A job whose context was cancelled never reports success, even if the job
 // returns a value or a nil error.
-func (p *Pool) execute(job Job) {
+func (p *Pool) execute(i int, job Job) {
 	d := job.Timeout
 	if d <= 0 {
 		d = p.timeout
@@ -367,25 +453,37 @@ func (p *Pool) execute(job Job) {
 
 	if err := ctx.Err(); err != nil {
 		// Cancelled before it could start (forced shutdown or pool context).
-		p.deliver(p.finishEvent(job, time.Time{}, p.clock.Now(), ctx, nil, nil))
+		fin := p.finishEvent(job, time.Time{}, p.clock.Now(), ctx, nil, nil)
+		p.emitTaskTerminal(i, job, fin)
+		p.emitProgress()
+		p.deliver(fin)
 		return
 	}
+
+	p.emitTaskStarted(i, job)
 
 	if p.limiter != nil {
 		if err := p.limiter.Wait(ctx); err != nil {
 			// The deadline elapsed or the context was cancelled while
 			// waiting for a start token: the job never started, but its
 			// fate is still surfaced as a terminal event.
-			p.deliver(p.finishEvent(job, time.Time{}, p.clock.Now(), ctx, nil, nil))
+			fin := p.finishEvent(job, time.Time{}, p.clock.Now(), ctx, nil, nil)
+			p.emitTaskTerminal(i, job, fin)
+			p.emitProgress()
+			p.deliver(fin)
 			return
 		}
 	}
 
 	startedAt := p.clock.Now()
 	p.deliver(Event{Kind: EventStarted, JobID: job.ID, StartedAt: startedAt, At: startedAt})
+	p.emitTaskRunning(i, job)
 
 	result, jerr := runSafe(ctx, job)
-	p.deliver(p.finishEvent(job, startedAt, p.clock.Now(), ctx, result, jerr))
+	fin := p.finishEvent(job, startedAt, p.clock.Now(), ctx, result, jerr)
+	p.emitTaskTerminal(i, job, fin)
+	p.emitProgress()
+	p.deliver(fin)
 }
 
 // finishEvent classifies a job's terminal event (see execute). It is also

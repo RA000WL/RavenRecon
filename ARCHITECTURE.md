@@ -342,6 +342,40 @@ a one-process self-healing removal delete an entry another process just wrote.
 No multi-process locking is claimed or tested. Leftover temporary files from a
 crashed write are inert (never read as entries) and are removed by `Clear`.
 
+### Cache instrumentation
+
+The cache (`internal/cache`, Phase 12) is instrumented like the runtime
+pool: `Open` accepts an optional observer through `WithObserver` (an
+`internal/event` Observer; the `Bus` satisfies it). A nil observer is the
+off switch: zero behavior change and a single nil check per lookup. When
+set, every `Get` publishes exactly one canonical `cache_hit` or
+`cache_miss` event (`event.CacheAccess`) carrying the REAL outcome of the
+lookup:
+
+- `event.CacheAccess.Key` <- the `cache.Key` digest (the 64-character
+  lowercase hex SHA-256; by construction it encodes the schema version,
+  the operation, the normalized target, the result-relevant
+  configuration, and the tool identity — see "Cache keys");
+- `event.CacheAccess.State` <- `cache.Outcome.State.String()` ("hit",
+  "miss", "expired", "corrupt", "schema-incompatible", "incomplete",
+  "error");
+- `event.CacheAccess.Hit` <- `cache.Outcome.IsHit()` (true exactly for
+  `StateHit`), and the kind is `cache_hit` exactly when it is true, so the
+  payload can never contradict its kind (the bus enforces that).
+
+The event timestamp is the cache's own injected clock (`WithClock`), so
+deterministic tests can pin it. The cache measures no lookup latency
+today, so none is reported. Emission never blocks a cache operation: the
+observer is invoked inline (one nil check per lookup) and the Observer
+contract bounds the call; with the canonical `Bus` observer, publish is a
+non-blocking enqueue that drops and counts on a full subscriber buffer.
+Only `Get` emits — `Put`/`Delete`/`Clear`/`InvalidateIncompatible` are
+not lookups and publish nothing, and the eviction/self-healing paths are
+reported through the outcome of the `Get` that triggered them, never as
+separate events. The instrumentation is purely additive: the cache's
+read/write semantics, self-healing, and outcome vocabulary are unchanged
+by it (pinned by outcome-equality tests).
+
 ## Runtime engine
 
 `internal/runtime` (roadmap v0.3) is the execution engine: a bounded,
@@ -401,6 +435,14 @@ never silently lost during normal operation: a slow subscriber applies
 backpressure rather than dropping events. Events are in-memory only;
 persistence is the cache layer's concern, and there are no cross-process
 semantics.
+
+Phase 12 adds optional canonical observability instrumentation on top of
+this subscription model: `Config.Observer` (an `internal/event` Observer;
+nil = zero behavior change) makes the pool emit canonical pool-boundary
+events — scan/worker/task lifecycle, phase transitions, honest progress,
+and shutdown — alongside the runtime `Event` stream, and `Config.Deriver`
+converts task results into derived events at the pool-job boundary (see
+"Runtime pool instrumentation" under "Event bus").
 
 ### Layering decision: the runtime is cache-independent
 
@@ -2572,6 +2614,203 @@ silently truncated.
 - Reports render from the in-memory corpus; there is no persistent asset
   store to reload a past run's graph from yet (deferred roadmap work).
 
+## Event bus
+
+The event bus (roadmap v1.2, phase 12; `internal/event`) is the
+observability foundation: the canonical runtime event model plus a
+concurrent, bounded, non-blocking fan-out bus. It is OBSERVER-ONLY — the
+data flow is one way (`instrumented code -> Bus -> consumers`), a consumer
+can never call an engine through it, and no engine mutates run state
+through it. The TUI controller is the first consumer (see "Terminal
+observability" below); the runtime pool is already instrumented (see
+"Runtime pool instrumentation" below), the cache is instrumented too (see
+"Cache instrumentation" under "Cache and resume"), and loggers and replays
+are later v1.2 items.
+
+### Canonical event model
+
+Every observability event is a structured, typed `Event`: a canonical
+`Kind` (27 values: scan/worker/task lifecycle, cache hit/miss, asset
+discovered, relationship/evidence/finding/recommendation created, request
+observed, rule executed, warning, error, progress, phase transition,
+shutdown, run metadata, summary ready), a bus-assigned strictly increasing
+`Sequence`, an injected-clock timestamp (`At`), a `Severity`
+(info/warning/error), bounded context labels (`Phase`, `Category`,
+`Identity`, `Value`, 512 bytes each via the `With*` constructors, rune-safe
+truncation with an explicit "…" marker), and a sealed, typed `Payload`
+(marker-method interface: anonymous maps are impossible; every field is a
+documented projection of a real Phase 2 / runtime / report / detect /
+priority field, with the source field named in the payload docs).
+`Event.Validate` enforces the whole contract — known kind, non-zero
+timestamp, valid severity, bounded labels, payload matches kind, and
+per-payload field rules (message bounds, state vocabularies, confidence/
+weight ranges, progress counts, cache-hit consistency) — so hand-built
+hostile events cannot smuggle oversized values past consumers. Bounded
+payload constructors (`NewWarning`, `NewError`, `NewTaskTerminal` and the
+four terminal-task wrappers) truncate message/category fields at
+construction, so a well-behaved emitter never produces an event the bus
+must reject.
+
+### Bus semantics
+
+A `Bus` fans one event out to any number of `Subscriber`s, each with a
+bounded buffer set at `Subscribe`. Publish never blocks the caller beyond a
+bounded enqueue: a full buffer drops the event for that subscriber and
+counts it (per-subscriber `Drops` and the bus aggregate), so a slow or dead
+consumer can never stall a producer and never costs other subscribers
+events. An event with a zero timestamp is stamped with the bus clock before
+validation (emitters that do not track time can publish zero-timestamp
+events; the canonical flow has emitters construct events with their own
+injected clock and the bus preserves them). Invalid events are dropped and
+counted in `Invalid` — never delivered, never sequenced. Valid events are
+sequenced and delivered to every subscriber under the publish lock, which
+makes the ordering contract real: every subscriber receives events in
+bus-assignment order even under concurrent publish (delivery is a
+non-blocking enqueue, so the lock hold is bounded and Publish remains
+non-blocking). Subscribers are single-consumer: exactly one goroutine calls
+`Next` (or receives from `Events`) at a time. `Close` is idempotent and
+concurrent-safe; the `Done` channel fires exactly once, buffered events are
+drained by `Next` before it reports `ErrSubscriptionClosed`, and the
+delivery channel is never closed (consumers selecting on it must also
+select on `Done`). `Bus.Close` closes every open subscriber and drops —
+counted, unsequenced — all later publishes, and `Subscribe` after close
+fails.
+
+### Instrumentation contract
+
+`Observer` is the single seam: instrumented packages (the runtime pool,
+the cache, stage result bridges) accept an optional `Observer` via their
+configuration; nil means zero behavior change. The `Bus` satisfies
+`Observer` (`Observe` is `Publish`), so instrumented code publishes
+straight into a bus. Derived events — asset discovered, finding created,
+relationship created — are produced only at the pool-job boundary by the
+`Deriving` bridge: it forwards every observed event untouched and, for
+`task_completed` events, passes the raw job result to the caller-provided
+`Deriver`, whose returned canonical events are forwarded after the terminal
+event. Engines never emit events themselves; a `Deriver` must recognize
+only its own result types (nil otherwise), never mutate the terminal event,
+return only valid events (the bus drops and counts anything else), and
+never panic.
+
+### Concurrency and resource bounds
+
+All concurrency is bounded and explicit: no goroutine per event (publish
+and delivery are inline under the bus mutex), per-subscriber buffers are
+bounded at subscribe time, and `Publish`/`Observe` never block the caller.
+There is no global state — every bus is explicit and independent. The
+counter state (`Seq`, `Drops`, `Invalid`, per-subscriber `Drops`) is
+atomic; `Seq` is safe to call concurrently with publish. Leak and race
+tests pin the teardown paths (subscriber close, bus close, concurrent
+publish/close under `-race`), and benchmarks pin the cost shape: ~0.5 µs
+per publish with a draining subscriber and ~1.7 µs for a four-subscriber
+fanout on current hardware (measured with `BenchmarkBusPublishFanout` /
+`BenchmarkBusPublishFanoutFourSubscribers`) — the event layer cannot
+materially slow a run.
+Events are in-memory only with no cross-process semantics; persistence is
+the cache layer's concern, and the event bus never touches the cache.
+
+### Runtime pool instrumentation
+
+The runtime pool (`internal/runtime`, Phase 12) is the first instrumented
+engine. Its `Config` accepts an optional `Observer` (an `internal/event`
+`Observer`; the `Bus` satisfies it) and an optional `Deriver`. A nil
+observer is the off switch: zero behavior change and a single nil check per
+emit point. When set, the pool emits canonical pool-boundary events for its
+whole lifecycle — `scan_started` (the pool configuration projection),
+`worker_started`/`worker_stopped` (per-worker index; `completed` for a
+graceful drain, `cancelled` for an abort), the task lifecycle
+(`task_submitted`/`task_started`/`task_running` plus the four terminal
+kinds carrying the real `JobID`, worker index, `StartedAt` — zero for jobs
+cancelled before they could start — the classification projected onto the
+report framework's `ErrorCategory` vocabulary ("timeout", "cancellation",
+"unknown"), the wrapped error text, and the raw job `Result` on
+completion), `phase_transition` ("running"/"draining"), honest `progress`
+(the pool's own submitted/terminated counters, `TotalKnown` always true),
+and `shutdown`/`scan_stopped` (graceful vs forced, plus the number of
+queued jobs dropped). Every payload field is grounded in a real pool field;
+terminal events are emitted before the corresponding runtime `Event` is
+delivered to pool subscriptions. Task results flow through the
+`Deriving` bridge, so a caller-provided `Deriver` converts raw job results
+into derived canonical events (asset discoveries, findings, ...) at the
+pool-job boundary — engines never emit those events themselves. All events
+are purely additive: the pool's execution, rate limiting, and
+classification semantics are unchanged by instrumentation.
+
+### Known limitations
+
+- No CLI or replay consumes the bus yet; the TUI controller does (see
+  "Terminal observability" below). The runtime pool and the cache are
+  instrumented (see "Runtime pool instrumentation" above and "Cache
+  instrumentation" under "Cache and resume"); loggers and replays are
+  later v1.2 items.
+- `Publish` is O(subscribers): fan-out cost grows linearly with
+  subscribers, by design (the TUI controller, loggers, and replays are a
+  small fixed set).
+- Events are lost when a subscriber's buffer overflows — by design, and
+  always counted; downstream consumers must treat drops as observable
+  signal (a healthy TUI should never see them).
+- Subscribers are single-consumer; sharing one subscriber across goroutines
+  is a caller error.
+- The pool's queued-but-dropped jobs (forced shutdown) have no terminal
+  event; the `shutdown` event's `Dropped` field reports the count.
+
+## Terminal observability
+
+`internal/tui` (roadmap v1.2) is the first consumer of the event bus: a
+library that renders deterministic, human-readable frames of a running
+scan. It is observer-only — the data flow is `instrumented code -> Bus ->
+Subscriber -> Controller.Run -> State.Apply -> Render -> one whole Write`;
+a frame is a pure function of (events consumed so far, the injected clock,
+the resolved options) and no path leads back into an engine.
+
+The `Controller` is single-goroutine by contract: `Run` owns the state,
+the replay history, and the writer for its whole lifetime, spawns no
+goroutines, and selects on events / refresh ticks / context cancellation /
+subscriber close, rendering one whole frame per tick. The run concludes on
+a consumed `scan_stopped` event (the pool emits it last, after shutdown),
+subscriber close, or context cancellation — an already-cancelled context
+is detected before the loop starts and wins over any buffered events.
+Before returning, the controller drains the subscriber buffer
+non-blocking (the final frame reflects the whole stream), renders exactly
+one final summary frame (`RenderFinal`) at the timestamp of the last
+consumed event, and returns the first write error, `ctx.Err()`, or nil. A
+failed or partial write (including EPIPE) disables rendering for the rest
+of the run while events keep flowing; the controller never panics.
+
+The state machine is single-consumer (the Run goroutine, or a test) and
+projects the stream into the documented components: progress (phase,
+in-flight, honest totals — unknown renders as "unknown", never a faked
+percentage), the worker dashboard (per-worker idle/waiting/running/stopped
+with current task and duration), fixed-window throughput rates over a 10 s
+window (assets, urls, requests, js, rules, relationships, cache hits and
+misses, plus an internal task rate backing the ETA), an ETA estimator
+honest about unknown totals and zero rates, best-effort resource sampling
+on render ticks only (heap, goroutines, open FDs via `/proc/self/fd` on
+Linux, queue depth, active workers — any failure degrades to "—"), a
+rate-limited and deduplicated interesting-asset feed, a severity-ranked
+grouped error feed, and the final run summary derived only from the
+consumed stream. A bounded replay history carries the stream tail in
+sequence order (`MaxEventHistory`, hard cap 4096), so the tail is fully
+replayable.
+
+`config.TUIConfig` flows in through `OptionsFromConfig`, which normalizes
+zero fields to the documented defaults (250 ms refresh interval,
+1024-event history, 10 events/s interesting rate) and resolves `Color`
+only for exactly `"on"` — `"auto"` is the caller's terminal detection, and
+the library never probes the terminal, never enters raw mode, never reads
+keys, and never touches signals. Every dynamic string is sanitized at the
+controller boundary (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8
+stripped; the renderer adds only its own fixed ANSI codes), and every
+structure is bounded — subscriber buffer, history ring, throughput sample
+rings (128 samples per metric), a 64-item interesting feed, a 32-group
+error feed, 200-byte lines, 64 KiB frames — with drop counters exposed
+(`History.Dropped`, `InterestingFeed.Dropped`, `ErrorFeed.Dropped`) so
+loss is measurable, never silent. The package is hermetic: deterministic
+fake-clock tests with an injected resource sampler, no terminal probing,
+no public Internet; race and leak tests pin the Run teardown paths. It is
+a library capability only — no CLI command wires it yet (the eventual
+dashboard command is a later item).
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -2667,6 +2906,30 @@ Implemented:
   a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
   (`internal/detect`; no rules ship with the framework)
+* event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
+  event model and the concurrent, bounded, non-blocking bus — typed,
+  validated, clock-stamped events with sealed payloads, per-subscriber
+  bounded buffers with drop counters, bus-assigned sequence order,
+  zero-timestamp stamping, the Observer instrumentation seam, and the
+  Deriver/Deriving pool-job-boundary bridge (`internal/event`; observer
+  only, nothing consumes it yet); plus the runtime pool instrumentation:
+  the pool emits canonical scan/worker/task lifecycle, phase-transition,
+  honest-progress, and shutdown events through its optional
+  `Config.Observer`/`Config.Deriver`, with every payload field grounded in
+  a real pool field (`internal/runtime`; nil observer = zero behavior
+  change)
+* terminal observability (see "Terminal observability" above; roadmap
+  v1.2): the first bus consumer — a single-goroutine `Controller`
+  consuming a `Subscriber` into sanitized, bounded `State`, live and
+  final deterministic frames, `OptionsFromConfig` normalization, bounded
+  replay history, and drop counters on every dropping component
+  (`internal/tui`; library only, no CLI wiring yet)
+* cache instrumentation (see "Cache instrumentation" under "Cache and
+  resume"; roadmap v1.2): the cache emits exactly one canonical
+  `cache_hit`/`cache_miss` event per `Get` through its optional
+  `WithObserver` option, with every payload field grounded in the real
+  lookup outcome (key digest, `Outcome.State`, `Outcome.IsHit()`), and a
+  nil observer as the zero-change off switch (`internal/cache`)
 
 Planned, not yet implemented:
 
@@ -2675,4 +2938,5 @@ Planned, not yet implemented:
 * asset store, graph, and graph correlation engine (the priority
   engine's identity-anchored Correlate is landed; relationship traversal
   is not)
-* reporting CLI front-end and terminal UI
+* reporting CLI front-end and terminal UI wiring (the TUI itself is a
+  landed library — `internal/tui`, no CLI command yet)

@@ -61,7 +61,8 @@ func assertPromptReturn(t *testing.T, start time.Time, bound time.Duration, what
 // awaitGoroutines forever; the worker would be stuck and the pool shutdown
 // could never complete. With the fix the whole group is killed and Run
 // returns a context error promptly after the deadline fires. The descendant's
-// pid is captured through $RAVEN_PIDFILE and probed after Run returns: the
+// pid is captured through $RAVEN_PIDFILE and probed (with a short bounded
+// poll, see assertDescendantReaped) after Run returns: the
 // group kill must have actually reaped it — a runner that only bounded the
 // wait (returning an error even when the descendant survives) must not be
 // able to pass this test.

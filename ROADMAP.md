@@ -42,7 +42,7 @@ Every phase must satisfy these before it is complete:
 | v0.9 | Secret Intelligence | ✅ Complete |
 | v1.0 | Attack Surface Intelligence / Detection Framework | ✅ Complete |
 | v1.1 | Reporting Framework | ✅ Complete |
-| v1.2 | Eventing, observability, operator feedback | 🚧 In progress |
+| v1.2 | Eventing, observability, operator feedback | ✅ Complete |
 | v1.2.5 | SDK and extension API stabilization | ⏳ Planned |
 | v1.3 | End-to-end pipeline | ⏳ Planned |
 | v1.4 | CLI surface area | ⏳ Planned |
@@ -301,19 +301,43 @@ Implemented in `internal/report` — the Reporting Framework & Evidence Export. 
 
 ## v1.2 — Eventing, observability, operator feedback
 
-Status: in progress
+Status: complete
 
 Goal: make runs visible, debuggable, and measurable in real time.
 
-- [ ] Event bus
-- [ ] Structured runtime events
-- [ ] Progress reporting
-- [ ] Worker health/status
-- [ ] Throughput and ETA
-- [ ] Resource monitoring
-- [ ] Interesting-asset feed
-- [ ] Error feed
-- [ ] Final execution summary
+The event bus lands first (`internal/event`, Phase 12): the canonical
+runtime event model — typed, validated, severity-marked, clock-stamped
+events with sealed payloads projected from the Phase 2 asset model, the
+runtime engine, and the report framework — fanned out through a concurrent,
+bounded, non-blocking bus (per-subscriber bounded buffers, drop counters,
+bus-assigned sequences preserved in per-subscriber order, zero-timestamp
+stamping, closed-bus drop semantics), plus the Observer contract and the
+`Deriver`/`Deriving` pool-job-boundary bridge that converts job results
+into derived events. It is observer-only: no engine consumes or mutates it
+yet. The runtime pool is already instrumented (the pool emits canonical
+scan/worker/task lifecycle, phase-transition, honest-progress, and shutdown
+events through its optional `Config.Observer`), and the cache is
+instrumented too (every `Get` emits exactly one canonical
+`cache_hit`/`cache_miss` event through its optional `WithObserver`
+option, nil observer = zero behavior change). The terminal observability
+library (`internal/tui`) landed
+as the first bus consumer and delivers the observability surface below:
+a single-goroutine controller replays a subscriber's stream into
+sanitized, bounded state and renders live frames plus one deterministic
+final summary frame, with all rendering hermetic and deterministic (no
+CLI wiring yet).
+
+- [x] Event bus
+- [x] Structured runtime events (runtime pool instrumentation)
+- [x] Cache instrumentation (cache hit/miss events)
+- [x] Progress reporting (TUI library: progress, phase, in-flight,
+  honest totals/ETA)
+- [x] Worker health/status (TUI library: per-worker dashboard)
+- [x] Throughput and ETA (TUI library: fixed-window rates)
+- [x] Resource monitoring (TUI library: sampled heap/goroutines/FDs/queue)
+- [x] Interesting-asset feed (TUI library: rate-limited, deduplicated)
+- [x] Error feed (TUI library: grouped, severity-ranked)
+- [x] Final execution summary (TUI library: `RenderFinal` block)
 
 Acceptance criteria:
 

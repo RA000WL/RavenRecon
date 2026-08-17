@@ -82,6 +82,29 @@
 // described above. Subscribers drain with Next(ctx); Next returns
 // ErrSubscriptionClosed once the pool shuts down or Close is called.
 //
+// # Instrumentation (Phase 12, optional)
+//
+// The pool accepts an optional observer in its Config (Config.Observer, an
+// internal/event Observer — the Bus satisfies it) and an optional deriver
+// (Config.Deriver). A nil observer is the off switch: zero behavior change
+// and a single nil check per emit point. When set, the pool emits canonical
+// pool-boundary events (internal/event): scan started/stopped, worker
+// started/stopped (with the worker index), task submitted/started/running
+// and the four terminal kinds (with JobID, worker index, real StartedAt,
+// the classification projected onto the report ErrorCategory vocabulary —
+// "timeout", "cancellation", "unknown" — the wrapped error text, and the
+// raw job result on completed), phase transitions ("running"/"draining"),
+// honest progress (the pool's own submitted/terminated counters,
+// TotalKnown), and shutdown (reason + dropped queued jobs). Terminal events
+// are emitted before the corresponding runtime Event is delivered to pool
+// subscriptions, and the job-start rate limiting and classification
+// semantics are unchanged: the observer is purely additive. Task results
+// flow through the event.Deriving bridge: a caller-provided Deriver
+// converts raw job results into derived canonical events at the pool-job
+// boundary; engines never emit those events themselves. Observer safety is
+// the interface contract (Observe must never block beyond a bounded
+// enqueue and must never panic on hostile events); the pool relies on it.
+//
 // # Known limitations
 //
 //   - The pool cannot kill a goroutine. A job that ignores context
@@ -90,7 +113,8 @@
 //     the goroutine out). Jobs must honor ctx.
 //   - During a forced shutdown, queued jobs that were never picked up are
 //     dropped without a terminal event, and terminal events may be dropped
-//     for subscribers whose buffers are full.
+//     for subscribers whose buffers are full (the Shutdown observer event
+//     reports the dropped queue count).
 //   - If the pool's context is cancelled without calling Shutdown, the
 //     workers unwind but the submission queue stays open and subscriptions
 //     stay open; callers must call Shutdown to fully release the pool.

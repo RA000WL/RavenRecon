@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RA000WL/RavenRecon/internal/event"
 )
 
 // Cache is the minimal contract future runtime stages use to persist and
@@ -46,8 +48,9 @@ const MaxRecordSize = 16 << 20 // 16 MiB
 
 // options configures a filesystem-backed cache.
 type options struct {
-	ttl time.Duration
-	now func() time.Time
+	ttl      time.Duration
+	now      func() time.Time
+	observer event.Observer
 }
 
 // Option customizes a filesystem-backed cache created by Open.
@@ -82,6 +85,12 @@ type FS struct {
 	ttl time.Duration
 	now func() time.Time
 
+	// observer is the Phase 12 instrumentation sink (nil = off). It is set
+	// once at Open and never mutated afterwards, so concurrent Gets read it
+	// race-free exactly like dir/ttl/now; see observer.go for the emission
+	// contract.
+	observer event.Observer
+
 	mu sync.Mutex // serializes mutating operations
 
 	// beforeSelfHeal is a test-only hook invoked after a read classified an
@@ -114,7 +123,7 @@ func Open(dir string, opts ...Option) (*FS, error) {
 	if err := os.MkdirAll(entries, 0o700); err != nil {
 		return nil, fmt.Errorf("cache: create cache directory %s: %w", entries, err)
 	}
-	return &FS{dir: dir, ttl: o.ttl, now: o.now}, nil
+	return &FS{dir: dir, ttl: o.ttl, now: o.now, observer: o.observer}, nil
 }
 
 // DefaultDir returns the default cache directory,
@@ -151,7 +160,20 @@ func isHex(b byte) bool {
 }
 
 // Get returns the outcome for key. See the Cache interface and outcome.go.
+// Every lookup outcome is published as exactly one canonical
+// cache_hit/cache_miss event when an observer is configured (see
+// observer.go); a nil observer keeps Get behaving exactly as before.
 func (c *FS) Get(ctx context.Context, key Key) Outcome {
+	out := c.get(ctx, key)
+	c.emitAccess(key, out)
+	return out
+}
+
+// get is the instrumentation-free lookup: the historical Get body. Get
+// wraps it with the optional cache_access emission so that exactly one
+// event is published per lookup, regardless of which terminal path
+// classified the outcome.
+func (c *FS) get(ctx context.Context, key Key) Outcome {
 	if err := ctx.Err(); err != nil {
 		return Outcome{State: StateError, Err: fmt.Errorf("cache get %s: %w", key, err)}
 	}
