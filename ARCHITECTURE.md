@@ -2725,7 +2725,10 @@ cancelled before they could start — the classification projected onto the
 report framework's `ErrorCategory` vocabulary ("timeout", "cancellation",
 "unknown"), the wrapped error text, and the raw job `Result` on
 completion), `phase_transition` ("running"/"draining"), honest `progress`
-(the pool's own submitted/terminated counters, `TotalKnown` always true),
+(the pool's own submitted/terminated counters, `TotalKnown` always true;
+`Completed` never exceeds `Total` on the wire because the submission
+counter increments before enqueue and every rejection compensates it, and
+the final progress event emitted by shutdown carries exact totals),
 and `shutdown`/`scan_stopped` (graceful vs forced, plus the number of
 queued jobs dropped). Every payload field is grounded in a real pool field;
 terminal events are emitted before the corresponding runtime `Event` is

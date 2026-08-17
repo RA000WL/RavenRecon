@@ -577,8 +577,11 @@ queue, race-tested, leak-tested, and benchmarked (~0.5 µs/publish with a
 draining consumer). The runtime pool is the first instrumented engine: an
 optional `Config.Observer`/`Config.Deriver` makes it emit canonical
 scan/worker/task lifecycle, phase-transition, honest-progress, and shutdown
-events with every payload field grounded in a real pool field (nil observer
-= zero behavior change). The cache is instrumented the same way
+events with every payload field grounded in a real pool field — the
+progress wire guarantee: `Completed` never exceeds `Total` (the submission
+counter increments before enqueue and every rejection compensates it), and
+the shutdown final event carries exact totals — with a nil observer
+= zero behavior change. The cache is instrumented the same way
 (`internal/cache`, roadmap v1.2): `Open` accepts an optional
 `WithObserver` option, and when set, every `Get` publishes exactly one
 canonical `cache_hit`/`cache_miss` event carrying the real lookup outcome
