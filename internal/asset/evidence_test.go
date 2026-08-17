@@ -318,8 +318,8 @@ func TestDetectionMethodParse(t *testing.T) {
 
 func TestKnownMethodsSortedAndFresh(t *testing.T) {
 	first := KnownMethods()
-	if len(first) != 14 {
-		t.Fatalf("KnownMethods has %d entries, want 14", len(first))
+	if len(first) != 15 {
+		t.Fatalf("KnownMethods has %d entries, want 15", len(first))
 	}
 	strs := make([]string, len(first))
 	for i, m := range first {

@@ -22,6 +22,7 @@ It should help researchers discover, correlate, prioritize, and report attack su
 - `internal/jsintel`, `internal/jsintel/adapt` — JavaScript intelligence engine: parser, fetch, pipeline, analyzers, and subjs/LinkFinder/SecretFinder adapters (library only)
 - `internal/secrentel`, `internal/secrentel/patterns` — Evidence & Secret Intelligence Engine: document seam, scan/correlation/confidence pipeline, offline verification queue, and the compile-once pattern database (library only)
 - `internal/priority` — Attack Surface Intelligence Engine: indicator catalogs, deterministic scoring, correlation, attack paths, recommendations, runtime-pool engine, and cache integration with strict decode re-validation (library only)
+- `internal/detect` — Detection Framework & Rule Engine: rule registration and validation, dependency level scheduling, the fixed detection context, canonical findings, the `detect.rule` cache record, execution metrics, and detector benchmarking (library only; no rules ship with the framework)
 
 ## Common commands
 

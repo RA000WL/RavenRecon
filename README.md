@@ -52,9 +52,17 @@ reduced to scoring signals are matched against two data-driven catalogs
 (53 indicators), every score is a fully explained factor list with
 evidence-tied reconnaissance recommendations, correlated into groups and
 evidence-tied attack-path hypotheses, and served through a bounded,
-cache-integrated engine stage (see "Priority engine (library)" below).
-None of the pipelines has a CLI command yet; the remaining active engines
-(crawling and secret verification) are still later roadmap milestones.
+cache-integrated engine stage (see "Priority engine (library)" below). The
+detection framework (`internal/detect`, phase 10) adds the Detection
+Framework & Rule Engine: reusable detection rules — immutable, validated
+descriptors plus detector functions — execute against the canonical
+knowledge graph on the shared runtime pool with dependency-ordered levels,
+per-rule timeouts, panic isolation, a rule result cache, execution metrics,
+and a canonical Finding model; the framework itself detects nothing and no
+vulnerability-specific rules ship (see "Detection framework (library)"
+below). None of the pipelines has a CLI command yet; the remaining active
+engines (crawling and secret verification) are still later roadmap
+milestones.
 
 The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
 
@@ -97,13 +105,15 @@ data:
 - Domain, Host, IP, Port, Service
 - URL, Endpoint, JavaScript, Parameter
 - Technology, Evidence
+- Finding (phase 10: the canonical detection finding — one structured,
+  evidence-cited judgment a rule produced about one subject asset)
 
 Every asset has a deterministic, namespaced identity for deduplication,
 records provenance ("where did this come from?"), supports deterministic
 merging, and serializes to JSON. See `ARCHITECTURE.md` for details.
 
-Deferred to later phases: Finding, the asset
-store/graph, and the graph correlation engine (the priority
+Deferred to later phases: the asset
+store/graph and the graph correlation engine (the priority
 engine's identity-anchored Correlate, phase 9, is not that engine).
 
 ## Cache and resume
@@ -387,6 +397,81 @@ row is evicted and recomputed in the same run, never served. Outcomes
 follow the house vocabulary: a run with failures or cancellations is
 never `completed`. There is no `ravenrecon priority` command yet — the
 priority engine is a library capability only.
+
+## Detection framework (library)
+
+`internal/detect` (phase 10) is the Detection Framework & Rule Engine: the
+execution engine that runs reusable detection rules against the canonical
+knowledge graph. The framework itself detects nothing — it provides rule
+registration, validation, dependency-ordered scheduling on the shared
+runtime pool, per-rule timeouts with panic isolation, a rule result cache,
+execution metrics, detector benchmarking, and the canonical Finding
+pipeline. Vulnerability-specific rules (XSS, SSRF, BAC, SQLi, CVE
+matching, ...) are future phases; none ship here, and the framework
+contains no browser automation, no exploitation, and no AI.
+
+Rules: every rule is an immutable descriptor — canonical ID, name,
+description, one of 14 categories, semantic version, declared input and
+output domains, dependencies, required asset kinds, estimated cost,
+timeout, author, enabled flag — plus a `Detector` function. The Registry
+validates every rule at registration (metadata completeness, duplicate IDs
+and names, category/version/cost/input/output/asset-kind vocabularies,
+dependency syntax, timeout bounds) and stores deep copies, so a registered
+rule can never be mutated through a caller-held alias. The dependency
+graph is validated before every run: missing references and cycles are
+rejected at startup with the smallest offending rule named.
+
+Context and findings: detectors receive a fixed, immutable Context — the
+normalized corpus domains (assets, relationships, evidence, technologies,
+secret candidates, JavaScript, endpoints), a bounded configuration map, a
+bounded Logger, the cancellation context, and the injected Clock — and
+nothing else. They operate only on structured assets (no raw HTTP, JS, or
+URL parsing — those phases are complete) and return canonical
+`asset.Finding` values: identity (`ruleID@subject`, namespaced by the new
+`finding` kind), category, rule metadata, confidence, evidence records,
+related assets, relationships, priority, status, timestamps, and bounded
+typed metadata — never anonymous maps. The engine validates every finding
+against the rule's own metadata (a rule can never forge another rule's
+findings), the asset model's bounds, and the observed corpus (a finding
+can never cite an asset that was not observed — not as its subject, not
+as a related asset, not as an evidence source), and requires at least one
+evidence record — a judgment that rests on nothing is not representable.
+
+Execution: one bounded `runtime.Pool` per run (no new scheduler); layered
+Kahn elimination computes deterministic dependency levels in
+O(V log V + E) — no quadratic scheduling — and rules within a level
+execute in parallel while a rule runs only after all of its dependencies
+completed (a failed, cancelled, or skipped dependency cascades an honest
+skip). Every detector call runs under its rule's own deadline with panic
+recovery (a panicking rule fails alone), findings stream through an
+optional emit hook, and the report is deterministic: rules sorted by ID,
+findings merged by identity and sorted, counts, aggregate outcome in the
+house vocabulary (skips for disabled rules or absent required asset kinds
+are honest observations, never failures; a run whose retained findings
+were cut at the 4096-finding cap reports incomplete — truncated results
+are never completed). Identical runs are identical up to the findings
+cap; above it, the retained findings are the completion-order prefix.
+
+Cache and metrics: one `detect.rule` record per rule per run,
+cache-before-execute composed around pool jobs exactly like the other
+consumer stages. The key carries the rule ID, the fingerprint of the
+rule's full declared metadata (version included — the documented bump
+contract), the fingerprint of the normalized snapshot (identities plus
+the provenance fields a rule can read: technology version and provenance
+source/reference/confidence, evidence and endpoint provenance
+reference/confidence, JavaScript content hash and size plus provenance
+reference/confidence, and secret provenance source/confidence;
+provenance timestamps deliberately excluded), and
+every configuration entry. Only completed executions are cached — partial
+executions never are — and every decoded record is re-validated through
+the same checks the fresh path applies; a tampered record is evicted and
+recomputed in the same run, never served. Metrics accumulate execution
+time, cache hits and misses, errors, timeouts, panics, and finding counts
+per rule and in aggregate; `BenchmarkDetector` measures any unregistered
+rule against a snapshot with the same isolation and validation.
+
+There is no `ravenrecon detect` command yet — the framework is a library
+capability only.
 
 ## Runtime engine
 

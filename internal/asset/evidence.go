@@ -45,6 +45,11 @@ const (
 	// (Phase 8): pattern matches, entropy assessments, context signals, and
 	// correlation records behind one secret candidate.
 	MethodSecret DetectionMethod = "secret"
+	// MethodDetection marks evidence produced by the detection framework's
+	// rule engine (phase 10): the recorded observation behind a rule's
+	// finding. The indicator is the rule ID; the source is the finding's
+	// subject asset.
+	MethodDetection DetectionMethod = "detect"
 )
 
 // String returns the canonical lowercase method value.
@@ -55,7 +60,7 @@ func (m DetectionMethod) Valid() bool {
 	switch m {
 	case MethodHeader, MethodCookie, MethodHTML, MethodGenerator, MethodMeta,
 		MethodScript, MethodCSS, MethodAttribute, MethodEndpoint, MethodTLS,
-		MethodDNS, MethodSourceMap, MethodJS, MethodSecret:
+		MethodDNS, MethodSourceMap, MethodJS, MethodSecret, MethodDetection:
 		return true
 	}
 	return false
@@ -74,9 +79,9 @@ func ParseDetectionMethod(s string) (DetectionMethod, error) {
 // returned slice is a fresh copy; callers may mutate it freely.
 func KnownMethods() []DetectionMethod {
 	return []DetectionMethod{
-		MethodAttribute, MethodCookie, MethodCSS, MethodDNS, MethodEndpoint,
-		MethodGenerator, MethodHeader, MethodHTML, MethodJS, MethodMeta,
-		MethodScript, MethodSecret, MethodSourceMap, MethodTLS,
+		MethodAttribute, MethodCookie, MethodCSS, MethodDetection, MethodDNS,
+		MethodEndpoint, MethodGenerator, MethodHeader, MethodHTML, MethodJS,
+		MethodMeta, MethodScript, MethodSecret, MethodSourceMap, MethodTLS,
 	}
 }
 

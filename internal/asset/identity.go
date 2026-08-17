@@ -29,7 +29,35 @@ const (
 	// model normalizes the observation; source map content is never parsed
 	// by the asset layer.
 	KindSourceMap Kind = "source_map"
+	// KindFinding identifies a detection finding produced by a rule of the
+	// detection framework (phase 10): a structured, evidence-cited judgment
+	// about one subject asset. Findings are produced, never discovered —
+	// they reference observed assets and carry no verification claim.
+	KindFinding Kind = "finding"
 )
+
+// Valid reports whether k is one of the implemented asset kinds.
+func (k Kind) Valid() bool {
+	switch k {
+	case KindDomain, KindHost, KindIP, KindPort, KindService, KindURL,
+		KindEndpoint, KindJavaScript, KindParameter, KindTechnology,
+		KindEvidence, KindTLSCertificate, KindSecretCandidate, KindSourceMap,
+		KindFinding:
+		return true
+	}
+	return false
+}
+
+// KnownKinds returns every implemented asset kind in canonical sorted order.
+// The returned slice is a fresh copy; callers may mutate it freely.
+func KnownKinds() []Kind {
+	return []Kind{
+		KindDomain, KindEndpoint, KindEvidence, KindFinding, KindHost, KindIP,
+		KindJavaScript, KindParameter, KindPort, KindSecretCandidate,
+		KindService, KindSourceMap, KindTechnology, KindTLSCertificate,
+		KindURL,
+	}
+}
 
 // Identity is a namespaced, deterministic asset key used for deduplication.
 //

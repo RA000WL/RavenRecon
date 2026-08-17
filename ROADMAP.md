@@ -48,7 +48,9 @@ Status: complete
 - [x] identity/deduplication tests
 - [x] serialization tests
 - [ ] persistent asset store
-- [ ] correlation engine
+- [x] correlation engine — landed with Phase 9 as the deterministic
+  identity-anchor `Correlate` grouping in `internal/priority`
+  (relationship-traversal correlation stays deferred, see v0.9)
 - [ ] asset graph storage/traversal
 
 Deferred: Technology, SecretCandidate, Finding (introduced with the phases
@@ -354,6 +356,57 @@ Deferred to future rounds: CLI wiring (a `ravenrecon priority` command is
 NOT part of Phase 9's landed scope), the reporting phase that consumes
 groups, attack paths, and recommendations, and any correlation beyond
 identity-derived anchors (relationship traversal).
+
+---
+
+## Phase 10 — Detection Framework & Rule Engine
+
+Status: complete (library capability; no CLI command yet)
+
+Implemented in `internal/detect` — the Detection Framework & Rule
+Engine. The framework itself detects nothing: it is the execution engine
+reusable detection rules plug into. It landed with: the canonical
+Finding model in the Phase 2 asset model (`asset.Finding` under the new
+`finding` kind, plus the `detect` evidence method); rule registration
+with full startup validation (duplicate IDs and names, metadata
+completeness, category/version/cost/input/output/asset-kind
+vocabularies, dependency syntax, timeout bounds, nil detector) and
+immutable deep-copied storage; the dependency system — layered Kahn
+level scheduling (O(V log V + E), deterministic) with cycle and
+missing-reference rejection and honest cascade skips; the fixed
+detection Context (assets, relationships, evidence, technologies,
+secrets, JavaScript, endpoints, bounded configuration, bounded Logger,
+injected Clock — nothing else) over a bounded, canonical,
+normalize-or-reject Snapshot; execution on the SHARED runtime pool (no
+new scheduler) with per-rule deadlines, panic isolation, streaming emit,
+and deterministic reports; a `detect.rule` cache-before-execute record
+keyed on the rule fingerprint (version included), the snapshot
+fingerprint, and the configuration, with strict decode re-validation and
+eviction — partial executions never cached; per-rule and aggregate
+execution metrics; and a `BenchmarkDetector` measurement helper.
+Vulnerability-specific rules are future phases; none ship here. See
+`ARCHITECTURE.md` ("Detection framework") for the full design and known
+limitations.
+
+- [x] Detection Framework (engine, statuses, deterministic report)
+- [x] Rule Registration (validated, immutable)
+- [x] Rule Scheduler (dependency levels, no quadratic scheduling)
+- [x] Detection Context (fixed domains, bounded)
+- [x] Finding Model (canonical asset.Finding)
+- [x] Evidence Model Extension (`detect` method)
+- [x] Rule Configuration (descriptor + run configuration)
+- [x] Rule Metadata (full descriptor vocabulary)
+- [x] Rule Dependencies (ordering, cycles rejected)
+- [x] Rule Result Cache (`detect.rule`)
+- [x] Rule Categories (14 typed categories)
+- [x] Rule Execution Metrics (per-rule and aggregate)
+- [x] Detector Benchmarking (BenchmarkDetector)
+- [x] Rule Validation (startup + output contract)
+- [x] tests, race tests, and benchmarks (100/500/1000 rules)
+
+Deferred to future phases: any vulnerability-specific rule (XSS, SSRF,
+BAC, SQLi, CVE matching, browser automation, exploitation, AI are all
+out of scope), data flow between dependent rules, and CLI wiring.
 
 ---
 
