@@ -60,9 +60,16 @@ knowledge graph on the shared runtime pool with dependency-ordered levels,
 per-rule timeouts, panic isolation, a rule result cache, execution metrics,
 and a canonical Finding model; the framework itself detects nothing and no
 vulnerability-specific rules ship (see "Detection framework (library)"
-below). None of the pipelines has a CLI command yet; the remaining active
-engines (crawling and secret verification) are still later roadmap
-milestones.
+below). The reporting framework (`internal/report`, phase 11) adds the
+Reporting & Evidence Export engine: a caller-composed run input is
+normalized once into the canonical report model (validated, deduplicated,
+merged, identity-sorted, with statistics, run/error summaries, and a
+digest), and registered, validated reporters render it as deterministic
+JSON, CSV, Markdown, and self-contained HTML exports through atomic
+crash-safe file writes, with export validation before exposure and an
+optional render cache (see "Reporting framework (library)" below). None
+of the pipelines has a CLI command yet; the remaining active engines
+(crawling and secret verification) are still later roadmap milestones.
 
 The JavaScript Intelligence Engine (roadmap v0.8, phase 7) provides:
 
@@ -472,6 +479,46 @@ rule against a snapshot with the same isolation and validation.
 
 There is no `ravenrecon detect` command yet — the framework is a library
 capability only.
+
+## Reporting framework (library)
+
+`internal/report` (roadmap v0.10, phase 11) is the Reporting Framework &
+Evidence Export. Reporting is presentation only: the framework consumes
+the canonical graph, findings, evidence, and metadata the earlier phases
+produced and never rescans a target, never mutates the data it is given,
+and never invents a field.
+
+A caller composes one `Context` — the typed Phase 2 corpus (every asset
+kind, relationships, evidence, findings), the priority engine's surfaces,
+groups, and attack paths, the run's error log, and its
+runtime/cache/execution statistics — and `NewModel` normalizes it exactly
+once: every entry re-validated through the Phase 2 builders (a
+non-canonical entry is rejected, not repaired), deduplicated, merged, and
+identity-sorted, with the statistics engine, the fixed-vocabulary run
+summary, the category-grouped error summary, and a SHA-256 model digest
+computed once. Every format renders from that one canonical model, so
+identical inputs produce byte-identical reports.
+
+Reports register like rules (validated metadata, duplicate-ID rejection)
+and four builtins ship: a versioned compact **JSON** export of the
+complete model, a six-dataset **CSV** export (one table per dataset, with
+spreadsheet-formula injection neutralized in the presentation), a
+human-readable **Markdown** summary with honest row caps, and a
+self-contained static **HTML** report (inline CSS, `<details>` sections,
+vanilla-script search and filtering, no frameworks, no external
+resources, every byte escaped). Every output is validated before it is
+exposed (schema version, CSV shape, Markdown structure, HTML balance),
+written through atomic crash-safe file writes (unique temp file + fsync +
+rename; a failed or cancelled render leaves no file and never overwrites
+the previous good one), into deterministic filenames derived from a
+sanitized base name. The engine runs every active reporter as one job on
+the shared bounded runtime pool with cancellation, streaming, and
+per-render deadlines, and can optionally compose cache-before-execute
+around renders (operation `report.render`) with strict decode
+re-validation — oversized renders are honestly never cached. Benchmarks
+cover the 100 / 1,000 / 10,000 / 100,000 asset targets. There is no
+`ravenrecon report` command yet — the framework is a library capability
+only. See `ARCHITECTURE.md` ("Reporting framework").
 
 ## Runtime engine
 

@@ -412,12 +412,41 @@ out of scope), data flow between dependent rules, and CLI wiring.
 
 ## v0.10 — Reporting
 
-- [ ] JSON
-- [ ] CSV
-- [ ] Markdown
-- [ ] HTML
-- [ ] run summaries
-- [ ] error summaries
+Status: complete (phase 11; library capability; no CLI command yet)
+
+Implemented in `internal/report` — the Reporting Framework & Evidence
+Export. Reporting is presentation only: the framework never rescans a
+target and never mutates the data it is given. It landed with: the
+caller-composed Context seam (typed Phase 2 corpus, priority outputs,
+error log, runtime/cache/execution statistics) under the same
+normalize-or-reject contract as the detection framework's snapshot; the
+canonical report Model built exactly once per run (validated through the
+Phase 2 builders, deduplicated, merged, identity-sorted, with the
+statistics engine, run summary, error summary, and SHA-256 model digest
+computed once); the report Registry (validated metadata — ID, name,
+description, version, output format, compression support, enabled — with
+duplicate-ID/name rejection, mirroring the rule registry); the four
+built-in exporters — versioned deterministic JSON, six-dataset CSV with
+spreadsheet-formula neutralization, human Markdown with honest row caps,
+and a self-contained static HTML report (inline CSS, vanilla-script
+search/filter, `<details>` sections, everything escaped); export
+validation before exposure (schema version, CSV shape, Markdown
+structure, HTML balance); atomic crash-safe file writes (unique temp +
+fsync + rename, sanitized deterministic filenames, directories created
+as needed, safe overwrites, no file left behind on failure); the engine
+on the SHARED runtime pool (one job per report, cancellation, streaming,
+per-render deadlines); an optional `report.render` cache-before-execute
+record with strict decode re-validation, eviction, and an honest
+over-size skip; and tests, race tests, and benchmarks at the documented
+100 / 1,000 / 10,000 / 100,000 asset targets. See ARCHITECTURE.md
+("Reporting framework").
+
+- [x] JSON
+- [x] CSV
+- [x] Markdown
+- [x] HTML
+- [x] run summaries
+- [x] error summaries
 
 ---
 

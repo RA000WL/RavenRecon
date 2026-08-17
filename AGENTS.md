@@ -23,6 +23,7 @@ It should help researchers discover, correlate, prioritize, and report attack su
 - `internal/secrentel`, `internal/secrentel/patterns` — Evidence & Secret Intelligence Engine: document seam, scan/correlation/confidence pipeline, offline verification queue, and the compile-once pattern database (library only)
 - `internal/priority` — Attack Surface Intelligence Engine: indicator catalogs, deterministic scoring, correlation, attack paths, recommendations, runtime-pool engine, and cache integration with strict decode re-validation (library only)
 - `internal/detect` — Detection Framework & Rule Engine: rule registration and validation, dependency level scheduling, the fixed detection context, canonical findings, the `detect.rule` cache record, execution metrics, and detector benchmarking (library only; no rules ship with the framework)
+- `internal/report` — Reporting Framework & Evidence Export: the canonical report model (a normalize-once Context validated, merged, identity-sorted, with statistics, run/error summaries, and a digest), the validated report registry, JSON/CSV/Markdown/HTML exporters, export validation before exposure, atomic crash-safe file writes with deterministic sanitized filenames, and the engine on the shared runtime pool with an optional `report.render` cache record (library only; presentation only — never rescans, never mutates data)
 
 ## Common commands
 

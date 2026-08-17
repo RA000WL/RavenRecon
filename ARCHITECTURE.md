@@ -103,9 +103,26 @@ evidence and rendered reconnaissance recommendations, surfaces correlate
 into groups and evidence-tied attack-path hypotheses, and the engine
 stage composes cache-before-execute (operation `priority.score`) around
 bounded pool jobs with strict decode re-validation (see "Priority
-engine"); it has no CLI command yet. The asset graph store and reports do
-not exist yet; scoring exists only as the priority engine's library-level
-surface judgments.
+engine"); it has no CLI command yet. The detection framework (phase 10;
+`internal/detect`) is the latest library-level stage — the Detection
+Framework & Rule Engine: immutable, validated rules execute against a
+normalized knowledge-graph snapshot on the shared runtime pool with
+dependency-ordered levels, per-rule deadlines, panic isolation, a
+`detect.rule` cache-before-execute record with strict decode
+re-validation, execution metrics, and the canonical Finding model the
+Phase 2 asset model gained with this phase (see "Detection framework");
+it has no CLI command yet. The reporting framework (phase 11;
+`internal/report`) is the latest library-level stage — the Reporting
+Framework & Evidence Export: a caller-composed Context is normalized once
+into the canonical report Model (validated through the Phase 2 builders,
+deduplicated, merged, identity-sorted, with statistics, run/error
+summaries, and a digest computed exactly once), and validated, registered
+reporters (JSON, CSV, Markdown, HTML) render it on the shared runtime
+pool through atomic crash-safe file writes with an optional
+`report.render` cache-before-execute record (see "Reporting framework");
+it has no CLI command yet. The asset graph store does not exist yet;
+scoring exists only as the priority engine's library-level surface
+judgments.
 
 ## Asset model
 
@@ -127,9 +144,13 @@ The technology asset landed with phase 6.5 (`asset.Technology`,
 (`asset.SecretCandidate`). Phase 8 extended the secret vocabulary to 35
 canonical types, added the `secret` detection method for evidence records,
 and added the `url -> secret_candidate` and `secret_candidate -> evidence`
-relationship kinds (see "Secret intelligence").
+relationship kinds (see "Secret intelligence"). Phase 10 added the
+canonical Finding (`asset.Finding`, identified by "ruleID@subject" under
+the `finding` kind) and the `detect` evidence method for records produced
+by rule execution.
 
-Deferred to later phases: Finding.
+Deferred to later phases: the asset store/graph and the graph correlation
+engine.
 
 Every implemented asset has:
 
@@ -2151,6 +2172,406 @@ and the warm-run bench).
   NaN); the decode-side NaN guard is defense in depth behind the cache
   layer's own corrupt classification, and is pinned by unit tests.
 
+## Detection framework
+
+The detection framework (phase 10; `internal/detect`) is a library-level
+engine with no CLI command yet: the Detection Framework & Rule Engine. It
+executes reusable detection rules against the canonical knowledge graph
+and produces canonical Findings. The framework itself detects nothing —
+there are no vulnerability-specific rules in this phase (XSS, SSRF, BAC,
+SQLi, CVE matching, browser automation, exploitation, and AI are all
+explicitly out of scope and all deferred to future phases); the framework
+is only the execution engine future detectors plug into.
+
+### Finding model
+
+The Finding landed in the Phase 2 asset model (`asset.Finding`, following
+the Technology and SecretCandidate precedent): one structured,
+evidence-cited judgment a rule produced about one subject asset. Fields:
+identity, category, rule ID and name (denormalized), subject, confidence
+in [0,1] (NaN rejected), evidence records (Phase 2 `asset.Evidence`, at
+least one REQUIRED — a judgment that rests on nothing is not
+representable), related assets, related-asset relationships (typed edges
+between the cited assets; a finding is a judgment about assets, never a
+graph node with its own edges), priority (an attention-ordering label —
+info/low/medium/high/critical — never a severity or exploitability
+claim), status (open; dismissed reserved for downstream bookkeeping),
+created/updated timestamps, and metadata as a bounded TYPED
+`map[string]string` (16 entries, 64-byte keys, 256-byte values — never an
+anonymous map). The identity is "ruleID@subject" (each component
+percent-encoded) under the new `finding` kind, so the same rule firing
+twice on the same subject is one finding that merges
+(`MergeFindings`: earliest created, latest updated, max confidence,
+denormalized fields from the higher-confidence side with a total-order
+tie-break, unioned deduplicated evidence/related/relationships) — and a
+finding can never collide with any other asset kind. The evidence
+vocabulary gained the `detect` method (mirroring phase 8's `secret`): the
+indicator is the rule ID, the source is the finding's subject.
+
+### Rules and registration
+
+A Rule is an immutable descriptor plus a Detector function:
+`func(ctx context.Context, dctx *Context) ([]asset.Finding, error)`. The
+descriptor carries the canonical ID (lowercase slug charset), name,
+description, one of 14 categories (information, misconfiguration,
+exposure, authentication, authorization, configuration, discovery, cloud,
+api, javascript, secrets, infrastructure, business_logic, custom), a
+"major.minor.patch" version, declared input domains (exactly the Context
+domains), outputs (findings — evidence and relationships ride ON
+findings), dependencies (≤ 16 rule IDs), required asset kinds (validated
+through the new `asset.Kind.Valid`/`KnownKinds`), estimated cost class,
+timeout (> 0, ≤ 10 min), author, and the enabled flag. The Registry
+validates everything at Register — metadata completeness, duplicate IDs,
+duplicate names (case-insensitive), vocabularies, dependency syntax, nil
+detector — and rejects invalid rules at startup, never at execution.
+Registered rules are deep-copied on the way in and on the way out, so no
+caller-held alias can mutate a registered rule. The registry cap is
+FIXED and INTENTIONAL at 4096 rules — far above the documented
+100/500/1000 performance targets, and there is no requirement to exceed
+it.
+
+### Dependency model
+
+Dependencies order execution; they do not (yet) flow data. Layered Kahn
+elimination computes deterministic dependency levels in O(V log V + E)
+(no quadratic scheduling): level 0 holds every dependency-free rule,
+level n+1 every rule whose dependencies all live in earlier levels, IDs
+sorted within each level. Cycles and missing references are rejected
+(before every run, and by `Registry.Validate` at startup) with the
+smallest offending rule named. At execution, a rule runs only after every
+dependency COMPLETED; a failed, cancelled, or skipped dependency cascades
+an honest skipped result naming the dependency and its status. Extending
+the Context with prior-rule outputs is documented future work.
+
+### Detection context and execution
+
+`Snapshot` is the caller-composed run input: the canonical structured
+corpus (core assets as identities, relationships, evidence, technologies,
+secret candidates, JavaScript, endpoints). It is NOT untrusted tool
+output — every entry must be a canonical Phase 2 value;
+`normalizeSnapshot` validates each entry (round-trips through the Phase 2
+builders), bounds every domain (assets 100k, relationships 200k, evidence
+100k, technologies 50k, secrets 50k, JavaScript 50k, endpoints 100k —
+over-bound input is REJECTED, never silently truncated, because
+truncating input would silently change findings), deduplicates through
+the Phase 2 merge primitives, sorts by identity, and derives the observed
+identity set plus the per-kind census. The `Context` handed to detectors
+carries exactly: the seven corpus domains, the bounded configuration map
+(64 entries), a bounded Logger (256 retained entries, oversized messages
+truncated, excess counted), and the injected Clock — nothing else; the
+cancellation context is the detector's first argument. Rules operate only
+on these structured domains: no raw HTTP parsing, no JS parsing, no URL
+parsing (those phases are complete).
+
+The engine deliberately passes ONE Context to every rule of a run: the
+same immutable snapshot (all seven corpus domains), bounded Config map,
+bounded Logger, and injected Clock are shared across every rule, and
+rules within a level execute in parallel on the shared runtime pool. The
+Context is immutable by contract, not by enforcement — a rule must not
+mutate it or any state it references, and a mutating rule is a data race
+by definition. The engine neither detects nor isolates such violations:
+rules are trusted, in-repo code, and a rule that mutates its Context is
+a rule bug, not an engine hazard.
+
+One bounded `runtime.Pool` per run owns all scheduling (no new
+scheduler): exactly one job per rule, per-job deadline = the rule's own
+timeout (belt: the pool's deadline; suspenders: the engine wraps the
+detector call in `context.WithTimeout`), rules within a level in
+parallel, levels strictly ordered. Every level's wait is
+cancellation-aware (a resolution channel per level; jobs dropped by a
+forced shutdown keep honest cancelled placeholders, and EVERY registered
+rule appears in the report). Detector calls are panic-contained: a
+panicking rule fails alone with a structured error (metrics count it),
+never taking down the worker, the run, or sibling rules. Findings
+validate against the framework's output contract (below), merge by
+identity, stream through an optional per-finding emit hook (hook panics
+and errors are contained as run diagnostics — findings are never lost),
+and land in the deterministic Report: rules sorted by ID, findings sorted
+by identity under the 4096-finding run cap (cut surfaced through
+FindingsTruncated, never silent — and the run's outcome becomes
+incomplete: truncated results are never completed), counts, aggregate
+outcome in the house vocabulary (any cancelled → cancelled; a truncated
+findings list → incomplete even when every attempted rule completed;
+failed alongside completed → incomplete; all attempted failed → failed;
+skipped rules — disabled, required-kind-absent, or cascaded — are honest
+observations that do not force a non-completed outcome), the bounded rule
+logs, and cache-hit counts. Two identical runs under an identical
+injected Clock produce identical reports (pinned by test) — identical up
+to the findings cap: above the 4096-finding cap the retained findings
+are the completion-order prefix, which is not deterministic across runs.
+Execution timings live in Metrics, never the Report.
+
+The output contract (enforced identically for fresh and cache-served
+findings): the finding re-validates canonically through
+`asset.NewFinding` and round-trips byte-identically; the denormalized
+rule metadata (RuleID, RuleName, Category) matches the EXECUTING rule
+exactly — the finding-corruption guard that makes it impossible for a
+rule to forge another rule's findings; the priority and status labels are
+known vocabulary; the subject, every related asset, and every evidence
+record's source asset were OBSERVED in the corpus (findings can never
+cite assets the earlier phases never produced — not as the subject, not
+as a related asset, not as an evidence source); and an optional
+"rule_version" metadata entry must equal the
+executing rule's version. A rule that returns more than 256 findings, or
+any contract-violating finding, fails with a structured error.
+
+### Cache behavior
+
+One `detect.rule` record per rule per run, cache-before-execute composed
+around pool jobs exactly like the other consumer stages (the runtime pool
+stays cache-independent). The key (`cache.NewKey`) carries: the
+operation; the detect `SchemaVersion`; the rule ID (the target) plus the
+fingerprint of the rule's full declared metadata — version included; the
+documented contract is that a rule's Version is bumped whenever its
+detector logic changes, so a bump invalidates its cached results; the
+fingerprint of the normalized snapshot — identities plus exactly the
+provenance and attribute fields a rule can read through the Context:
+technology version and provenance (source, reference, confidence);
+evidence and endpoint provenance (reference, confidence — the evidence
+identity already embeds the source asset); JavaScript content hash and
+size plus provenance (reference, confidence); and secret provenance
+(source, confidence). Relationships carry no provenance in the asset
+model, so their edge ID is the complete observable. Provenance
+timestamps (DiscoveredAt) are deliberately excluded from every form
+(echoed metadata that changes every run while
+producing identical findings); and every run configuration entry
+(prefixed). Only COMPLETED executions are cached — partial executions
+(failed, timed out, cancelled, panicked) are never stored, never served.
+Decode re-validation is strict: envelope (status, operation, target,
+payload version) plus EVERY finding through the same output-contract
+validation; a rejected record is deleted (evicted) and recomputed in the
+same run, never served.
+
+### Metrics and benchmarking
+
+`Metrics` accumulates — per rule and in aggregate — executions, total
+execution time, findings, errors, timeouts, panics, and cache hits and
+misses; snapshots are consistent and per-rule stats sort by ID; a nil
+Metrics is a no-op. `BenchmarkDetector` measures any rule (registered or
+not) against a snapshot: bounded iterations, each under the rule's own
+deadline with the engine's panic isolation, findings validated through
+the same contract, deterministic min/max/mean/median duration summary.
+
+### Security considerations
+
+- Panic isolation: detector and emit-hook panics are recovered and
+  contained as structured per-rule errors or bounded run diagnostics; a
+  malicious rule cannot crash the run or corrupt sibling results.
+- Finding corruption: the executing-rule metadata match makes cross-rule
+  forgery unrepresentable; observed-corpus membership makes fabrication
+  unrepresentable; both checks run identically on cache-decoded records.
+- Cache poisoning: strict decode re-validation with eviction-and-recompute
+  (see "Cache behavior"); the schema version, rule fingerprint, snapshot
+  fingerprint, and configuration all enter the key.
+- Resource exhaustion: bounded pool and queue (backpressure), per-rule
+  deadlines, snapshot bounds (reject, never truncate), per-rule and
+  per-run finding caps, bounded diagnostics, bounded logs, bounded
+  metadata, and the bounded registry.
+- Dependency loops: rejected before any work executes, deterministically.
+- Inherent limit (mirroring the runtime engine's documented one): a
+  detector that ignores its context can delay its level's barrier and the
+  run until it returns — contexts and deadlines bound cooperative
+  detectors; no hard preemption exists or is claimed.
+
+### Known limitations
+
+- Library capability only: no `ravenrecon detect` CLI command.
+- No rules ship with phase 10; the framework is the plug-in surface for
+  future detector phases.
+- Dependencies order execution but do not yet flow data between rules;
+  the Context's domains are the fixed pre-run corpus (documented future
+  work).
+- The detector closure is not fingerprintable; the version-bump contract
+  (bump Version when logic changes) is the cache-coherence mechanism.
+- Streaming order across parallel rules is completion order; the REPORT
+  is the deterministic artifact.
+- Findings carry a researcher-attention priority, never a severity; no
+  verification, exploitation, or submission is represented or claimed.
+- All tests and benchmarks are hermetic: synthetic corpora and a real
+  filesystem-backed cache, never the public Internet.
+
+## Reporting framework
+
+`internal/report` (phase 11) is the Reporting Framework & Evidence Export:
+it consumes the canonical graph, findings, evidence, and metadata the
+earlier phases produced and exports them as deterministic, reproducible
+reports. Reporting is presentation only — the framework never rescans a
+target, never mutates the data it is given, and never invents a field.
+It is a library capability only; there is no `ravenrecon report` command
+yet.
+
+### Report lifecycle
+
+1. **Context** — the caller composes one run input: the typed Phase 2
+   corpus (domains, hosts, IPs, ports, services, URLs, endpoints,
+   JavaScript, parameters, technologies, secrets, evidence, findings, TLS
+   certificates, source maps, relationships), the priority engine's
+   outputs (surfaces, groups, attack paths), the run's error log, and the
+   run's runtime/cache/execution statistics. A Context entry that is not
+   a canonical Phase 2 value is rejected with a structured error naming
+   it — the same normalize-or-reject snapshot contract the detection
+   framework enforces. The engine reads no wall clock: StartedAt/EndedAt
+   are caller-declared inputs, so identical inputs produce identical
+   reports.
+2. **Model** — `NewModel` builds the canonical report model exactly once
+   per run: every list is validated through the Phase 2 builders,
+   deduplicated by identity, merged through the Phase 2 merge primitives,
+   and sorted by canonical identity; surfaces, groups, and attack paths
+   are deduplicated by identity and ordered by (score desc, identity
+   asc); the recommendations are the deterministic `priority.Recommend`
+   projection (capped at 10,000); the error summary groups by category
+   with totals and bounded samples; and the statistics, run summary, and
+   SHA-256 model digest are computed once. The digest covers every byte
+   the exports render — corpus identities and observations, priority
+   outputs and factors, recommendations, statistics, summaries, error
+   records, and run metadata — so any export-visible change (a technology
+   version, a finding's confidence, a factor list) changes the digest and
+   therefore the render-cache key. Every renderer — current and future —
+   renders from this one model, so no format re-validates, re-sorts, or
+   re-traverses the corpus.
+3. **Registry** — reports register like rules: `Reporter` carries the
+   validated metadata (bounded lowercase ID, name, description, version,
+   output format, compression support, enabled flag) plus the render
+   function and an optional output validator. Duplicate IDs and duplicate
+   case-insensitive names are rejected at registration; the registry is
+   concurrent-read safe and optionally sealable. Four builtins ship
+   (json, csv, markdown, html) through `NewDefaultRegistry`; future
+   formats plug into the same contract.
+4. **Render + commit** — the engine runs every active reporter as exactly
+   one job on one bounded `runtime.Pool` (no new scheduler; default 4
+   workers, bounded queue, per-render deadline, cancellation honored
+   between output units). Each job renders into a `Sink`: every part
+   writes to a unique temporary file in the output directory (created as
+   needed, 0700/0600), is flushed and fsynced, VALIDATED on the temp
+   file, and only then atomically renamed into place. A cancelled,
+   failed, or invalid render therefore never leaves a file behind, and a
+   failed render never overwrites the previous good one. Filenames are
+   deterministic (`<base>.<ext>`, `<base>.<part>.<ext>` for CSV datasets,
+   `.gz` when compressed), derived from a sanitized base name — no
+   untrusted string ever reaches a filesystem path. Per-report outcomes
+   follow the house vocabulary (completed/failed/cancelled/skipped), and
+   the aggregate outcome folds them with the usual precedence.
+5. **Validation** — every output is validated BEFORE exposure: JSON must
+   decode as exactly one value carrying the framework's schema version;
+   CSV must reparse completely with a header row and a uniform field
+   count; Markdown must start with a heading and carry balanced code
+   fences; HTML must be non-empty, closed, and carry balanced
+   `<details>` sections. Custom reporters may install their own
+   validator; the default requires non-empty (and decompressible)
+   output.
+
+### Output formats
+
+- **JSON** — the complete canonical model as one compact, versioned
+  (`schema_version`), machine-readable document: every dataset in
+  identity order, the statistics, run summary, error summary,
+  recommendations, and the model digest. Struct field order is fixed and
+  map keys are encoder-sorted, so two renders of one model are
+  byte-identical; HTML escaping is disabled so `<`, `>`, and `&` appear
+  literally, as in the data.
+- **CSV** — one table per dataset (hosts, urls, endpoints, technologies,
+  secrets, findings), each with a header row even when empty. Every field
+  passes `csvSafe`: a field beginning with `=`, `+`, `-`, `@`, tab, or CR
+  is prefixed with a single quote, neutralizing spreadsheet formula
+  injection in the presentation (the JSON export carries the exact
+  bytes). UTF-8 is preserved; no BOM.
+- **Markdown** — the human summary: target, summary, interesting assets
+  (top 20 scored surfaces with their top factor), technologies, secrets,
+  top findings (20), attack surface (top 20 groups, top 10 paths),
+  recommendations, statistics, and errors. Long lists are cut at
+  documented bounds (200 rows per list) with honest "_And N more — see
+  the JSON and CSV exports._" lines.
+- **HTML** — a self-contained static report: inline CSS, native
+  `<details>` collapsible sections, a global search box and a
+  finding-priority filter driven by a small inline vanilla script (no
+  frameworks, no external resources; the document is fully meaningful
+  without scripting). Tables are capped at 1,000 rows with the same
+  honest truncation note. Every interpolated byte passes
+  `html.EscapeString`.
+
+### Run summary, error summary, statistics
+
+The run summary is the fixed-vocabulary block (target, times, duration,
+assets, hosts, URLs, JavaScript, secrets, findings, rules, relationships,
+recommendations, cache hits/misses, worker time). The error summary
+groups the run's bounded error records into the fixed category vocabulary
+(dns, http, tls, parsing, cache, timeout, cancellation, tool_failure,
+permission, unknown) with per-category totals, unique counts, and at most
+8 samples; `ClassifyError` derives categories structurally (context
+cancellation, deadlines, DNS errors, URL errors, permission errors,
+net-level timeouts) and never guesses from message text — callers that
+know an error's stage record an explicit category. The statistics engine
+computes the dataset census once (per-kind counts, asset total,
+relationship count, surface/group/path/recommendation/rule counts, the
+runtime/cache/execution statistics, and the duration).
+
+### Render cache
+
+The engine can optionally compose cache-before-execute around renders
+through the existing `internal/cache` (operation `report.render`), off by
+default (no cache configured). The key covers the operation, the model
+digest, the reporter ID, the reporter's declared version (the same bump
+contract as detection rules), the output format, and whether the output
+is compressed — nothing timing- or path-derived. A hit serves the exact
+stored bytes through the same atomic pipeline with zero rendering; the
+record is strictly re-validated on decode (identity match on report ID,
+version, format, and digest; declared part sizes must equal their bytes;
+the total must sit under the cacheable bound) and a violating record is
+evicted and re-rendered in the same run, never served. Oversized renders
+(total over 11 MiB, comfortably inside the cache's 16 MiB record bound
+after base64 inflation) are honestly never cached — nothing is truncated
+to fit a cache record. A failed store never fails the committed render.
+
+### Performance and resource bounds
+
+The documented targets (100 / 1,000 / 10,000 / 100,000 assets) are
+covered by benchmarks: at 100,000 mixed assets the one-time model build
+takes ~1.1 s, the JSON export ~0.6 s, and the CSV export ~0.2 s
+(measured, not extrapolated; Markdown and HTML are bounded by their row
+caps). Every renderer streams through a 64 KiB buffered writer — no
+format buffers a whole report in memory — and every model list is bounded
+by a fixed constant, with over-bound input rejected outright rather than
+silently truncated.
+
+### Reporting security considerations
+
+- HTML escaping: every dynamic byte in the HTML export passes
+  `html.EscapeString` in text and quoted-attribute contexts; the
+  injection tests pin that hostile values (script tags, event-handler
+  attributes, SQL-ish strings) never reach the document raw.
+- CSV injection: `csvSafe` neutralizes spreadsheet formula prefixes in
+  the CSV presentation only; JSON remains byte-exact.
+- Path traversal: output filenames derive from `sanitizeBaseName`
+  (lowercase, `[a-z0-9.-]` only, runs collapsed, both ends trimmed,
+  bounded, non-empty) plus framework-vocabulary parts and extensions —
+  no target- or caller-derived string reaches a path unsanitized, and
+  the tests pin traversal-shaped inputs.
+- Unsafe temporary files: every part renders into a `os.CreateTemp`
+  file (0600, created in the output directory), fsynced before rename;
+  aborted renders remove their temps, and no temp file is ever read as a
+  report.
+- Resource exhaustion: fixed bounds on every model list, error log, and
+  recommendation projection; streamed rendering; per-render deadlines;
+  the bounded pool; and the cacheable-render cap.
+- Secret leakage: the exports present exactly what the caller's corpus
+  carries — secret candidates are detection-only values the secret
+  engine already bounded and truncated; the framework adds no redaction
+  layer and no new secret surface (error records are caller-composed and
+  message-bounded).
+
+### Known limitations
+
+- Library capability only: no CLI command.
+- Multi-part commits (CSV) are atomic per file, not transactional across
+  files.
+- The HTML and Markdown exports are deliberately capped summary views;
+  the complete datasets live in JSON and CSV only.
+- The render cache stores base64-encoded bytes; at the 11 MiB cap a
+  cached render re-materializes in memory during a cache hit (bounded,
+  and the cache is optional and off by default).
+- Reports render from the in-memory corpus; there is no persistent asset
+  store to reload a past run's graph from yet (deferred roadmap work).
+
 ## Configuration precedence
 
 Future configuration should follow:
@@ -2232,6 +2653,20 @@ Implemented:
   engines, explicit false-positive suppression, a `secret.scan`
   cache-before-execute record with strict decode re-validation, and an
   offline verification queue (`internal/secrentel`)
+* priority intelligence (see "Priority engine" above, phase 9): a
+  library-level Attack Surface Intelligence Engine over scoring signals
+  with two compile-once indicator catalogs, fully explained factor-list
+  scores, deterministic correlation, evidence-tied attack-path
+  hypotheses, rendered reconnaissance recommendations, and a
+  cache-integrated bounded engine stage (`internal/priority`)
+* detection framework (see "Detection framework" above, phase 10): a
+  library-level Detection Framework & Rule Engine — the canonical
+  `asset.Finding` model, rule registration with startup validation,
+  dependency-ordered level scheduling on the shared runtime pool,
+  per-rule deadlines with panic isolation, the fixed detection Context,
+  a `detect.rule` cache-before-execute record with strict decode
+  re-validation, execution metrics, and detector benchmarking
+  (`internal/detect`; no rules ship with the framework)
 
 Planned, not yet implemented:
 
@@ -2240,4 +2675,4 @@ Planned, not yet implemented:
 * asset store, graph, and graph correlation engine (the priority
   engine's identity-anchored Correlate is landed; relationship traversal
   is not)
-* reporting and terminal UI
+* reporting CLI front-end and terminal UI
