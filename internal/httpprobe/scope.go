@@ -91,14 +91,19 @@ type RedirectHop struct {
 func recordHop(cur asset.URL, loc string, domain asset.Domain, clock runtime.Clock) (RedirectHop, bool) {
 	base, err := url.Parse(cur.String())
 	if err != nil {
-		// A canonical asset URL always parses; keep the raw Location as the
-		// observation and never follow.
-		return RedirectHop{Target: loc, InScope: false}, false
+		// A canonical asset URL always parses; keep the defensive path.
+		// Never echo the raw Location: url.Parse rejects control bytes, so
+		// a raw string that fails here is sanitized (userinfo and control
+		// bytes stripped) and never followed.
+		return RedirectHop{Target: sanitizeLocation(loc), InScope: false}, false
 	}
 	ref, err := url.Parse(loc)
 	if err != nil {
-		// Unparseable Location: observed as-is, never requested.
-		return RedirectHop{Target: loc, InScope: false}, false
+		// Unparseable Location — for example an out-of-range port with
+		// embedded userinfo (http://user:supersecret@evil.net:99999/x):
+		// observed in sanitized form, never requested, and NEVER echoed
+		// verbatim into observations, reports, or cache records.
+		return RedirectHop{Target: sanitizeLocation(loc), InScope: false}, false
 	}
 	resolved := base.ResolveReference(ref)
 
@@ -201,4 +206,56 @@ func canonicalizeTarget(u *url.URL) string {
 		out += "?" + q
 	}
 	return out
+}
+
+// sanitizeLocation renders an UNPARSEABLE Location header value as a safe
+// observation string. The raw header is never returned as a target: control
+// bytes are stripped, userinfo is stripped (credentials in a hostile
+// Location must never be echoed), and when the sanitized result parses it is
+// canonicalized through canonicalizeTarget (the same display form used for
+// parseable out-of-scope hops). When even the sanitized string does not
+// parse — for example an out-of-range port — the sanitized string itself is
+// the best-effort display form. The result is display data only: it is never
+// parsed back into the asset model and never requested.
+func sanitizeLocation(loc string) string {
+	// Strip control bytes first so no raw server byte can survive into an
+	// observation, a report, or a cache record.
+	var b strings.Builder
+	b.Grow(len(loc))
+	for i := 0; i < len(loc); i++ {
+		if c := loc[i]; c >= 0x20 && c != 0x7f {
+			b.WriteByte(c)
+		}
+	}
+	clean := stripLocationUserinfo(b.String())
+	if u, err := url.Parse(clean); err == nil {
+		return canonicalizeTarget(u)
+	}
+	return clean
+}
+
+// stripLocationUserinfo removes the userinfo part of a URL string: anything
+// between the scheme separator "://" and the last '@' that precedes the
+// first '/', '?' or '#'. The '@' separator itself is removed with it, so
+// credentials (user and password) can never be echoed. A string without
+// "://" has no authority to carry userinfo and is returned unchanged, as is
+// a string whose only '@' characters sit in the path, query, or fragment.
+func stripLocationUserinfo(s string) string {
+	schemeEnd := strings.Index(s, "://")
+	if schemeEnd < 0 {
+		return s
+	}
+	// The authority runs from after "://" to the first '/', '?' or '#'.
+	authStart := schemeEnd + 3
+	authEnd := len(s)
+	for _, c := range []byte{'/', '?', '#'} {
+		if i := strings.IndexByte(s[authStart:], c); i >= 0 && authStart+i < authEnd {
+			authEnd = authStart + i
+		}
+	}
+	at := strings.LastIndexByte(s[authStart:authEnd], '@')
+	if at < 0 {
+		return s
+	}
+	return s[:authStart] + s[authStart+at+1:]
 }

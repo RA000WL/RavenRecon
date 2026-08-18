@@ -3,6 +3,7 @@ package techintel
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -13,18 +14,23 @@ import (
 const Operation = "tech.detect"
 
 // techKey builds the cache key for one observation's detection run. The key
-// covers the observation identity, the fingerprint database schema version
+// covers the observation identity; the fingerprint database schema version
 // (bumping fingerprints.SchemaVersion invalidates every cached detection by
-// construction), and the sources bitmask (sorted letters: b body, c cookies,
-// d DNS, e endpoint, h headers, t TLS). Timings, concurrency, the status
-// code, and the fixed analysis caps never enter keys.
-func techKey(o Observation, schema int) (cache.Key, error) {
+// construction); the fingerprint database CONTENT digest
+// (fingerprints.DB.Digest — ANY data-only edit to the fingerprint tables,
+// with no schema bump, changes the digest and invalidates every cached
+// detection, so stale detections can never be replayed after a table
+// edit); and the sources bitmask (sorted letters: b body, c cookies, d DNS,
+// e endpoint, h headers, t TLS). Timings, concurrency, the status code, and
+// the fixed analysis caps never enter keys.
+func techKey(o Observation, schema int, dbDigest string) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    o.identity().String(),
 		Config: map[string]string{
-			"schema":  fmt.Sprintf("%d", schema),
-			"sources": sourcesMask(o),
+			"schema":    fmt.Sprintf("%d", schema),
+			"db_digest": dbDigest,
+			"sources":   sourcesMask(o),
 		},
 	})
 }
@@ -156,8 +162,8 @@ func decodeStoredTech(rec cache.Record, o Observation, wantMask string, capTech,
 
 	for i, t := range s.Technologies {
 		score := t.Prov.Confidence
-		if score < 0 || score > 1 {
-			return nil, fmt.Errorf("technology %q score %.3f out of [0,1]", t.Name, score)
+		if err := validateStoredScore(t.Name, score); err != nil {
+			return nil, err
 		}
 		// Canonical identity: the stored technology must round-trip through
 		// the asset constructor unchanged.
@@ -199,6 +205,21 @@ func decodeStoredTech(rec cache.Record, o Observation, wantMask string, capTech,
 		}
 	}
 	return &s, nil
+}
+
+// validateStoredScore enforces the stored-score contract on one decoded
+// technology. NaN is rejected explicitly (defense in depth): encoding/json
+// can neither marshal nor unmarshal a NaN float, so a payload stored on
+// disk can never carry one — this guard covers a tampered in-memory record
+// or a future non-JSON storage format. A NaN score must never pass the
+// [0,1] bounds (both comparisons are false for NaN) and reach
+// levelForScore, where it would silently fall through every threshold to
+// LevelUnknown.
+func validateStoredScore(name string, score float64) error {
+	if math.IsNaN(score) || score < 0 || score > 1 {
+		return fmt.Errorf("technology %q score %v is NaN or out of [0,1]", name, score)
+	}
+	return nil
 }
 
 // methodPossible reports whether a detection method can ever fire under a

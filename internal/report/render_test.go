@@ -257,26 +257,86 @@ func TestRenderMarkdownDeterministic(t *testing.T) {
 
 func TestRenderMarkdownEscapesCellsExactlyOnce(t *testing.T) {
 	// A pipe- and backslash-carrying value must render inside ONE cell:
-	// the emitted "\|" must not be re-escaped into a literal backslash
-	// plus a live delimiter, which would split the row in GFM.
-	m := modelWithSecrets(t, "token|with|pipes", `C:\temp\keys|admin`)
+	// backslashes are doubled first and pipes escaped exactly once, so a
+	// literal backslash-pipe value ("f\|g") can never re-parse as an
+	// escaped backslash followed by a live delimiter, which would split
+	// the row in GFM.
+	m := modelWithSecrets(t,
+		"token|with|pipes",
+		`C:\temp\keys|admin`,
+		`a|b`,
+		`c\d|e`,
+		`f\|g`, // literal backslash immediately before the pipe
+	)
 	out := string(renderToMem(t, builtin(t, "markdown"), m)[""])
-	if !strings.Contains(out, `token\|with\|pipes`) {
-		t.Fatalf("markdown lost the single-escaped pipe cell")
-	}
-	if strings.Contains(out, `token\\|with`) {
-		t.Fatalf("markdown double-escaped the pipe (backslash + live delimiter)")
-	}
-	if !strings.Contains(out, `C:\temp\keys\|admin`) {
-		t.Fatalf("markdown lost the single-escaped backslash+pipe cell")
-	}
-	if strings.Contains(out, `C:\temp\keys\\|admin`) {
-		t.Fatalf("markdown double-escaped the backslash+pipe cell")
+	for _, cell := range []string{
+		`token\|with\|pipes`,    // pipes escaped exactly once
+		`a\|b`,                  // plain pipe cell
+		`c\\d\|e`,               // bare backslash doubled, pipe escaped
+		`C:\\temp\\keys\|admin`, // backslashes doubled, pipe escaped
+		`f\\\|g`,                // backslash-pipe: odd backslash run + escaped pipe
+	} {
+		if !strings.Contains(out, cell) {
+			t.Fatalf("markdown lost the escaped cell %q", cell)
+		}
 	}
 	// The header must stay escaped too (framework vocabulary, but the
 	// choke point applies to every cell).
 	if !strings.Contains(out, "| metric | value |") {
 		t.Fatalf("markdown header row malformed")
+	}
+	// No table row may split: every row must keep exactly the header's
+	// GFM cell structure (escaped pipes do not count as boundaries).
+	assertMarkdownTablesIntact(t, out)
+}
+
+// markdownCellCount counts the cell-boundary tokens of one Markdown table
+// row the way GFM parses them: a pipe is a delimiter unless the backslash
+// run immediately before it is ODD (the trailing backslash escapes the
+// pipe). The fixed mdEscape only ever emits odd backslash runs before a
+// pipe (2N+1 = doubled content backslashes plus the escape), so a content
+// pipe can never be miscounted as a boundary, and framework pipes (the
+// row delimiters, preceded by spaces) have a zero run and always count.
+func markdownCellCount(line string) int {
+	cells := 1
+	run := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			run++
+		case '|':
+			if run%2 == 0 {
+				cells++
+			}
+			run = 0
+		default:
+			run = 0
+		}
+	}
+	return cells
+}
+
+// assertMarkdownTablesIntact checks every table in a rendered Markdown
+// document: each consecutive run of pipe-led lines must keep the cell
+// count of the table's first (header) row — a split cell, were one
+// emitted, would change the count mid-table.
+func assertMarkdownTablesIntact(t *testing.T, out string) {
+	t.Helper()
+	want := 0
+	inTable := false
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "|") {
+			inTable = false
+			continue
+		}
+		n := markdownCellCount(line)
+		if !inTable {
+			want = n
+			inTable = true
+		}
+		if n != want {
+			t.Fatalf("table row breaks the header's cell structure (header %d boundary tokens, row %d): %q", want, n, line)
+		}
 	}
 }
 

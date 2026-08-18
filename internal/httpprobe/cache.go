@@ -21,23 +21,40 @@ const Operation = "http.probe"
 // probeKey derives the Phase 3 cache key for one probe target.
 //
 // The key contains every input that materially changes the result: the
-// operation ("http.probe") and the canonical Phase 2 URL identity of the
-// probe target ("url:http://example.com" — raw input never reaches a key,
-// and the scheme is part of the identity, so the http and https probes of
-// one host are distinct keys). The request shape is fixed (GET, no body, a
-// fixed RavenRecon user agent) and the redirect policy and the caps
-// (MaxRedirects, MaxHeaderBytes, MaxHeaders, MaxBodyBytes) are fixed
-// constants, not configuration — so, like the DNS pipeline's answer cap,
-// they must never enter the key: a completed entry written under the
-// current caps stays valid under any future caps that only retain more,
-// and truncated entries are stored incomplete (never served) under every
-// cap. Timings, timeouts, concurrency, rate limits, and the transport
-// (trust roots, dial routing) never enter the key either — exactly like
-// the DNS pipeline, which never hashes the resolver.
-func probeKey(target asset.URL) (cache.Key, error) {
+// operation ("http.probe"), the canonical Phase 2 URL identity of the probe
+// target ("url:http://example.com" — raw input never reaches a key, and the
+// scheme is part of the identity, so the http and https probes of one host
+// are distinct keys), AND the canonical declared domain. The domain is a key
+// input because the redirect scope boundary is part of the walk semantics:
+// recordHop decides follow-vs-observe against the declared domain, so two
+// runs of the same target under different declared domains can legitimately
+// produce different walks. A narrow-scope run stores a completed record
+// whose out-of-scope hops were observed but never followed; a later
+// broader-scope run must never be served that scope-truncated walk as
+// complete — under the old key shape it was, because the record decodes
+// cleanly (its stored hops are all in-scope for the broader domain).
+//
+// The request shape is fixed (GET, no body, a fixed RavenRecon user agent)
+// and the redirect policy and the caps (MaxRedirects, MaxHeaderBytes,
+// MaxHeaders, MaxBodyBytes) are fixed constants, not configuration — so,
+// like the DNS pipeline's answer cap, they must never enter the key: a
+// completed entry written under the current caps stays valid under any
+// future caps that only retain more, and truncated entries are stored
+// incomplete (never served) under every cap. Timings, timeouts,
+// concurrency, rate limits, and the transport (trust roots, dial routing)
+// never enter the key either — exactly like the DNS pipeline, which never
+// hashes the resolver.
+//
+// The domain entered the key in the M-2 release; records written by earlier
+// builds (keyed on operation + target only) are unreachable under the new
+// key shape and are simply re-probed. That is acceptable at release: stale
+// scope-truncated records must never be served, and a re-probe is the safe
+// outcome.
+func probeKey(target asset.URL, domain asset.Domain) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    target.Identity().String(),
+		Config:    map[string]string{"domain": domain.Name},
 	})
 }
 
@@ -325,7 +342,7 @@ func probeResultFromStored(s storedProbe, host asset.Host, target asset.URL, sch
 // unusable records — any diagnosis is joined into Err), or already
 // classified failed when the key cannot be built.
 func lookupProbe(ctx context.Context, host asset.Host, target asset.URL, domain asset.Domain, pr ProbeResult, e env) ProbeResult {
-	key, err := probeKey(target)
+	key, err := probeKey(target, domain)
 	if err != nil {
 		pr.Status = ProbeFailed
 		pr.FailureReason = ReasonOther
@@ -378,8 +395,8 @@ func lookupProbe(ctx context.Context, host asset.Host, target asset.URL, domain 
 // a later run can inspect the partial state. A cancelled run still persists
 // its terminal record using a detached, bounded context so the write cannot
 // wedge shutdown (Phase 4 convention).
-func storeProbe(ctx context.Context, host asset.Host, target asset.URL, pr ProbeResult, e env) ProbeResult {
-	key, err := probeKey(target)
+func storeProbe(ctx context.Context, host asset.Host, target asset.URL, domain asset.Domain, pr ProbeResult, e env) ProbeResult {
+	key, err := probeKey(target, domain)
 	if err != nil {
 		pr.Err = errors.Join(pr.Err, fmt.Errorf("httpprobe: %s %s: build cache key: %w", host.Name, target, err))
 		return pr

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1282,5 +1284,130 @@ func TestEngineOverlongSpecifierNoChurn(t *testing.T) {
 		!reflect.DeepEqual(e1.Evidence, e2.Evidence) ||
 		!reflect.DeepEqual(e1.Relationships, e2.Relationships) {
 		t.Errorf("cache-served entry data differs from the fresh one")
+	}
+}
+
+// TestEngineAnalyzeRebindsOnContentChange pins the M-5 content binding end
+// to end: a js.analyze record is bound to the content hash it was derived
+// from, so a refreshed fetch with NEW content can never pair with an OLD
+// analysis (fetch and analyze records have independent lifecycles). Content
+// A is analyzed on run 1; the js.fetch record is then deleted and the
+// server switches to content B, so run 2 re-fetches B: the stale analyze
+// record (bound to A) must be refused and deleted, B must be re-analyzed,
+// and the record rebound to B's hash under the SAME key. Run 3 is fully
+// cache-served (zero parses); run 4 refreshes the fetch again with
+// IDENTICAL content B — the stored analysis must still serve.
+func TestEngineAnalyzeRebindsOnContentChange(t *testing.T) {
+	contentA := []byte(`const api = "/api/alpha";`)
+	contentB := []byte(`const api = "/api/beta";`)
+	var served atomic.Value // holds []byte
+	served.Store(contentA)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(served.Load().([]byte))
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	cfg.Cache = openTestCache(t)
+	items := []Item{{Kind: ItemLine, Line: "http://js.test/app.js"}}
+	u := mustURL(t, "http://js.test/app.js")
+
+	endpointURLs := func(rep Report) []string {
+		e := entryByURL(t, rep, "http://js.test/app.js")
+		out := make([]string, 0, len(e.Endpoints))
+		for _, ep := range e.Endpoints {
+			out = append(out, ep.URL.String())
+		}
+		return out
+	}
+	has := func(xs []string, x string) bool {
+		for _, y := range xs {
+			if y == x {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Run 1: content A analyzed fresh; the record is bound to A's hash.
+	rep1 := runEngine(t, cfg, items)
+	if m := rep1.Metrics(); m.Parses != 1 || m.Fetches != 1 {
+		t.Fatalf("run 1 metrics = %+v, want 1 parse, 1 fetch", m)
+	}
+	if eps := endpointURLs(rep1); !has(eps, "http://js.test/api/alpha") {
+		t.Errorf("run 1 endpoints = %v, want /api/alpha", eps)
+	}
+
+	// Refresh the fetch with NEW content: delete the js.fetch record (the
+	// js.analyze record stays) and switch the server to content B.
+	fkey, err := fetchKey(u)
+	if err != nil {
+		t.Fatalf("fetchKey: %v", err)
+	}
+	if err := cfg.Cache.Delete(context.Background(), fkey); err != nil {
+		t.Fatalf("delete fetch record: %v", err)
+	}
+	served.Store(contentB)
+
+	// Run 2: the refreshed fetch serves B, and the stale analyze record
+	// (bound to A) must NOT serve — it is deleted and B is re-analyzed.
+	// The discard is a routine lifecycle event (content change between
+	// runs), so it must NOT surface a run-error diagnostic: runEngine
+	// fails the test on any run error, so passing run 2 asserts the
+	// silent-miss behavior end to end.
+	rep2 := runEngine(t, cfg, items)
+	if m := rep2.Metrics(); m.Fetches != 1 || m.Parses != 1 || m.Stores != 2 {
+		t.Fatalf("run 2 metrics = %+v, want 1 fetch, 1 parse (stale analysis refused), 2 stores (js.fetch + rebound js.analyze)", m)
+	}
+	if e2 := entryByURL(t, rep2, "http://js.test/app.js"); e2.Cached {
+		t.Error("run 2 must be a fresh fetch (the fetch record was deleted)")
+	}
+	eps2 := endpointURLs(rep2)
+	if !has(eps2, "http://js.test/api/beta") {
+		t.Errorf("run 2 endpoints = %v, want /api/beta (a fresh analysis of content B)", eps2)
+	}
+	if has(eps2, "http://js.test/api/alpha") {
+		t.Errorf("run 2 endpoints = %v, contain the OLD analysis's /api/alpha", eps2)
+	}
+
+	// The rebound record carries B's hash under the SAME key.
+	akey, err := analyzeKey(u)
+	if err != nil {
+		t.Fatalf("analyzeKey: %v", err)
+	}
+	out := cfg.Cache.Get(context.Background(), akey)
+	if !out.IsHit() {
+		t.Fatal("run 2 must leave a completed js.analyze record")
+	}
+	var st storedAnalyze
+	if err := json.Unmarshal(out.Record.Data, &st); err != nil {
+		t.Fatalf("decode stored analyze: %v", err)
+	}
+	if want := hex.EncodeToString(sha256Sum(contentB)); st.AnalyzedHash != want {
+		t.Errorf("stored analyzed_hash = %q, want %q (the hash of content B)", st.AnalyzedHash, want)
+	}
+
+	// Run 3: both records cache-served — zero network, zero parses.
+	rep3 := runEngine(t, cfg, items)
+	if m := rep3.Metrics(); m.Parses != 0 || m.Fetches != 0 || m.Stores != 0 {
+		t.Errorf("run 3 metrics = %+v, want 0 parses/fetches/stores (full cache)", m)
+	}
+	if !entryByURL(t, rep3, "http://js.test/app.js").Cached {
+		t.Error("run 3 must be fully cache-served")
+	}
+	if eps := endpointURLs(rep3); !has(eps, "http://js.test/api/beta") {
+		t.Errorf("run 3 endpoints = %v, want /api/beta", eps)
+	}
+
+	// Run 4: refresh the fetch again with IDENTICAL content B — the
+	// stored analysis, still bound to B's hash, must serve (zero parses).
+	if err := cfg.Cache.Delete(context.Background(), fkey); err != nil {
+		t.Fatalf("delete fetch record (run 4): %v", err)
+	}
+	rep4 := runEngine(t, cfg, items)
+	if m := rep4.Metrics(); m.Fetches != 1 || m.Parses != 0 {
+		t.Errorf("run 4 metrics = %+v, want 1 fetch, 0 parses (identical content still serves the hit)", m)
+	}
+	if eps := endpointURLs(rep4); !has(eps, "http://js.test/api/beta") {
+		t.Errorf("run 4 endpoints = %v, want /api/beta", eps)
 	}
 }

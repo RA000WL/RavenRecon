@@ -24,8 +24,8 @@ func TestDefault(t *testing.T) {
 		t.Fatal("expected non-empty user agent")
 	}
 
-	if cfg.Timeout != 10*time.Second {
-		t.Fatalf("expected 10s timeout, got %s", cfg.Timeout)
+	if cfg.Timeout != 120*time.Second {
+		t.Fatalf("expected 120s timeout, got %s", cfg.Timeout)
 	}
 }
 

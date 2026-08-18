@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
 	"syscall"
 	"time"
 
@@ -351,13 +350,79 @@ func buildEnv(cfg Config, ips map[string]asset.IP) (env, error) {
 // http.DefaultTransport with an explicit response-header byte cap, a
 // response-header timeout, and direct connection only (environment proxies
 // are never consulted).
+//
+// TLS handshake failures are tagged at the dial boundary: DialTLSContext
+// performs the handshake and wraps ANY handshake error in the typed
+// tlsHandshakeError sentinel, so classification never depends on matching
+// error text (server-controlled bytes can reach error strings via
+// textproto.ProtocolError and net/http's badStringError, so text matching
+// is spoofable). Dial-level failures — connection refused, DNS failures,
+// dial timeouts — happen in DialContext BEFORE the handshake and pass
+// through untagged, keeping their own classification.
 func newTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxResponseHeaderBytes = MaxHeaderBytes
 	t.ResponseHeaderTimeout = 30 * time.Second
 	t.Proxy = nil // direct only: a stray environment proxy must never silently reroute probing
+	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Dial through the transport's own DialContext so dial-level
+		// failures (refused, DNS, timeout) keep the classification the
+		// default TLS path gives them; only the handshake itself is
+		// tagged.
+		plain, err := t.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// The transport normally derives ServerName from the request host
+		// (addTLS); with a custom dialer the address is all we have.
+		// tls.DialWithDialer infers it the same way.
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		cfg := t.TLSClientConfig.Clone()
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		if cfg.ServerName == "" && net.ParseIP(host) == nil {
+			cfg.ServerName = host
+		}
+		// The transport applies TLSHandshakeTimeout only on its own TLS
+		// path (addTLS); the custom dialer must bound the handshake
+		// itself. A timeout surfaces as context.DeadlineExceeded wrapped
+		// in the sentinel and classifies failed/timeout, exactly like the
+		// default path's handshake-timeout error.
+		hsCtx := ctx
+		var cancel context.CancelFunc
+		if d := t.TLSHandshakeTimeout; d > 0 {
+			hsCtx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+		tlsConn := tls.Client(plain, cfg)
+		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+			plain.Close()
+			return nil, &tlsHandshakeError{err: err}
+		}
+		return tlsConn, nil
+	}
 	return t
 }
+
+// tlsHandshakeError tags an error as a TLS handshake failure observed at the
+// dial boundary (the production transport's DialTLSContext). Classification
+// matches this type structurally — never error text — so a hostile server
+// that embeds "tls:"-looking text in a malformed response cannot fabricate
+// a TLS observation. Unwrap keeps the underlying stdlib error reachable for
+// the typed checks (tls.AlertError, tls.RecordHeaderError,
+// tls.CertificateVerificationError, the x509 set) and for context-error
+// classification (cancellation and deadline checks run before the TLS
+// checks, so a cancelled or timed-out handshake keeps its own outcome).
+type tlsHandshakeError struct{ err error }
+
+func (e *tlsHandshakeError) Error() string {
+	return "httpprobe: tls handshake failed: " + e.err.Error()
+}
+func (e *tlsHandshakeError) Unwrap() error { return e.err }
 
 // wallClock is the production runtime.Clock backed by the wall clock,
 // mirroring the runtime package's own production clock (which is
@@ -494,7 +559,7 @@ func probeTarget(ctx context.Context, host asset.Host, target asset.URL, domain 
 	pr = doProbe(ctx, host, target, domain, e, pr)
 
 	if e.cache != nil {
-		pr = storeProbe(ctx, host, target, pr, e)
+		pr = storeProbe(ctx, host, target, domain, pr, e)
 	}
 	return pr
 }
@@ -740,10 +805,25 @@ func classifyContextError(err error) (ProbeStatus, FailureReason, error) {
 //     observation, the service is absent on this port
 //   - TLS handshake failure (including certificate verification failures) ->
 //     COMPLETED, tls: a legitimate negative observation, https is not
-//     served on this endpoint from RavenRecon's trust perspective
-//   - response-header block over the transport cap -> truncated (the
-//     stdlib aborts such responses; the observation is incomplete by
-//     definition)
+//     served on this endpoint from RavenRecon's trust perspective. Tagged
+//     structurally at the dial boundary (tlsHandshakeError) or matched by
+//     typed stdlib errors — never by error text: the stdlib embeds raw
+//     server bytes in some error strings (textproto.ProtocolError quotes
+//     the offending header line; net/http's badStringError quotes the
+//     status line), so text matching is spoofable.
+//   - response-header block over the transport cap -> truncated. The
+//     stdlib aborts such responses with the EXACT message
+//     "net/http: server response headers exceeded <cap> bytes; aborted"
+//     where <cap> is the transport's MaxResponseHeaderBytes (ours:
+//     MaxHeaderBytes); the abort replaces whatever read error occurred
+//     and is then %w-wrapped by the transport, so the check walks the %w
+//     chain and requires exact equality with that message on some wrapped
+//     error — never a substring: a server-tainted error (for example a
+//     malformed header line containing the same words) can never
+//     fabricate truncation. If a future stdlib changes the message or
+//     stops wrapping it, this degrades to failed/other — the safe
+//     direction (a genuine cap hit is then re-probed instead of being
+//     served as a completed observation).
 //   - anything else -> failed, other
 func classifyProbeError(ctx context.Context, err error) (ProbeStatus, FailureReason) {
 	if errors.Is(err, context.Canceled) {
@@ -776,24 +856,67 @@ func classifyProbeError(ctx context.Context, err error) (ProbeStatus, FailureRea
 		return ProbeCompleted, ReasonTLS
 	}
 	// The stdlib transport aborts a response whose header block exceeds
-	// MaxResponseHeaderBytes with a fixed message; the observation is
-	// incomplete by definition. Checked last: no network error carries this
-	// text.
-	if strings.Contains(err.Error(), "server response headers exceeded") {
+	// MaxResponseHeaderBytes with a fixed, EXACT message embedding OUR cap
+	// (net/http/transport.go: "net/http: server response headers exceeded
+	// %d bytes; aborted" with the transport's MaxResponseHeaderBytes). The
+	// abort REPLACES whatever read error occurred — the server's own bytes
+	// never survive into it — and the transport then wraps it with %w
+	// ("net/http: HTTP/1.x transport connection broken: ..."), so a
+	// round-trip error surfaces several wraps deep. The check therefore
+	// walks the %w chain and requires exact equality with the
+	// stdlib-constructed message on SOME wrapped error; it is never a
+	// substring match on the top-level text, because every error class
+	// that embeds server bytes (textproto.ProtocolError, net/http's
+	// badStringError) quotes or prefixes the text and a hostile server
+	// could otherwise fabricate truncation. Checked last: no network error
+	// carries this message. If a future stdlib changes the message or
+	// stops wrapping it, this degrades to failed/other — the safe
+	// direction (a genuine cap hit is then re-probed instead of being
+	// served as a completed observation).
+	if isHeaderCapAbort(err) {
 		return ProbeTruncated, ReasonNone
 	}
 	return ProbeFailed, ReasonOther
 }
 
+// isHeaderCapAbort reports whether err — or any error it wraps through the
+// stdlib's %w layers (persistConn.roundTrip's "HTTP/1.x transport connection
+// broken" wrap, and *url.Error's wrap when a client is used) — is exactly
+// the header-cap abort message. Exact equality on a wrapped error, never a
+// substring of the top-level text: the abort message is constructed by the
+// stdlib from OUR cap and replaces the (server-tainted) read error, so a
+// hostile server can neither produce the exact message nor inject it into
+// the chain.
+func isHeaderCapAbort(err error) bool {
+	want := fmt.Sprintf("net/http: server response headers exceeded %d bytes; aborted", MaxHeaderBytes)
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if e.Error() == want {
+			return true
+		}
+	}
+	return false
+}
+
 // isTLSError reports whether err stems from a TLS handshake failure:
-// protocol alerts, certificate verification failures, or the crypto/tls
-// text errors ("tls: first record does not look like a TLS handshake").
-// The text check is a last resort because crypto/tls surfaces some
-// handshake failures as plain errors; the texts are stdlib-fixed and never
-// server-controlled.
+// the dial-boundary sentinel (the production transport's DialTLSContext
+// tags every handshake error), protocol alerts, record-header failures
+// ("first record does not look like a TLS handshake"), certificate
+// verification failures, or the x509 error set. Classification is strictly
+// structural — there is deliberately NO error-text fallback: the stdlib
+// embeds raw server bytes in some error strings, so matching "tls:" text
+// would let a hostile server fabricate a TLS observation (and with it an
+// open-port report and a completed cache record).
 func isTLSError(err error) bool {
+	var hsErr *tlsHandshakeError
+	if errors.As(err, &hsErr) {
+		return true
+	}
 	var alert tls.AlertError
 	if errors.As(err, &alert) {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
 		return true
 	}
 	var verifyErr *tls.CertificateVerificationError
@@ -816,5 +939,5 @@ func isTLSError(err error) bool {
 	if errors.As(err, &rootsErr) {
 		return true
 	}
-	return strings.Contains(err.Error(), "tls:")
+	return false
 }

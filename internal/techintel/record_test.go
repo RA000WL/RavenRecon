@@ -2,6 +2,7 @@ package techintel
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,18 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/techintel/fingerprints"
 )
+
+// techDigest returns the content digest of the production fingerprint
+// database — the exact value the engine computes once at env construction —
+// so key assertions reproduce the engine's keys.
+func techDigest(t *testing.T) string {
+	t.Helper()
+	db, err := fingerprints.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db.Digest()
+}
 
 // testCompletedEntry builds a completed entry for a small observation using
 // the production fingerprint database, so the record round-trips real data.
@@ -54,11 +67,12 @@ func canonicalObs(t *testing.T) Observation {
 
 func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	o := canonicalObs(t)
-	k1, err := techKey(o, 1)
+	dig := techDigest(t)
+	k1, err := techKey(o, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k2, err := techKey(o, 1)
+	k2, err := techKey(o, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +81,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	}
 
 	// Schema sensitivity: a bumped schema version changes the key.
-	otherSchema, err := techKey(o, 2)
+	otherSchema, err := techKey(o, 2, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,12 +89,43 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 		t.Error("schema version must enter the key")
 	}
 
+	// Database-content sensitivity: ANY data-only edit to the fingerprint
+	// tables changes the content digest and therefore the key — a table
+	// edit that never bumps the schema must still invalidate every cached
+	// detection.
+	base, err := fingerprints.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := base.Fingerprints()
+	mut := entries[0]
+	mut.Indicators = append([]fingerprints.Indicator(nil), entries[0].Indicators...)
+	w := mut.Indicators[0].Weight
+	if math.Abs(w-0.42) < 1e-9 {
+		w = 0.43
+	} else {
+		w = 0.42
+	}
+	mut.Indicators[0].Weight = w
+	entries[0] = mut
+	modDB, err := fingerprints.CompileForTest(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modDigest := modDB.Digest()
+	if modDigest == dig {
+		t.Fatal("a mutated table must change the content digest")
+	}
+	if k, err := techKey(o, 1, modDigest); err != nil || k == k1 {
+		t.Errorf("database content digest must enter the key (err=%v)", err)
+	}
+
 	// Sources sensitivity: a body-ful observation must not share a key with
 	// a headers-only observation of the same target.
 	headersOnly := newObs(t, "https://ok.example/api")
 	headersOnly.Headers = o.Headers
 	headersOnly.StatusCode = o.StatusCode
-	ko, err := techKey(headersOnly, 1)
+	ko, err := techKey(headersOnly, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +137,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	// never part of the key.
 	withStatus := newObs(t, "https://ok.example/api")
 	withStatus.Headers = o.Headers
-	ks, err := techKey(withStatus, 1)
+	ks, err := techKey(withStatus, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +146,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	}
 
 	// Target sensitivity: a different URL yields a different key.
-	other, err := techKey(newObs(t, "https://other.example/api"), 1)
+	other, err := techKey(newObs(t, "https://other.example/api"), 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,11 +158,11 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	withEndpoint := canonicalObs(t)
 	withoutEndpoint := canonicalObs(t)
 	withoutEndpoint.Endpoint = nil
-	ke, err := techKey(withEndpoint, 1)
+	ke, err := techKey(withEndpoint, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	kn, err := techKey(withoutEndpoint, 1)
+	kn, err := techKey(withoutEndpoint, 1, dig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,6 +454,59 @@ func TestDecodeStoredTechRejectsInvalid(t *testing.T) {
 	// The untampered record still decodes within the same caps.
 	if _, err := decodeStoredTech(valid, o, mask, 128, 512); err != nil {
 		t.Fatalf("valid record must decode: %v", err)
+	}
+}
+
+// TestValidateStoredScoreRejectsNaN pins the decode-side score guard
+// directly with Go-constructed values. encoding/json can neither marshal
+// nor unmarshal a NaN float, so the NaN branch is unreachable through a
+// stored record's JSON payload — the guard is defense in depth against a
+// tampered in-memory payload or a future non-JSON storage format. Without
+// the guard a NaN score would pass both `score < 0` and `score > 1` and
+// reach levelForScore, where it silently falls through every threshold to
+// LevelUnknown.
+func TestValidateStoredScoreRejectsNaN(t *testing.T) {
+	if err := validateStoredScore("tech", math.NaN()); err == nil || !strings.Contains(err.Error(), "NaN") {
+		t.Errorf("NaN score must be rejected, got %v", err)
+	}
+	if err := validateStoredScore("tech", 1.5); err == nil || !strings.Contains(err.Error(), "out of [0,1]") {
+		t.Errorf("1.5 must be rejected, got %v", err)
+	}
+	if err := validateStoredScore("tech", -0.01); err == nil || !strings.Contains(err.Error(), "out of [0,1]") {
+		t.Errorf("-0.01 must be rejected, got %v", err)
+	}
+	for _, ok := range []float64{0, 0.2, 1} {
+		if err := validateStoredScore("tech", ok); err != nil {
+			t.Errorf("score %v must be accepted, got %v", ok, err)
+		}
+	}
+}
+
+// TestStoredTechJSONCannotRepresentNaN documents the defense-in-depth
+// rationale: a stored record's payload can never carry a NaN score, because
+// encoding/json rejects NaN in both directions — marshal fails on a NaN
+// float field and unmarshal fails on a NaN literal.
+func TestStoredTechJSONCannotRepresentNaN(t *testing.T) {
+	o := canonicalObs(t)
+	entry := testCompletedEntry(t, o)
+	rec, err := encodeStoredTech(o, entry, sourcesMask(o), fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s storedTech
+	if err := json.Unmarshal(rec.Data, &s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Technologies) == 0 {
+		t.Fatal("canonical observation must detect at least one technology")
+	}
+	s.Technologies[0].Prov.Confidence = math.NaN()
+	if _, err := json.Marshal(s); err == nil {
+		t.Error("json.Marshal must refuse a NaN score (records on disk can never carry one)")
+	}
+	var s2 storedTech
+	if err := json.Unmarshal([]byte(`{"technologies":[{"prov":{"confidence":NaN}}]}`), &s2); err == nil {
+		t.Error("json.Unmarshal must refuse a NaN literal")
 	}
 }
 

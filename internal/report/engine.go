@@ -432,14 +432,15 @@ func processReport(jctx context.Context, cfg *EngineConfig, m *Model, plan repor
 	}
 
 	// Cache-before-execute: a validated hit serves the exact bytes with
-	// zero rendering. A tampered or contradictory record is evicted and
-	// re-rendered in the same run, never served.
+	// zero rendering. A tampered, contradictory, or unusable record (for
+	// example one with a zero-byte part payload) is evicted and re-rendered
+	// in the same run, never served.
 	if cfg.Cache != nil {
 		key, err := renderCacheKey(m, plan.rep, plan.compress)
 		if err == nil {
 			outcome := cfg.Cache.Get(jctx, key)
 			if !outcome.IsMiss() {
-				if parts, ok := decodeRender(outcome, m, plan.rep, plan.compress); ok {
+				if parts, derr := decodeRender(outcome, m, plan.rep, plan.compress); derr == nil {
 					files, bytes, cerr := commitCachedRender(jctx, plan, sink, parts)
 					if cerr == nil {
 						return ReportResult{

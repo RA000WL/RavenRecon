@@ -31,14 +31,16 @@ func openTestCache(t testing.TB, now func() time.Time, ttl time.Duration) *cache
 	return c
 }
 
-// probeKeyFor builds the cache key of one scheme's probe target of a host.
-func probeKeyFor(t testing.TB, host asset.Host, scheme string) cache.Key {
+// probeKeyFor builds the cache key of one scheme's probe target of a host
+// under the given declared domain (the domain is a key input: the redirect
+// scope boundary is part of the walk semantics).
+func probeKeyFor(t testing.TB, host asset.Host, scheme string, domain asset.Domain) cache.Key {
 	t.Helper()
 	u, err := probeTargetURL(host, scheme, newFakeClock(fixedTime))
 	if err != nil {
 		t.Fatalf("probeTargetURL: %v", err)
 	}
-	key, err := probeKey(u)
+	key, err := probeKey(u, domain)
 	if err != nil {
 		t.Fatalf("probeKey: %v", err)
 	}
@@ -98,7 +100,7 @@ func TestCacheMissStoresExactlyOneRequest(t *testing.T) {
 		t.Fatalf("http probe = %+v", pr)
 	}
 
-	key := probeKeyFor(t, host, "http")
+	key := probeKeyFor(t, host, "http", mustDomain(t, "example.com"))
 	out := cfg.Cache.Get(context.Background(), key)
 	if !out.IsHit() {
 		t.Fatalf("record state = %s, want hit", out.State)
@@ -326,7 +328,7 @@ func TestCacheTruncatedNeverServed(t *testing.T) {
 	if pr1.Status != ProbeTruncated || !pr1.Truncated || pr1.ResponseSize != MaxBodyBytes {
 		t.Fatalf("first run http probe = %+v (want truncated at the body cap)", pr1)
 	}
-	out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), "http"))
+	out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), "http", mustDomain(t, "example.com")))
 	if out.State != cache.StateIncomplete {
 		t.Fatalf("truncated record state = %s, want incomplete", out.State)
 	}
@@ -359,7 +361,7 @@ func TestCacheTamperedRecordSelfHeals(t *testing.T) {
 	hosts := []asset.Host{host}
 
 	probeOne(t, cs.srv, hosts, cfg)
-	key := probeKeyFor(t, host, "http")
+	key := probeKeyFor(t, host, "http", mustDomain(t, "example.com"))
 	out := c.Get(context.Background(), key)
 	if !out.IsHit() {
 		t.Fatalf("record state = %s, want hit", out.State)
@@ -749,7 +751,7 @@ func TestCacheTamperedTLSMetadataSelfHeals(t *testing.T) {
 	if _, err := Probe(context.Background(), domain, hosts, nil, cfg); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
-	key := probeKeyFor(t, host, "https")
+	key := probeKeyFor(t, host, "https", mustDomain(t, "example.com"))
 	out := c.Get(context.Background(), key)
 	if !out.IsHit() {
 		t.Fatalf("record state = %s, want hit", out.State)

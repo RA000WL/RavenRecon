@@ -84,9 +84,17 @@ func csvRow(row []string) []string {
 	return out
 }
 
-// mdEscape makes a cell safe for a Markdown table: pipes are escaped and
-// newlines collapse to spaces.
+// mdEscape makes a cell safe for a Markdown table: backslashes are doubled
+// FIRST, then pipes are escaped, and newlines collapse to spaces. The
+// order is the standard one and it is load-bearing: escaping only the pipe
+// would turn a literal backslash-pipe cell value ("f\|g") into "f\\|g",
+// which GFM parses as an escaped backslash followed by a LIVE cell
+// delimiter — a silent cell split. With backslashes doubled first, every
+// emitted "\|" carries an odd backslash run (2N doubled content
+// backslashes plus the escape's own), and GFM reads an odd run as "the
+// last backslash escapes the pipe" — the cell boundary stays intact.
 func mdEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, "|", `\|`)
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")

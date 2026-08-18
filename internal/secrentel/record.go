@@ -140,6 +140,18 @@ func encodeStoredScan(sd scannedDocument, entry ReportEntry, now time.Time) (cac
 	}, nil
 }
 
+// redactedCandidateID returns the diagnostic-safe form of one candidate's
+// identity: the candidate type plus a short SHA-256 prefix of its value
+// (the first four digest bytes, eight hex characters). The full canonical
+// identity embeds the percent-encoded candidate VALUE, so it must never
+// appear in errors or logs: a tampered cache record — or a valid record
+// rejected by a newer analysisVersion — would otherwise print real secret
+// material into diagnostics. Findings output (reports, evidence records)
+// carries the value by design and is never routed through this helper.
+func redactedCandidateID(c asset.SecretCandidate) string {
+	return string(c.Type) + "/" + digestHex([]byte(c.Value))[:8]
+}
+
 // decodeStoredScan strictly re-validates a completed cache record before it
 // is served. Every violated invariant rejects the record (never served);
 // the caller deletes it and recomputes. Validation covers: envelope fields,
@@ -265,7 +277,7 @@ func decodeStoredScan(rec cache.Record, sd scannedDocument, limits scanLimits) (
 		expCap := expectedCapFor(ss.Candidate.Type, string(ss.Family), ss.FPFlags, nonPattern)
 		if ss.Score > expCap+capTolerance {
 			return nil, fmt.Errorf("secret %d (%s) score %.3f exceeds the derived cap %.3f for its type/family/flags",
-				i, canon.ID(), ss.Score, expCap)
+				i, redactedCandidateID(ss.Candidate), ss.Score, expCap)
 		}
 		// The weight-0 url_type_cap marker is appended by the engine exactly
 		// when the type is cap-eligible (deriveConfidence): a record that
@@ -281,11 +293,11 @@ func decodeStoredScan(rec cache.Record, sd scannedDocument, limits scanLimits) (
 		}
 		if urlTypeCapped(ss.Candidate.Type) && !hasURLCap {
 			return nil, fmt.Errorf("secret %d (%s): url_type_cap factor missing for cap-eligible type %s",
-				i, canon.ID(), ss.Candidate.Type)
+				i, redactedCandidateID(ss.Candidate), ss.Candidate.Type)
 		}
 		if !urlTypeCapped(ss.Candidate.Type) && hasURLCap {
 			return nil, fmt.Errorf("secret %d (%s): url_type_cap factor present for uncapped type %s",
-				i, canon.ID(), ss.Candidate.Type)
+				i, redactedCandidateID(ss.Candidate), ss.Candidate.Type)
 		}
 		// Level-gate re-validation: the engine's own invariant is that the
 		// stored level equals applyGates(levelForScore(score), storedFactors)
@@ -315,7 +327,7 @@ func decodeStoredScan(rec cache.Record, sd scannedDocument, limits scanLimits) (
 		recomposed := round4(recomputeCapped(ss.Factors, ss.Candidate.Type, string(ss.Family), ss.FPFlags))
 		if math.Abs(ss.Score-recomposed) > capTolerance {
 			return nil, fmt.Errorf("secret %d (%s) score %.3f does not match the recomposed score %.3f from its factors",
-				i, canon.ID(), ss.Score, recomposed)
+				i, redactedCandidateID(ss.Candidate), ss.Score, recomposed)
 		}
 		if len(ss.PatternIDs) == 0 {
 			return nil, fmt.Errorf("secret %d carries no pattern IDs", i)

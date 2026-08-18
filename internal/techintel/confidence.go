@@ -2,6 +2,7 @@ package techintel
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/RA000WL/RavenRecon/internal/techintel/fingerprints"
 )
@@ -135,6 +136,15 @@ type indicatorGroup struct {
 //  3. thresholds: score >= 0.8 High, >= 0.5 Medium, >= 0.2 Low, else
 //     Unknown. Unknown technologies are still reported.
 //
+// NaN weights carry no evidence and are SKIPPED entirely (never merged,
+// never multiplied): a NaN weight must not poison the product, must not
+// win a max-weight collapse, and must not produce a NaN score whose level
+// would fall through every threshold to Unknown. This is defense in depth —
+// the fingerprints loader rejects NaN weights, so a NaN group is
+// unreachable from a validated database. As a result the returned score is
+// always finite, and the returned level is always the honest threshold
+// level of a real score.
+//
 // The returned score is the capped score (after rule 1), so stored levels
 // and scores are mutually consistent for the decode re-check.
 func deriveConfidence(groups []indicatorGroup) (float64, ConfidenceLevel) {
@@ -142,9 +152,14 @@ func deriveConfidence(groups []indicatorGroup) (float64, ConfidenceLevel) {
 		return 0, LevelUnknown
 	}
 
-	// Collapse dependent (same kind+slot) groups to their max weight.
+	// Drop NaN-weight groups before the collapse, so NaN never enters a
+	// max-weight comparison (NaN comparisons are false in every direction
+	// and could otherwise let a NaN group win or stick in the merged set).
 	merged := make([]indicatorGroup, 0, len(groups))
 	for _, g := range groups {
+		if math.IsNaN(g.weight) {
+			continue
+		}
 		placed := false
 		for i := range merged {
 			if merged[i].kind == g.kind && merged[i].slot == g.slot {
@@ -158,6 +173,10 @@ func deriveConfidence(groups []indicatorGroup) (float64, ConfidenceLevel) {
 		if !placed {
 			merged = append(merged, g)
 		}
+	}
+	if len(merged) == 0 {
+		// Every group carried a NaN weight: no evidence at all.
+		return 0, LevelUnknown
 	}
 
 	hasStructural := false

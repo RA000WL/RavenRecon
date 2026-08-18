@@ -248,6 +248,12 @@ type env struct {
 	capTech      int
 	capInd       int
 	schema       int
+	// digest is the content digest of the fingerprint database in use
+	// (fingerprints.DB.Digest), computed ONCE at env construction: a
+	// data-only edit to any fingerprint table changes it and therefore
+	// every cache key, so stale detections can never replay after a table
+	// edit. Never recomputed per observation.
+	digest string
 
 	metrics *Metrics
 
@@ -337,6 +343,7 @@ func Ingest(ctx context.Context, cfg Config, src ObservationSource) (Report, err
 		capTech:      c.MaxTechnologiesPerObservation,
 		capInd:       c.MaxIndicatorsPerObservation,
 		schema:       fingerprints.SchemaVersion,
+		digest:       c.DB.Digest(),
 		metrics:      c.Metrics,
 	}
 
@@ -459,7 +466,7 @@ func processObservation(ctx context.Context, o Observation, truncated bool, e *e
 	prov := asset.Provenance{Source: o.Source, DiscoveredAt: o.ObservedAt}
 
 	if e.cache != nil {
-		key, err := techKey(o, e.schema)
+		key, err := techKey(o, e.schema, e.digest)
 		if err != nil {
 			e.recordErr(fmt.Errorf("techintel: cache key: %w", err))
 			return failedEntry(o, err)
@@ -480,7 +487,7 @@ func processObservation(ctx context.Context, o Observation, truncated bool, e *e
 	entry := completedEntry(o, outcome, prov)
 
 	if e.cache != nil {
-		key, err := techKey(o, e.schema)
+		key, err := techKey(o, e.schema, e.digest)
 		if err != nil {
 			return entry // analysis succeeded; key failure only skips the store
 		}

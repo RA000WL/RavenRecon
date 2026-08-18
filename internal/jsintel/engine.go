@@ -1100,14 +1100,22 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 	// Analysis: cache-before-execute. A usable js.analyze record serves
 	// the stored payload — zero parse — and the entry is built through the
 	// same applyAnalysis as the fresh path, so a cache-served entry is
-	// byte-identical in payload to a freshly analyzed one. A miss (or a
-	// discarded unusable record) falls through to a fresh analysis, which
-	// is stored for the next run — completed records as hits, truncated
-	// records as incomplete (never served). Analysis is only ever stored
-	// for completed-positive JS observations, so the store side needs no
-	// further status guard.
+	// byte-identical in payload to a freshly analyzed one. The lookup is
+	// cross-validated against the CURRENT content's hash (js.ContentHash,
+	// the SHA-256 of the fetched bytes): a record derived from different
+	// content is deleted and never served — a refreshed fetch with NEW
+	// content always falls through to a fresh analysis, and the fresh
+	// store overwrites the same key bound to the new hash. A content
+	// mismatch is a routine lifecycle event (fetch and analyze records
+	// have independent lifecycles), so it falls through as a silent miss;
+	// only a discarded unusable record (identity contradiction or decode
+	// failure — tampering or corruption) surfaces a diagnostic. A miss
+	// falls through to a fresh analysis, which is stored for the next run
+	// — completed records as hits, truncated records as incomplete (never
+	// served). Analysis is only ever stored for completed-positive JS
+	// observations, so the store side needs no further status guard.
 	if e.cache != nil {
-		lookup := lookupAnalyze(ctx, u, e.cfg, e.cache, e.clock)
+		lookup := lookupAnalyze(ctx, u, js.ContentHash, e.cfg, e.cache, e.clock)
 		e.metricsRead()
 		if lookup.Err != nil {
 			e.recordErr(fmt.Errorf("jsintel: %s: %w", u.String(), lookup.Err))
@@ -1161,7 +1169,7 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 	}
 	entry = applyAnalysis(entry, js, data, e.cfg)
 	if e.cache != nil {
-		if serr := storeAnalyze(ctx, e.cfg, e.cache, e.clock, u, data, parsed.Truncated, entry.Sources, entry.FirstSeen, entry.LastSeen); serr != nil {
+		if serr := storeAnalyze(ctx, e.cfg, e.cache, e.clock, u, js.ContentHash, data, parsed.Truncated, entry.Sources, entry.FirstSeen, entry.LastSeen); serr != nil {
 			e.recordErr(serr)
 		} else {
 			e.metricsStore()

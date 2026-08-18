@@ -908,6 +908,13 @@ Each probe records a typed outcome, in a fixed classification order:
   `truncated-incomplete`: the captured observation is incomplete by
   definition and is never served from cache.
 
+Classification is structural, never server-tainted text matching: TLS
+handshake failures are tagged at the dial boundary with a typed sentinel,
+and the header-cap abort is recognized only by exact equality on a wrapped
+error. The stdlib embeds raw server bytes in some error strings, so text
+matching would let a hostile server fabricate a `tls` or
+`truncated-incomplete` classification.
+
 Retention is bounded: at most MaxRedirects+1 redirect hops, at most
 MaxHeaders sorted header entries from a byte-capped header block, and a
 counted (never retained) body size capped at MaxBodyBytes. The TLS flag
@@ -999,14 +1006,17 @@ emitted sorted, deterministically.
 
 ### Cache behavior
 
-Each probe target is cached under its own Phase 3 key composed of exactly
-the operation (`"http.probe"`) and the canonical Phase 2 URL identity of the
-target — nothing else. The request shape is fixed (GET, no body, a fixed
-RavenRecon user agent) and the redirect policy and caps are fixed
-constants, so there is no result-relevant configuration today; whatever
-configuration could matter in the future must enter the key, but timings,
-timeouts, concurrency, rate limits, and the transport (trust roots, dial
-routing) never do — exactly like the DNS pipeline. HTTP responses of any
+Each probe target is cached under its own Phase 3 key composed of the
+operation (`"http.probe"`), the canonical Phase 2 URL identity of the
+target, and the canonical declared domain — the redirect scope boundary is
+a key input, so two runs of the same target under different declared
+domains are distinct keys (pinned by test). The request shape is fixed
+(GET, no body, a fixed RavenRecon user agent) and the redirect policy and
+caps are fixed constants, so there is no other result-relevant
+configuration today; whatever configuration could matter in the future
+must enter the key, but timings, timeouts, concurrency, rate limits, and
+the transport (trust roots, dial routing) never do — exactly like the DNS
+pipeline. HTTP responses of any
 code and the two legitimate negative observations (`conn_refused`, `tls`)
 are stored `completed`; truncated probes are stored `incomplete` and never
 served; failed and cancelled probes are stored `failed`/`cancelled` and can
@@ -1163,7 +1173,10 @@ arbitrary addresses.
   Credentials in a hostile Location are redacted at the observation
   boundary — the single construction point where Location-derived strings
   become asset URLs — so userinfo can never reach the report, the cache, or
-  errors.
+  errors. Location values that fail to parse at all (out-of-range ports,
+  control bytes) are never echoed verbatim either: they are observed only
+  in sanitized form (userinfo and control bytes stripped) and never
+  requested.
 
 ### Known limitations
 
@@ -1312,7 +1325,10 @@ per-job deadlines and job-start rate limiting. Raw strings exist only at
 the ingest boundary: a line is capped at 32 KiB, rejected as malformed
 (counted, reported, never cached, never fatal) when oversized or
 unparseable, then immediately canonicalized through `asset.ParseURL` —
-raw strings never travel beyond the parse stage. Each canonical URL is
+raw strings never travel beyond the parse stage. Userinfo carried by a raw
+line is redacted at that same construction point: the asset is rebuilt
+through its canonical string, so credentials never reach records, reports,
+exports, or merges. Each canonical URL is
 pre-registered as a cancelled entry before submission, so a job dropped by
 a forced shutdown still appears in the report with an honest status.
 
@@ -1345,7 +1361,9 @@ observations rebuild the identical graph (host and edges are not stored).
 ### Limits
 
 The line cap (32 KiB), the per-URL parameter cap (256 distinct parameters,
-beyond which the entry is flagged `Overflow` but stays completed), and the
+beyond which the entry is flagged `Overflow` but stays completed — the
+AGENTS.md truncation carve-out: `completed` with the end-to-end sticky
+flag, which consumers treat as an incomplete retained set), and the
 Phase 2 per-parameter value cap (1024, flagged `Truncated` on the
 parameter) are fixed constants, deliberately not configuration, and never
 enter cache keys. Failed and cancelled observations are never cached: a
@@ -1436,8 +1454,10 @@ paths, endpoints, TLS certificate fields) — and the tier is derived from
 the kind, never stored per entry, so data cannot mislabel it.
 `SchemaVersion = 1` enters every detection cache key: bumping it
 invalidates every cached result by construction (cache schema versioning
-mirrors `internal/cache`). `Load()` validates every entry and compiles
-every regular expression exactly once; the engine NEVER compiles its own
+mirrors `internal/cache`). `Load()` validates every entry — NaN indicator
+weights are rejected at load (a NaN weight would poison the confidence
+product) — and compiles every regular expression exactly once; the engine
+NEVER compiles its own
 regexes and consumes the DB only through the compile-once accessors
 (`MatchRe`/`VersionRe`). Extension is a data-only change: add a table entry
 (name, category, indicators, optional version spec) and `Load` validates
@@ -1486,8 +1506,11 @@ session flags (HttpOnly/Secure/SameSite) become evidence-only records
 
 Operation `tech.detect`. The key is the observation identity (the canonical
 URL identity, or the endpoint identity when attached) plus
-`fingerprints.SchemaVersion` plus the sources bitmask (sorted letters: b
-body, c cookies, d DNS, e endpoint, h headers, t TLS), so a body-ful and a
+`fingerprints.SchemaVersion` plus the fingerprint database CONTENT digest
+(`fingerprints.DB.Digest`: any data-only table edit — with no schema bump —
+changes the digest and invalidates every cached detection) plus the
+sources bitmask (sorted letters: b body, c cookies, d DNS, e endpoint,
+h headers, t TLS), so a body-ful and a
 headers-only observation of the same target are never served each other's
 results. A completed hit serves the stored result with ZERO analysis
 (pinned by the Metrics.Analyzed counter) and rebuilds the identical graph;
@@ -1496,7 +1519,8 @@ record, never from the observation, and the status code never enters keys.
 Timings, concurrency, and the fixed caps never enter keys either. Decode
 re-validation covers identity containment, mask equality, parallel-array
 lengths (levels, version ordinals), timestamp ordering, canonical
-technology and evidence identities, scores in [0,1], levels never stronger
+technology and evidence identities, scores in [0,1] (NaN rejected), levels
+never stronger
 than the score allows, and the method-possible guard (a body-less record
 can never carry HTML-derived evidence — the truncated-as-completed tamper
 class); a rejected record is deleted and recomputed in the same run, never
@@ -1524,7 +1548,9 @@ beyond), 256 cookies (analyzer cap, Overflow.Cookies), 128 technologies /
 512 indicators per observation (configurable caps with documented
 defaults, Overflow flags), bounded HTML candidate lists (scripts/css/metas
 128, attributes 256, sourcemaps 32, generators 16), and evidence values
-capped by `asset.NewEvidence`.
+capped by `asset.NewEvidence` — a flagged entry stays `completed` only per
+the AGENTS.md truncation carve-out (the flag survives record → cache hit →
+merge → report), and consumers treat it as an incomplete retained set.
 
 ### Relationships
 
@@ -1647,8 +1673,11 @@ dropped; SecretLines counts every raw match line, ingested or not.
 ### Fetch engine
 
 One bounded GET per canonical URL: fixed user agent, no cookies or custom
-headers, ≤ 5 redirect hops (the cap-exceeding 3xx is the terminal
-completed observation), a per-attempt deadline (default 10 s) covering the
+headers, ≤ 5 redirect hops following http(s) targets ONLY — a redirect to
+a non-http(s) target is observed, never followed, the walk ending with the
+redirect response as the final observation (the cap-exceeding 3xx is the
+terminal completed observation in the same way) — a per-attempt deadline
+(default 10 s) covering the
 whole walk, a 64 KiB header-block cap, and content retention streamed
 under `MaxJSBytes` (default 2 MiB, clamped to [64 KiB, 8 MiB]) with
 transparent gzip decompression (the stored content is the decompressed
@@ -1987,7 +2016,9 @@ Cached flag.
   never served; the truncated-as-completed tamper class is rejected
   explicitly.
 - Secret handling: values are bounded to the asset layer's 512-byte stored
-  form; error strings and diagnostics never echo secret values; cache keys
+  form; error strings and diagnostics never echo secret values —
+  decode-rejection diagnostics carry only a redacted candidate form (type
+  plus a 4-byte SHA-256 prefix), never the candidate value; cache keys
   carry content digests, never raw bytes.
 - Verification boundary: nothing is ever validated online; the queue is
   bookkeeping for a future phase, and no severity is ever claimed.
@@ -2362,17 +2393,18 @@ any contract-violating finding, fails with a structured error.
 One `detect.rule` record per rule per run, cache-before-execute composed
 around pool jobs exactly like the other consumer stages (the runtime pool
 stays cache-independent). The key (`cache.NewKey`) carries: the
-operation; the detect `SchemaVersion`; the rule ID (the target) plus the
+operation; the detect `SchemaVersion` (`2` today — records written under
+version 1 are refused at decode and self-invalidate); the rule ID (the
+target) plus the
 fingerprint of the rule's full declared metadata — version included; the
 documented contract is that a rule's Version is bumped whenever its
 detector logic changes, so a bump invalidates its cached results; the
-fingerprint of the normalized snapshot — identities plus exactly the
-provenance and attribute fields a rule can read through the Context:
-technology version and provenance (source, reference, confidence);
-evidence and endpoint provenance (reference, confidence — the evidence
-identity already embeds the source asset); JavaScript content hash and
-size plus provenance (reference, confidence); and secret provenance
-(source, confidence). Relationships carry no provenance in the asset
+fingerprint of the normalized snapshot — identities plus every observable
+JavaScript asset field (content hash, size, content type, ETag,
+last-modified, discovery source, status code, final URL, host) and full
+provenance — source, reference, confidence — on JavaScript, technology,
+evidence, endpoint, and secret entries. Relationships carry no provenance
+in the asset
 model, so their edge ID is the complete observable. Provenance
 timestamps (DiscoveredAt) are deliberately excluded from every form
 (echoed metadata that changes every run while
@@ -2520,7 +2552,9 @@ yet.
 - **Markdown** — the human summary: target, summary, interesting assets
   (top 20 scored surfaces with their top factor), technologies, secrets,
   top findings (20), attack surface (top 20 groups, top 10 paths),
-  recommendations, statistics, and errors. Long lists are cut at
+  recommendations, statistics, and errors; cell content escapes pipes,
+  with content backslashes doubled first so a literal backslash-pipe can
+  never re-parse as a live delimiter. Long lists are cut at
   documented bounds (200 rows per list) with honest "_And N more — see
   the JSON and CSV exports._" lines.
 - **HTML** — a self-contained static report: inline CSS, native
@@ -2558,7 +2592,8 @@ is compressed — nothing timing- or path-derived. A hit serves the exact
 stored bytes through the same atomic pipeline with zero rendering; the
 record is strictly re-validated on decode (identity match on report ID,
 version, format, and digest; declared part sizes must equal their bytes;
-the total must sit under the cacheable bound) and a violating record is
+the total must sit under the cacheable bound; a zero-byte part payload is
+refused outright with a descriptive error) and a violating record is
 evicted and re-rendered in the same run, never served. Oversized renders
 (total over 11 MiB, comfortably inside the cache's 16 MiB record bound
 after base64 inflation) are honestly never cached — nothing is truncated

@@ -9,10 +9,25 @@
 //
 // # Schema versioning
 //
-// SchemaVersion versions the database schema. Cache keys for technology
-// detection results MUST include it: bumping SchemaVersion invalidates every
-// cached detection result by construction, mirroring internal/cache's schema
-// versioning. Never reuse a bumped version number.
+// SchemaVersion versions the database SCHEMA (the data model's layout).
+// Cache keys for technology detection results MUST include it: bumping
+// SchemaVersion invalidates every cached detection result by construction,
+// mirroring internal/cache's schema versioning. Never reuse a bumped
+// version number.
+//
+// # Content digest
+//
+// DB.Digest() is a stable content digest of the database's complete
+// detection data: every fingerprint's name, category, and full indicator
+// payload (kind, match, weight, version spec), serialized canonically
+// (fingerprints sorted by name; see DB.Digest). Cache keys for technology
+// detection results MUST include it alongside SchemaVersion: a DATA-ONLY
+// edit to any table — a weight, match, kind, category, or version change
+// that never bumps the schema — changes the digest and therefore
+// invalidates every cached detection by construction, so stale results can
+// never be replayed after a table edit. SchemaVersion stays the layout
+// version; the digest is the content version. The engine computes the
+// digest once per run at environment construction, never per observation.
 //
 // # Compile-once contract
 //

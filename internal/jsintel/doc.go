@@ -76,13 +76,18 @@
 // MaxRedirects redirect hops (each hop gated on the central limiter), a
 // per-attempt deadline, bounded header capture, and content retention
 // bounded by FetchConfig.MaxJSBytes (default 2 MiB, clamped to 64 KiB .. 8
-// MiB). Every outcome is classified with a typed FetchStatus and
-// FetchReason; failures are retried immediately up to cfg.Retries times
-// (bounded 1..3); completed negative observations (conn_refused, tls) are
-// legitimate observations, never failures. The transport is a seam: nil
-// means a bounded production transport (header-block cap, header timeout,
-// direct-only, transparent gzip decompression); tests inject hermetic
-// loopback transports.
+// MiB). Redirect policy: cross-host http(s) redirects ARE followed — jsintel
+// has no declared-scope concept, fetch targets come from the operator's own
+// corpus — but a redirect to a NON-http(s) scheme (ftp:, file:, ...) is
+// observed, never followed: the walk ends with the redirect response as the
+// final observation, so one scheme-incompatible redirect can never wedge the
+// URL into permanent failures. Every outcome is classified with a typed
+// FetchStatus and FetchReason; failures are retried immediately up to
+// cfg.Retries times (bounded 1..3); completed negative observations
+// (conn_refused, tls) are legitimate observations, never failures. The
+// transport is a seam: nil means a bounded production transport
+// (header-block cap, header timeout, direct-only, transparent gzip
+// decompression); tests inject hermetic loopback transports.
 //
 // # Truncation honesty
 //

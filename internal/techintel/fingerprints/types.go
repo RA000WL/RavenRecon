@@ -180,6 +180,10 @@ type Fingerprint struct {
 // Cache keys for technology detection results must include it: bumping
 // SchemaVersion invalidates every cached result by construction, mirroring
 // internal/cache's schema versioning. Never reuse a bumped version number.
+// SchemaVersion is the LAYOUT version only: cache keys must ALSO include
+// DB.Digest() (the content digest), so a data-only table edit that never
+// bumps the schema still invalidates every cached detection (see doc.go,
+// "Content digest").
 const SchemaVersion = 1
 
 // DB is an immutable, validated, compile-once fingerprint database.

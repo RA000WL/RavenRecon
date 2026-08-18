@@ -121,43 +121,52 @@ func storeRender(ctx context.Context, c cache.Cache, key cache.Key, m *Model, re
 // (exact identity match on report ID, version, format, and model digest;
 // non-empty parts whose declared sizes match their bytes; total within the
 // cacheable bound) and returns its parts. A record failing any check is
-// unusable — the caller evicts it and renders fresh.
-func decodeRender(outcome cache.Outcome, m *Model, rep Reporter, compress bool) ([]renderPart, bool) {
+// unusable — the caller evicts it and renders fresh, never serves it. The
+// rejection is always a descriptive error ("empty part payload" for a
+// zero-byte part): a part that rendered no bytes is by definition unusable
+// (every builtin validator rejects empty output), so storing it can only
+// produce a permanently failing render that the decode boundary must refuse.
+func decodeRender(outcome cache.Outcome, m *Model, rep Reporter, compress bool) ([]renderPart, error) {
 	rec, ok := outcome.ValidResult()
 	if !ok || rec.Status != cache.StatusCompleted {
-		return nil, false
+		return nil, fmt.Errorf("render record is not a completed result")
 	}
 	var record renderRecord
 	dec := json.NewDecoder(bytes.NewReader(rec.Data))
 	if err := dec.Decode(&record); err != nil {
-		return nil, false
+		return nil, fmt.Errorf("decode render record: %w", err)
 	}
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, false
+		return nil, fmt.Errorf("render record has trailing content after the document")
 	}
 	if record.ReportID != rep.ID || record.Version != rep.Version ||
 		record.Format != string(rep.Format) || record.Digest != m.Digest {
-		return nil, false
+		return nil, fmt.Errorf("render record identity does not match the current run")
 	}
 	if len(record.Parts) == 0 {
-		return nil, false
+		return nil, fmt.Errorf("render record has no parts")
 	}
 	total := int64(0)
 	for _, part := range record.Parts {
 		if !validPartName(part.Part) {
-			return nil, false // part names enter filenames: reject outright
+			// Part names enter filenames: reject outright.
+			return nil, fmt.Errorf("render record part name %q is invalid", part.Part)
 		}
 		if part.Part == "" && len(record.Parts) > 1 {
-			return nil, false // the default part only exists alone
+			// The default part only exists alone.
+			return nil, fmt.Errorf("render record default part exists alongside other parts")
+		}
+		if len(part.Data) == 0 {
+			return nil, fmt.Errorf("render record part %q has an empty payload", part.Part)
 		}
 		if part.Bytes != int64(len(part.Data)) {
-			return nil, false
+			return nil, fmt.Errorf("render record part %q declares %d bytes but carries %d", part.Part, part.Bytes, len(part.Data))
 		}
 		total += part.Bytes
 		if total > maxCacheableRenderBytes {
-			return nil, false
+			return nil, fmt.Errorf("render record exceeds the cacheable byte bound")
 		}
 	}
-	return record.Parts, true
+	return record.Parts, nil
 }

@@ -37,9 +37,11 @@ const (
 	// (GET semantics, Location resolved against the current URL). A
 	// redirect beyond the cap is observed but never requested: the walk
 	// stops and the terminal 3xx response IS the final observation
-	// (completed, Redirects == MaxRedirects). The redirect cap is NOT a
-	// content truncation: the terminal 3xx record is a complete observation
-	// of the chain prefix and is stored completed.
+	// (completed, Redirects == MaxRedirects). A redirect to a NON-http(s)
+	// scheme is likewise observed but never requested (see
+	// resolveRedirect). The redirect cap is NOT a content truncation: the
+	// terminal 3xx record is a complete observation of the chain prefix
+	// and is stored completed.
 	MaxRedirects = 5
 
 	// MaxHeaderBytes bounds the size of one response's header block. The
@@ -185,7 +187,10 @@ type FetchResult struct {
 	// (content cap hit, or a read failure mid-body). Never true together
 	// with non-nil Content.
 	Truncated bool
-	// Redirects is the number of redirect hops followed.
+	// Redirects is the number of redirect hops FOLLOWED. An observed but
+	// un-followed redirect (the cap-exceeding hop, an unparseable
+	// Location, or a non-http(s) target) ends the walk with the redirect
+	// response itself as the final observation and is not counted here.
 	Redirects int
 	// Status classifies the outcome (see FetchStatus).
 	Status FetchStatus
@@ -289,10 +294,13 @@ func (c FetchConfig) validated() (FetchConfig, error) {
 // Fetch performs one bounded fetch of the canonical URL u: a GET with no
 // body, a fixed RavenRecon user agent, and no cookies or custom headers,
 // built from the canonical asset URL form (userinfo and fragment never reach
-// the wire). It follows up to MaxRedirects redirects, streams the terminal
-// body under the MaxJSBytes content cap (truncating honestly, never
-// retaining a partial prefix), and classifies every outcome with a typed
-// FetchStatus and FetchReason.
+// the wire). It follows up to MaxRedirects redirects — cross-host http(s)
+// redirects included, since jsintel has no declared-scope concept — but a
+// redirect to a NON-http(s) scheme is observed, never requested: the walk
+// ends with the redirect response as the final observation. It streams the
+// terminal body under the MaxJSBytes content cap (truncating honestly,
+// never retaining a partial prefix), and classifies every outcome with a
+// typed FetchStatus and FetchReason.
 //
 // Retries are immediate and deterministic: an attempt classified failed
 // (any failed reason) is retried up to cfg.Retries times while the caller's
@@ -402,9 +410,11 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 		if isRedirectCode(resp.StatusCode) && resp.Header.Get("Location") != "" && hops < MaxRedirects {
 			next, ok := resolveRedirect(resp, cfg.Clock)
 			if !ok {
-				// An unparseable Location ends the walk: the redirect
-				// response itself is the final observation (completed,
-				// FinalURL = the URL it was received from).
+				// An unparseable Location — or a Location whose target is
+				// NOT http(s) — ends the walk: the redirect response
+				// itself is the final observation (completed, FinalURL =
+				// the URL it was received from), observed but never
+				// followed.
 				return readTerminal(u, cur, resp, hops, cfg)
 			}
 			// Intermediate redirect bodies are never read — only closed.
@@ -422,8 +432,19 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 
 // resolveRedirect resolves a response's Location against the request URL and
 // canonicalizes it through the asset model. ok is false when the Location is
-// absent, unparseable, or fails canonicalization — the caller then ends the
-// walk with the current response as the final observation.
+// absent, unparseable, fails canonicalization, or points at a NON-http(s)
+// scheme — the caller then ends the walk with the current response as the
+// final observation (observed, not followed).
+//
+// Redirect scheme policy: cross-host http(s) redirect targets ARE followed —
+// jsintel has no declared-scope concept, fetch targets come from the
+// operator's own corpus, and asset.ParseURL accepts any syntactically valid
+// scheme (ftp:, file:, ws:, ...), so an explicit gate is required here. A
+// non-http(s) target is NEVER requested: the walk ends with the redirect
+// response as the final observation, exactly like the unparseable-Location
+// path. That keeps one scheme-incompatible redirect from turning the whole
+// observation into a permanently failed record (an unsupported scheme can
+// never be fetched, so a "failed" classification would retry forever).
 func resolveRedirect(resp *http.Response, clock runtime.Clock) (asset.URL, bool) {
 	loc, err := resp.Location()
 	if err != nil {
@@ -434,6 +455,9 @@ func resolveRedirect(resp *http.Response, clock runtime.Clock) (asset.URL, bool)
 		DiscoveredAt: clock.Now().UTC(),
 	})
 	if err != nil {
+		return asset.URL{}, false
+	}
+	if next.Scheme != "http" && next.Scheme != "https" {
 		return asset.URL{}, false
 	}
 	return next, true

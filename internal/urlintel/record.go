@@ -54,7 +54,10 @@ func urlKey(u asset.URL, adapter string, parseParams bool) (cache.Key, error) {
 // storedURL is the structured Data payload of one (canonical URL, adapter)
 // cache record. It is never terminal output: the URL, endpoint, and
 // parameters are stored as the typed Phase 2 assets (with provenance)
-// exactly as they will be served back. Relationships and the host asset are
+// exactly as they will be served back. The stored URL is ALWAYS in canonical
+// form — ingest redacts userinfo at the construction point (see parseRawURL
+// in engine.go), so URL.Original equals URL.String() and no credential-bearing
+// raw line can reach the record. Relationships and the host asset are
 // NOT stored: they are rebuilt deterministically at emit time by graphOf
 // from the URL, host, endpoints, and parameters, so a cached observation
 // reproduces the exact same graph as a fresh extraction.
@@ -62,7 +65,9 @@ type storedURL struct {
 	// Target is the canonical URL identity the record belongs to, e.g.
 	// "url:http://example.com/p?a=1".
 	Target string `json:"target"`
-	// URL is the canonical URL asset.
+	// URL is the canonical URL asset, always stored in canonical form:
+	// Original equals String() (userinfo is redacted at ingest — see
+	// parseRawURL), so the record never carries credentials.
 	URL asset.URL `json:"url"`
 	// Adapter is the adapter identity the observation came from.
 	Adapter string `json:"adapter"`

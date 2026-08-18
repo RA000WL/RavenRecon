@@ -37,8 +37,11 @@ const shutdownForceBudget = 30 * time.Second
 
 // LineSource is the ingest seam: a stream of raw URL lines. Raw strings
 // exist only at this boundary — a line is parsed into a canonical Phase 2
-// URL asset immediately and never travels beyond the parse stage (URL assets
-// and typed observations flow through the pipeline from there on).
+// URL asset immediately and never travels beyond the parse stage, and
+// userinfo credentials carried by a raw line are dropped at that same parse
+// point (see parseRawURL), so no credential-bearing string ever flows past
+// the boundary. URL assets and typed observations flow through the pipeline
+// from there on.
 //
 // Next returns io.EOF at end of stream. It must honor ctx cancellation and
 // may return ctx.Err() when cancelled. Tool adapters (roadmap 6C) implement
@@ -535,9 +538,36 @@ func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) 
 // parseRawURL canonicalizes one raw line into a Phase 2 URL asset at the
 // ingest boundary. This is the ONLY place raw strings enter the asset model;
 // everything downstream works with the canonical URL asset.
+//
+// Credential redaction: asset.URL.Original preserves userinfo by design
+// (asset/url.go), and the stored observation marshals Original into the
+// cache record AND the report/export — so a raw line like
+// http://user:pass@example.com/p must never survive. When the parsed URL's
+// Original differs from its canonical string (the raw line carries
+// non-canonical surface, userinfo included), the asset is rebuilt through
+// the canonical string, so Original equals the canonical form and the
+// userinfo is gone everywhere downstream (records, reports, exports,
+// merges). A line already in canonical form is untouched. This is the single
+// construction point where a raw line becomes an asset.URL, so redacting
+// here redacts every observation path (mirrors the httpprobe scope-layer
+// construction-point redaction).
 func parseRawURL(raw, adapter string, clock runtime.Clock) (asset.URL, error) {
 	prov := asset.Provenance{Source: adapter, DiscoveredAt: clock.Now().UTC()}
-	return asset.ParseURL(raw, prov)
+	u, err := asset.ParseURL(raw, prov)
+	if err != nil {
+		return asset.URL{}, err
+	}
+	if u.Original != u.String() {
+		// Rebuild through the canonical string: Original becomes the
+		// canonical form and any userinfo the raw line carried is dropped.
+		u, err = asset.ParseURL(u.String(), u.Prov)
+		if err != nil {
+			// Cannot happen for a canonical asset URL; keep the defensive
+			// path so a malformed line is still rejected.
+			return asset.URL{}, err
+		}
+	}
+	return u, nil
 }
 
 // processURL runs the cache-before-execute per-line work: serve the stored

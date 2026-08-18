@@ -165,9 +165,13 @@ type DiscoveryConfig struct {
 func Default() Config {
 	return Config{
 		Concurrency: 10,
-		Timeout:     10 * time.Second,
-		Rate:        5,
-		UserAgent:   "RavenRecon/0.5.0",
+		// 120s: passive enumeration tools (subfinder, amass) routinely
+		// exceed short deadlines on real targets; 10s killed every source
+		// before it could produce output. Operator overrides: the discover
+		// command's --timeout flag, or Discovery.Timeout in configuration.
+		Timeout:   120 * time.Second,
+		Rate:      5,
+		UserAgent: "RavenRecon/1.0.0",
 		Cache: CacheConfig{
 			Enabled: false,
 			Dir:     "",

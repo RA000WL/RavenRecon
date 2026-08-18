@@ -98,6 +98,12 @@ type HeaderEntry struct {
 // truncated is set: the observation is incomplete by definition (the caller
 // stores it incomplete, never as a completed hit). Keys are re-canonicalized
 // defensively.
+//
+// A Location header's values are redacted at retention: userinfo is stripped
+// (the same rule recordHop applies to hop targets), so a hostile redirect
+// target carrying credentials can never be echoed into the retained headers
+// of the terminal response — and therefore never into reports or cache
+// records. The key and the rest of each value are preserved as observed.
 func boundedHeaders(h http.Header) ([]HeaderEntry, bool) {
 	keys := make([]string, 0, len(h))
 	for k := range h {
@@ -110,9 +116,24 @@ func boundedHeaders(h http.Header) ([]HeaderEntry, bool) {
 	}
 	entries := make([]HeaderEntry, 0, len(keys))
 	for _, k := range keys {
-		entries = append(entries, HeaderEntry{Key: k, Values: h[k]})
+		vals := h[k]
+		if k == "Location" {
+			vals = redactLocationValues(vals)
+		}
+		entries = append(entries, HeaderEntry{Key: k, Values: vals})
 	}
 	return entries, truncated
+}
+
+// redactLocationValues strips userinfo from every value of a Location
+// header (see stripLocationUserinfo). The slice is copied; the observed
+// header map is never mutated.
+func redactLocationValues(vals []string) []string {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = stripLocationUserinfo(v)
+	}
+	return out
 }
 
 // ProbeResult is the typed observation of one probe target: GET <url>.

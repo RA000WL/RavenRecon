@@ -433,6 +433,40 @@ func newPlainResponder(t testing.TB) *plainResponder {
 	return pr
 }
 
+// rawResponder is a deterministic loopback server that writes exactly one
+// fixed byte string on every accepted connection and closes it. It exists
+// for malformed-response tests the stdlib server cannot produce (for
+// example a header block containing a continuation-looking line whose text
+// embeds "tls:" — textproto rejects it as a ProtocolError quoting the raw
+// server bytes).
+type rawResponder struct {
+	addr string
+	ln   net.Listener
+}
+
+func newRawResponder(t testing.TB, response string) *rawResponder {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("raw responder listen: %v", err)
+	}
+	rr := &rawResponder{addr: ln.Addr().String(), ln: ln}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.Write([]byte(response))
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return rr
+}
+
 // refusedLoopbackAddr finds a loopback port that verifiably refuses
 // connections and stays verifiably refused for the whole test. The port is
 // deliberately never bound by this process: it sits below the kernel's

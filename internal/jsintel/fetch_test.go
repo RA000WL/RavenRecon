@@ -568,6 +568,88 @@ func TestFetchRedirectUnparseableLocation(t *testing.T) {
 	}
 }
 
+func TestFetchRedirectNonHTTPSchemeNotFollowed(t *testing.T) {
+	// A redirect to a NON-http(s) target is observed, never followed: the
+	// walk ends with the redirect response as the final observation — the
+	// same semantics as the unparseable-Location path (completed, the
+	// terminal 3xx response, no follow attempted). asset.ParseURL accepts
+	// any syntactically valid scheme, so ftp:// passes the parse and is
+	// stopped by the explicit scheme gate; file:///etc/passwd is stopped
+	// by ParseURL's missing-host rule. Either way the target is never
+	// requested and the observation is completed, never failed — one
+	// scheme-incompatible redirect cannot wedge the URL in retries.
+	for _, tc := range []struct {
+		name     string
+		location string
+	}{
+		{name: "ftp scheme", location: "ftp://ftp.example.com/x.js"},
+		{name: "file scheme", location: "file:///etc/passwd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", tc.location)
+				w.WriteHeader(http.StatusFound)
+			})
+			cfg := testFetchConfig()
+			cfg.Transport = transportFor(t, srv.srv)
+
+			res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+			if res.Status != FetchCompleted || res.Reason != ReasonNone {
+				t.Fatalf("status/reason = %s/%s, want completed/none", res.Status, res.Reason)
+			}
+			if res.Err != nil {
+				t.Fatalf("err = %v, want nil (the redirect is observed, not failed)", res.Err)
+			}
+			if res.StatusCode != http.StatusFound {
+				t.Errorf("status code = %d, want %d (the terminal redirect response IS the observation)", res.StatusCode, http.StatusFound)
+			}
+			if res.Redirects != 0 {
+				t.Errorf("redirects = %d, want 0 (the refused hop is observed, never followed)", res.Redirects)
+			}
+			if got, want := res.FinalURL.String(), srv.url()+"/start"; got != want {
+				t.Errorf("final url = %s, want %s (the walk ends at the redirect response)", got, want)
+			}
+			if srv.count() != 1 {
+				t.Errorf("requests = %d, want 1 (the %s target must never be requested)", srv.count(), tc.location)
+			}
+		})
+	}
+}
+
+func TestFetchRedirectCrossHostFollowed(t *testing.T) {
+	// Cross-host http(s) redirects ARE followed by design: jsintel has no
+	// declared-scope concept, and fetch targets come from the operator's
+	// own corpus. The test transport routes ANY destination to the
+	// loopback server, so the other-host target reaches the same handler.
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "http://other-host.test/final.js")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Write([]byte("cross-host-body"))
+	})
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+	if res.Status != FetchCompleted || res.Reason != ReasonNone {
+		t.Fatalf("status/reason = %s/%s, want completed/none", res.Status, res.Reason)
+	}
+	if res.Redirects != 1 {
+		t.Errorf("redirects = %d, want 1 (the cross-host hop was followed)", res.Redirects)
+	}
+	if got, want := res.FinalURL.String(), "http://other-host.test/final.js"; got != want {
+		t.Errorf("final url = %s, want %s", got, want)
+	}
+	if string(res.Content) != "cross-host-body" {
+		t.Errorf("content = %q, want the cross-host target's body", res.Content)
+	}
+	if srv.count() != 2 {
+		t.Errorf("requests = %d, want 2 (initial + cross-host hop)", srv.count())
+	}
+}
+
 func TestFetchConnRefused(t *testing.T) {
 	addr := refusedLoopbackAddr(t)
 	cfg := testFetchConfig()

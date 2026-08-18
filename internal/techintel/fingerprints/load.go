@@ -2,6 +2,7 @@ package fingerprints
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 )
@@ -105,8 +106,8 @@ func validateFingerprint(fp Fingerprint) error {
 		if ind.Match == "" {
 			return fmt.Errorf("indicator %d: match must not be empty", i)
 		}
-		if ind.Weight <= 0 || ind.Weight > 1 {
-			return fmt.Errorf("indicator %d: weight %v must satisfy 0 < weight <= 1", i, ind.Weight)
+		if math.IsNaN(ind.Weight) || ind.Weight <= 0 || ind.Weight > 1 {
+			return fmt.Errorf("indicator %d: weight %v must satisfy 0 < weight <= 1 and must not be NaN", i, ind.Weight)
 		}
 		if ind.Kind == IndicatorHTMLRegex || ind.Kind == IndicatorGenerator {
 			if _, err := regexp.Compile(ind.Match); err != nil {

@@ -109,6 +109,17 @@ type analysisData struct {
 // derives different keys without ever misreading old records. Per-file
 // caps, timings, and concurrency NEVER enter the key: a completed record
 // stays a complete record under any cap configuration.
+//
+// The content hash is deliberately NOT part of the key: it lives in the
+// record payload (storedAnalyze.AnalyzedHash) and is cross-validated at
+// lookup time against the CURRENT content's hash. A content change must
+// never be served stale analysis, and putting the hash in the key would
+// orphan one key per content version forever (every old key would retain
+// its record, and only the latest version would ever be reachable).
+// Payload cross-validation delivers the same freshness guarantee with
+// self-healing: a record bound to different content is deleted and
+// recomputed under the SAME key, so a changed script heals in one run
+// and never accumulates orphaned entries.
 func analyzeKey(u asset.URL) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: AnalyzeOperation,
@@ -128,10 +139,11 @@ type storedImport struct {
 }
 
 // storedAnalyze is the structured Data payload of one js.analyze cache
-// record: the analysisData payload plus the record's identity and
-// observation window. The record's cache Status is "completed" for a full
-// analysis and "incomplete" for a truncated one (a parser cap hit) — a
-// truncated record is stored incomplete and NEVER served as a hit.
+// record: the analysisData payload plus the record's identity, the content
+// binding, and the observation window. The record's cache Status is
+// "completed" for a full analysis and "incomplete" for a truncated one (a
+// parser cap hit) — a truncated record is stored incomplete and NEVER
+// served as a hit.
 type storedAnalyze struct {
 	// Target is the canonical URL identity the record belongs to.
 	Target string `json:"target"`
@@ -140,6 +152,18 @@ type storedAnalyze struct {
 	ParserVersion int `json:"parser_version"`
 	// Mask is the analysis-family mask; must equal analyzeMask.
 	Mask string `json:"mask"`
+	// AnalyzedHash is the lowercase hex SHA-256 of the content this
+	// analysis was derived from — the JS asset's ContentHash at the time
+	// the record was stored. It binds the record to its content: the
+	// lookup refuses a record whose hash differs from the current
+	// content's hash (a refreshed fetch with NEW content must never pair
+	// with an OLD analysis) and deletes the stale record. Exactly 64
+	// lowercase hex characters; NEVER empty — an analysis of empty
+	// content is deliberately not stored (see storeAnalyze), so a stored
+	// record always carries a real binding, and a legacy record written
+	// before this field existed decodes as empty and is rejected,
+	// deleted, and recomputed exactly once.
+	AnalyzedHash string `json:"analyzed_hash"`
 	// Imports are the resolved-import observations.
 	Imports []storedImport `json:"imports,omitempty"`
 	// BareImports are the bare specifiers.
@@ -370,7 +394,9 @@ func capEvidence(xs []asset.Evidence, cap int) []asset.Evidence {
 // decodeStoredAnalyze validates and decodes a stored js.analyze payload
 // before it may be served as a hit. It refuses payloads whose identity
 // fields contradict the queried URL, whose parser version or family mask
-// differ from this build's contract, whose URL-bearing entries do not
+// differ from this build's contract, whose content binding (AnalyzedHash)
+// is missing or malformed — the lookup separately cross-validates the
+// binding against the current content — whose URL-bearing entries do not
 // re-parse canonically to their own identities, whose secrets/technologies/
 // evidence do not re-derive their own identities through the asset
 // constructors (unknown types, empty values, non-canonical names, wrong
@@ -392,6 +418,17 @@ func decodeStoredAnalyze(raw json.RawMessage, u asset.URL) (storedAnalyze, error
 	}
 	if s.Mask != analyzeMask {
 		return s, fmt.Errorf("jsintel: stored analyze mask %q does not match %q", truncateStored(s.Mask), analyzeMask)
+	}
+	// The content binding must be present and canonical: a record without
+	// a hash (legacy, or tampered) can never be served — its analysis
+	// cannot be bound to any content — and a malformed hash is refused.
+	// The lookup cross-validates the hash against the CURRENT content
+	// after decode; a mismatch deletes the record (see lookupAnalyze).
+	if s.AnalyzedHash == "" {
+		return s, fmt.Errorf("jsintel: stored analyze has no analyzed_hash")
+	}
+	if len(s.AnalyzedHash) != 64 || !lowerHex(s.AnalyzedHash) {
+		return s, fmt.Errorf("jsintel: stored analyze analyzed_hash %q is not 64 lowercase hex digits", truncateStored(s.AnalyzedHash))
 	}
 	// Every URL-bearing entry must re-parse canonically to its own
 	// identity: a non-canonical or non-reparseable URL could only be
@@ -691,7 +728,11 @@ type analyzeLookup struct {
 	Hit bool
 	// Err carries the diagnostic of a lookup that could not serve a hit
 	// for a non-miss reason (key build failure, cache error, discarded
-	// mismatched or unusable record). Nil on a hit and on a clean miss.
+	// unusable record — identity contradiction or decode failure). Nil on
+	// a hit and on a clean miss. A record bound to DIFFERENT content is a
+	// clean miss: content change between runs is a routine lifecycle
+	// event (fetch and analyze records have independent lifecycles), not
+	// an anomaly, so it surfaces no diagnostic.
 	Err error
 }
 
@@ -702,6 +743,19 @@ type analyzeLookup struct {
 // engine performs the lookup BEFORE parsing, so an analyze hit never parses
 // content.
 //
+// contentHash is the CURRENT content's hash (the JS asset's ContentHash —
+// the SHA-256 of the fetched bytes the analysis would be derived from). The
+// stored record is cross-validated against it: a record whose AnalyzedHash
+// differs was derived from DIFFERENT content (a refreshed fetch with new
+// content must never pair with an old analysis) and is never served — it is
+// deleted so the fresh analysis overwrites the same key (self-healing), and
+// the lookup falls through as a routine MISS. A content change between runs
+// is a normal lifecycle event — the fetch and analyze records have
+// independent lifecycles — so it is silent, unlike a record failing decode
+// validation, which indicates tampering or corruption and carries a
+// diagnostic. Records without a hash at all (legacy, or tampered) are
+// refused by decodeStoredAnalyze already.
+//
 // A hit serves the stored record regardless of the current per-file caps:
 // cap changes never invalidate entries (see analyzeKey and the fixed
 // stored-analysis bounds). Records failing the identity or decode
@@ -709,8 +763,8 @@ type analyzeLookup struct {
 // they are never served as hits and never wedge the observation into
 // repeated failures. cfg and clock are accepted for the engine's calling
 // convention and future use; the lookup itself does not consult them — its
-// inputs are the URL, the cache, and the context only.
-func lookupAnalyze(ctx context.Context, u asset.URL, cfg Config, c cache.Cache, clock runtime.Clock) analyzeLookup {
+// inputs are the URL, the content hash, the cache, and the context only.
+func lookupAnalyze(ctx context.Context, u asset.URL, contentHash string, cfg Config, c cache.Cache, clock runtime.Clock) analyzeLookup {
 	key, err := analyzeKey(u)
 	if err != nil {
 		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: build cache key: %w", u.String(), err)}
@@ -750,6 +804,25 @@ func lookupAnalyze(ctx context.Context, u asset.URL, cfg Config, c cache.Cache, 
 		}
 		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: discarded unusable cached analyze: %w", u.String(), derr)}
 	}
+	// Content binding: the record's analysis is only valid for the content
+	// it was derived from. A hash mismatch means the fetched content
+	// changed since the record was stored (fresh fetch, old analysis) —
+	// never serve it; delete it so the fresh analysis overwrites the same
+	// key in this run (self-healing), and fall through as a routine miss.
+	// The record itself is well-formed (decode passed) and legitimate —
+	// it was written by an earlier run for earlier content — so this is a
+	// normal lifecycle event, not an anomaly, and carries NO diagnostic:
+	// every content refresh would otherwise pollute the run-error summary
+	// on the first analyze after the refresh. The delete still matters
+	// when no fresh store follows (empty content is never cached, a parse
+	// failure stores nothing): without it an outdated record would linger
+	// under the key.
+	if st.AnalyzedHash != contentHash {
+		if delerr := c.Delete(ctx, key); delerr != nil {
+			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: delete stale cached analyze: %w", u.String(), delerr)}
+		}
+		return analyzeLookup{}
+	}
 	return analyzeLookup{
 		Result:    storedToAnalysis(st),
 		FirstSeen: st.FirstSeen,
@@ -770,7 +843,29 @@ func lookupAnalyze(ctx context.Context, u asset.URL, cfg Config, c cache.Cache, 
 // the clock; a cancelled run still persists its terminal records using a
 // detached, bounded context so the write cannot wedge shutdown (Phase 4
 // convention). Put failures are returned as diagnostics, never fatal.
-func storeAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.Clock, u asset.URL, data analysisData, truncated bool, sources []string, firstSeen, lastSeen time.Time) error {
+//
+// contentHash is the content hash the analysis was derived from (the JS
+// asset's ContentHash, the SHA-256 of the fetched bytes). It is recorded as
+// the record's AnalyzedHash, binding the analysis to its content: a later
+// lookup cross-validates it and refuses a record whose content changed
+// (see lookupAnalyze). An EMPTY hash — only possible for an empty body,
+// the one content whose SHA-256 is empty under the fetch layer's
+// convention — is deliberately NOT stored: an empty-body analysis cannot
+// be content-bound unambiguously (a legacy record without the field would
+// decode to the same empty hash), so it is recomputed on every run. The
+// recompute is a single trivial parse of zero bytes; the alternative would
+// be a record that either passes its own decode with no binding or is
+// rejected by it, and a record this layer writes must always satisfy its
+// own decode.
+func storeAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.Clock, u asset.URL, contentHash string, data analysisData, truncated bool, sources []string, firstSeen, lastSeen time.Time) error {
+	if contentHash == "" {
+		// Empty content: never cached (see above). This is a deliberate
+		// no-op, not an error — the analysis itself is unaffected.
+		return nil
+	}
+	if len(contentHash) != 64 || !lowerHex(contentHash) {
+		return fmt.Errorf("jsintel: store analyze %s: content hash %q is not 64 lowercase hex digits", u.String(), truncateStored(contentHash))
+	}
 	if clock == nil {
 		clock = wallClock{}
 	}
@@ -799,6 +894,7 @@ func storeAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.
 
 	st := analysisToStored(data)
 	st.Target = u.Identity().String()
+	st.AnalyzedHash = contentHash
 	st.Truncated = truncated
 	st.FirstSeen = firstSeen
 	st.LastSeen = lastSeen

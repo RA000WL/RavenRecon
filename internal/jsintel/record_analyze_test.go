@@ -3,7 +3,9 @@
 package jsintel
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -54,16 +56,24 @@ func analyzeFixture(t *testing.T, u asset.URL) analysisData {
 	}
 }
 
+// analyzeHash returns a deterministic 64-character lowercase hex content
+// hash for tests — the exact form the fetch layer produces for real
+// content (readTerminal) and the JS asset's ContentHash carries.
+func analyzeHash(seed byte) string {
+	return hex.EncodeToString(bytes.Repeat([]byte{seed}, 32))
+}
+
 func TestAnalyzeCacheRoundTrip(t *testing.T) {
 	u := mustURL(t, "https://example.com/app.js")
 	c := openTestCache(t)
 	clock := newFakeClock(fixedTime)
 	data := analyzeFixture(t, u)
+	hash := analyzeHash(0x11)
 
-	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hash, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
 		t.Fatalf("storeAnalyze: %v", err)
 	}
-	lu := lookupAnalyze(context.Background(), u, Config{}, c, clock)
+	lu := lookupAnalyze(context.Background(), u, hash, Config{}, c, clock)
 	if !lu.Hit {
 		t.Fatalf("lookup = hit false (err %v), want a hit", lu.Err)
 	}
@@ -80,11 +90,12 @@ func TestAnalyzeIncompleteNeverHit(t *testing.T) {
 	c := openTestCache(t)
 	clock := newFakeClock(fixedTime)
 	data := analyzeFixture(t, u)
+	hash := analyzeHash(0x11)
 
-	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, data, true, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hash, data, true, []string{"test-src"}, fixedTime, fixedTime); err != nil {
 		t.Fatalf("storeAnalyze: %v", err)
 	}
-	lu := lookupAnalyze(context.Background(), u, Config{}, c, clock)
+	lu := lookupAnalyze(context.Background(), u, hash, Config{}, c, clock)
 	if lu.Hit {
 		t.Fatal("a truncated analysis must never be served as a hit")
 	}
@@ -120,9 +131,10 @@ func TestAnalyzeCacheTamperTable(t *testing.T) {
 		t.Fatalf("analyzeKey: %v", err)
 	}
 	data := analyzeFixture(t, u)
+	hash := analyzeHash(0x11)
 
 	// The valid base record every mutation starts from.
-	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hash, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
 		t.Fatalf("base storeAnalyze: %v", err)
 	}
 	baseOut := c.Get(context.Background(), key)
@@ -141,6 +153,12 @@ func TestAnalyzeCacheTamperTable(t *testing.T) {
 		{"wrong target", func(s *storedAnalyze) { s.Target = "url:http://other.example/x.js" }},
 		{"wrong parser version", func(s *storedAnalyze) { s.ParserVersion++ }},
 		{"wrong mask", func(s *storedAnalyze) { s.Mask = "eim" }},
+		{"empty analyzed hash", func(s *storedAnalyze) { s.AnalyzedHash = "" }},
+		{"malformed analyzed hash", func(s *storedAnalyze) { s.AnalyzedHash = "zz" + strings.Repeat("0", 62) }},
+		// NOTE: a well-formed hash of DIFFERENT content is NOT a tamper —
+		// it is the routine lifecycle case (content changed between runs;
+		// fetch and analyze records have independent lifecycles), pinned by
+		// TestAnalyzeHashMismatchHeals as a silent miss.
 		{"non-canonical import url", func(s *storedAnalyze) { s.Imports[0].URL = asset.URL{} }},
 		{"unknown import kind", func(s *storedAnalyze) { s.Imports[0].Kind = "bogus" }},
 		{"empty import specifier", func(s *storedAnalyze) { s.Imports[0].Specifier = "" }},
@@ -176,7 +194,7 @@ func TestAnalyzeCacheTamperTable(t *testing.T) {
 			tc.mutate(&mut)
 			putAnalyzeRecord(t, c, key, mut)
 
-			lu := lookupAnalyze(context.Background(), u, Config{}, c, clock)
+			lu := lookupAnalyze(context.Background(), u, hash, Config{}, c, clock)
 			if lu.Hit {
 				t.Fatal("tampered record served as a hit")
 			}
@@ -193,10 +211,10 @@ func TestAnalyzeCacheTamperTable(t *testing.T) {
 
 	// A fresh store after the last rejection recomputes a valid record
 	// (self-healing in the same run).
-	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hash, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
 		t.Fatalf("recompute storeAnalyze: %v", err)
 	}
-	if lu := lookupAnalyze(context.Background(), u, Config{}, c, clock); !lu.Hit {
+	if lu := lookupAnalyze(context.Background(), u, hash, Config{}, c, clock); !lu.Hit {
 		t.Fatalf("recomputed record not served (err %v)", lu.Err)
 	}
 }
@@ -243,7 +261,102 @@ func TestAnalyzeKeyStability(t *testing.T) {
 	// Per-file caps are not part of the key by construction: analyzeKey
 	// takes only the URL. Documented, not asserted mechanically beyond the
 	// signature (a stored record stays valid under any cap configuration).
+	// The content hash is likewise NOT part of the key: it lives in the
+	// record payload (storedAnalyze.AnalyzedHash) and is cross-validated at
+	// lookup — a content change deletes the stale record under the same
+	// key instead of orphaning one key per content version.
 	if strings.Contains(string(ka1), "MaxEndpoints") {
 		t.Error("key must not embed configurable caps")
 	}
+}
+
+// TestAnalyzeHashMismatchHeals pins the M-5 content binding: a record
+// derived from content A must never serve the analysis for content B. The
+// lookup cross-validates the stored hash against the CURRENT content's
+// hash, deletes the stale record (self-healing under the same key), and
+// falls through to a fresh analysis; the fresh store rebinds the key.
+func TestAnalyzeHashMismatchHeals(t *testing.T) {
+	u := mustURL(t, "https://example.com/app.js")
+	c := openTestCache(t)
+	clock := newFakeClock(fixedTime)
+	data := analyzeFixture(t, u)
+	hashA := analyzeHash(0x11)
+	hashB := analyzeHash(0x22)
+
+	// Content A analyzed: the record is bound to A's hash.
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hashA, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+		t.Fatalf("storeAnalyze(A): %v", err)
+	}
+	if lu := lookupAnalyze(context.Background(), u, hashA, Config{}, c, clock); !lu.Hit {
+		t.Fatalf("lookup with A's content = hit false (err %v), want a hit", lu.Err)
+	}
+
+	// The content changed (hash B): the stale record must not serve. The
+	// record is well-formed and legitimate — only outdated — so the
+	// mismatch is a routine lifecycle event (fetch and analyze records
+	// have independent lifecycles), NOT an anomaly: the lookup falls
+	// through as a silent miss with no diagnostic, exactly like a plain
+	// cache miss.
+	lu := lookupAnalyze(context.Background(), u, hashB, Config{}, c, clock)
+	if lu.Hit {
+		t.Fatal("stale analysis served for different content")
+	}
+	if lu.Err != nil {
+		t.Fatalf("lookup err = %v, want nil (a content change is a routine miss, not a diagnostic)", lu.Err)
+	}
+	key, err := analyzeKey(u)
+	if err != nil {
+		t.Fatalf("analyzeKey: %v", err)
+	}
+	if out := c.Get(context.Background(), key); out.State != cache.StateMiss {
+		t.Fatalf("state after stale rejection = %v, want miss (the stale record was deleted)", out.State)
+	}
+
+	// The fresh analysis of B stores under the SAME key, bound to B.
+	if err := storeAnalyze(context.Background(), Config{}, c, clock, u, hashB, data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+		t.Fatalf("storeAnalyze(B): %v", err)
+	}
+	if lu := lookupAnalyze(context.Background(), u, hashB, Config{}, c, clock); !lu.Hit {
+		t.Fatalf("lookup with B's content = hit false (err %v), want a hit", lu.Err)
+	}
+	// The rebound record must not serve A either: binding is bidirectional.
+	if lu := lookupAnalyze(context.Background(), u, hashA, Config{}, c, clock); lu.Hit {
+		t.Fatal("rebound record served for the old content")
+	}
+}
+
+// TestAnalyzeStoreHashValidation pins the store-side hash contract: an
+// analysis of EMPTY content (the only content whose SHA-256 is empty under
+// the fetch layer's convention) is never cached — the lookup falls through
+// to a fresh analysis — and a malformed hash is a store error, so a record
+// this layer writes always satisfies its own decode.
+func TestAnalyzeStoreHashValidation(t *testing.T) {
+	u := mustURL(t, "https://example.com/app.js")
+	data := analyzeFixture(t, u)
+
+	t.Run("empty content is never cached", func(t *testing.T) {
+		c := openTestCache(t)
+		clock := newFakeClock(fixedTime)
+		if err := storeAnalyze(context.Background(), Config{}, c, clock, u, "", data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
+			t.Fatalf("storeAnalyze(empty hash): %v", err)
+		}
+		key, err := analyzeKey(u)
+		if err != nil {
+			t.Fatalf("analyzeKey: %v", err)
+		}
+		if out := c.Get(context.Background(), key); out.State != cache.StateMiss {
+			t.Fatalf("state = %v, want miss (empty-content analysis is never stored)", out.State)
+		}
+		if lu := lookupAnalyze(context.Background(), u, "", Config{}, c, clock); lu.Hit {
+			t.Fatal("empty-content analysis served as a hit")
+		}
+	})
+
+	t.Run("malformed hash rejected", func(t *testing.T) {
+		c := openTestCache(t)
+		clock := newFakeClock(fixedTime)
+		if err := storeAnalyze(context.Background(), Config{}, c, clock, u, "zz"+strings.Repeat("0", 62), data, false, []string{"test-src"}, fixedTime, fixedTime); err == nil {
+			t.Error("storeAnalyze accepted a malformed content hash")
+		}
+	})
 }

@@ -4,8 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v0.5.0 — Passive Discovery** (DNS pipeline landed as Active
-Infrastructure sub-milestone 5A)
+**v1.0.0**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -241,8 +240,10 @@ probing") for the full design and security considerations.
 ## URL intelligence (library)
 
 `internal/urlintel` (roadmap v0.7, sub-milestone 6B) streams raw observed
-URLs through the Phase 2 asset model: each line is canonicalized (never
-trusted raw), classified as a GET endpoint, and mined for query parameters
+URLs through the Phase 2 asset model: each line is canonicalized at the
+ingest boundary (never trusted raw; userinfo carried by a raw line is
+redacted at that same construction point), classified as a GET endpoint,
+and mined for query parameters
 (names and values kept exactly as observed), then cached per (URL, adapter)
 with cache-before-execute. Observations merge at emit time across adapters
 into one deterministic report per canonical URL, and every entry carries
@@ -282,7 +283,9 @@ requirement for High), and emits typed Technology and Evidence assets plus
 asset-graph edges (host/url/endpoint → technology, technology →
 evidence). Detections are cached per target under operation `tech.detect`
 with cache-before-execute — a cache hit serves the stored result with ZERO
-analysis — and observations merge deterministically at emit time, with
+analysis, and the cache key carries the fingerprint database content
+digest, so a data-only table edit invalidates every cached detection —
+and observations merge deterministically at emit time, with
 honest completed/cancelled/failed/malformed statuses. Runs use a bounded
 pool with cancellation and bounded diagnostics, and all tests and
 benchmarks are hermetic (synthetic input and a real filesystem-backed
@@ -298,9 +301,10 @@ Engine: a typed Source seam (raw lines, HTML page observations, tool
 adapters) feeds a bounded worker pool where every candidate URL runs
 cache-before-execute fetch → classify → parse → extract → merge → emit →
 bounded import expansion. Fetches retain bounded content with honest
-truncation (a partial prefix is never kept), follow redirects under fixed
-caps, and classify completed negatives (`conn_refused`, `tls`) as
-legitimate observations. The stdlib-only parser extracts imports, string
+truncation (a partial prefix is never kept), follow redirects to http(s)
+targets only under fixed caps — a non-http(s) redirect target is observed,
+never followed — and classify completed negatives (`conn_refused`, `tls`)
+as legitimate observations. The stdlib-only parser extracts imports, string
 literals, and source map references without ever building an AST or
 executing code; the analyzers turn those observations into endpoint
 candidates, secret candidates (detection only — never verification),
@@ -476,14 +480,15 @@ cap; above it, the retained findings are the completion-order prefix.
 
 Cache and metrics: one `detect.rule` record per rule per run,
 cache-before-execute composed around pool jobs exactly like the other
-consumer stages. The key carries the rule ID, the fingerprint of the
-rule's full declared metadata (version included — the documented bump
+consumer stages. The key carries the detect schema version, the rule ID,
+the fingerprint of
+the rule's full declared metadata (version included — the documented bump
 contract), the fingerprint of the normalized snapshot (identities plus
-the provenance fields a rule can read: technology version and provenance
-source/reference/confidence, evidence and endpoint provenance
-reference/confidence, JavaScript content hash and size plus provenance
-reference/confidence, and secret provenance source/confidence;
-provenance timestamps deliberately excluded), and
+every observable JavaScript asset field — content hash, size, content
+type, ETag, last-modified, discovery source, status code, final URL, host
+— and full provenance source/reference/confidence on JavaScript,
+technology, evidence, endpoint, and secret entries; provenance timestamps
+deliberately excluded), and
 every configuration entry. Only completed executions are cached — partial
 executions never are — and every decoded record is re-validated through
 the same checks the fresh path applies; a tampered record is evicted and
@@ -518,7 +523,8 @@ Reports register like rules (validated metadata, duplicate-ID rejection)
 and four builtins ship: a versioned compact **JSON** export of the
 complete model, a six-dataset **CSV** export (one table per dataset, with
 spreadsheet-formula injection neutralized in the presentation), a
-human-readable **Markdown** summary with honest row caps, and a
+human-readable **Markdown** summary with honest row caps and escaped cell
+delimiters (content backslashes doubled before pipes are escaped), and a
 self-contained static **HTML** report (inline CSS, `<details>` sections,
 vanilla-script search and filtering, no frameworks, no external
 resources, every byte escaped). Every output is validated before it is

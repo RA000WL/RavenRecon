@@ -18,7 +18,12 @@
 // Next returns io.EOF at end of stream. A line is immediately canonicalized
 // into a Phase 2 asset.URL by the ingest loop — raw strings never travel
 // beyond the parse stage; the pipeline, cache, report, and graph carry only
-// typed assets. SliceSource wraps a []string for tests and static input.
+// typed assets. Userinfo credentials in a raw line are redacted at that same
+// parse point: asset.URL.Original preserves userinfo by design, so a line
+// that differs from its canonical form is rebuilt through the canonical
+// string and Original never contains credentials anywhere downstream
+// (records, reports, exports, merges; the stored form is always canonical).
+// SliceSource wraps a []string for tests and static input.
 // The companion package internal/urlintel/adapt presents external tools
 // (gau, waybackurls, waymore) as LineSources over their stdout.
 //
@@ -34,7 +39,11 @@
 //  2. rejects lines over maxRawURLLen (32 KiB) as malformed — counted,
 //     reported, never cached, never fatal;
 //  3. canonicalizes the line through asset.ParseURL — parse failures are
-//     malformed, counted, and the run continues;
+//     malformed, counted, and the run continues; a line carrying userinfo
+//     (any line whose spelling differs from its canonical form) is
+//     immediately rebuilt through the canonical string so the asset's
+//     Original never contains credentials and the stored form is always
+//     canonical;
 //  4. pre-registers a cancelled entry for the canonical URL (so a job
 //     dropped by forced shutdown still appears honestly);
 //  5. submits the per-line job: cache-before-execute (serve the stored

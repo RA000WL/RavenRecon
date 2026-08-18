@@ -599,7 +599,7 @@ func TestIngestRecordCreatedAtIsStoreTime(t *testing.T) {
 		t.Fatalf("Ingest: %v", err)
 	}
 
-	key, err := techKey(obs, fingerprints.SchemaVersion)
+	key, err := techKey(obs, fingerprints.SchemaVersion, techDigest(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestIngestRecordCreatedAtIsStoreTimeFutureObservedAt(t *testing.T) {
 		t.Fatalf("Ingest: %v", err)
 	}
 
-	key, err := techKey(obs, fingerprints.SchemaVersion)
+	key, err := techKey(obs, fingerprints.SchemaVersion, techDigest(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,8 +15,15 @@ import (
 // SchemaVersion versions the detection framework's record layout and key
 // semantics. Bump it when the stored payload structure or the key inputs
 // change: a bump invalidates every previously cached rule result by
-// construction.
-const SchemaVersion = 1
+// construction — the version enters every rule key ("schema" part below)
+// and every stored payload (storedFindings.Version, re-validated on
+// decode), so old records are both unreachable and rejected.
+//
+// Version 2: the snapshot fingerprint now covers every observable
+// asset.JavaScript field (legacy hash, canonical host name, content type,
+// ETag, last-modified, discovery source, status code, final URL) and the
+// provenance source of evidence/endpoints and reference of secrets.
+const SchemaVersion = 2
 
 // Operation is the stable cache operation name for rule results.
 const Operation = "detect.rule"
@@ -27,17 +34,23 @@ const maxCachedFindingsPerRule = 256
 
 // fingerprintTech / fingerprintEvidence / fingerprintSecret /
 // fingerprintScript / fingerprintEndp are the canonical per-element forms
-// the run fingerprint digests. They cover every provenance field a rule can
+// the run fingerprint digests. They cover every observable field a rule can
 // read through the Context that materially changes what it can observe:
 // technology version, source, reference, and confidence; evidence and
-// endpoint reference and confidence (the evidence identity already embeds
-// the source asset); JavaScript content hash, size, reference, and
-// confidence; secret source and confidence. Relationships carry no
-// provenance in the asset model, so their edge ID is the complete
-// observable. Provenance timestamps (DiscoveredAt) are deliberately
-// excluded from every form — they are echoed metadata that changes every
-// run while producing identical findings; including them would bust the
-// cache on every run for zero difference.
+// endpoint source, reference, and confidence (the evidence identity already
+// embeds the source asset, which is separate from the provenance source);
+// JavaScript — every observation field (legacy hash, canonical host name,
+// content hash, size, content type, ETag, last-modified, discovery source,
+// status code, final URL) plus provenance source, reference, and confidence;
+// secret source, reference, and confidence. Nested assets (the JavaScript
+// URL, final URL, and host) enter by their canonical form only — the raw
+// Originals and nested provenance are echo metadata, exactly like the core
+// asset list's identity-only entries. Relationships carry no provenance in
+// the asset model, so their edge ID is the complete observable. Provenance
+// timestamps (DiscoveredAt) are deliberately excluded from every form —
+// they are echoed metadata that changes every run while producing identical
+// findings; including them would bust the cache on every run for zero
+// difference.
 type fingerprintTech struct {
 	Identity   string  `json:"id"`
 	Version    string  `json:"version,omitempty"`
@@ -48,6 +61,7 @@ type fingerprintTech struct {
 
 type fingerprintEvidence struct {
 	Identity   string  `json:"id"`
+	Source     string  `json:"source,omitempty"`
 	Reference  string  `json:"reference,omitempty"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
@@ -55,19 +69,30 @@ type fingerprintEvidence struct {
 type fingerprintSecret struct {
 	Identity   string  `json:"id"`
 	Source     string  `json:"source,omitempty"`
+	Reference  string  `json:"reference,omitempty"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
 
 type fingerprintScript struct {
-	Identity    string  `json:"id"`
-	ContentHash string  `json:"content_hash,omitempty"`
-	Size        int64   `json:"size,omitempty"`
-	Reference   string  `json:"reference,omitempty"`
-	Confidence  float64 `json:"confidence,omitempty"`
+	Identity        string  `json:"id"`
+	Hash            string  `json:"hash,omitempty"`
+	Host            string  `json:"host,omitempty"`
+	ContentHash     string  `json:"content_hash,omitempty"`
+	Size            int64   `json:"size,omitempty"`
+	ContentType     string  `json:"content_type,omitempty"`
+	ETag            string  `json:"etag,omitempty"`
+	LastModified    string  `json:"last_modified,omitempty"`
+	DiscoverySource string  `json:"discovery_source,omitempty"`
+	StatusCode      int     `json:"status_code,omitempty"`
+	FinalURL        string  `json:"final_url,omitempty"`
+	Source          string  `json:"source,omitempty"`
+	Reference       string  `json:"reference,omitempty"`
+	Confidence      float64 `json:"confidence,omitempty"`
 }
 
 type fingerprintEndp struct {
 	Identity   string  `json:"id"`
+	Source     string  `json:"source,omitempty"`
 	Reference  string  `json:"reference,omitempty"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
@@ -103,6 +128,7 @@ func fingerprintSnapshot(c *corpus) (string, error) {
 	for _, ev := range c.context.Evidence {
 		fp.Evidence = append(fp.Evidence, fingerprintEvidence{
 			Identity:   ev.Identity().Value,
+			Source:     ev.Prov.Source,
 			Reference:  ev.Prov.Reference,
 			Confidence: ev.Prov.Confidence,
 		})
@@ -120,21 +146,50 @@ func fingerprintSnapshot(c *corpus) (string, error) {
 		fp.Secrets = append(fp.Secrets, fingerprintSecret{
 			Identity:   s.Identity().Value,
 			Source:     s.Prov.Source,
+			Reference:  s.Prov.Reference,
 			Confidence: s.Prov.Confidence,
 		})
 	}
 	for _, j := range c.context.JavaScript {
+		// Nested assets enter by their canonical form only: the host by its
+		// canonical name, the final URL by its canonical identity string.
+		// Zero values mean "not observed" and are omitted.
+		host := ""
+		if !j.Host.Identity().IsZero() {
+			host = j.Host.Name
+		}
+		finalURL := ""
+		if !j.FinalURL.IsZero() {
+			finalURL = j.FinalURL.String()
+		}
+		// The observed Last-Modified header time is an observation, not a
+		// provenance timestamp: it enters the fingerprint in canonical UTC
+		// form, so equal instants in different zones cannot diverge.
+		lastModified := ""
+		if !j.LastModified.IsZero() {
+			lastModified = j.LastModified.UTC().Format(time.RFC3339Nano)
+		}
 		fp.JavaScript = append(fp.JavaScript, fingerprintScript{
-			Identity:    j.Identity().Value,
-			ContentHash: j.ContentHash,
-			Size:        j.Size,
-			Reference:   j.Prov.Reference,
-			Confidence:  j.Prov.Confidence,
+			Identity:        j.Identity().Value,
+			Hash:            j.Hash,
+			Host:            host,
+			ContentHash:     j.ContentHash,
+			Size:            j.Size,
+			ContentType:     j.ContentType,
+			ETag:            j.ETag,
+			LastModified:    lastModified,
+			DiscoverySource: j.DiscoverySource,
+			StatusCode:      j.StatusCode,
+			FinalURL:        finalURL,
+			Source:          j.Prov.Source,
+			Reference:       j.Prov.Reference,
+			Confidence:      j.Prov.Confidence,
 		})
 	}
 	for _, e := range c.context.Endpoints {
 		fp.Endpoints = append(fp.Endpoints, fingerprintEndp{
 			Identity:   e.Identity().Value,
+			Source:     e.Prov.Source,
 			Reference:  e.Prov.Reference,
 			Confidence: e.Prov.Confidence,
 		})

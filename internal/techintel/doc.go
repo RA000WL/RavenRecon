@@ -106,7 +106,11 @@
 //
 // Level = High/Medium/Low/Unknown. Score = 1 − ∏(1 − wᵢ) over INDEPENDENT
 // matches; independence is exactly: distinct indicator kinds OR distinct
-// match slots (same kind+slot collapses to max weight). Caps: no structural
+// match slots (same kind+slot collapses to max weight). Weights are
+// validated at load (NaN rejected), and deriveConfidence additionally
+// SKIPS any NaN-weight group as carrying no evidence (defense in depth), so
+// the score is always finite and its level is always the honest threshold
+// level — never a NaN fall-through to Unknown. Caps: no structural
 // indicator -> score capped at 0.59 (spoofable-only never exceeds Medium);
 // High requires at least one structural indicator; a lone weak indicator
 // (weight < 0.35) never exceeds Low. Thresholds: >=0.8 High, >=0.5 Medium,
@@ -125,12 +129,18 @@
 // # Cache
 //
 // Operation "tech.detect". Key = {operation, observation identity, the
-// fingerprint database SchemaVersion, the sources bitmask (sorted letters:
-// b body, c cookies, d DNS, e endpoint, h headers, t TLS)}. Bumping
-// fingerprints.SchemaVersion invalidates every cached detection by
-// construction. Timings, concurrency, the status code, and the fixed caps
-// never enter keys; the analysis caps are bounded by decode re-checking
-// retained counts against the current run's caps. On a cache HIT the
+// fingerprint database SchemaVersion, the fingerprint database CONTENT
+// digest (fingerprints.DB.Digest, computed once per run at env
+// construction), the sources bitmask (sorted letters: b body, c cookies, d
+// DNS, e endpoint, h headers, t TLS)}. Bumping fingerprints.SchemaVersion —
+// or any DATA-ONLY edit to the fingerprint tables, which changes the
+// content digest — invalidates every cached detection by construction.
+// Timings, concurrency, the status code, and the fixed caps never enter
+// keys; the analysis caps are bounded by decode re-checking retained
+// counts against the current run's caps. Decode score re-validation
+// rejects NaN scores explicitly (defense in depth: encoding/json can
+// neither marshal nor unmarshal NaN, so a stored payload can never carry
+// one). On a cache HIT the
 // entry's StatusCode comes from the stored record: it is never re-derived
 // from the observation and never enters the key. Record CreatedAt is
 // stamped from the RUN clock at store time — never from the observation's

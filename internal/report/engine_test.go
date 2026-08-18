@@ -721,6 +721,129 @@ func TestRunCompressedRenderCacheHitAndTamperEviction(t *testing.T) {
 	}
 }
 
+func TestRunRenderCacheZeroBytePartEvictedAndReRendered(t *testing.T) {
+	// L-10 regression: a cached render record whose part payload is
+	// zero-byte (Bytes 0, Data empty) used to pass decodeRender and then
+	// fail validation on EVERY warm run — a permanently failing render
+	// with no eviction and no self-heal. The decode boundary must refuse
+	// the empty payload, and the engine's decode-failure path must evict
+	// the record and recompute the render in the same run.
+	dir := t.TempDir()
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	store, err := cache.Open(cacheDir)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+
+	reg, _ := NewDefaultRegistry()
+	cfg := DefaultEngineConfig(reg, dir)
+	cfg.Cache = store
+	cfg.Reports = []string{"json"}
+
+	// Cold run: renders fresh and stores a usable record.
+	res1, err := Run(context.Background(), cfg, testContext(t))
+	if err != nil {
+		t.Fatalf("cold run: %v", err)
+	}
+	cold := resultFor(t, res1, "json")
+	if cold.Cached {
+		t.Fatalf("cold run served from cache")
+	}
+	coldBytes, err := os.ReadFile(cold.Files[0])
+	if err != nil {
+		t.Fatalf("read cold render: %v", err)
+	}
+
+	// Plant a zero-byte-part record whose identity fields match the run
+	// EXACTLY (report ID, version, format, digest): the empty payload is
+	// the record's only defect, so only the decode rejection can catch it.
+	rep, _ := reg.Get("json")
+	m := testModel(t)
+	poisonPayload, err := json.Marshal(renderRecord{
+		ReportID: rep.ID, Version: rep.Version, Format: string(rep.Format),
+		Digest: m.Digest,
+		Parts:  []renderPart{{Part: "", Bytes: 0, Data: []byte{}}},
+	})
+	if err != nil {
+		t.Fatalf("marshal poison record: %v", err)
+	}
+	raw, err := json.Marshal(cache.Record{
+		SchemaVersion: cache.SchemaVersion,
+		Operation:     renderOperation,
+		Target:        "report:" + m.Digest,
+		CreatedAt:     fixedTime,
+		Status:        cache.StatusCompleted,
+		Data:          poisonPayload,
+	})
+	if err != nil {
+		t.Fatalf("marshal poisoned cache entry: %v", err)
+	}
+	err = filepath.Walk(filepath.Join(cacheDir, "entries"), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		return os.WriteFile(path, raw, 0o600)
+	})
+	if err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+
+	// The planted record must be refused at the decode boundary with a
+	// descriptive error (lookup treats it as unusable, never a hit).
+	key, err := renderCacheKey(m, rep, false)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	out := store.Get(context.Background(), key)
+	if !out.IsHit() {
+		t.Fatalf("planted record did not surface as a hit: %+v", out.State)
+	}
+	if parts, derr := decodeRender(out, m, rep, false); derr == nil {
+		t.Fatalf("zero-byte part record accepted by decode: %+v", parts)
+	} else if !strings.Contains(derr.Error(), "empty payload") {
+		t.Fatalf("rejection error not descriptive: %v", derr)
+	}
+
+	// Warm run against the poisoned record: it must be evicted and the
+	// render recomputed fresh (completed, not cached, byte-identical).
+	res2, err := Run(context.Background(), cfg, testContext(t))
+	if err != nil {
+		t.Fatalf("warm run: %v", err)
+	}
+	warm := resultFor(t, res2, "json")
+	if warm.Status != ReportStatusCompleted {
+		t.Fatalf("self-healed run failed: %q %v", warm.Status, warm.Err)
+	}
+	if warm.Cached {
+		t.Fatalf("zero-byte part record was served as a hit")
+	}
+	reRendered, err := os.ReadFile(warm.Files[0])
+	if err != nil {
+		t.Fatalf("read re-rendered output: %v", err)
+	}
+	if !equalBytes(coldBytes, reRendered) {
+		t.Fatalf("recomputed render differs from the cold render")
+	}
+
+	// Self-heal proven: the eviction + fresh store left a USABLE record
+	// behind, so the next run is a genuine cache hit.
+	out2 := store.Get(context.Background(), key)
+	parts, derr := decodeRender(out2, m, rep, false)
+	if derr != nil {
+		t.Fatalf("stored record after self-heal is unusable: %v", derr)
+	}
+	if len(parts) != 1 || len(parts[0].Data) == 0 {
+		t.Fatalf("stored record after self-heal is not the fresh render: %+v", parts)
+	}
+	res3, err := Run(context.Background(), cfg, testContext(t))
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if !resultFor(t, res3, "json").Cached {
+		t.Fatalf("third run did not serve the self-healed record from cache")
+	}
+}
+
 func TestRunRenderCacheTamperedRecordEvicted(t *testing.T) {
 	dir := t.TempDir()
 	cacheDir := filepath.Join(t.TempDir(), "cache")

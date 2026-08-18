@@ -699,58 +699,123 @@ func TestProbeCancelledBeforeSubmitKeepsHonestStatus(t *testing.T) {
 func TestProbeURLErrorsNeverLeakCredentials(t *testing.T) {
 	// Redirect hops with userinfo must never surface credentials anywhere:
 	// hop targets, the typed URL assets' Original fields (which asset.URL
-	// preserves by design), errors, AND the on-disk cache records (the
-	// HIGH-2 regression — the leak was previously proven to reach both the
+	// preserves by design), errors, the retained response headers, the
+	// serialized report, AND the on-disk cache records (the HIGH-2
+	// regression — the leak was previously proven to reach both the
 	// report and the cache).
-	cs := newCountingServer(t, 200, "ok")
-	cs.setHandler(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			w.Header().Set("Location", "http://user:supersecret@www.example.com/private")
-			w.WriteHeader(302)
-			return
-		}
-		w.WriteHeader(200)
-	})
+	//
+	// Two vectors are pinned: a parseable in-scope Location whose userinfo
+	// is dropped at the hop boundary, and an UNPARSEABLE Location whose
+	// invalid port (99999) makes url.Parse fail while the header still
+	// carries credentials (the H-1 regression): the raw header must never
+	// be echoed — as the hop target (the raw Location was previously
+	// returned verbatim by the unparseable branch), into the retained
+	// headers of the terminal redirect response, into the serialized
+	// report, or into the cache record.
+	cases := []struct {
+		name       string
+		loc        string
+		inScope    bool
+		wantTarget string // expected hop target
+		wantReqs   int    // requests on the http probe
+		wantStatus int    // the TERMINAL response's status code (see below)
+	}{
+		{"in-scope parseable userinfo",
+			"http://user:supersecret@www.example.com/private", true,
+			"http://www.example.com/private", 2, 200},
+		{"out-of-scope invalid-port userinfo",
+			"http://user:supersecret@evil.net:99999/x", false,
+			"http://evil.net:99999/x", 1, 302},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCountingServer(t, 200, "ok")
+			cs.setHandler(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/" {
+					w.Header().Set("Location", tc.loc)
+					w.WriteHeader(302)
+					return
+				}
+				w.WriteHeader(200)
+			})
 
-	cfg := testConfig()
-	cfg.Cache = openTestCache(t, func() time.Time { return fixedTime }, 0)
-	rep := probeOne(t, cs.srv, []asset.Host{mustHost(t, "www.example.com")}, cfg)
-	hr := hostByName(t, rep, "www.example.com")
-	for _, pr := range hr.Probes {
-		for _, hop := range pr.RedirectChain {
-			if strings.Contains(hop.Target, "supersecret") {
+			cfg := testConfig()
+			cfg.Cache = openTestCache(t, func() time.Time { return fixedTime }, 0)
+			rep := probeOne(t, cs.srv, []asset.Host{mustHost(t, "www.example.com")}, cfg)
+			hr := hostByName(t, rep, "www.example.com")
+
+			httpPr := probeResultFor(hr, "http")
+			// The recorded status code is the TERMINAL response's — the
+			// response that ended the walk, exactly as the redirect tests
+			// pin (TestProbeRedirectInScope): the followed in-scope
+			// redirect ends at the 200 /private response, while the
+			// unparseable out-of-scope redirect is never followed, so the
+			// 302 itself is terminal.
+			if httpPr.Status != ProbeCompleted || httpPr.StatusCode != tc.wantStatus {
+				t.Fatalf("http probe = %+v (want completed %d)", httpPr, tc.wantStatus)
+			}
+			if got := cs.requestCount(); got != tc.wantReqs {
+				t.Fatalf("requests = %d, want %d", got, tc.wantReqs)
+			}
+			if len(httpPr.RedirectChain) != 1 {
+				t.Fatalf("chain = %+v, want exactly 1 hop", httpPr.RedirectChain)
+			}
+			hop := httpPr.RedirectChain[0]
+			if hop.InScope != tc.inScope || hop.Followed != tc.inScope {
+				t.Fatalf("hop = %+v, want inScope=%v followed=%v", hop, tc.inScope, tc.inScope)
+			}
+			if hop.Target != tc.wantTarget {
+				t.Fatalf("hop target = %q, want %q", hop.Target, tc.wantTarget)
+			}
+			if strings.Contains(hop.Target, "supersecret") || strings.Contains(hop.Target, "@") {
 				t.Fatalf("credentials leaked into hop target %q", hop.Target)
 			}
 			if strings.Contains(hop.URL.Original, "supersecret") || strings.Contains(hop.URL.Original, "@") {
 				t.Fatalf("credentials leaked into hop URL original %q", hop.URL.Original)
 			}
-		}
-		if strings.Contains(pr.FinalURL.String(), "supersecret") {
-			t.Fatalf("credentials leaked into final url %q", pr.FinalURL.String())
-		}
-		if strings.Contains(pr.FinalURL.Original, "supersecret") || strings.Contains(pr.FinalURL.Original, "@") {
-			t.Fatalf("credentials leaked into final url original %q", pr.FinalURL.Original)
-		}
-		if pr.Err != nil && strings.Contains(pr.Err.Error(), "supersecret") {
-			t.Fatalf("credentials leaked into error %v", pr.Err)
-		}
-	}
-	// The in-scope redirect was followed once: 2 requests on the http probe.
-	if got := cs.requestCount(); got != 2 {
-		t.Fatalf("requests = %d, want 2 (redirect followed once)", got)
-	}
-	// The on-disk cache records must not contain the credentials either
-	// (inspected through the cache API, exactly as a later run would read
-	// them back).
-	for _, scheme := range []string{"http", "https"} {
-		out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), scheme))
-		if !out.IsHit() {
-			t.Fatalf("%s record state = %s, want hit", scheme, out.State)
-		}
-		data := string(out.Record.Data)
-		if strings.Contains(data, "supersecret") || strings.Contains(data, "user:supersecret") {
-			t.Fatalf("credentials leaked into the on-disk %s cache record: %s", scheme, data)
-		}
+			if strings.Contains(httpPr.FinalURL.String(), "supersecret") {
+				t.Fatalf("credentials leaked into final url %q", httpPr.FinalURL.String())
+			}
+			if strings.Contains(httpPr.FinalURL.Original, "supersecret") || strings.Contains(httpPr.FinalURL.Original, "@") {
+				t.Fatalf("credentials leaked into final url original %q", httpPr.FinalURL.Original)
+			}
+			if httpPr.Err != nil && strings.Contains(httpPr.Err.Error(), "supersecret") {
+				t.Fatalf("credentials leaked into error %v", httpPr.Err)
+			}
+			// The retained headers of the terminal redirect response must
+			// not carry the credentials either: the Location header is
+			// redacted at retention (the header otherwise reaches both
+			// the report and the cache record verbatim).
+			for _, h := range httpPr.Headers {
+				for _, v := range h.Values {
+					if strings.Contains(v, "supersecret") || strings.Contains(v, "@") {
+						t.Fatalf("credentials leaked into retained header %q = %q", h.Key, v)
+					}
+				}
+			}
+			// The serialized report path (what a report consumer sees)
+			// must not contain the credentials.
+			reportJSON, err := json.Marshal(httpPr)
+			if err != nil {
+				t.Fatalf("marshal probe result: %v", err)
+			}
+			if strings.Contains(string(reportJSON), "supersecret") {
+				t.Fatalf("credentials leaked into the serialized report: %s", reportJSON)
+			}
+			// The on-disk cache records must not contain the credentials
+			// either (inspected through the cache API, exactly as a later
+			// run would read them back).
+			for _, scheme := range []string{"http", "https"} {
+				out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), scheme, mustDomain(t, "example.com")))
+				if !out.IsHit() {
+					t.Fatalf("%s record state = %s, want hit", scheme, out.State)
+				}
+				data := string(out.Record.Data)
+				if strings.Contains(data, "supersecret") || strings.Contains(data, "user:supersecret") {
+					t.Fatalf("credentials leaked into the on-disk %s cache record: %s", scheme, data)
+				}
+			}
+		})
 	}
 }
 
@@ -953,7 +1018,7 @@ func TestProbeTLSFlagOnRedirectTerminal(t *testing.T) {
 	if !httpsPr2.TLS {
 		t.Fatalf("https probe with cache = %+v (want TLS=true)", httpsPr2)
 	}
-	out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), "https"))
+	out := cfg.Cache.Get(context.Background(), probeKeyFor(t, mustHost(t, "www.example.com"), "https", mustDomain(t, "example.com")))
 	if !out.IsHit() {
 		t.Fatalf("https record state = %s, want hit", out.State)
 	}

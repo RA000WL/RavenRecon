@@ -1,6 +1,7 @@
 package fingerprints
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -77,6 +78,13 @@ func TestIndicatorKindTier(t *testing.T) {
 	}
 }
 
+// wantDigest is the pinned content digest of the production fingerprint
+// tables (DB.Digest). It changes ONLY when a table's detection data changes
+// — which is exactly the moment the cache-key contract wants every cached
+// detection invalidated. Update this constant together with the table edit;
+// do not bump SchemaVersion for data-only changes.
+const wantDigest = "f152a005424ff2a8"
+
 func TestLoadAndSchemaVersion(t *testing.T) {
 	if SchemaVersion != 1 {
 		t.Fatalf("SchemaVersion = %d, want 1", SchemaVersion)
@@ -92,6 +100,139 @@ func TestLoadAndSchemaVersion(t *testing.T) {
 	if d.Len() < 120 {
 		t.Errorf("DB has %d fingerprints, want at least 120", d.Len())
 	}
+
+	// Content digest: pinned to the documented value and stable across
+	// loads. The pin makes a data-only table edit fail this test on
+	// purpose: the edit must update wantDigest (the cache invalidation
+	// contract) even when SchemaVersion does not change.
+	if got, want := d.Digest(), wantDigest; got != want {
+		t.Errorf("Digest = %s, want %s (a table-data edit changed detection content; update wantDigest)", got, want)
+	}
+	again, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Digest() != d.Digest() {
+		t.Errorf("Digest = %s then %s across loads, want stable", d.Digest(), again.Digest())
+	}
+}
+
+// TestDigestContentSensitivityAndCoverage pins the content-addressing
+// contract: the digest covers EVERY loaded fingerprint (dropping any one
+// changes it), is sensitive to every data field family (category, weight,
+// version spec), and is order-deterministic (input order never matters).
+func TestDigestContentSensitivityAndCoverage(t *testing.T) {
+	d, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := d.Fingerprints()
+	if len(full) < 2 {
+		t.Fatal("test needs at least two fingerprints")
+	}
+	base := d.Digest()
+
+	// Coverage: dropping ANY single fingerprint changes the digest.
+	for dropped := range full {
+		subset := make([]Fingerprint, 0, len(full)-1)
+		for i, fp := range full {
+			if i != dropped {
+				subset = append(subset, fp)
+			}
+		}
+		sub, err := newRawDB(subset)
+		if err != nil {
+			t.Fatalf("newRawDB without %q: %v", full[dropped].Name, err)
+		}
+		if sub.Digest() == base {
+			t.Errorf("dropping fingerprint %q must change the digest", full[dropped].Name)
+		}
+	}
+
+	// Content sensitivity: mutating category, weight, or version pattern
+	// each changes the digest (the hash is over data, not just names).
+	deepCopy := func(fp Fingerprint) Fingerprint {
+		t.Helper()
+		out := fp
+		out.Indicators = make([]Indicator, len(fp.Indicators))
+		for i, ind := range fp.Indicators {
+			out.Indicators[i] = ind
+			if ind.Version != nil {
+				v := *ind.Version
+				out.Indicators[i].Version = &v
+			}
+		}
+		return out
+	}
+	digestWith := func(entries []Fingerprint) string {
+		t.Helper()
+		got, err := newRawDB(entries)
+		if err != nil {
+			t.Fatalf("newRawDB: %v", err)
+		}
+		return got.Digest()
+	}
+
+	t.Run("category change", func(t *testing.T) {
+		mut := deepCopy(full[0])
+		for _, c := range asset.KnownCategories() {
+			if c != mut.Category {
+				mut.Category = c
+				break
+			}
+		}
+		if mut.Category == full[0].Category {
+			t.Fatal("no alternate category found")
+		}
+		if digestWith(append([]Fingerprint{mut}, full[1:]...)) == base {
+			t.Error("changing one fingerprint's category must change the digest")
+		}
+	})
+
+	t.Run("indicator weight change", func(t *testing.T) {
+		mut := deepCopy(full[0])
+		w := mut.Indicators[0].Weight
+		if w >= 1 {
+			w = 0.99
+		} else {
+			w = math.Min(1, w+0.01)
+		}
+		mut.Indicators[0].Weight = w
+		if digestWith(append([]Fingerprint{mut}, full[1:]...)) == base {
+			t.Error("changing one indicator's weight must change the digest")
+		}
+	})
+
+	t.Run("version pattern change", func(t *testing.T) {
+		// Find any version-bearing indicator in the whole DB.
+		for fi := range full {
+			for ii := range full[fi].Indicators {
+				ind := full[fi].Indicators[ii]
+				if ind.Version == nil {
+					continue
+				}
+				mut := deepCopy(full[fi])
+				v := *ind.Version
+				v.Pattern = "(?:" + ind.Version.Pattern + ")" // still a valid regex
+				mut.Indicators[ii].Version = &v
+				entries := append([]Fingerprint(nil), full...)
+				entries[fi] = mut
+				if digestWith(entries) == base {
+					t.Error("changing a version pattern must change the digest")
+				}
+				return
+			}
+		}
+		t.Fatal("no version-bearing indicator found")
+	})
+
+	t.Run("input order never matters", func(t *testing.T) {
+		swapped := append([]Fingerprint(nil), full...)
+		swapped[0], swapped[1] = swapped[1], swapped[0]
+		if digestWith(swapped) != base {
+			t.Error("reordering the input must NOT change the digest")
+		}
+	})
 }
 
 // TestLoadCategoriesAllRepresented pins that every one of the 21
@@ -313,6 +454,9 @@ func TestLoadValidationErrors(t *testing.T) {
 	}, `0 < weight <= 1`)
 	try("weight above one", func(fp *Fingerprint) {
 		fp.Indicators[0].Weight = 1.5
+	}, `0 < weight <= 1`)
+	try("weight NaN", func(fp *Fingerprint) {
+		fp.Indicators[0].Weight = math.NaN()
 	}, `0 < weight <= 1`)
 
 	try("invalid html_regex match", func(fp *Fingerprint) {
@@ -559,8 +703,8 @@ func TestDataSanityAcrossDB(t *testing.T) {
 		for _, ind := range fp.Indicators {
 			totalIndicators++
 			allKinds[ind.Kind] = true
-			if ind.Weight <= 0 || ind.Weight > 1 {
-				t.Errorf("%s/%s: weight %v out of range", fp.Name, ind.Match, ind.Weight)
+			if math.IsNaN(ind.Weight) || ind.Weight <= 0 || ind.Weight > 1 {
+				t.Errorf("%s/%s: weight %v out of range (must satisfy 0 < weight <= 1 and must not be NaN)", fp.Name, ind.Match, ind.Weight)
 			}
 			if ind.Kind.Tier() == TierSpoofable {
 				spoobableSeen = true

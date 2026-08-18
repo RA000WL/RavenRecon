@@ -79,13 +79,15 @@ func TestIngestBasic(t *testing.T) {
 	}
 	requireEqualStrings(t, "relationships", relationIDs(e), wantRels)
 
-	// URL asset provenance (the canonical URL's Original still carries the
-	// raw line).
+	// URL asset provenance and the redaction invariant: the input line is
+	// already canonical, so Original equals the canonical form (a line that
+	// differs from its canonical spelling — userinfo included — is rebuilt
+	// at ingest; see parseRawURL).
 	if e.URL.Prov.Source != "test-adapter" || !e.URL.Prov.DiscoveredAt.Equal(fixedTime) {
 		t.Fatalf("URL provenance = %+v", e.URL.Prov)
 	}
-	if e.URL.Original != "http://example.com/p?a=1&b=2" {
-		t.Fatalf("URL Original = %q", e.URL.Original)
+	if e.URL.Original != "http://example.com/p?a=1&b=2" || e.URL.Original != e.URL.String() {
+		t.Fatalf("URL Original = %q, want the canonical form (raw line was already canonical)", e.URL.Original)
 	}
 
 	// Work counters: one line read, canonicalized, extracted; no cache.

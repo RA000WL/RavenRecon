@@ -183,6 +183,32 @@ func TestDeriveConfidence(t *testing.T) {
 		}
 	})
 
+	t.Run("NaN weights carry no evidence", func(t *testing.T) {
+		// Defense in depth: the loader rejects NaN weights, so a NaN group
+		// is unreachable from a validated database. If one ever appears it
+		// must not poison the product: it is skipped entirely.
+		score, lvl := deriveConfidence([]indicatorGroup{g(fingerprints.IndicatorHTMLSubstring, 0, math.NaN())})
+		if math.IsNaN(score) || score != 0 || lvl != LevelUnknown {
+			t.Errorf("lone NaN group: score = %v level = %q, want 0/unknown (never NaN)", score, lvl)
+		}
+		score, lvl = deriveConfidence([]indicatorGroup{
+			g(fingerprints.IndicatorHTMLSubstring, 0, math.NaN()),
+			g(fingerprints.IndicatorHTMLSubstring, 1, 0.9),
+		})
+		if math.IsNaN(score) || math.Abs(score-0.9) > 1e-9 || lvl != LevelHigh {
+			t.Errorf("NaN among valid groups: score = %v level = %q, want 0.9/high (never NaN)", score, lvl)
+		}
+		// A NaN group sharing kind+slot with a valid one must not win (or
+		// stick in) the max-weight collapse.
+		score, lvl = deriveConfidence([]indicatorGroup{
+			g(fingerprints.IndicatorHeader, 0, math.NaN()),
+			g(fingerprints.IndicatorHeader, 0, 0.9),
+		})
+		if math.IsNaN(score) || math.Abs(score-spoofableScoreCap) > 1e-9 || lvl != LevelMedium {
+			t.Errorf("NaN collapsing with a valid group: score = %v level = %q, want cap/medium", score, lvl)
+		}
+	})
+
 	t.Run("weights clamp to [0,1]", func(t *testing.T) {
 		score, lvl := deriveConfidence([]indicatorGroup{g(fingerprints.IndicatorHTMLSubstring, 0, 1.5)})
 		if math.Abs(score-1.0) > 1e-9 || lvl != LevelHigh {
@@ -202,6 +228,7 @@ func TestDeriveConfidence(t *testing.T) {
 			{g(fingerprints.IndicatorHeader, 0, 0.7), g(fingerprints.IndicatorHTMLSubstring, 0, 0.7)},
 			{g(fingerprints.IndicatorHTMLSubstring, 0, 0.3)},
 			{g(fingerprints.IndicatorDNSCNAME, 3, 0.5)},
+			{g(fingerprints.IndicatorHeader, 0, math.NaN())},
 		} {
 			score, lvl := deriveConfidence(groups)
 			if lvl.stronger(levelForScore(score)) {
