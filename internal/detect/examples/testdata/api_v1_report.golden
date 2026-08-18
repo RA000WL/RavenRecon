@@ -1,0 +1,491 @@
+# api_v1_report.golden — semantic-compatibility regression golden of the
+# examples pack (milestone v1.2.5 SDK freeze). Pinned by TestSemanticCompat
+# in internal/detect/examples/compat_test.go: one full pack run (fixed
+# synthetic snapshot from rules_test.go's buildSnapshot, fixed injected
+# clock, cache disabled) is marshaled with encoding/json and byte-compared
+# against this file. Any drift in pack output — rule results (statuses,
+# versions, finding counts), finding fields (subjects, evidence records,
+# related-asset citations, metadata, fixed-clock timestamps), or the audit
+# rule's log lines — fails the test.
+#
+# The document below is the deterministic JSON form of detect.Report:
+#   "outcome"         aggregate run outcome
+#   "rules"           one entry per pack rule, sorted by rule ID:
+#                     rule_id, rule_version, status, findings (count)
+#   "findings"        the run's findings, sorted by finding identity; every
+#                     field is pinned, incl. subject (kind + value),
+#                     category, confidence, evidence records (method,
+#                     indicator, value, source, provenance),
+#                     related_assets, priority, status,
+#                     created/updated (fixed clock), and metadata
+#   "completed"/...   per-rule status counts
+#   "levels"          dependency levels of the executed schedule
+#   "logs"            the audit rule's config-driven log lines
+#
+# Regenerate ONLY when the pack LEGITIMATELY changes its output (new rule,
+# new finding, detector behavior change, version bump) with:
+#
+#   go test ./internal/detect/examples/ -run TestSemanticCompat -update
+#
+# A normal run never writes. Do not edit by hand.
+{
+  "outcome": "completed",
+  "rules": [
+    {
+      "rule_id": "example.assets.census",
+      "rule_version": "1.0.0",
+      "status": "completed",
+      "findings": 4
+    },
+    {
+      "rule_id": "example.config.audit-summary",
+      "rule_version": "1.0.0",
+      "status": "completed",
+      "findings": 0
+    },
+    {
+      "rule_id": "example.endpoints.url-coverage",
+      "rule_version": "1.0.0",
+      "status": "completed",
+      "findings": 2
+    },
+    {
+      "rule_id": "example.evidence.method-inventory",
+      "rule_version": "1.0.0",
+      "status": "completed",
+      "findings": 1
+    },
+    {
+      "rule_id": "example.relationships.degree-index",
+      "rule_version": "1.0.1",
+      "status": "completed",
+      "findings": 4
+    },
+    {
+      "rule_id": "example.technology.version-listing",
+      "rule_version": "1.0.0",
+      "status": "completed",
+      "findings": 1
+    }
+  ],
+  "findings": [
+    {
+      "rule_id": "example.assets.census",
+      "rule_name": "Asset Census",
+      "category": "discovery",
+      "subject": {
+        "kind": "domain",
+        "value": "example.com"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.assets.census",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "domain",
+            "value": "example.com"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "count": "1",
+        "kind": "domain"
+      }
+    },
+    {
+      "rule_id": "example.assets.census",
+      "rule_name": "Asset Census",
+      "category": "discovery",
+      "subject": {
+        "kind": "host",
+        "value": "www.example.com"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.assets.census",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "host",
+            "value": "www.example.com"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "count": "1",
+        "kind": "host"
+      }
+    },
+    {
+      "rule_id": "example.assets.census",
+      "rule_name": "Asset Census",
+      "category": "discovery",
+      "subject": {
+        "kind": "ip",
+        "value": "192.0.2.1"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.assets.census",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "ip",
+            "value": "192.0.2.1"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "count": "1",
+        "kind": "ip"
+      }
+    },
+    {
+      "rule_id": "example.assets.census",
+      "rule_name": "Asset Census",
+      "category": "discovery",
+      "subject": {
+        "kind": "url",
+        "value": "https://www.example.com/"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.assets.census",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "url",
+            "value": "https://www.example.com/"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "count": "2",
+        "kind": "url"
+      }
+    },
+    {
+      "rule_id": "example.endpoints.url-coverage",
+      "rule_name": "Endpoint URL Coverage",
+      "category": "discovery",
+      "subject": {
+        "kind": "endpoint",
+        "value": "GET https://www.example.com/login"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.endpoints.url-coverage",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "endpoint",
+            "value": "GET https://www.example.com/login"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "related_assets": [
+        {
+          "kind": "url",
+          "value": "https://www.example.com/login"
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "method": "GET"
+      }
+    },
+    {
+      "rule_id": "example.endpoints.url-coverage",
+      "rule_name": "Endpoint URL Coverage",
+      "category": "discovery",
+      "subject": {
+        "kind": "endpoint",
+        "value": "POST https://www.example.com/api"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.endpoints.url-coverage",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "endpoint",
+            "value": "POST https://www.example.com/api"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "method": "POST"
+      }
+    },
+    {
+      "rule_id": "example.evidence.method-inventory",
+      "rule_name": "Evidence Method Inventory",
+      "category": "information",
+      "subject": {
+        "kind": "evidence",
+        "value": "header/header%3Aserver/nginx/url%3Ahttps%3A%2F%2Fwww%2Eexample%2Ecom%2F"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.evidence.method-inventory",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "evidence",
+            "value": "header/header%3Aserver/nginx/url%3Ahttps%3A%2F%2Fwww%2Eexample%2Ecom%2F"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "count": "1",
+        "method": "header"
+      }
+    },
+    {
+      "rule_id": "example.relationships.degree-index",
+      "rule_name": "Relationship Degree Index",
+      "category": "discovery",
+      "subject": {
+        "kind": "endpoint",
+        "value": "GET https://www.example.com/login"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.relationships.degree-index",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "endpoint",
+            "value": "GET https://www.example.com/login"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "in_degree": "1",
+        "out_degree": "0"
+      }
+    },
+    {
+      "rule_id": "example.relationships.degree-index",
+      "rule_name": "Relationship Degree Index",
+      "category": "discovery",
+      "subject": {
+        "kind": "host",
+        "value": "www.example.com"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.relationships.degree-index",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "host",
+            "value": "www.example.com"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "in_degree": "0",
+        "out_degree": "2"
+      }
+    },
+    {
+      "rule_id": "example.relationships.degree-index",
+      "rule_name": "Relationship Degree Index",
+      "category": "discovery",
+      "subject": {
+        "kind": "ip",
+        "value": "192.0.2.1"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.relationships.degree-index",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "ip",
+            "value": "192.0.2.1"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "in_degree": "1",
+        "out_degree": "0"
+      }
+    },
+    {
+      "rule_id": "example.relationships.degree-index",
+      "rule_name": "Relationship Degree Index",
+      "category": "discovery",
+      "subject": {
+        "kind": "url",
+        "value": "https://www.example.com/"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.relationships.degree-index",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "url",
+            "value": "https://www.example.com/"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "in_degree": "1",
+        "out_degree": "1"
+      }
+    },
+    {
+      "rule_id": "example.technology.version-listing",
+      "rule_name": "Technology Version Listing",
+      "category": "information",
+      "subject": {
+        "kind": "technology",
+        "value": "server/nginx"
+      },
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "method": "detect",
+          "indicator": "example.technology.version-listing",
+          "value": "mechanical demonstration signal",
+          "source": {
+            "kind": "technology",
+            "value": "server/nginx"
+          },
+          "provenance": {
+            "source": "examples",
+            "discovered_at": "0001-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "priority": "info",
+      "status": "open",
+      "created": "2026-08-17T12:00:00Z",
+      "updated": "2026-08-17T12:00:00Z",
+      "metadata": {
+        "category": "server",
+        "technology": "nginx"
+      }
+    }
+  ],
+  "completed": 6,
+  "failed": 0,
+  "cancelled": 0,
+  "skipped": 0,
+  "cache_hits": 0,
+  "levels": 2,
+  "logs": [
+    {
+      "level": "info",
+      "rule": "example.config.audit-summary",
+      "message": "secret candidates: 1; types: 1; script assets: 1"
+    },
+    {
+      "level": "info",
+      "rule": "example.config.audit-summary",
+      "message": "secret type jwt: 1"
+    }
+  ]
+}

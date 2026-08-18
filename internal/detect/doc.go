@@ -26,4 +26,14 @@
 // dependency levels execute in order, rules within a level execute in
 // parallel. Findings stream through an optional Emit hook and land in a
 // deterministic Report.
+//
+// SDK stability (milestone v1.2.5, "SDK v1 (Core)" freeze): the rule-author
+// surface is frozen at API level 1.0 — Rule, Detector, Context, Snapshot,
+// Registry (including Seal), Run, the vocabularies and parsers
+// (ValidateRule, ParseRuleVersion, ParseCategory, ParseCost, ...), and the
+// exported bounds constants (MaxRule* / MaxContext* / MaxLog*) are stable
+// contracts. CheckAPIVersion is the single gate pack loaders call before
+// loading a pack, and the three-layer versioning policy (SchemaVersion =
+// cache layout, APIMajor/APIMinor = SDK surface, Rule.Version = content)
+// is documented in api.go.
 package detect

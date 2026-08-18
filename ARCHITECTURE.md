@@ -2464,6 +2464,297 @@ the same contract, deterministic min/max/mean/median duration summary.
 - All tests and benchmarks are hermetic: synthetic corpora and a real
   filesystem-backed cache, never the public Internet.
 
+### SDK contract
+
+Milestone v1.2.5 freezes the rule-author surface as "SDK v1 (Core)" at
+API level 1.0 (`APIMajor = 1`, `APIMinor = 0`). The freeze itself is
+documented in `internal/detect/api.go` (three-layer versioning and the
+Level-1 stability policy) and `internal/detect/doc.go`; this subsection
+is the pack-author guide: the lifecycle, the rule contract, the finding
+contract, the pack story, and the tests that are the executable
+documentation. Every claim below is verifiable against the code it names.
+
+#### Lifecycle
+
+```text
+Rule (immutable descriptor + Detector)
+  |
+  v
+Registry: Register -> Validate -> Seal        registration confined to startup
+  |                                            (deep copies; never mutated)
+  v
+Run(ctx, EngineConfig{Registry, ...}, Snapshot)
+  |   normalizeSnapshot: bound, deduplicate, sort; derive the observed
+  |   identity set and the per-kind census (the RequiredAssetTypes gate)
+  v
+one bounded pool job per rule, dependency levels in order
+  |   cache-before-execute per rule:            <- findings cached per
+  |     key = Operation "detect.rule"             (rule, snapshot, config):
+  |         + detect SchemaVersion (= 2)          SchemaVersion=2 enters the
+  |         + fingerprintRule(rule)                key and the stored payload;
+  |             (full declared metadata,          fingerprintRule covers the
+  |              Description included)            full declared metadata;
+  |         + rule Version                        a Version bump invalidates
+  |         + snapshot fingerprint                the rule's cached results;
+  |         + every cfg:* config entry            only COMPLETED executions
+  |                                               are stored, never partial
+  v
+Detector(ctx, Context) -> []asset.Finding
+  |   validateFinding: canonical round-trip; denormalized RuleID/RuleName/
+  |     Category match the EXECUTING rule; subject, related assets, and
+  |     evidence sources were observed in the corpus
+  v
+Report (RuleResults sorted by ID; Findings merged and sorted; outcome;
+        counts; bounded logs)
+  |
+  v
+Report consumer (reporting framework, TUI, next pipeline stage)
+
+Finding vocabulary path (asset.Finding, identity "ruleID@subject"):
+  Category — the rule's declared label (14 fixed values), denormalized
+             onto every finding the rule emits
+  Priority — info / low / medium / high / critical: attention ordering
+             only, NEVER a severity or exploitability claim (the
+             framework defines no severity vocabulary)
+  Status   — open / dismissed: the framework emits open only; dismissed
+             is downstream consumer bookkeeping
+```
+
+#### Rule authoring contract
+
+A rule is a `detect.Rule` value: an immutable metadata descriptor plus
+a `Detector` (`func(ctx context.Context, dctx *Context) ([]asset.Finding,
+error)`). The engine enforces the contract at registration and at
+execution; the single validation entry point is `ValidateRule`, which
+`Registry.Register` and `BenchmarkDetector` both delegate to — a rule
+rejected there is rejected identically everywhere.
+
+- **Metadata.** `ID` is the canonical lowercase slug: letters, digits,
+  `.`, `-`, `_`, at most `MaxRuleIDBytes` (128) — the shape enforced by
+  `validateRuleID`, which also guards every dependency reference. `Name`
+  and `Description` are required and bounded; `Category` must be one of
+  the 14 fixed labels; `Version` must be numeric "major.minor.patch"
+  (`ParseRuleVersion` is the exported parser, shared with validation);
+  `Inputs` and `Outputs` are non-empty, duplicate-free vocabulary lists;
+  `Dependencies` (at most `MaxRuleDependencies` = 16) are rule IDs, never
+  self-references; `RequiredAssetTypes` are validated `asset.Kind`
+  values; `EstimatedCost` is one of low/medium/high; `Timeout` is
+  `> 0` and at most `MaxRuleTimeout` (10 min); `Author` is required;
+  `Detector` must not be nil. `Enabled = false` keeps the rule
+  registered and validated but skipped at run time.
+- **The version-bump contract** (documented on `Rule.Version` in
+  rule.go): bump the version whenever the detector's logic or metadata
+  changes — the version enters the rule result cache key, so an edit
+  without a bump can serve stale cached findings. The examples pack
+  demonstrates the contract in its own style:
+  `example.relationships.degree-index` is the pack's only rule at
+  `1.0.1` (every other rule sits at `1.0.0`).
+- **Inputs and required kinds.** `Inputs` is descriptive metadata
+  ("the Context always carries every domain and a rule reads what it
+  declared"); `RequiredAssetTypes` is a run-time gate — when the
+  snapshot's census shows zero members of a required kind, the engine
+  skips the rule with an honest reason instead of executing it against
+  nothing.
+- **Config, logging, time.** `Context.Config` is the run's bounded
+  typed map (at most `MaxContextConfigEntries` = 64 entries, keys ≤ 64
+  bytes, values ≤ 256 bytes) and every entry enters the rule's cache
+  key. `Context.Logger` is the bounded logging seam (at most
+  `MaxLogEntries` = 256 retained entries, messages truncated at
+  `MaxLogMessageBytes` = 512, excess counted); a caller-provided logger
+  replaces the engine's default, and only the default's entries surface
+  on the Report. `Context.Clock` is the injectable time seam — findings
+  must be stamped with it (`dctx.Clock.Now()`), never the wall clock,
+  or reports stop being deterministic.
+- **Determinism.** A rule must be a deterministic function of its
+  Context: the engine shares ONE immutable Context across every rule of
+  a run, rules within a level execute in parallel, and identical runs
+  under an identical injected Clock must produce byte-identical reports
+  (pinned by `TestContractRunDeterminismByteIdentical` and the pack's
+  `TestPackDeterministicReports`). A rule that mutates the Context is a
+  data race by definition — the engine documents the boundary, it does
+  not police it.
+
+#### Finding contract
+
+Findings are canonical `asset.Finding` values built through
+`asset.NewFinding` (which requires at least one evidence record — a
+judgment that rests on nothing is not representable) and validated by
+`validateFinding` on both the fresh-execution and the cache-decode
+paths, identically:
+
+- the finding re-validates canonically and round-trips byte-identically;
+- the denormalized `RuleID`, `RuleName`, and `Category` match the
+  EXECUTING rule exactly — a rule can never forge another rule's
+  findings;
+- `Priority` and `Status` are known vocabulary values;
+- the subject, every related asset, and every evidence record's source
+  asset were OBSERVED in the run's corpus — findings can never cite
+  assets the earlier phases never produced (the observed-corpus rule;
+  the examples pack demonstrates both sides: `endpointCoverageDetector`
+  cites a URL only when the corpus observed it, and
+  `degreeIndexDetector` skips relationship endpoints the corpus never
+  observed);
+- an optional `rule_version` metadata entry must equal the executing
+  rule's version.
+
+A rule that returns more than `maxFindingsPerRule` (256) findings, or
+any contract-violating finding, fails with a structured error. The
+finding identity is `ruleID@subject` under the `finding` kind, so the
+same rule firing twice on the same subject merges into one finding
+(`MergeFindings`).
+
+#### The pack story
+
+`internal/detect/examples` (package `examples`) ships as a SIBLING
+package of the framework, loaded explicitly by importing it — the
+framework auto-detects nothing, and "no rules ship with the framework"
+stays true: package `detect` contains no rule definitions, and a pack
+is just another caller of the exported SDK. Because the pack can use
+only what `internal/detect` exports, it proves by construction that a
+pack loads, validates, and runs without special-case code in the
+framework (the Go compiler enforces this; `TestPackUsesOnlyExportedSurface`
+carries it into the suite). The pack gates itself at load time: its
+`Rules()` entry point begins with `detect.CheckAPIVersion(1, 0)`
+(`requiredAPIMajor`/`requiredAPIMinor` constants), so an incompatible
+SDK level surfaces as a structured load-time error before any rule is
+registered. Its six rules exercise every Context domain, the dependency
+pair (`example.relationships.degree-index` depends on
+`example.assets.census`), `RequiredAssetTypes` gating
+(`example.technology.version-listing`), config + logging + the
+empty-output path (`example.config.audit-summary`), observed-corpus
+citations, and the cache round-trip; its content policy is mechanical
+demonstration only (`example.` IDs, information/discovery categories,
+never vulnerability detections). A pack's registration pattern is:
+`examples.Rules()` → `NewRegistry` + `Register` per rule →
+`Registry.Validate()` (dependency graph) → optional `Registry.Seal()` →
+`Run` with `DefaultEngineConfig`.
+
+#### Executable documentation
+
+The milestone's contract tests are the runnable form of this guide:
+
+- **Surface snapshot** — `TestSDKAPISurfaceSnapshot`
+  (`internal/detect/surface_snapshot_test.go`) serializes the package's
+  exported surface from its own Go source and diffs it against
+  `internal/detect/testdata/api_v1.golden`: any added/removed symbol,
+  changed signature, changed struct field/tag, or changed constant
+  value fails. Regeneration is opt-in only:
+  `go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update`.
+- **Behavior contracts** — `internal/detect/behavior_contract_test.go`:
+  nine semantic contracts (`TestContractSealRejectsLateRegistration`,
+  `TestContractPostSealReadsStillWork`, `TestContractRegisterDeepCopiesRule`,
+  `TestContractGraphValidationDeterministic`, `TestContractAPIVersioning`,
+  `TestContractVocabularyCompletenessAndRoundTrip`,
+  `TestContractReportOutcomeVocabulary`,
+  `TestContractRunDeterminismByteIdentical`,
+  `TestContractContextImmutabilityHonestBoundary`).
+- **SDK unit surface** — `internal/detect/sdk_test.go`:
+  `TestValidateRuleExportedAcceptsFixture`, `TestRegisterDelegatesToValidateRule`,
+  `TestParseRuleVersion`, `TestSDKBoundsConstants`, `TestRuleBoundsEnforced`,
+  `TestContextBoundsEnforced`, `TestRegistrySeal`, `TestCheckAPIVersion`.
+  The seal race is pinned by `TestRegistrySealRegisterRace`
+  (`registry_race_test.go`).
+- **External examples** — `internal/detect/example_test.go` (package
+  `detect_test`, exported surface only): `ExampleDetector`,
+  `ExampleRegistry_Register`, `ExampleRun` (the full register → seal →
+  cold/warm cached run, executed by `go test`).
+- **Pack tests** — `internal/detect/examples/rules_test.go`:
+  `TestPackRulesValidate`, `TestPackFullPipelineWithCache`,
+  `TestDegreeIndexSkipsUnobservedNodes`, `TestPackDeterministicReports`,
+  `TestPackUsesOnlyExportedSurface`.
+- **Semantic compatibility** — the compat regression
+  (`internal/detect/examples/compat_test.go` against
+  `internal/detect/testdata/api_v1_report.golden`) replays a fixed
+  snapshot through the pack and diffs the deterministic report against
+  the pinned golden; it lands with this milestone and is part of the
+  reopening gates below.
+
+### SDK stability policy
+
+The "SDK v1 (Core)" freeze is formalized as a three-level stability
+policy. The levels name which exported surface changes require what
+process; the mechanical gates are the tests listed under "Executable
+documentation" above.
+
+**Level 1 — frozen forever (the SDK contract).** The rule-author
+contract: `Rule`, `Detector`, `Registry` (including `Seal`), `Context`,
+`Finding` (the `asset.Finding` model), `Snapshot`, and `Run`, plus the
+run-contract surface: `EngineConfig` and `DefaultEngineConfig`,
+`Report`, `RuleResult`, `RuleStatus`, `Outcome`, the vocabularies
+(`Category`, `RuleInput`, `RuleOutput`, `FindingPriority`,
+`FindingStatus`, `Cost`, `LogLevel`, `LogEntry`, `Logger`) with their
+`Valid`/`Parse`/`Known*` helpers, the cache constants (`Operation`,
+`SchemaVersion`), `CheckAPIVersion`, `ValidateRule`,
+`ParseRuleVersion`, and the 12 exported bounds constants
+(`MaxRuleIDBytes` … `MaxLogMessageBytes`). Level 1 is pinned by the
+surface snapshot golden, the nine behavior contracts, and the semantic
+compat regression; any change to it happens ONLY through the reopening
+process below.
+
+**Level 2 — frozen after pipeline validation.** The instrumentation and
+execution-observability surface: `Metrics`, `MetricsSnapshot`,
+`RuleStats`, and any future event/metrics surface the engine gains.
+These are currently EXCLUDED from the golden with documented reasons
+(see the header of `surface_snapshot_test.go`: run-internal detail, not
+a rule-author contract — packs never read them, and the only Level-1
+touch point, the `EngineConfig.Metrics` field, stays pinned). They
+freeze when a real pipeline consumer depends on them, per the roadmap
+rule that public interfaces stabilize only after pipeline integration
+or real-world validation.
+
+**Level 3 — experimental.** Helper functions, benchmark utilities, and
+internal optimizations: `BenchmarkDetector` and `BenchResult` today.
+Their shape may evolve freely; a new experimental helper must be
+deliberately added to the snapshot test's `excludedSurface` map with a
+reason — never silently — and any exported symbol that is neither
+Level-1 nor a named exclusion fails the surface snapshot test.
+
+#### Versioning contract
+
+The three layers are independent (documented in `api.go`):
+`SchemaVersion` versions the cache record layout (a bump invalidates
+stored rule results, never the SDK contract); `APIMajor`/`APIMinor`
+version the frozen Level-1 surface; `Rule.Version` versions rule
+content (the cache-coherence bump contract). `CheckAPIVersion` is the
+single gate pack loaders call: compatibility holds exactly when the
+required major equals this build's `APIMajor` and this build's
+`APIMinor` >= the required minor — a major mismatch means the pack must
+be recompiled, a too-new required minor means this build predates the
+pack, and a minor bump is backward compatible (this build understands
+every pack compiled against its own minor or lower). `TestCheckAPIVersion`
+pins the gate's own semantics.
+
+#### Reopening criteria
+
+A Level-1 change requires all four steps, in order:
+
+1. **A concrete failing need** — a pack inexpressible on the frozen
+   surface. The standing bar is the v1.7 acceptance criterion: "Any
+   SDK reopening is backed by concrete evidence, not preference"
+   (ROADMAP.md).
+2. **A proposal naming the exact symbols to change** and their new
+   shapes.
+3. **Maintainer approval** — the api.go policy: "a deliberate,
+   documented reopening decision that bumps APIMajor — never a silent
+   alteration of the contract."
+4. **Golden regeneration and version bump in the SAME change** —
+   regeneration of `testdata/api_v1.golden` and
+   `testdata/api_v1_report.golden` plus a `CheckAPIVersion` bump
+   (`APIMajor` for breaking changes, `APIMinor` for compatible
+   additions) land in the same change as the surface edit, never in a
+   follow-up.
+
+The criteria are mechanically enforced: `TestSDKAPISurfaceSnapshot`
+fails on any surface drift (the golden diff names every added/removed
+symbol and changed shape); the nine behavior contracts fail on semantic
+drift (seal semantics, deep copies, deterministic graph validation, API
+versioning, vocabulary round-trips, outcome vocabulary, run
+determinism, Context immutability); the semantic compat regression
+fails on report output drift; and `TestCheckAPIVersion` fails if the
+gate's semantics drift. A Level-1 change that passes every gate without
+following the four steps above is evidence it was additive — and
+additions to a frozen surface still require steps 2 and 3.
+
 ## Reporting framework
 
 `internal/report` (phase 11) is the Reporting Framework & Evidence Export:

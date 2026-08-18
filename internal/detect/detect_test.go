@@ -54,7 +54,7 @@ func TestValidateRuleRejections(t *testing.T) {
 		{"empty id", func(r *Rule) { r.ID = "" }},
 		{"uppercase id", func(r *Rule) { r.ID = "Bad-ID" }},
 		{"space in id", func(r *Rule) { r.ID = "bad id" }},
-		{"oversized id", func(r *Rule) { r.ID = strings.Repeat("a", maxRuleIDBytes+1) }},
+		{"oversized id", func(r *Rule) { r.ID = strings.Repeat("a", MaxRuleIDBytes+1) }},
 		{"empty name", func(r *Rule) { r.Name = "" }},
 		{"empty description", func(r *Rule) { r.Description = "" }},
 		{"unknown category", func(r *Rule) { r.Category = Category("bogus") }},
@@ -68,7 +68,7 @@ func TestValidateRuleRejections(t *testing.T) {
 		{"self dependency", func(r *Rule) { r.Dependencies = []string{"a.b"}; r.ID = "a.b" }},
 		{"duplicate dependency", func(r *Rule) { r.Dependencies = []string{"x.y", "x.y"} }},
 		{"too many dependencies", func(r *Rule) {
-			deps := make([]string, maxRuleDependencies+1)
+			deps := make([]string, MaxRuleDependencies+1)
 			for i := range deps {
 				deps[i] = fmtDep(i)
 			}
@@ -78,7 +78,7 @@ func TestValidateRuleRejections(t *testing.T) {
 		{"unknown cost", func(r *Rule) { r.EstimatedCost = Cost("extreme") }},
 		{"zero timeout", func(r *Rule) { r.Timeout = 0 }},
 		{"negative timeout", func(r *Rule) { r.Timeout = -time.Second }},
-		{"oversized timeout", func(r *Rule) { r.Timeout = maxRuleTimeout + time.Second }},
+		{"oversized timeout", func(r *Rule) { r.Timeout = MaxRuleTimeout + time.Second }},
 		{"empty author", func(r *Rule) { r.Author = "" }},
 		{"nil detector", func(r *Rule) { r.Detector = nil }},
 	}
@@ -277,7 +277,7 @@ func TestValidateConfig(t *testing.T) {
 		t.Fatalf("nil config must be valid: %v", err)
 	}
 	tooMany := make(map[string]string)
-	for i := 0; i < maxContextConfigEntries+1; i++ {
+	for i := 0; i < MaxContextConfigEntries+1; i++ {
 		tooMany[string(rune('a'+i%26))+string(rune('0'+i/26))] = "v"
 	}
 	if err := validateConfig(tooMany); err == nil {
@@ -286,19 +286,19 @@ func TestValidateConfig(t *testing.T) {
 	if err := validateConfig(map[string]string{"": "v"}); err == nil {
 		t.Fatalf("empty key must be rejected")
 	}
-	if err := validateConfig(map[string]string{"k": strings.Repeat("v", maxContextConfigValueBytes+1)}); err == nil {
+	if err := validateConfig(map[string]string{"k": strings.Repeat("v", MaxContextConfigValueBytes+1)}); err == nil {
 		t.Fatalf("oversized value must be rejected")
 	}
 }
 
 func TestBoundedLogger(t *testing.T) {
 	l := newBoundedLogger()
-	for i := 0; i < maxLogEntries+50; i++ {
+	for i := 0; i < MaxLogEntries+50; i++ {
 		l.Log(LevelInfo, "a.b", "message")
 	}
 	entries, dropped := l.snapshot()
-	if len(entries) != maxLogEntries {
-		t.Fatalf("retained %d entries, want %d", len(entries), maxLogEntries)
+	if len(entries) != MaxLogEntries {
+		t.Fatalf("retained %d entries, want %d", len(entries), MaxLogEntries)
 	}
 	if dropped != 50 {
 		t.Fatalf("dropped %d, want 50", dropped)
@@ -312,9 +312,9 @@ func TestBoundedLogger(t *testing.T) {
 	}
 	// Unknown levels normalize; oversized messages are truncated.
 	l2 := newBoundedLogger()
-	l2.Log(LogLevel("bogus"), "a.b", strings.Repeat("x", maxLogMessageBytes+10))
+	l2.Log(LogLevel("bogus"), "a.b", strings.Repeat("x", MaxLogMessageBytes+10))
 	e, _ := l2.snapshot()
-	if e[0].Level != LevelInfo || len(e[0].Message) != maxLogMessageBytes {
+	if e[0].Level != LevelInfo || len(e[0].Message) != MaxLogMessageBytes {
 		t.Fatalf("level/message normalization failed: %+v", e[0])
 	}
 }

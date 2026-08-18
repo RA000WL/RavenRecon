@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -57,7 +58,10 @@ func urlKey(u asset.URL, adapter string, parseParams bool) (cache.Key, error) {
 // exactly as they will be served back. The stored URL is ALWAYS in canonical
 // form — ingest redacts userinfo at the construction point (see parseRawURL
 // in engine.go), so URL.Original equals URL.String() and no credential-bearing
-// raw line can reach the record. Relationships and the host asset are
+// raw line can reach the record. A record that nonetheless carries userinfo
+// in a stored Original (tampering, or a record written by a pre-redaction
+// build) is refused at decode time and self-healed, never served as a hit
+// (see decodeStoredURL). Relationships and the host asset are
 // NOT stored: they are rebuilt deterministically at emit time by graphOf
 // from the URL, host, endpoints, and parameters, so a cached observation
 // reproduces the exact same graph as a fresh extraction.
@@ -67,7 +71,10 @@ type storedURL struct {
 	Target string `json:"target"`
 	// URL is the canonical URL asset, always stored in canonical form:
 	// Original equals String() (userinfo is redacted at ingest — see
-	// parseRawURL), so the record never carries credentials.
+	// parseRawURL), so the record never carries credentials. Decode
+	// refuses a stored URL whose non-empty Original differs from String()
+	// — userinfo included, parseable or not (tampering or a pre-redaction
+	// record) — instead of serving it.
 	URL asset.URL `json:"url"`
 	// Adapter is the adapter identity the observation came from.
 	Adapter string `json:"adapter"`
@@ -95,11 +102,17 @@ type storedURL struct {
 // adapter, re-validates every endpoint (GET on the same URL, canonical) and
 // every parameter (query location only, bounds re-checked through
 // asset.NewParameter / asset.WithValue so a tampered record can never
-// smuggle oversized or control-character names/values), and refuses
-// contradictory time windows (LastSeen before FirstSeen) — so a corrupt,
-// tampered, or legacy completed record can never produce bogus assets. On
-// any error the caller deletes the record and falls through to a fresh
-// extraction (self-healing), never serving it as a hit.
+// smuggle oversized or control-character names/values), refuses stored URLs
+// whose Original is non-empty and not in canonical form — including any
+// Original carrying credentials in its userinfo, parseable or not (the
+// record's own URL and every endpoint URL: userinfo is preserved in
+// Original by the asset model by design, and every legitimate path stores
+// the canonical form, so a non-canonical Original can only be tampering or
+// a pre-redaction record) — and refuses contradictory time windows
+// (LastSeen before FirstSeen) — so a corrupt, tampered, or legacy completed
+// record can never produce bogus assets. On any error the caller deletes
+// the record and falls through to a fresh extraction (self-healing), never
+// serving it as a hit.
 func decodeStoredURL(raw json.RawMessage, u asset.URL, adapter string) (storedURL, error) {
 	var s storedURL
 	if err := json.Unmarshal(raw, &s); err != nil {
@@ -124,6 +137,17 @@ func decodeStoredURL(raw json.RawMessage, u asset.URL, adapter string) (storedUR
 	if got.Identity() != u.Identity() {
 		return s, fmt.Errorf("stored url identity %q does not match %q", got.Identity().String(), u.Identity().String())
 	}
+	// Credential defense at decode time: asset.URL.Original preserves
+	// userinfo by design, and a stored record whose Original is non-empty
+	// and differs from the canonical String() — a credential-bearing
+	// form, for example, or one written by a pre-redaction build of this
+	// pipeline — must never be served as a hit: it is refused, deleted,
+	// and recomputed by the self-healing path. Fresh records never trip
+	// this: ingest redacts userinfo at the construction point
+	// (parseRawURL), so Original always equals the canonical String().
+	if storedURLCarriesCredentials(s.URL) {
+		return s, fmt.Errorf("stored url carries credentials in its original form")
+	}
 	if len(s.Endpoints) > 1 {
 		return s, fmt.Errorf("stored result retains %d endpoints (cap 1)", len(s.Endpoints))
 	}
@@ -140,6 +164,13 @@ func decodeStoredURL(raw json.RawMessage, u asset.URL, adapter string) (storedUR
 		}
 		if nep.Identity() != ep.Identity() {
 			return s, fmt.Errorf("stored endpoint is not in canonical form")
+		}
+		// Same credential defense as the record URL: an endpoint whose
+		// Original is non-empty and differs from the canonical form can
+		// only be tampering or a pre-redaction record, and must never be
+		// served into a report.
+		if storedURLCarriesCredentials(ep.URL) {
+			return s, fmt.Errorf("stored endpoint url carries credentials in its original form")
 		}
 	}
 	if len(s.Parameters) > maxParametersPerURL {
@@ -190,6 +221,37 @@ func decodeStoredURL(raw json.RawMessage, u asset.URL, adapter string) (storedUR
 		return s, fmt.Errorf("stored result last_seen %v is before first_seen %v", s.LastSeen, s.FirstSeen)
 	}
 	return s, nil
+}
+
+// storedURLCarriesCredentials reports whether a stored URL asset's Original
+// field must be refused at decode time. Every legitimate construction path
+// stores the canonical form: ingest redacts userinfo and rebuilds any
+// non-canonical Original through the canonical string (parseRawURL in
+// engine.go), endpoints are built from the canonical string (extractURL),
+// and no merge path introduces a non-canonical Original (asset.MergeURLs
+// keeps the first observation's, which is canonical). A stored Original
+// that differs from the canonical String() — including one carrying
+// userinfo, whether it parses or not (e.g. a control byte in the path, or
+// an out-of-range port) — can only belong to a tampered record or one
+// written by a pre-redaction build of this pipeline. Fresh records never
+// trip this, but such an Original must never be served into a report, so
+// decode refuses it (mirrors httpprobe's decode-time refusal).
+func storedURLCarriesCredentials(u asset.URL) bool {
+	if u.Original == "" {
+		return false
+	}
+	// Any stored Original differing from the canonical form is refused: no
+	// legitimate path stores non-canonical Originals (parseRawURL rebuilds
+	// them at ingest), and a userinfo-bearing Original that does not even
+	// parse (e.g. a control byte in the path) must not slip through a
+	// parse-based check into the report.
+	if u.Original != u.String() {
+		return true
+	}
+	if orig, oerr := url.Parse(u.Original); oerr == nil && orig.User != nil {
+		return true
+	}
+	return false
 }
 
 // truncateName bounds a possibly hostile stored parameter name echoed into

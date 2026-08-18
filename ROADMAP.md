@@ -352,19 +352,19 @@ Acceptance criteria:
 
 ## v1.2.5 — SDK and extension API stabilization
 
-Status: planned
+Status: implemented — final review pending (all items landed; milestone stays open until reviewer sign-off)
 
 Goal: freeze the contracts that v2.0 packs will depend on, but only after the data flow is real enough to validate.
 
-- [ ] Stable Rule SDK
-- [ ] Stable Context API
-- [ ] Rule registration
-- [ ] Metadata validation
-- [ ] Helper utilities
-- [ ] Compatibility/versioning rules
-- [ ] Example rules
-- [ ] Developer documentation
-- [ ] Reopening criteria
+- [x] Stable Rule SDK — frozen Level-1 surface ("SDK v1 (Core)", API 1.0): Rule, Detector, the vocabularies and parsers, ValidateRule (rule.go, api.go)
+- [x] Stable Context API — fixed, immutable Context (context.go), pinned in the Level-1 surface golden
+- [x] Rule registration — Registry.Register/Seal with deep copies and post-seal locking (registry.go)
+- [x] Metadata validation — one validation entry point (ValidateRule), enforced identically by Register and BenchmarkDetector
+- [x] Helper utilities — ParseCost, ParseRuleVersion, ParseFindingPriority, ParseFindingStatus, ParseCategory, KnownRuleInputs/KnownRuleOutputs/Categories
+- [x] Compatibility/versioning rules — three-layer versioning (SchemaVersion / APIMajor.Minor / Rule.Version) with CheckAPIVersion(1,0) as the pack-loading gate; enforced by the surface golden and nine behavior contracts
+- [x] Example rules — internal/detect/examples, the only rule pack (explicitly loaded, never auto-loaded)
+- [x] Developer documentation — ARCHITECTURE.md "Detection framework → SDK contract / SDK stability policy"; pack-author guide in internal/detect/doc.go
+- [x] Reopening criteria — written, testable, and present in code (api.go Level-1 policy; surface snapshot golden + CheckAPIVersion gates) and docs (ARCHITECTURE.md "Detection framework → SDK contract / SDK stability policy")
 
 Acceptance criteria:
 

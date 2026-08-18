@@ -346,6 +346,28 @@ func TestDecodeStoredURLValidation(t *testing.T) {
 			ep.URL = mustURL(t, "http://other.example/p")
 			s.Endpoints = []asset.Endpoint{ep}
 		}, "does not match"},
+		{"endpoint original carries credentials", func(s *storedURL) {
+			// Canonical fields untouched (String() stays canonical, so all
+			// pre-existing checks pass): only the decode-time credential
+			// defense can refuse this.
+			ep := s.Endpoints[0]
+			ep.URL.Original = "http://user:pass@example.com/p?a=1"
+			s.Endpoints = []asset.Endpoint{ep}
+		}, "credentials"},
+		{"url original carries credentials", func(s *storedURL) {
+			// Same, on the record's own URL asset.
+			s.URL.Original = "http://user:pass@example.com/p?a=1"
+		}, "credentials"},
+		{"endpoint original carries credentials in an unparseable form", func(s *storedURL) {
+			// The canonical fields are untouched (String() stays canonical,
+			// so every parse- and identity-based check passes): only the
+			// canonical-form refusal can catch this. url.Parse fails on the
+			// raw control byte, so a parse-based userinfo check alone would
+			// let the credential-bearing Original through to the report.
+			ep := s.Endpoints[0]
+			ep.URL.Original = "http://user:pass@example.com/\x01"
+			s.Endpoints = []asset.Endpoint{ep}
+		}, "credentials"},
 		{"parameter location not query", func(s *storedURL) {
 			s.Parameters[0].Location = "path"
 		}, "not query"},
@@ -501,6 +523,66 @@ func TestIngestCacheSelfHealing(t *testing.T) {
 		}
 		if snap := cfg.Metrics.Snapshot(); snap.Extracted != 1 {
 			t.Fatalf("extracted = %d, want recomputation", snap.Extracted)
+		}
+	})
+
+	t.Run("credentials in stored original", func(t *testing.T) {
+		// A fully valid payload whose endpoint URL's Original carries
+		// userinfo: the canonical checks all pass (String() is untouched),
+		// so only the decode-time credential defense can refuse it — a
+		// tampered credential-bearing Original must never be served into
+		// the report. The record is deleted, the observation recomputed in
+		// the same run, and the healed record carries no userinfo.
+		st := entryToStored(entryFor("http://example.com/p?q=1", cfg.Adapter, fixedTime), cfg.Adapter)
+		ep := st.Endpoints[0]
+		ep.URL.Original = "http://user:pass@example.com/p?q=1"
+		st.Endpoints = []asset.Endpoint{ep}
+		data, err := json.Marshal(st)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		rec := cache.Record{
+			Operation: Operation,
+			Target:    u.Identity().String(),
+			Status:    cache.StatusCompleted,
+			Meta:      map[string]string{"adapter": cfg.Adapter},
+			Data:      data,
+		}
+		if err := cfg.Cache.Put(context.Background(), key, rec); err != nil {
+			t.Fatalf("cache.Put: %v", err)
+		}
+
+		cfg.Metrics = &Metrics{}
+		rep, rerr := Ingest(context.Background(), cfg, SliceSource(line))
+		if rerr == nil || !strings.Contains(rerr.Error(), "discarded unusable cached result") ||
+			!strings.Contains(rerr.Error(), "credentials") {
+			t.Fatalf("err = %v, want the credential discard diagnostic", rerr)
+		}
+		if snap := cfg.Metrics.Snapshot(); snap.Extracted != 1 || snap.Stored != 1 {
+			t.Fatalf("metrics = %+v, want recomputation in the same run", snap)
+		}
+		e := rep.Entries[0]
+		if e.Status != StatusCompleted || e.Cached {
+			t.Fatalf("entry = status %s cached %v, want completed fresh", e.Status, e.Cached)
+		}
+		if len(e.Endpoints) != 1 {
+			t.Fatalf("endpoints = %d, want 1", len(e.Endpoints))
+		}
+		if strings.Contains(e.Endpoints[0].URL.Original, "user:pass") {
+			t.Fatalf("endpoint URL.Original leaks the credential: %q", e.Endpoints[0].URL.Original)
+		}
+		if e.Endpoints[0].URL.Original != e.Endpoints[0].URL.String() {
+			t.Fatalf("endpoint URL.Original = %q, want the canonical form %q",
+				e.Endpoints[0].URL.Original, e.Endpoints[0].URL.String())
+		}
+
+		// The record was repaired: the next run is a pure hit.
+		cfg.Metrics = &Metrics{}
+		if _, err := Ingest(context.Background(), cfg, SliceSource(line)); err != nil {
+			t.Fatalf("healed re-run: %v", err)
+		}
+		if snap := cfg.Metrics.Snapshot(); snap.Extracted != 0 {
+			t.Fatalf("healed re-run extracted = %d, want 0", snap.Extracted)
 		}
 	})
 }

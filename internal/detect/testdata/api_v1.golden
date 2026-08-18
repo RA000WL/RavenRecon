@@ -1,0 +1,227 @@
+# api_v1.golden — frozen Level-1 SDK surface of package detect ("SDK v1
+# Core", milestone v1.2.5; see api.go for the stability policy). Pinned by
+# TestSDKAPISurfaceSnapshot: any drift — added/removed exported symbol,
+# changed signature, changed struct fields/tags, changed constant value —
+# fails the test. Regenerate ONLY with:
+#
+#   go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update
+#
+# Do not edit by hand. The Level-2/Level-3 experimental surface (Metrics,
+# MetricsSnapshot, RuleStats, BenchmarkDetector, BenchResult) is documented
+# in surface_snapshot_test.go and deliberately absent here.
+
+## consts
+
+const APIMajor = 1
+const APIMinor = 0
+const CategoryAPI Category = "api"
+const CategoryAuthentication Category = "authentication"
+const CategoryAuthorization Category = "authorization"
+const CategoryBusinessLogic Category = "business_logic"
+const CategoryCloud Category = "cloud"
+const CategoryConfiguration Category = "configuration"
+const CategoryCustom Category = "custom"
+const CategoryDiscovery Category = "discovery"
+const CategoryExposure Category = "exposure"
+const CategoryInformation Category = "information"
+const CategoryInfrastructure Category = "infrastructure"
+const CategoryJavaScript Category = "javascript"
+const CategoryMisconfig Category = "misconfiguration"
+const CategorySecrets Category = "secrets"
+const CostHigh Cost = "high"
+const CostLow Cost = "low"
+const CostMedium Cost = "medium"
+const InputAssets RuleInput = "assets"
+const InputEndpoints RuleInput = "endpoints"
+const InputEvidence RuleInput = "evidence"
+const InputJavaScript RuleInput = "javascript"
+const InputRelationships RuleInput = "relationships"
+const InputSecrets RuleInput = "secrets"
+const InputTechnology RuleInput = "technology"
+const LevelDebug LogLevel = "debug"
+const LevelError LogLevel = "error"
+const LevelInfo LogLevel = "info"
+const LevelWarn LogLevel = "warn"
+const MaxContextConfigEntries = 64
+const MaxContextConfigKeyBytes = 64
+const MaxContextConfigValueBytes = 256
+const MaxLogEntries = 256
+const MaxLogMessageBytes = 512
+const MaxRuleAuthorBytes = 128
+const MaxRuleDependencies = 16
+const MaxRuleDescriptionBytes = 1024
+const MaxRuleIDBytes = 128
+const MaxRuleNameBytes = 256
+const MaxRuleTimeout = 600000000000
+const MaxRuleVersionBytes = 32
+const Operation = "detect.rule"
+const OutcomeCancelled Outcome = "cancelled"
+const OutcomeCompleted Outcome = "completed"
+const OutcomeFailed Outcome = "failed"
+const OutcomeIncomplete Outcome = "incomplete"
+const OutputFindings RuleOutput = "findings"
+const PriorityCritical FindingPriority = "critical"
+const PriorityHigh FindingPriority = "high"
+const PriorityInfo FindingPriority = "info"
+const PriorityLow FindingPriority = "low"
+const PriorityMedium FindingPriority = "medium"
+const RuleStatusCancelled RuleStatus = "cancelled"
+const RuleStatusCompleted RuleStatus = "completed"
+const RuleStatusFailed RuleStatus = "failed"
+const RuleStatusSkipped RuleStatus = "skipped"
+const SchemaVersion = 2
+const StatusDismissed FindingStatus = "dismissed"
+const StatusOpen FindingStatus = "open"
+
+## types
+
+type Category string
+
+type Context struct {
+	Assets []asset.Identity `json:"assets"`
+	Relationships []asset.Relationship `json:"relationships"`
+	Evidence []asset.Evidence `json:"evidence"`
+	Technologies []asset.Technology `json:"technologies"`
+	Secrets []asset.SecretCandidate `json:"secrets"`
+	JavaScript []asset.JavaScript `json:"javascript"`
+	Endpoints []asset.Endpoint `json:"endpoints"`
+	Config map[string]string `json:"config,omitempty"`
+	Logger Logger `json:"-"`
+	Clock runtime.Clock `json:"-"`
+}
+
+type Cost string
+
+type Detector func(ctx context.Context, dctx *Context) ([]asset.Finding, error)
+
+type EngineConfig struct {
+	Registry *Registry
+	Concurrency int
+	QueueSize int
+	Timeout time.Duration
+	Rate float64
+	Burst int
+	Clock runtime.Clock
+	Cache cache.Cache
+	Logger Logger
+	Config map[string]string
+	Emit func(context.Context, asset.Finding) error
+	Metrics *Metrics
+}
+
+type FindingPriority string
+
+type FindingStatus string
+
+type LogEntry struct {
+	Level LogLevel `json:"level"`
+	Rule string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type LogLevel string
+
+type Logger interface { Log(level LogLevel, ruleID, message string) }
+
+type Outcome string
+
+type Registry struct {
+	mu sync.RWMutex
+	rules map[string]Rule
+	names map[string]string
+	readonly atomic.Bool
+}
+
+type Report struct {
+	Outcome Outcome `json:"outcome"`
+	Rules []RuleResult `json:"rules"`
+	Findings []asset.Finding `json:"findings"`
+	FindingsTruncated bool `json:"findings_truncated,omitempty"`
+	Completed int `json:"completed"`
+	Failed int `json:"failed"`
+	Cancelled int `json:"cancelled"`
+	Skipped int `json:"skipped"`
+	CacheHits int `json:"cache_hits"`
+	Levels int `json:"levels"`
+	Logs []LogEntry `json:"logs,omitempty"`
+	LogsDropped int `json:"logs_dropped,omitempty"`
+}
+
+type Rule struct {
+	ID string `json:"id"`
+	Name string `json:"name"`
+	Description string `json:"description"`
+	Category Category `json:"category"`
+	Version string `json:"version"`
+	Inputs []RuleInput `json:"inputs"`
+	Outputs []RuleOutput `json:"outputs"`
+	Dependencies []string `json:"dependencies,omitempty"`
+	RequiredAssetTypes []asset.Kind `json:"required_asset_types,omitempty"`
+	EstimatedCost Cost `json:"estimated_cost"`
+	Timeout time.Duration `json:"timeout"`
+	Author string `json:"author"`
+	Enabled bool `json:"enabled"`
+	Detector Detector `json:"-"`
+}
+
+type RuleInput string
+
+type RuleOutput string
+
+type RuleResult struct {
+	RuleID string `json:"rule_id"`
+	RuleVersion string `json:"rule_version"`
+	Status RuleStatus `json:"status"`
+	SkipReason string `json:"skip_reason,omitempty"`
+	Cached bool `json:"cached,omitempty"`
+	Findings int `json:"findings"`
+	Err error `json:"-"`
+}
+
+type RuleStatus string
+
+type Snapshot struct {
+	Assets []asset.Identity `json:"assets,omitempty"`
+	Relationships []asset.Relationship `json:"relationships,omitempty"`
+	Evidence []asset.Evidence `json:"evidence,omitempty"`
+	Technologies []asset.Technology `json:"technologies,omitempty"`
+	Secrets []asset.SecretCandidate `json:"secrets,omitempty"`
+	JavaScript []asset.JavaScript `json:"javascript,omitempty"`
+	Endpoints []asset.Endpoint `json:"endpoints,omitempty"`
+}
+
+## methods
+
+*Registry.Get(id string) (Rule, bool)
+*Registry.Len() int
+*Registry.Register(rule Rule) error
+*Registry.Rules() []Rule
+*Registry.Seal()
+*Registry.Validate() error
+Category.String() string
+Category.Valid() bool
+Cost.String() string
+Cost.Valid() bool
+FindingPriority.String() string
+FindingPriority.Valid() bool
+FindingStatus.String() string
+FindingStatus.Valid() bool
+LogLevel.Valid() bool
+RuleInput.Valid() bool
+RuleOutput.Valid() bool
+
+## funcs
+
+func Categories() []Category
+func CheckAPIVersion(requiredMajor, requiredMinor int) error
+func DefaultEngineConfig(registry *Registry) EngineConfig
+func KnownRuleInputs() []RuleInput
+func KnownRuleOutputs() []RuleOutput
+func NewRegistry() *Registry
+func ParseCategory(s string) (Category, error)
+func ParseCost(s string) (Cost, error)
+func ParseFindingPriority(s string) (FindingPriority, error)
+func ParseFindingStatus(s string) (FindingStatus, error)
+func ParseRuleVersion(s string) (major, minor, patch int, err error)
+func Run(ctx context.Context, cfg EngineConfig, snap Snapshot) (Report, error)
+func ValidateRule(r Rule) error

@@ -80,7 +80,7 @@ When in doubt, round up a tier. Never round down to skip §0.
 - `internal/jsintel`, `internal/jsintel/adapt` — JS intelligence engine: parser, fetch, pipeline, analyzers, subjs/LinkFinder/SecretFinder adapters (library only)
 - `internal/secrentel`, `internal/secrentel/patterns` — Evidence & Secret Intelligence Engine (library only)
 - `internal/priority` — Attack Surface Intelligence Engine: scoring, correlation, attack paths, recommendations (library only)
-- `internal/detect` — Detection Framework & Rule Engine (library only; no rules ship with the framework)
+- `internal/detect` — Detection Framework & Rule Engine (library only; no rules ship with the framework — `internal/detect/examples` is the only pack, explicitly loaded, never auto-loaded)
 - `internal/report` — Reporting Framework & Evidence Export (library only; presentation only — never rescans, never mutates data)
 - `internal/event` — canonical runtime event model + concurrent, bounded, non-blocking event bus (observer-only, library only)
 - `internal/tui` — terminal observability (library only; no CLI wiring yet)
@@ -260,6 +260,13 @@ servers, synthetic input only.
 
 If a check fails or wasn't run, say so explicitly rather than omitting it.
 
+**Before declaring a change complete, update TODO.md** (the agent-coordination
+board): record new open issues (severity + file:line evidence + concrete fix),
+mark claimed entries IN PROGRESS, and never self-close entries — the
+orchestrator moves entries to VERIFIED. Work that is not on the board is work
+the next session will lose; a change is not done until the board says what it
+was for and what state it is in.
+
 ---
 
 ## 14. Performance
@@ -314,6 +321,9 @@ list explicitly, item by item, against your actual diff:
 7. Check for incorrect cancellation (§10).
 8. Check for leaked secrets (§12, §15).
 9. Confirm §13's commands were actually run, not assumed.
-10. Report exactly what changed — no more, no less than what was asked.
+10. Confirm TODO.md reflects this work — new issues recorded with evidence,
+    claimed entries marked IN PROGRESS, nothing self-closed (the orchestrator
+    closes entries).
+11. Report exactly what changed — no more, no less than what was asked.
 
 Do not claim work that was not performed.

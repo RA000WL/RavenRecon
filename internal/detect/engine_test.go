@@ -1008,7 +1008,7 @@ func TestRunRejectsInvalidInputs(t *testing.T) {
 	}
 	// Over-bound configuration.
 	cfg2 := DefaultEngineConfig(newTestRegistry(t, makeRule(t, "a.x", nil)))
-	cfg2.Config = map[string]string{"k": strings.Repeat("v", maxContextConfigValueBytes+1)}
+	cfg2.Config = map[string]string{"k": strings.Repeat("v", MaxContextConfigValueBytes+1)}
 	if _, err := Run(context.Background(), cfg2, testSnapshot(t)); err == nil {
 		t.Fatalf("over-bound config must be rejected")
 	}

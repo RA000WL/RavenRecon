@@ -3,28 +3,46 @@ package detect
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
 
-// Rule model bounds (fixed constants).
+// Rule, context, and logger bounds (fixed constants). These constants are
+// part of the frozen SDK surface (Level 1, the "SDK v1 (Core)" freeze of
+// milestone v1.2.5; see api.go for the stability policy): the framework
+// enforces exactly these limits at validation and at run time, and rule
+// authors compile against them. A bound change is an SDK change — it must
+// not happen silently.
 const (
-	// maxRuleIDBytes bounds a rule ID.
-	maxRuleIDBytes = 128
-	// maxRuleNameBytes bounds a rule name.
-	maxRuleNameBytes = 256
-	// maxRuleDescriptionBytes bounds a rule description.
-	maxRuleDescriptionBytes = 1024
-	// maxRuleAuthorBytes bounds the author attribution.
-	maxRuleAuthorBytes = 128
-	// maxRuleVersionBytes bounds a rule version.
-	maxRuleVersionBytes = 32
-	// maxRuleDependencies bounds the dependency list of one rule.
-	maxRuleDependencies = 16
-	// maxRuleTimeout bounds a rule's declared timeout.
-	maxRuleTimeout = 10 * time.Minute
+	// MaxRuleIDBytes bounds a rule ID.
+	MaxRuleIDBytes = 128
+	// MaxRuleNameBytes bounds a rule name.
+	MaxRuleNameBytes = 256
+	// MaxRuleDescriptionBytes bounds a rule description.
+	MaxRuleDescriptionBytes = 1024
+	// MaxRuleAuthorBytes bounds the author attribution.
+	MaxRuleAuthorBytes = 128
+	// MaxRuleVersionBytes bounds a rule version.
+	MaxRuleVersionBytes = 32
+	// MaxRuleDependencies bounds the dependency list of one rule.
+	MaxRuleDependencies = 16
+	// MaxRuleTimeout bounds a rule's declared timeout.
+	MaxRuleTimeout = 10 * time.Minute
+	// MaxContextConfigEntries bounds the configuration map delivered to
+	// rules.
+	MaxContextConfigEntries = 64
+	// MaxContextConfigKeyBytes bounds one configuration key.
+	MaxContextConfigKeyBytes = 64
+	// MaxContextConfigValueBytes bounds one configuration value.
+	MaxContextConfigValueBytes = 256
+	// MaxLogEntries bounds the default logger's retained entries; entries
+	// beyond the bound are counted, never stored.
+	MaxLogEntries = 256
+	// MaxLogMessageBytes bounds one log message.
+	MaxLogMessageBytes = 512
 )
 
 // RuleInput names one structured input domain a rule consumes from the
@@ -191,20 +209,32 @@ type Rule struct {
 	Detector Detector `json:"-"`
 }
 
+// ValidateRule checks the complete rule contract (everything except the
+// dependency graph, which the Registry validates as a whole): metadata
+// completeness, category/version/cost vocabularies, input and output
+// domains, dependency syntax, required asset kinds, timeout bounds, and the
+// detector's presence. It is the exported SDK validation entry point and
+// the SINGLE validation point: Registry.Register and BenchmarkDetector
+// delegate to it, so a rule rejected here is rejected identically at
+// registration.
+func ValidateRule(r Rule) error {
+	return validateRule(r)
+}
+
 // validateRule checks the complete rule contract (everything except the
 // dependency graph, which the Registry validates as a whole): metadata
 // completeness, category/version/cost vocabularies, input and output
 // domains, dependency syntax, required asset kinds, timeout bounds, and the
-// detector's presence.
+// detector's presence. Exported callers use ValidateRule.
 func validateRule(r Rule) error {
 	if err := validateRuleID(r.ID); err != nil {
 		return err
 	}
-	if r.Name == "" || len(r.Name) > maxRuleNameBytes {
-		return fmt.Errorf("rule %q name is empty or over %d bytes", r.ID, maxRuleNameBytes)
+	if r.Name == "" || len(r.Name) > MaxRuleNameBytes {
+		return fmt.Errorf("rule %q name is empty or over %d bytes", r.ID, MaxRuleNameBytes)
 	}
-	if r.Description == "" || len(r.Description) > maxRuleDescriptionBytes {
-		return fmt.Errorf("rule %q description is empty or over %d bytes", r.ID, maxRuleDescriptionBytes)
+	if r.Description == "" || len(r.Description) > MaxRuleDescriptionBytes {
+		return fmt.Errorf("rule %q description is empty or over %d bytes", r.ID, MaxRuleDescriptionBytes)
 	}
 	if !r.Category.Valid() {
 		return fmt.Errorf("rule %q category %q is unknown (known: %s)",
@@ -239,9 +269,9 @@ func validateRule(r Rule) error {
 		}
 		seenOutputs[out] = true
 	}
-	if len(r.Dependencies) > maxRuleDependencies {
+	if len(r.Dependencies) > MaxRuleDependencies {
 		return fmt.Errorf("rule %q declares %d dependencies over bound %d",
-			r.ID, len(r.Dependencies), maxRuleDependencies)
+			r.ID, len(r.Dependencies), MaxRuleDependencies)
 	}
 	seenDeps := make(map[string]bool, len(r.Dependencies))
 	for _, dep := range r.Dependencies {
@@ -264,11 +294,11 @@ func validateRule(r Rule) error {
 	if !r.EstimatedCost.Valid() {
 		return fmt.Errorf("rule %q estimated cost %q is unknown", r.ID, r.EstimatedCost)
 	}
-	if r.Timeout <= 0 || r.Timeout > maxRuleTimeout {
-		return fmt.Errorf("rule %q timeout %s must be > 0 and <= %s", r.ID, r.Timeout, maxRuleTimeout)
+	if r.Timeout <= 0 || r.Timeout > MaxRuleTimeout {
+		return fmt.Errorf("rule %q timeout %s must be > 0 and <= %s", r.ID, r.Timeout, MaxRuleTimeout)
 	}
-	if r.Author == "" || len(r.Author) > maxRuleAuthorBytes {
-		return fmt.Errorf("rule %q author is empty or over %d bytes", r.ID, maxRuleAuthorBytes)
+	if r.Author == "" || len(r.Author) > MaxRuleAuthorBytes {
+		return fmt.Errorf("rule %q author is empty or over %d bytes", r.ID, MaxRuleAuthorBytes)
 	}
 	if r.Detector == nil {
 		return fmt.Errorf("rule %q has no detector", r.ID)
@@ -277,14 +307,14 @@ func validateRule(r Rule) error {
 }
 
 // validateRuleID enforces the canonical rule ID shape: lowercase slug
-// characters only, 1..maxRuleIDBytes bytes. Canonical IDs make dependency
+// characters only, 1..MaxRuleIDBytes bytes. Canonical IDs make dependency
 // references and cache targets unambiguous.
 func validateRuleID(id string) error {
 	if id == "" {
 		return fmt.Errorf("rule id must not be empty")
 	}
-	if len(id) > maxRuleIDBytes {
-		return fmt.Errorf("rule id %q is over %d bytes", id, maxRuleIDBytes)
+	if len(id) > MaxRuleIDBytes {
+		return fmt.Errorf("rule id %q is over %d bytes", id, MaxRuleIDBytes)
 	}
 	for i := 0; i < len(id); i++ {
 		c := id[i]
@@ -300,29 +330,56 @@ func validateRuleID(id string) error {
 	return nil
 }
 
-// validateRuleVersion enforces the "major.minor.patch" numeric shape.
-func validateRuleVersion(v string) error {
+// ParseRuleVersion parses a rule version, "major.minor.patch" with numeric
+// components (each 1..9 digits, whole string at most MaxRuleVersionBytes
+// bytes), and returns the three components. It is the exported SDK entry
+// point of the single version parser; validateRuleVersion shares the same
+// parser, so a version that parses validates, and vice versa.
+func ParseRuleVersion(s string) (major, minor, patch int, err error) {
+	return parseRuleVersion(s)
+}
+
+// parseRuleVersion is the single rule-version parser: it enforces the
+// "major.minor.patch" numeric shape and returns the three components.
+// validateRuleVersion and the exported ParseRuleVersion both use it.
+func parseRuleVersion(v string) (major, minor, patch int, err error) {
 	if v == "" {
-		return fmt.Errorf("version must not be empty")
+		return 0, 0, 0, fmt.Errorf("version must not be empty")
 	}
-	if len(v) > maxRuleVersionBytes {
-		return fmt.Errorf("version %q is over %d bytes", v, maxRuleVersionBytes)
+	if len(v) > MaxRuleVersionBytes {
+		return 0, 0, 0, fmt.Errorf("version %q is over %d bytes", v, MaxRuleVersionBytes)
 	}
 	parts := strings.Split(v, ".")
 	if len(parts) != 3 {
-		return fmt.Errorf("version %q is not major.minor.patch", v)
+		return 0, 0, 0, fmt.Errorf("version %q is not major.minor.patch", v)
 	}
-	for _, p := range parts {
+	nums := [3]int{}
+	for i, p := range parts {
 		if p == "" || len(p) > 9 {
-			return fmt.Errorf("version %q has a malformed component", v)
+			return 0, 0, 0, fmt.Errorf("version %q has a malformed component", v)
 		}
-		for i := 0; i < len(p); i++ {
-			if p[i] < '0' || p[i] > '9' {
-				return fmt.Errorf("version %q has a non-numeric component", v)
+		for j := 0; j < len(p); j++ {
+			if p[j] < '0' || p[j] > '9' {
+				return 0, 0, 0, fmt.Errorf("version %q has a non-numeric component", v)
 			}
 		}
+		n, convErr := strconv.Atoi(p)
+		if convErr != nil {
+			// Unreachable after the digit and 9-byte checks above (a
+			// 9-digit component always fits an int); defensive only, so a
+			// future bound change can never silently truncate.
+			return 0, 0, 0, fmt.Errorf("version %q has a malformed component", v)
+		}
+		nums[i] = n
 	}
-	return nil
+	return nums[0], nums[1], nums[2], nil
+}
+
+// validateRuleVersion enforces the "major.minor.patch" numeric shape
+// through the shared parser.
+func validateRuleVersion(v string) error {
+	_, _, _, err := parseRuleVersion(v)
+	return err
 }
 
 // clone returns a deep copy of the rule's slice and map fields so a

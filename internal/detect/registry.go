@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // maxRegistryRules bounds the registry (fixed constant): it protects the
@@ -23,13 +24,18 @@ const maxRegistryRules = 4096
 // dependency GRAPH (missing dependency references, cycles) spans multiple
 // rules and is validated by Validate, which the engine calls before every
 // run (and which callers should call once at startup).
+//
+// Seal freezes the registry: pack loading must happen before Seal (startup
+// confinement); Seal and Register are single-writer startup operations and
+// must not run concurrently. Get/Rules/Len/Validate keep working after Seal.
 type Registry struct {
-	mu    sync.RWMutex
-	rules map[string]Rule
-	names map[string]string // lowercase name -> rule ID
+	mu       sync.RWMutex
+	rules    map[string]Rule
+	names    map[string]string // lowercase name -> rule ID
+	readonly atomic.Bool
 }
 
-// NewRegistry returns an empty registry.
+// NewRegistry returns an empty, unsealed registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		rules: make(map[string]Rule),
@@ -39,13 +45,25 @@ func NewRegistry() *Registry {
 
 // Register validates rule and adds it to the registry as an immutable deep
 // copy. Duplicate rule IDs and duplicate names (case-insensitive) are
-// rejected.
+// rejected. Per-rule validation delegates to ValidateRule — the single
+// validation point — so the same rule is rejected with the same error
+// whether validated directly or at registration. After Seal, Register
+// fails with "detect: registry is sealed".
 func (r *Registry) Register(rule Rule) error {
-	if err := validateRule(rule); err != nil {
+	if r.readonly.Load() {
+		return fmt.Errorf("detect: registry is sealed")
+	}
+	if err := ValidateRule(rule); err != nil {
 		return fmt.Errorf("detect: register rule: %w", err)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Re-check under the write lock: Seal may have run while we validated.
+	// This closes the check-then-act window — a Register that passed the
+	// fast path must not complete after Seal.
+	if r.readonly.Load() {
+		return fmt.Errorf("detect: registry is sealed")
+	}
 	if len(r.rules) >= maxRegistryRules {
 		return fmt.Errorf("detect: registry is full (%d rules)", maxRegistryRules)
 	}
@@ -59,6 +77,16 @@ func (r *Registry) Register(rule Rule) error {
 	r.rules[rule.ID] = rule.clone()
 	r.names[nameKey] = rule.ID
 	return nil
+}
+
+// Seal freezes the registry: any later Register call fails. Sealing is
+// optional; it exists for callers that want registration confined to
+// startup — pack loading must happen before Seal. Read operations
+// (Get/Rules/Len/Validate) keep working after Seal.
+func (r *Registry) Seal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readonly.Store(true)
 }
 
 // Get returns a copy of the registered rule with the given ID.

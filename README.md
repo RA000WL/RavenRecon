@@ -436,6 +436,16 @@ pipeline. Vulnerability-specific rules (XSS, SSRF, BAC, SQLi, CVE
 matching, ...) are future phases; none ship here, and the framework
 contains no browser automation, no exploitation, and no AI.
 
+SDK: the rule-author surface is frozen at milestone v1.2.5 as "SDK v1
+(Core)" (API level 1.0 — `APIMajor`/`APIMinor` in `api.go`): Rule,
+Detector, Registry, Context, the canonical Finding model, Snapshot, Run,
+and the run-contract surface. The freeze is enforced by an API-shape
+golden test (`surface_snapshot_test.go` against `testdata/api_v1.golden`)
+and nine behavior contracts; pack loaders gate on `CheckAPIVersion(1, 0)`
+before loading any rule. The module ships `internal/detect/examples` as
+the only rule pack — explicitly loaded, never auto-loaded — and the
+framework detects nothing on its own.
+
 Rules: every rule is an immutable descriptor — canonical ID, name,
 description, one of 14 categories, semantic version, declared input and
 output domains, dependencies, required asset kinds, estimated cost,

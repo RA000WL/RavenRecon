@@ -35,8 +35,12 @@ const (
 
 	// MaxHeaderBytes bounds the size of one response's header block. The
 	// production transport enforces it via http.Transport's
-	// MaxResponseHeaderBytes; a server that exceeds it aborts the response,
-	// and the probe is truncated.
+	// MaxResponseHeaderBytes, which aborts only when the block STRICTLY
+	// exceeds the cap — an exactly-at-cap block is normal, never truncated.
+	// Truncation requires EXACT equality with the stdlib-constructed abort
+	// message on some wrapped error (isHeaderCapAbort), never a substring:
+	// hostile header bytes cannot fabricate truncation, and a message
+	// change degrades the probe to failed/other (safe direction).
 	MaxHeaderBytes = 64 << 10 // 64 KiB
 
 	// MaxHeaders bounds how many response header entries are retained per

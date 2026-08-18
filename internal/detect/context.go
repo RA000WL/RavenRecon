@@ -22,18 +22,6 @@ const (
 	maxSnapshotSecrets       = 50_000
 	maxSnapshotJavaScript    = 50_000
 	maxSnapshotEndpoints     = 100_000
-	// maxContextConfigEntries bounds the configuration map delivered to
-	// rules.
-	maxContextConfigEntries = 64
-	// maxContextConfigKeyBytes / maxContextConfigValueBytes bound one
-	// configuration entry.
-	maxContextConfigKeyBytes   = 64
-	maxContextConfigValueBytes = 256
-	// maxLogEntries bounds the default logger's retained entries; entries
-	// beyond the bound are counted, never stored.
-	maxLogEntries = 256
-	// maxLogMessageBytes bounds one log message.
-	maxLogMessageBytes = 512
 )
 
 // Snapshot is the caller-composed input of one detection run: the canonical
@@ -144,7 +132,7 @@ type Logger interface {
 }
 
 // boundedLogger is the engine's default Logger: it retains at most
-// maxLogEntries entries (sorted for the report) and counts the excess, so a
+// MaxLogEntries entries (sorted for the report) and counts the excess, so a
 // flooding rule can never grow run memory without bound.
 type boundedLogger struct {
 	mu      sync.Mutex
@@ -162,12 +150,12 @@ func (l *boundedLogger) Log(level LogLevel, ruleID, message string) {
 	if !level.Valid() {
 		level = LevelInfo
 	}
-	if len(message) > maxLogMessageBytes {
-		message = message[:maxLogMessageBytes]
+	if len(message) > MaxLogMessageBytes {
+		message = message[:MaxLogMessageBytes]
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.entries) >= maxLogEntries {
+	if len(l.entries) >= MaxLogEntries {
 		l.dropped++
 		return
 	}
@@ -372,15 +360,15 @@ func normalizeSnapshot(s Snapshot) (*corpus, error) {
 
 // validateConfig checks the bounded configuration map delivered to rules.
 func validateConfig(cfg map[string]string) error {
-	if len(cfg) > maxContextConfigEntries {
-		return fmt.Errorf("detect: configuration carries %d entries over bound %d", len(cfg), maxContextConfigEntries)
+	if len(cfg) > MaxContextConfigEntries {
+		return fmt.Errorf("detect: configuration carries %d entries over bound %d", len(cfg), MaxContextConfigEntries)
 	}
 	for k, v := range cfg {
-		if k == "" || len(k) > maxContextConfigKeyBytes {
-			return fmt.Errorf("detect: configuration key %q is empty or over %d bytes", k, maxContextConfigKeyBytes)
+		if k == "" || len(k) > MaxContextConfigKeyBytes {
+			return fmt.Errorf("detect: configuration key %q is empty or over %d bytes", k, MaxContextConfigKeyBytes)
 		}
-		if len(v) > maxContextConfigValueBytes {
-			return fmt.Errorf("detect: configuration value for %q is over %d bytes", k, maxContextConfigValueBytes)
+		if len(v) > MaxContextConfigValueBytes {
+			return fmt.Errorf("detect: configuration value for %q is over %d bytes", k, MaxContextConfigValueBytes)
 		}
 	}
 	return nil

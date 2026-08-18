@@ -54,7 +54,7 @@ type BenchResult struct {
 // failed returns the last error alongside the result (the counts are still
 // reported).
 func BenchmarkDetector(ctx context.Context, rule Rule, snap Snapshot, iterations int, clock runtime.Clock) (BenchResult, error) {
-	if err := validateRule(rule); err != nil {
+	if err := ValidateRule(rule); err != nil {
 		return BenchResult{}, fmt.Errorf("detect: benchmark rule: %w", err)
 	}
 	if iterations <= 0 || iterations > maxBenchmarkIterations {
