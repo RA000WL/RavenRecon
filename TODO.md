@@ -68,15 +68,21 @@ actual gate runs. Final full-milestone re-review happens at T9 before commit.
   Note: internal/report/registry.go carries the same inherited pattern —
   follow-up scheduled when report is next touched (out of milestone scope).
 - NEW-8 (HIGH) — VERIFIED: T5a surface_snapshot_test.go (790 lines) +
-  testdata/api_v1.golden (7301 bytes, sha256 abe5dd3e) — stdlib-only AST
-  snapshot of the Level-1 surface with Level-2/3 exclusions documented and
-  drift demonstrated twice (const value change, symbol rename) during
-  development; T5b behavior_contract_test.go pins all 9 contracts. Builder
-  gates all green; orchestrator re-ran the package (`-count=1` ok), the
-  snapshot test (PASS), and the race suite (ok). Golden regenerable only via
-  explicit `-update` flag. Incident note: T5a's builder briefly restored
-  rule.go from HEAD during a drift demo; restore verified byte-exact via
-  sha256 (0b6829a6) against the pre-demo state.
+  testdata/api_v1.golden — stdlib-only AST snapshot of the Level-1 surface
+  with Level-2/3 exclusions documented and drift demonstrated (const value
+  change, symbol rename) during development; T5b behavior_contract_test.go
+  pins all 9 contracts. Builder gates all green; orchestrator re-ran the
+  package (`-count=1` ok), the snapshot test (PASS), and the race suite
+  (ok). Golden regenerable only via explicit `-update` flag. Incident note:
+  T5a's builder briefly restored rule.go from HEAD during a drift demo;
+  restore verified byte-exact via sha256 (0b6829a6) against the pre-demo
+  state. FINAL-REVIEW FIX (post-sign-off, in same changeset): golden
+  de-overpinned — now pins only exported symbols, exported fields
+  (name+type+tag), const values, and signature TYPES (param/result names and
+  unexported fields dropped, arity preserved); regenerated in the same
+  change (7216 bytes, sha256 034f292a; old: 7301 bytes, abe5dd3e). Proven by
+  live demos: cosmetic param rename (dctx→c) and internal-field rename
+  (readonly→frozen) PASS; exported-symbol rename still FAILS.
 
 - NEW-7 (HIGH) — VERIFIED: T4 examples pack (internal/detect/examples:
   doc.go, rules.go, rules_test.go + internal/detect/example_test.go).
@@ -121,106 +127,12 @@ actual gate runs. Final full-milestone re-review happens at T9 before commit.
 
 ## Open items
 
-### NEW-7 (HIGH) — v1.2.5 T4: examples pack + Example funcs (internal/detect/examples)
-- Status: IN PROGRESS (implemented; review pending)
-- Reporter: master
-- Owner: builder
-- Problem: v1.2.5 requires SDK examples that compile AND run, and at least one
-  internal rule pack loading through the SDK with zero special-case code —
-  while "no rules ship with the framework" stays true.
-- Fix: landed — `internal/detect/examples` (package examples):
-  `Rules() ([]detect.Rule, error)` opening with `CheckAPIVersion(1, 0)`;
-  6 mechanical rules (`example.` IDs, information/discovery only) covering all
-  7 Context domains + dependency pair (Registry.Validate graph) + Config/Logger
-  rule + empty-output rule; `ExampleDetector`/`ExampleRegistry_Register`/
-  `ExampleRun` in package detect_test (first external test package — compiler
-  proves exported-only usage).
-- Verification: examples/rules_test.go — validate → register → Run with real
-  cache → second run all-Cached hits; deterministic reports; content-policy
-  test. Example funcs run under `go test -run '^Example'`. Gates on
-  `./internal/detect/...`.
-- Review round (builder): reviewer APPROVE WITH NITS — all four closed in the
-  examples pack only (rules.go, rules_test.go, doc.go):
-  - MEDIUM: degreeIndexDetector emitted findings about relationship endpoints
-    the corpus never observed (relationships validate for canonical form
-    only; normalizeSnapshot's observed set excludes relationship endpoints)
-    → validateFinding rejected the subject and the rule failed loudly.
-    Fixed: observed set rebuilt from the Context's observed collections
-    (Assets + evidence identities/sources + technologies + secrets +
-    javascript + endpoints, mirroring context.go normalizeSnapshot);
-    unobserved nodes skipped. Documented in the rule Description and doc.go
-    as the pack's second observed-corpus demonstration. Regression:
-    TestDegreeIndexSkipsUnobservedNodes — full pipeline on a legal snapshot
-    whose relationship cites an unobserved IP; fails pre-fix (verified:
-    "finding subject ip:192.0.2.99 was not observed in the corpus",
-    outcome incomplete), passes post-fix (1 degree finding for the observed
-    host only).
-  - LOW: rules[1].Dependencies = []string{rules[0].ID} index-coupled wiring
-    replaced by explicit named linkage — newRule gains variadic deps, the
-    degree rule declares ruleAssetsCensus by ID constant at construction;
-    TestPackRulesValidate still pins the graph.
-  - Doc NITs: "One rule per Context domain family" rephrased (six rules,
-    seven domains — audit covers secrets+javascript); usage sketch now points
-    to ExampleRun for the compilable version.
-  - Gates run by builder: gofmt clean; go test ./internal/detect/examples/ ok;
-    go test -count=1 ./internal/detect/ ok (incl. TestSDKAPISurfaceSnapshot);
-    go vet ./internal/detect/examples/ ./internal/detect/ ok;
-    go test -race ./internal/detect/... ok; go build ./... ok;
-    go test -count=1 ./... ok (all 22 packages).
-
-### NEW-9 (MED) — v1.2.5 T6: semantic compat regression (internal/detect)
-- Status: IN PROGRESS
-- Reporter: master
-- Owner: builder
-- Problem: shape tests catch compile breaks only; semantic drift (Context
-  behavior, output changes) must also fail CI — the maintainer's "run it
-  forever" compat gate.
-- Fix: compat test reusing the examples pack: fixed snapshot → Run →
-  deterministic report marshaled and diffed against a pinned golden
-  (testdata/api_v1_report.golden); any output drift fails CI.
-- Verification: green on clean tree; a deliberate output change fails; gates
-  on `./internal/detect/...`.
-
-### NEW-10 (MED) — v1.2.5 T7: SDK docs — pack-author guide + lifecycle diagram (docs)
-- Status: OPEN
-- Reporter: master
-- Owner: docs (builder fallback — docs agent unavailable)
-- Problem: v1.2.5 checklist requires developer documentation; pack authors
-  need the Rule contract, finding contract, cache-key semantics, and the
-  lifecycle picture.
-- Fix: lifecycle diagram (Rule → Registry → Snapshot → Run → Finding →
-  Report) in ARCHITECTURE.md "Detection framework → SDK contract" subsection;
-  pack-author guide (examples/doc.go or dedicated docs file); Level-1 freeze
-  + CheckAPIVersion usage documented.
-- Verification: docs reference real symbols and test names; gates green.
-
-### NEW-11 (MED) — v1.2.5 T8: SDK stability policy + reopening criteria (docs)
-- Status: OPEN
-- Reporter: master
-- Owner: docs (builder fallback — docs agent unavailable)
-- Problem: maintainer requires a formal 3-level stability policy (L1 frozen
-  forever; L2 frozen after pipeline validation; L3 experimental) and written,
-  testable reopening criteria.
-- Fix: policy in ARCHITECTURE.md + ROADMAP.md v1.2.5; reopening = concrete
-  failing need (pack inexpressible on the frozen surface) + proposal naming
-  symbols + maintainer approval + golden regeneration in the same change;
-  testable half = golden test + CheckAPIVersion test.
-- Verification: policy names the real gates (api_v1.golden test,
-  CheckAPIVersion); ROADMAP v1.2.5 checklist updated; tests green.
-
 ### NEW-12 (MED) — v1.2.5 T9: roadmap/README/AGENTS sync + final verification
-- Status: OPEN
-- Reporter: master
-- Owner: master
-- Problem: ROADMAP v1.2.5 still "Status: planned"; README detect section lacks
-  the SDK-freeze mention; AGENTS.md §2 needs the examples-pack footnote.
-- Fix: ROADMAP v1.2.5 checklist ticks + status; README one paragraph; AGENTS.md
-  §2 footnote ("no rules ship with the framework; the module ships
-  internal/detect/examples"); full-gate verification from clean checkout
-  (gofmt, go test ./..., go vet ./..., go build ./..., go test -race on
-  changed packages) + reviewer sign-off; then commit.
-- Verification: all gates green; reviewer APPROVE; board entries moved to
-  VERIFIED by orchestrator.
+- Status: IN PROGRESS (T9 landed — ROADMAP checklist fully ticked, README
+  SDK paragraph, AGENTS §2 footnote; final-review NITs closed by builder:
+  golden de-overpinned, ROADMAP table row, schema-bump carve-out sentence;
+  full-milestone reviewer sign-off APPROVE WITH NITS. Remaining: commit
+  pending user decision; close this entry at commit time)
 
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED

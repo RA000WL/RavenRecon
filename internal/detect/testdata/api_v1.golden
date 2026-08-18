@@ -2,7 +2,8 @@
 # Core", milestone v1.2.5; see api.go for the stability policy). Pinned by
 # TestSDKAPISurfaceSnapshot: any drift — added/removed exported symbol,
 # changed signature, changed struct fields/tags, changed constant value —
-# fails the test. Regenerate ONLY with:
+# fails the test. Only the exported contract is pinned: unexported fields
+# and parameter/result names are never rendered. Regenerate ONLY with:
 #
 #   go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update
 #
@@ -92,7 +93,7 @@ type Context struct {
 
 type Cost string
 
-type Detector func(ctx context.Context, dctx *Context) ([]asset.Finding, error)
+type Detector func(context.Context, *Context) ([]asset.Finding, error)
 
 type EngineConfig struct {
 	Registry *Registry
@@ -121,15 +122,11 @@ type LogEntry struct {
 
 type LogLevel string
 
-type Logger interface { Log(level LogLevel, ruleID, message string) }
+type Logger interface { Log(LogLevel, string, string) }
 
 type Outcome string
 
 type Registry struct {
-	mu sync.RWMutex
-	rules map[string]Rule
-	names map[string]string
-	readonly atomic.Bool
 }
 
 type Report struct {
@@ -192,9 +189,9 @@ type Snapshot struct {
 
 ## methods
 
-*Registry.Get(id string) (Rule, bool)
+*Registry.Get(string) (Rule, bool)
 *Registry.Len() int
-*Registry.Register(rule Rule) error
+*Registry.Register(Rule) error
 *Registry.Rules() []Rule
 *Registry.Seal()
 *Registry.Validate() error
@@ -213,15 +210,15 @@ RuleOutput.Valid() bool
 ## funcs
 
 func Categories() []Category
-func CheckAPIVersion(requiredMajor, requiredMinor int) error
-func DefaultEngineConfig(registry *Registry) EngineConfig
+func CheckAPIVersion(int, int) error
+func DefaultEngineConfig(*Registry) EngineConfig
 func KnownRuleInputs() []RuleInput
 func KnownRuleOutputs() []RuleOutput
 func NewRegistry() *Registry
-func ParseCategory(s string) (Category, error)
-func ParseCost(s string) (Cost, error)
-func ParseFindingPriority(s string) (FindingPriority, error)
-func ParseFindingStatus(s string) (FindingStatus, error)
-func ParseRuleVersion(s string) (major, minor, patch int, err error)
-func Run(ctx context.Context, cfg EngineConfig, snap Snapshot) (Report, error)
-func ValidateRule(r Rule) error
+func ParseCategory(string) (Category, error)
+func ParseCost(string) (Cost, error)
+func ParseFindingPriority(string) (FindingPriority, error)
+func ParseFindingStatus(string) (FindingStatus, error)
+func ParseRuleVersion(string) (int, int, int, error)
+func Run(context.Context, EngineConfig, Snapshot) (Report, error)
+func ValidateRule(Rule) error

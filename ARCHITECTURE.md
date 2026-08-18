@@ -2715,7 +2715,12 @@ The three layers are independent (documented in `api.go`):
 `SchemaVersion` versions the cache record layout (a bump invalidates
 stored rule results, never the SDK contract); `APIMajor`/`APIMinor`
 version the frozen Level-1 surface; `Rule.Version` versions rule
-content (the cache-coherence bump contract). `CheckAPIVersion` is the
+content (the cache-coherence bump contract). Because the surface golden
+pins the `SchemaVersion` constant itself, a record-layout bump follows a
+documented carve-out: it regenerates the Level-1 golden in the same
+change as the schema edit, with NO `CheckAPIVersion` bump — a schema
+bump changes only cache-record layout and never the SDK contract.
+`CheckAPIVersion` is the
 single gate pack loaders call: compatibility holds exactly when the
 required major equals this build's `APIMajor` and this build's
 `APIMinor` >= the required minor — a major mismatch means the pack must

@@ -43,7 +43,7 @@ Every phase must satisfy these before it is complete:
 | v1.0 | Attack Surface Intelligence / Detection Framework | ✅ Complete |
 | v1.1 | Reporting Framework | ✅ Complete |
 | v1.2 | Eventing, observability, operator feedback | ✅ Complete |
-| v1.2.5 | SDK and extension API stabilization | ⏳ Planned |
+| v1.2.5 | SDK and extension API stabilization | ⏳ Implemented — final review pending |
 | v1.3 | End-to-end pipeline | ⏳ Planned |
 | v1.4 | CLI surface area | ⏳ Planned |
 | v1.5 | Robustness and hostile-input hardening | ⏳ Planned |

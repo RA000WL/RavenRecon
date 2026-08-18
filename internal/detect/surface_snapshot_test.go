@@ -7,6 +7,14 @@
 // removed exported symbol, changed signature, changed struct fields/tags,
 // or changed constant value.
 //
+// The golden pins ONLY the exported Go contract: unexported struct fields
+// (a type's internals) and parameter/result names (and receiver names,
+// which are never rendered) are not part of the contract and are never
+// serialized. A cosmetic rename or an internal refactor (e.g. replacing an
+// atomic.Bool field with a mutex-guarded bool) therefore cannot drift the
+// snapshot — only exported symbols, exported fields (name + type + tag),
+// signature TYPES, and constant values are pinned.
+//
 // The golden is regenerated ONLY through the explicit -update opt-in:
 //
 //	go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update
@@ -80,7 +88,8 @@ const surfaceGoldenHeader = `# api_v1.golden — frozen Level-1 SDK surface of p
 # Core", milestone v1.2.5; see api.go for the stability policy). Pinned by
 # TestSDKAPISurfaceSnapshot: any drift — added/removed exported symbol,
 # changed signature, changed struct fields/tags, changed constant value —
-# fails the test. Regenerate ONLY with:
+# fails the test. Only the exported contract is pinned: unexported fields
+# and parameter/result names are never rendered. Regenerate ONLY with:
 #
 #   go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update
 #
@@ -317,15 +326,19 @@ func surfaceRenderTypeSpec(ts *ast.TypeSpec) string {
 
 // surfaceRenderFields serializes a field list (struct fields or interface
 // methods), one entry per source field, tags included when withTags is set.
-// methodForm renders fields as interface methods ("Log(level LogLevel,
-// ruleID string, message string)") instead of struct fields ("Log
-// func(...)").
+// methodForm renders fields as interface methods ("Log(LogLevel, string,
+// string)") instead of struct fields ("Log func(...)"). Unexported fields
+// are skipped: only the exported Go contract is pinned (see
+// surfaceFieldExported).
 func surfaceRenderFields(list *ast.FieldList, withTags, methodForm bool) []string {
 	if list == nil {
 		return nil
 	}
 	out := make([]string, 0, len(list.List))
 	for _, f := range list.List {
+		if !surfaceFieldExported(f) {
+			continue
+		}
 		var b strings.Builder
 		if len(f.Names) > 0 {
 			names := make([]string, len(f.Names))
@@ -350,36 +363,65 @@ func surfaceRenderFields(list *ast.FieldList, withTags, methodForm bool) []strin
 	return out
 }
 
+// surfaceFieldExported reports whether a struct field or interface method
+// belongs to the exported Go contract. A named field is exported when at
+// least one of its names is exported — an exported field with an
+// unexported TYPE is still exported, so only the name governs visibility.
+// A nameless embedded field is exported when its (base) type name is
+// exported. Unknown shapes default to kept.
+func surfaceFieldExported(f *ast.Field) bool {
+	if len(f.Names) > 0 {
+		for _, n := range f.Names {
+			if n.IsExported() {
+				return true
+			}
+		}
+		return false
+	}
+	switch t := f.Type.(type) {
+	case *ast.Ident:
+		return t.IsExported()
+	case *ast.SelectorExpr:
+		return t.Sel.IsExported()
+	case *ast.StarExpr:
+		return surfaceFieldExported(&ast.Field{Type: t.X})
+	}
+	return true
+}
+
 // surfaceRenderFuncSuffix serializes "(params) results" of a function type
-// without the "func" keyword.
+// without the "func" keyword. Parameter and result lists render as types
+// only — names are not part of the exported Go contract.
 func surfaceRenderFuncSuffix(t *ast.FuncType) string {
 	params := surfaceRenderParams(t.Params)
 	if t.Results == nil || len(t.Results.List) == 0 {
 		return params
 	}
-	if len(t.Results.List) == 1 && len(t.Results.List[0].Names) == 0 {
+	if len(t.Results.List) == 1 && len(t.Results.List[0].Names) <= 1 {
 		return params + " " + surfaceRenderType(t.Results.List[0].Type)
 	}
 	return params + " " + surfaceRenderParams(t.Results)
 }
 
-// surfaceRenderParams serializes a parameter or result list, always
-// parenthesized.
+// surfaceRenderParams serializes a parameter or result list as TYPES ONLY
+// (parameter/result names are never rendered), always parenthesized. A
+// field entry declares one parameter per name, so "a, b int" renders as
+// "int, int" — the name list encodes arity, and arity is part of the
+// signature contract.
 func surfaceRenderParams(list *ast.FieldList) string {
 	if list == nil || len(list.List) == 0 {
 		return "()"
 	}
 	parts := make([]string, 0, len(list.List))
 	for _, f := range list.List {
-		if len(f.Names) == 0 {
-			parts = append(parts, surfaceRenderType(f.Type))
-			continue
+		typ := surfaceRenderType(f.Type)
+		n := len(f.Names)
+		if n == 0 {
+			n = 1
 		}
-		names := make([]string, len(f.Names))
-		for i, n := range f.Names {
-			names[i] = n.Name
+		for i := 0; i < n; i++ {
+			parts = append(parts, typ)
 		}
-		parts = append(parts, strings.Join(names, ", ")+" "+surfaceRenderType(f.Type))
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
 }
