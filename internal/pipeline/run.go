@@ -51,11 +51,24 @@ type RunReport struct {
 	Hosts   []asset.Host
 	URLs    []asset.URL
 
+	// Results is the final merged results channel after all stages
+	// (first-seen dedup, deterministic order; per-channel MaxOutput caps
+	// at each merge). Every channel mirrors one report.Context data
+	// channel 1:1 (internal/report/context.go) — the report stage will
+	// consume the full Context from this struct in a later milestone. A
+	// channel cut by a cap carries its <channel>_truncated sticky flag
+	// below, marking the retained set incomplete (never silently
+	// completed).
+	Results Results
+
 	// StickyFlags names the runner-level cuts — "corpus_capped" when a
-	// per-stage MaxCorpusSize cut the corpus at a merge. Preserved
-	// end-to-end (result → RunReport → report stage): consumers must
-	// treat a flagged run as an incomplete retained set (AGENTS §0.6
-	// carve-out — a completed run may carry the flag, never silence it).
+	// per-stage MaxCorpusSize cut the corpus at a merge, plus one
+	// "<channel>_truncated" flag per results channel a per-stage
+	// MaxOutput cap cut (ips_truncated, attack_paths_truncated, ...; see
+	// mergeResults for the full vocabulary). Preserved end-to-end (result
+	// → RunReport → report stage): consumers must treat a flagged run as
+	// an incomplete retained set (AGENTS §0.6 carve-out — a completed
+	// run may carry the flags, never silence them).
 	StickyFlags map[string]bool
 }
 
@@ -170,7 +183,9 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	var domains []asset.Domain
 	var hosts []asset.Host
 	var urls []asset.URL
+	var results Results
 	seen := make(map[asset.Identity]struct{})
+	resultsSeen := make(map[string]struct{})
 
 	for i, entry := range entries {
 		name := cfg.Stages[i]
@@ -200,6 +215,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			Domains:   domains,
 			Hosts:     hosts,
 			URLs:      urls,
+			Results:   results,
 			Bounds:    eff,
 			Config:    effectiveStageParams(cfg, name),
 			Clock:     clock,
@@ -238,6 +254,24 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags["corpus_capped"] = true
 		}
+		// Results propagation: merge this stage's result-channel additions
+		// into the shared channel handed to the remaining stages (first-seen
+		// dedup, deterministic order), then enforce this stage's MaxOutput
+		// cap per channel. The merge runs regardless of the stage's outcome
+		// — a failed stage's retained results are still merged (mirroring
+		// the corpus Additions semantics above). Runner-side capping records
+		// one <channel>_truncated sticky flag per cut channel at the report
+		// level (AGENTS §0.6 carve-out, mirroring corpus_capped): the
+		// stage's own outcome is untouched, but the flags and Truncated mark
+		// the retained set incomplete. A stage never sees its own additions:
+		// StageInput.Results is the merged state before this stage's turn.
+		for _, ch := range mergeResults(&results, res.Results, resultsSeen, eff.MaxOutput) {
+			report.Truncated = true
+			if report.StickyFlags == nil {
+				report.StickyFlags = make(map[string]bool)
+			}
+			report.StickyFlags[ch+"_truncated"] = true
+		}
 	}
 
 	report.EndAt = clock.Now()
@@ -250,6 +284,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	report.Domains = domains
 	report.Hosts = hosts
 	report.URLs = urls
+	report.Results = results
 	for _, sr := range report.Stages {
 		report.ItemsProcessed += sr.ItemsProcessed
 		report.ItemsFailed += sr.ItemsFailed

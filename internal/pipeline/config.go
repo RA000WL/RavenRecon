@@ -10,10 +10,13 @@
 // propagation (T2a) is real: stages return Additions, the runner merges
 // them (first-seen dedup, deterministic order) into the corpus handed to
 // later stages, bounded by the per-stage MaxCorpusSize caps (runner-side
-// capping records the corpus_capped sticky flag). Additions carry the
-// corpus kinds only (domains/hosts/URLs): results propagation
-// (technology, evidence, findings, parameters) is a separate milestone.
-// Stage eventing (T3a) is real: the runner emits canonical
+// capping records the corpus_capped sticky flag). Results propagation
+// (T3b) is real: stages report result-channel additions (StageResult.
+// Results), the runner merges them (first-seen dedup, deterministic
+// order, per-channel MaxOutput caps recording the <channel>_truncated
+// sticky flags) into the shared Results channel handed to later stages
+// and the final RunReport.Results — but no adapter PRODUCES results yet
+// (T3d). Stage eventing (T3a) is real: the runner emits canonical
 // stage_started/stage_finished events when configured with an Observer.
 // Report rendering is a separate milestone.
 package pipeline
@@ -141,8 +144,13 @@ type StageConfig struct {
 	// corpus_capped sticky flag (AGENTS §0.6 carve-out).
 	MaxCorpusSize int
 
-	// MaxOutput bounds the result entries a stage may retain; the stage
-	// itself enforces the cap and reports Truncated honestly.
+	// MaxOutput bounds the result entries a stage may retain, applied per
+	// result channel per stage at the merge: after each stage's results
+	// are merged into the shared channel, every channel holds at most
+	// MaxOutput entries (first-seen order kept, tail dropped), and each
+	// cut channel records its <channel>_truncated sticky flag (AGENTS
+	// §0.6 carve-out, mirroring corpus_capped). A later stage with a
+	// smaller MaxOutput re-caps the channel at its own merge.
 	MaxOutput int
 }
 

@@ -75,7 +75,10 @@ orchestrator; every agent may append or update its own entries.
 - Status: IN PROGRESS (T1/T2a/T2b VERIFIED; T2c VERIFIED — review APPROVE
   WITH NITS, all nits closed + gates re-run; T2d VERIFIED — re-review
   APPROVE WITH NITS, all findings closed, gates re-run; T3a stage events
-  IN PROGRESS — claimed by builder this session)
+  VERIFIED — review APPROVE (7/7 findings closed, gates re-run), committed
+  ad791c3; T3b results channel VERIFIED — review APPROVE WITH NITS
+  (FIND-1 LOW + 3 INFO closed in a nit round, gates re-run), committed
+  this session)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -173,7 +176,12 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
    session: kind+payload+validate, ScanConfig.Observer seam, synchronous
    in-order started/finished on every path incl. pre-cancelled, panic-
    contained emission, 7 pipeline tests + event table rows, gates green;
-   see the T3a record below) · T3b results channel · T4 determinism
+   see the T3a record below — committed ad791c3) · T3b results channel
+   DONE (this session: 16-channel Results struct, StageInput/StageResult/
+   RunReport plumbing, first-seen identity-keyed per-channel dedup,
+   MaxOutput per-channel caps + <channel>_truncated sticky flags, 20
+   tests; see the T3b record below) · T3c secrentel
+   adapter · T3d adapter results production/consumption · T4 determinism
    (discovery clock seam) · T5 hermetic E2E · T6 CLI+docs.
 - SESSION-LOSS AUDIT (2026-08-19, NEW OS — previous machine wiped; all prior
   local gate evidence gone; re-verified fresh with Go 1.26.6):
@@ -374,6 +382,76 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
     twice, recorded event streams DeepEqual).
   Status: still IN PROGRESS — fixes applied, gates re-run below;
   orchestrator verifies and closes (never self-closed).
+- T3b IMPLEMENTED (this session, builder): pipeline results channel,
+  exactly per orchestrator contract — no deviations. New
+  internal/pipeline/results.go: the 16-channel Results struct (asset.IP/
+  Port/Service/Endpoint/JavaScript/Parameter/Technology/SecretCandidate/
+  Evidence/Finding/TLSCertificate/SourceMap/Relationship + priority.
+  SurfaceAsset/Group/AttackPath — one channel per report.Context data
+  channel; imports asset+priority only, types only), field doc comments
+  name the T3d adapters as the producers (none wired yet), plus
+  mergeResults/mergeChannel (the runner-side merge). StageResult.Results
+  (additions semantics + AGENTS §0.6 truncation rule doc), StageInput.
+  Results (read-only merged PRIOR state, identical contract to the corpus
+  slices), RunReport.Results (final merged state, doc mirroring the
+  corpus fields). Run merges each stage's Results after its StageRecord
+  is finalized — the same place as the corpus merge — unconditionally
+  (a failed/partial stage's retained results still merge, mirroring
+  Additions; documented in run.go), first-seen dedup keyed by canonical
+  identity PER CHANNEL (asset Identity() "kind:value" string; Relationship.
+  ID() — the type has no Identity() method, ID() is its documented
+  canonical identity (asset/relationship.go:118); priority SurfaceAsset.
+  Identity / Group.Anchor / AttackPath.Root fields), keys namespaced per
+  channel in the shared seen map so identical identities carried by
+  different channels never collide (pinned by test), deterministic
+  first-seen order, then the per-channel MaxOutput cap (eff.MaxOutput
+  per stage; smaller later caps re-cut, cut entries stay first-seen and
+  cannot re-enter — corpus-mirrored), returning the fixed-order list of
+  cut channel names → report.StickyFlags["<channel>_truncated"] +
+  report.Truncated (AGENTS §0.6 carve-out, mirroring corpus_capped; the
+  stage's own outcome untouched). Flag vocabulary: ips, ports, services,
+  endpoints, javascript, parameters, technologies, secrets, evidence,
+  findings, tls_certificates, source_maps, relationships, surfaces,
+  groups, attack_paths. No event emission changes (T3a's emit point
+  stays), no normalizeResult changes (Results are not counters), no
+  engine/asset/priority/event changes, no Results JSON/caching story.
+  Tests: internal/pipeline/results_test.go (18 tests — first-seen dedup
+  across stages incl. reverse-edge relationship distinctness, kind-
+  namespace no-collision, per-channel dedup namespacing, nil/empty
+  additions legal, single+multi-channel caps with flag vocabulary +
+  outcome-untouched carve-out, fixed capped-name order, negative-cap
+  defensive branch, visibility-at-stage-turn (prior merged state only,
+  own additions excluded), RunReport.Results final merged, failed-stage
+  results still merged, pre-cancelled empty/no-flags, cross-run
+  determinism incl. Results+StickyFlags, cap permanence + smaller-later-
+  cap re-cut, defensive copy (no aliasing), corpus+results caps combined,
+  all-16-channels unit merge, no-flag-without-cut, stage-not-run-no-
+  merge). One leftover fixed in the inherited working tree: the
+  mergeChannel unit call in results_test.go was missing the namespace
+  argument (build failure). Gates run this session, verbatim: gofmt -l
+  clean (repo-wide), go test -count=1 ./internal/pipeline/... ok, go vet
+  ./... ok, go build ./... ok, go test -race -count=1
+  ./internal/pipeline/... ok, full suite go test -count=1 ./... ok (26
+  packages — 20 top-level test functions in results_test.go after the
+  nit round). Existing pipeline tests pass unmodified (nil-observer zero
+  change). New issue opened: NEW-15 (INFO, T3c document-content gap).
+  REVIEW: APPROVE WITH NITS — FIND-1 (LOW) full 16-name flag vocabulary
+  pinned by TestMergeResultsFullVocabularyPinned (unit capped-name list
+  DeepEqual + runner-level all-16 StickyFlags; typo-failure demonstrated,
+  reverted); FIND-4 (INFO) NEW-15 pointers added to adapt/doc.go +
+  ARCHITECTURE.md (secrentel document-carrier reads as undecided, not
+  settled); FIND-7 (INFO) results.go empty-additions doc reworded (cap
+  may re-slice). All 3 closed, closure verified (reviewer), gates re-run.
+  FIND-2 carried to T3d: Groups/AttackPaths dedup keys (Anchor/Root) are
+  GROUPING keys, not full identities — two distinct groups anchored
+  identically collapse silently to first-seen; today's only producer
+  (single priority stage, engine-guaranteed unique anchors) cannot hit
+  it, but T3d must document "first-seen group per anchor wins" on
+  Results.Groups/AttackPaths or widen the key (anchor + members +
+  score). FIND-5/FIND-6 accepted as documented semantics (outer-slice
+  defensive copy only, same as corpus; per-run seen map grows with total
+  distinct identities, same as corpus). Orchestrator moved T3b to
+  VERIFIED.
 - T3b OBSERVATIONS (no implementation): (1) the stage_started/finished
   events are emitted from the stage LOOP, which is also where T3b's
   per-stage results aggregation will live (run.go:154-235) — the finished
@@ -389,9 +467,19 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   StageRecord is appended), so if T3b results are derived from the merged
   corpus the emit point may need to move after the merge — flagged now so
   the orchestrator can decide placement deliberately. (4) The stage_finished
-  Err field is bounded to 512 bytes and validated; any future results
-  payloads added to events must respect the same per-payload bounds in
-  validatePayload (hand-built hostile events re-validated by consumers).
+   Err field is bounded to 512 bytes and validated; any future results
+   payloads added to events must respect the same per-payload bounds in
+   validatePayload (hand-built hostile events re-validated by consumers).
+- T3b RESOLUTION of the above (this session): (1) StageResult.Results and
+  RunReport.Results landed; stage_finished events deliberately carry NO
+  results — the contract's out-of-scope list forbids event emission
+  changes, and the finished payload stays a mirror of the StageRecord.
+  (2) No new delivery seam was needed: the results channel is
+  runner-internal struct plumbing (StageInput/StageResult/RunReport), not
+  an observer-style channel. (3) The results merge runs AFTER
+  emitStageFinished and BEFORE the next stage — placement documented in
+  run.go; the finished event therefore never reflects the merged results
+  (by design, per (1)). (4) No results payloads were added to events.
 
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED
@@ -442,6 +530,27 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   of longer lists) — requires a scoped milestone decision; the engines'
   fixed bounds are deliberate contracts.
 - Verification: n/a while deferred.
+
+### NEW-15 (INFO) — T3c secrentel adapter: the JavaScript channel carries no document content (internal/asset)
+- Status: OPEN
+- Reporter: builder (T3b round)
+- Owner: (none)
+- Problem: the T3b contract documents secrentel's T3c adapter as consuming
+  the channel's `JavaScript` documents as its document source — but
+  `asset.JavaScript` (internal/asset/javascript.go:25-77) retains
+  OBSERVATIONS only: canonical URL identity, ContentHash (SHA-256 of the
+  body), Size, ContentType, ETag, LastModified, StatusCode, FinalURL —
+  never the body itself (jsintel's bounded fetch truncates honestly and
+  retains no prefix). secrentel's Document seam is caller-composed
+  bounded content (the engine never fetches); with no body in the
+  channel, a T3c adapter has nothing to scan without re-fetching
+  (violates the caller-composed contract) or a new content carrier.
+- Fix (when T3c is scoped): decide the document-content source before
+  wiring the secrentel adapter — e.g. a pipeline document channel or a
+  content-bearing JavaScript field (bounded, honestly truncated) produced
+  by the T3d jsintel adapter; the T3b channel shape is final and should
+  not be re-opened for this.
+- Verification: n/a while open.
 
 ## Operational warnings (all agents)
 

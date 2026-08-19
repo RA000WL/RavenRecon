@@ -60,6 +60,18 @@ type StageInput struct {
 	Hosts   []asset.Host
 	URLs    []asset.URL
 
+	// Results is the merged results channel accumulated by the earlier
+	// stages (first-seen dedup, deterministic order, per-channel
+	// MaxOutput caps at each merge): the Phase-2 values beyond the corpus
+	// itself — technologies, evidence, findings, parameters, secrets,
+	// endpoints, JavaScript assets, scoring output, ... (see Results for
+	// the full channel list and its producers). Stages must treat the
+	// slices as read-only, with the identical contract as the corpus
+	// slices: the runner passes its live slices, so an in-place write
+	// corrupts the channel handed to later stages and the final report;
+	// the runner only copies at the merge.
+	Results Results
+
 	// Bounds is the resolved per-stage bound set (defaults applied).
 	Bounds StageConfig
 
@@ -129,6 +141,26 @@ type StageResult struct {
 	// outcome vocabulary already carries the honesty signal. The runner
 	// never aliases these slices.
 	Additions StageAdditions
+
+	// Results are the stage's ADDITIONS to the results channel: the
+	// Phase-2 values it produced beyond the corpus itself (technologies,
+	// evidence, findings, parameters, secrets, endpoints, JavaScript
+	// assets, scoring output, ... — see Results for the full channel
+	// list). Nil or empty fields are legal and mean "nothing added". The
+	// runner merges them into the shared channel handed to the remaining
+	// stages (first-seen dedup, deterministic order, per-channel
+	// MaxOutput cap at the merge) and never aliases these slices.
+	// Results are merged even from a failed or partial stage, with the
+	// same rule and rationale as Additions.
+	//
+	// Truncation rule: a stage that had to cut its own retained results
+	// must record its outcome partial/incomplete or carry its own sticky
+	// flag (the existing AGENTS §0.6 discipline). This milestone only
+	// merges what stages report — the runner-side per-channel MaxOutput
+	// cap is the runner's cut and records the <channel>_truncated sticky
+	// flags itself; adapter-side production of these channels comes later
+	// (T3d).
+	Results Results
 
 	// Err is the failure detail for Outcome failed. For cancelled,
 	// return a nil Err: the outcome, not the error field, carries

@@ -42,7 +42,7 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Terminal observability (TUI) | 3139-3195 | single-goroutine controller, deterministic frames; library only |
 | Configuration precedence | 3196-3209 | CLI flags → environment → config file → defaults |
 | Safety boundary | 3210-3222 | recon-only: what must never be added |
-| v0.3 boundary | 3223-3324 | implemented-vs-planned inventory of every subsystem |
+| v0.3 boundary | 3224-3356 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -3321,6 +3321,30 @@ Implemented:
   field for field (outcome, truncation, clamped non-negative counters,
   duration, bounded error text) and a nil `Observer` as the zero-change
   off switch (`internal/pipeline`)
+* pipeline results channel (see "Pipeline requirements" above; v1.3 T3b):
+  the runner merges every stage's result-channel additions
+  (`StageResult.Results`) into one shared `Results` channel — 16 channels
+  mirroring `report.Context` 1:1 (`IPs`, `Ports`, `Services`, `Endpoints`,
+  `JavaScript`, `Parameters`, `Technologies`, `Secrets`, `Evidence`,
+  `Findings`, `TLSCertificates`, `SourceMaps`, `Relationships`, `Surfaces`,
+  `Groups`, `AttackPaths`) — first-seen dedup keyed by canonical identity
+  (the asset `Identity()` "kind:value" string, `Relationship.ID()`, and
+  the priority `Identity`/`Anchor`/`Root` fields), deterministic first-seen
+  order, merged regardless of the stage's outcome (failed stages' retained
+  results still merge, mirroring the corpus), exposed as
+  `RunReport.Results`. `MaxOutput` is enforced per result channel per
+  stage at the merge: every channel holds at most `MaxOutput` entries
+  after each stage, and every cut channel records its `<channel>_truncated`
+  sticky flag (`ips_truncated`, `attack_paths_truncated`, ... — the
+  AGENTS §0.6 carve-out, mirroring `corpus_capped`) plus `Truncated`.
+  Stages receive the merged PRIOR state via `StageInput.Results`
+  (read-only, identical contract to the corpus slices) and never see
+  their own additions. Planned, not yet implemented: adapter-side
+  production and the report stage's consumption of the full `Context`
+  from this struct (T3d), and secrentel's adapter consuming the
+  channel's `JavaScript` documents as its document source (T3c;
+  document-content carrier undecided — see TODO.md NEW-15)
+  (`internal/pipeline`)
 
 Planned, not yet implemented:
 

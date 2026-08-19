@@ -108,6 +108,36 @@
 //     results/document channel (T3); a no-op stage would violate the
 //     no-placeholder rule (AGENTS §5).
 //
+// T3b conventions (the results channel):
+//
+//   - Stages ADD to the results channel through StageResult.Results —
+//     nil/empty fields are legal and mean "nothing added". The runner
+//     merges additions into the channel handed to the remaining stages
+//     and the final report (first-seen dedup keyed by canonical identity
+//     — the asset Identity() "kind:value" string, Relationship.ID(), and
+//     the priority SurfaceAsset.Identity / Group.Anchor / AttackPath.Root
+//     identities — deterministic first-seen order, merged even from
+//     failed/partial stages, mirroring corpus Additions).
+//   - MaxOutput is enforced per result channel per stage AT THE MERGE
+//     (not inside the adapter): after each stage's merge every channel
+//     holds at most MaxOutput entries, and every cut channel records its
+//     <channel>_truncated sticky flag + report.Truncated (AGENTS §0.6
+//     carve-out; flag vocabulary: ips, ports, services, endpoints,
+//     javascript, parameters, technologies, secrets, evidence, findings,
+//     tls_certificates, source_maps, relationships, surfaces, groups,
+//     attack_paths). Adapters therefore do NOT cap their Results; an
+//     adapter that cuts its OWN retained results (a different, stage-side
+//     cut) keeps the existing discipline: outcome partial/incomplete or
+//     its own sticky flag — never silently completed.
+//   - StageInput.Results is read-only: the runner passes its live merged
+//     slices, so an adapter that mutates them corrupts later stages and
+//     the final report (identical contract to the corpus slices).
+//   - No adapter produces or consumes Results yet: production (and the
+//     report stage's consumption of the full Context) is wired in T3d;
+//     secrentel's T3c adapter consumes JavaScript documents from the
+//     channel's JavaScript field as its document source (document-content
+//     carrier undecided — see TODO.md NEW-15).
+//
 // T2d conventions (priority / detect / report):
 //
 //   - priority consumes the in-scope corpus (domains, hosts, URLs) as one
