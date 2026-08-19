@@ -13,7 +13,9 @@
 // capping records the corpus_capped sticky flag). Additions carry the
 // corpus kinds only (domains/hosts/URLs): results propagation
 // (technology, evidence, findings, parameters) is a separate milestone.
-// Eventing and report rendering are separate milestones.
+// Stage eventing (T3a) is real: the runner emits canonical
+// stage_started/stage_finished events when configured with an Observer.
+// Report rendering is a separate milestone.
 package pipeline
 
 import (
@@ -25,6 +27,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -177,7 +180,9 @@ func (c StageConfig) WithDefaults() StageConfig {
 // Cache and Clock appear here so the run description is complete and
 // self-contained (a report stage records them). Run's explicit cache and
 // clock parameters are the operative values and are never derived from
-// these fields.
+// these fields. Observer is the exception: unlike Cache and Clock, it is
+// operative in config — a nil Observer is the off switch (zero behavior
+// change), per internal/event/observer.go's convention.
 type ScanConfig struct {
 	// Target is the canonical declared domain; must be built with
 	// asset.NewDomain (validation rejects anything non-canonical).
@@ -214,6 +219,15 @@ type ScanConfig struct {
 	// pipeline never creates or opens it; the report stage validates it
 	// (T6).
 	OutputDir string
+
+	// Observer is the optional stage-event sink (an internal/event
+	// Observer; the Bus satisfies it). When non-nil, the runner emits
+	// exactly one stage_started event immediately before each stage entry
+	// is invoked or recorded, and exactly one stage_finished event after
+	// its StageRecord is finalized — synchronously, in stage order, before
+	// Run returns (see Run in run.go). A nil observer (the default) means
+	// zero behavior change.
+	Observer event.Observer
 }
 
 // ConfigError is one validation problem: a field path and the problem.

@@ -138,6 +138,32 @@ func validatePayload(kind Kind, p Payload) error {
 		if p.State != "completed" && p.State != "cancelled" {
 			return fmt.Errorf("event: scan_stopped carries invalid state %q", p.State)
 		}
+	case StageStarted:
+		if kind != KindStageStarted {
+			return payloadMismatch(kind, p)
+		}
+		if p.Name == "" {
+			return fmt.Errorf("event: stage_started carries an empty name")
+		}
+	case StageFinished:
+		if kind != KindStageFinished {
+			return payloadMismatch(kind, p)
+		}
+		if p.Name == "" {
+			return fmt.Errorf("event: stage_finished carries an empty name")
+		}
+		if !stageOutcomeValid(p.Outcome) {
+			return fmt.Errorf("event: stage_finished carries invalid outcome %q (vocabulary: completed/partial/failed/cancelled/incomplete)", p.Outcome)
+		}
+		if p.ItemsProcessed < 0 || p.ItemsFailed < 0 {
+			return fmt.Errorf("event: stage_finished carries negative counts (processed=%d failed=%d)", p.ItemsProcessed, p.ItemsFailed)
+		}
+		if p.Duration < 0 {
+			return fmt.Errorf("event: stage_finished carries negative duration %s", p.Duration)
+		}
+		if len(p.Err) > maxMessageBytes {
+			return fmt.Errorf("event: stage_finished err is %d bytes over bound %d", len(p.Err), maxMessageBytes)
+		}
 	case WorkerStarted:
 		if kind != KindWorkerStarted {
 			return payloadMismatch(kind, p)
@@ -286,6 +312,19 @@ func validatePayload(kind Kind, p Payload) error {
 
 func payloadMismatch(kind Kind, p Payload) error {
 	return fmt.Errorf("event: kind %s carries mismatched payload %T", kind, p)
+}
+
+// stageOutcomeValid reports whether s is one of the fixed run-outcome
+// vocabulary values (AGENTS.md §0.6: completed/partial/failed/cancelled/
+// incomplete). The literal strings are kept here deliberately: internal/
+// event must not import internal/pipeline, whose Outcome constants define
+// the same vocabulary.
+func stageOutcomeValid(s string) bool {
+	switch s {
+	case "completed", "partial", "failed", "cancelled", "incomplete":
+		return true
+	}
+	return false
 }
 
 // String returns the standardized deterministic text form for tests and

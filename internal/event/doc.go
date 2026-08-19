@@ -7,7 +7,8 @@
 // The event layer is OBSERVER-ONLY. It never owns scheduling, scanning,
 // detection, ranking, caching, or reporting, and it never mutates execution
 // state. Data flows one way: instrumented code (the runtime pool, the cache,
-// and stage result bridges) -> Bus -> consumers (the TUI, loggers, replays).
+// the pipeline runner, and stage result bridges) -> Bus -> consumers (the
+// TUI, loggers, replays).
 // A consumer can never call an engine through this package and can never
 // change what a run does.
 //
@@ -36,11 +37,11 @@
 //
 // # Instrumentation contract
 //
-// Instrumented packages (internal/runtime, internal/cache) accept an
-// optional Observer via their configuration. A nil observer is the default
-// and means zero behavior change. Events are derived at pool-job boundaries
-// from result types (see Deriving and Deriver); engine packages never emit
-// events themselves.
+// Instrumented packages (internal/runtime, internal/cache,
+// internal/pipeline) accept an optional Observer via their configuration.
+// A nil observer is the default and means zero behavior change. Events are
+// derived at pool-job boundaries from result types (see Deriving and
+// Deriver); engine packages never emit events themselves.
 //
 // The Bus satisfies Observer, so instrumented code can publish straight
 // into a bus: b.Publish and b.Observe are the same non-blocking operation.

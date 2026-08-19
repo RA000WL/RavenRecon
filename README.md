@@ -556,11 +556,11 @@ only. See `ARCHITECTURE.md` ("Reporting framework").
 `internal/event` (roadmap v1.2, phase 12) is the observability foundation:
 a canonical, typed runtime event model and a concurrent, bounded,
 non-blocking event bus. It is observer-only — data flows one way from
-instrumented code (the runtime pool, the cache, stage result bridges) to
-consumers (a future TUI, loggers, replays); no consumer can call an engine
-through it, and no engine mutates run state through it.
+instrumented code (the runtime pool, the cache, the pipeline runner, stage
+result bridges) to consumers (a future TUI, loggers, replays); no consumer
+can call an engine through it, and no engine mutates run state through it.
 
-The canonical event model: 27 typed `Kind` values (scan/worker/task
+The canonical event model: 29 typed `Kind` values (scan/worker/task/stage
 lifecycle, cache hits and misses, asset/relationship/evidence/finding/
 recommendation observations, requests, rule executions, warnings, errors,
 progress, phase transitions, shutdown, run metadata, summaries), a

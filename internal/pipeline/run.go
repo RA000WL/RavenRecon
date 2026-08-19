@@ -8,6 +8,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -69,6 +70,11 @@ type StageRecord struct {
 	// StickyFlags is a defensive copy of the stage's StickyFlags.
 	StickyFlags map[string]bool
 
+	// ItemsProcessed and ItemsFailed are the stage's counters, always
+	// >= 0: negative counters are a contract violation and are clamped to
+	// 0 (the stage is recorded failed — see normalizeResult), so a
+	// recorded record and its mirrored stage_finished event always
+	// validate.
 	ItemsProcessed int
 	ItemsFailed    int
 
@@ -107,6 +113,21 @@ type StageRecord struct {
 // problems (nil clock, invalid config, unresolvable stage). Run-level
 // outcomes — including cancellation — are carried in the report, never
 // as an error.
+//
+// Stage events: when cfg.Observer is non-nil, the runner emits exactly
+// one stage_started event immediately before each stage entry is invoked
+// or recorded, and exactly one stage_finished event after its StageRecord
+// is finalized — including entries that never run (recorded cancelled
+// because the run context was already cancelled, or failed because the
+// provided stage could not be resolved). Emission is synchronous, in stage
+// order, before Run returns: no goroutines, no buffering. At is the
+// injected clock's Now() at emission time, Identity is the stage name,
+// Phase is "stage", Severity is the default (info), and Sequence stays 0
+// — the bus assigns sequence numbers at publish time. The finished
+// payload mirrors the recorded StageRecord (outcome, truncation,
+// counters, duration) and carries the record's error text bounded by the
+// event package (empty when the record has none). A hostile observer that
+// panics is contained: the event is dropped and the run continues.
 //
 // The explicit cache and clock parameters are the operative values; a
 // nil cache disables caching for the run, and a nil clock is rejected
@@ -154,12 +175,14 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	for i, entry := range entries {
 		name := cfg.Stages[i]
 		sr := StageRecord{Name: name}
+		emitStageStarted(cfg.Observer, clock, name)
 		if ctx.Err() != nil {
 			// The run is cancelled: this stage and every remaining
 			// stage is recorded cancelled without being invoked.
 			sr.Outcome = OutcomeCancelled
 			sr.Err = ctx.Err()
 			report.Stages = append(report.Stages, sr)
+			emitStageFinished(cfg.Observer, clock, sr)
 			continue
 		}
 		if entry.nameErr != nil {
@@ -168,6 +191,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			sr.Outcome = OutcomeFailed
 			sr.Err = entry.nameErr
 			report.Stages = append(report.Stages, sr)
+			emitStageFinished(cfg.Observer, clock, sr)
 			continue
 		}
 		eff := effectiveConfig(cfg, name)
@@ -194,6 +218,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 		sr = normalizeResult(sr, res, err)
 		sr.Duration = t1.Sub(t0)
 		report.Stages = append(report.Stages, sr)
+		emitStageFinished(cfg.Observer, clock, sr)
 		// Corpus propagation: merge this stage's additions into the
 		// shared corpus handed to the remaining stages (first-seen dedup,
 		// deterministic order), then enforce this stage's MaxCorpusSize
@@ -231,6 +256,57 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 		report.Truncated = report.Truncated || sr.Truncated
 	}
 	return report, nil
+}
+
+// emitStageStarted publishes one stage_started event immediately before a
+// stage entry is invoked or recorded. A nil observer is the off switch: a
+// single nil check, nothing else. The event is canonical and pre-bus: At
+// is the injected clock's Now() at emission, Identity is the stage name,
+// Phase is "stage", Severity is the default, and Sequence stays 0 (the
+// bus assigns sequence numbers at publish time).
+func emitStageStarted(obs event.Observer, clock runtime.Clock, name StageName) {
+	if obs == nil {
+		return
+	}
+	observeStageEvent(obs, event.New(event.KindStageStarted, clock.Now(), event.StageStarted{Name: string(name)}).
+		WithPhase("stage").
+		WithIdentity(string(name)))
+}
+
+// emitStageFinished publishes one stage_finished event after a stage
+// entry's StageRecord is finalized, mirroring the record exactly: Outcome,
+// Truncated, ItemsProcessed, ItemsFailed, Duration, and Err (the record's
+// error message, empty when none, bounded by the event package's message
+// bound). Emission rules match emitStageStarted.
+func emitStageFinished(obs event.Observer, clock runtime.Clock, sr StageRecord) {
+	if obs == nil {
+		return
+	}
+	errMsg := ""
+	if sr.Err != nil {
+		errMsg = sr.Err.Error()
+	}
+	observeStageEvent(obs, event.New(event.KindStageFinished, clock.Now(),
+		event.NewStageFinished(string(sr.Name), string(sr.Outcome), sr.Truncated,
+			sr.ItemsProcessed, sr.ItemsFailed, sr.Duration, errMsg)).
+		WithPhase("stage").
+		WithIdentity(string(sr.Name)))
+}
+
+// observeStageEvent delivers ev to the observer under panic containment,
+// recovering in the same goroutine as the Observe call — the same
+// containment shape as the event package's deriveSafe and the pipeline's
+// runStage recovery. A panicking or hostile observer must never crash the
+// run: the event is dropped and the run continues unchanged. A nil
+// observer is a no-op.
+func observeStageEvent(obs event.Observer, ev event.Event) {
+	if obs == nil {
+		return
+	}
+	defer func() {
+		_ = recover() // contained: drop the event, keep the run alive
+	}()
+	obs.Observe(ev)
 }
 
 // indexStages maps the provided stages by name, rejecting nil stages and
@@ -352,6 +428,14 @@ func runStage(s Stage, ctx context.Context, in StageInput) (res StageResult, err
 //     violation and is recorded as failed with that error;
 //   - an empty or unknown Outcome is a contract violation and is
 //     recorded as failed;
+//   - negative ItemsProcessed/ItemsFailed are a contract violation and
+//     are recorded as failed with a structured error (the counters are
+//     impossible: the event layer rejects negative counts by design, so
+//     a record could never be mirrored into a valid stage_finished
+//     event). Counters are clamped to >= 0 on EVERY path below — the
+//     error-return and cancellation paths keep their truthful outcomes
+//     but must still never carry a negative count into the record or
+//     the emitted event;
 //   - StickyFlags is defensively copied into the report (never aliased);
 //   - Truncated=true with Outcome completed and an empty StickyFlags set
 //     is downgraded to Outcome incomplete — exactly one behavior, pinned
@@ -373,6 +457,9 @@ func normalizeResult(sr StageRecord, res StageResult, err error) StageRecord {
 	case !ValidOutcome(res.Outcome):
 		sr.Outcome = OutcomeFailed
 		sr.Err = fmt.Errorf("stage %s: invalid outcome %q (vocabulary: completed/partial/failed/cancelled/incomplete)", sr.Name, res.Outcome)
+	case res.ItemsProcessed < 0 || res.ItemsFailed < 0:
+		sr.Outcome = OutcomeFailed
+		sr.Err = fmt.Errorf("stage %s: negative counters (processed=%d failed=%d): counters must be >= 0", sr.Name, res.ItemsProcessed, res.ItemsFailed)
 	default:
 		sr.Outcome = res.Outcome
 		sr.Err = res.Err
@@ -384,8 +471,20 @@ func normalizeResult(sr StageRecord, res StageResult, err error) StageRecord {
 			sr.StickyFlags[k] = v
 		}
 	}
-	sr.ItemsProcessed = res.ItemsProcessed
-	sr.ItemsFailed = res.ItemsFailed
+	// Clamp counters to >= 0 unconditionally: whatever outcome path fired
+	// above, a negative count in the record would make the mirrored
+	// stage_finished event invalid (the event layer rejects negative
+	// counts by design), so the record must never carry one.
+	if res.ItemsProcessed < 0 {
+		sr.ItemsProcessed = 0
+	} else {
+		sr.ItemsProcessed = res.ItemsProcessed
+	}
+	if res.ItemsFailed < 0 {
+		sr.ItemsFailed = 0
+	} else {
+		sr.ItemsFailed = res.ItemsFailed
+	}
 	if sr.Outcome == OutcomeCompleted && sr.Truncated && len(sr.StickyFlags) == 0 {
 		sr.Outcome = OutcomeIncomplete
 	}

@@ -113,6 +113,11 @@ type StageResult struct {
 	StickyFlags map[string]bool
 
 	// ItemsProcessed and ItemsFailed are the stage's honest counters.
+	// Both must be >= 0: a negative counter is a stage-contract
+	// violation — the runner records the stage failed with a structured
+	// error and clamps the counters to 0 (the event layer rejects
+	// negative counts by design, so a record and its mirrored
+	// stage_finished event can never carry them). See normalizeResult.
 	ItemsProcessed int
 	ItemsFailed    int
 

@@ -74,7 +74,8 @@ orchestrator; every agent may append or update its own entries.
 ### NEW-13 (HIGH) — v1.3 End-to-end pipeline: `ravenrecon scan` (internal/pipeline)
 - Status: IN PROGRESS (T1/T2a/T2b VERIFIED; T2c VERIFIED — review APPROVE
   WITH NITS, all nits closed + gates re-run; T2d VERIFIED — re-review
-  APPROVE WITH NITS, all findings closed, gates re-run; T3 next)
+  APPROVE WITH NITS, all findings closed, gates re-run; T3a stage events
+  IN PROGRESS — claimed by builder this session)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -168,7 +169,11 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
    to T3 — the corpus carries no document content, its engine consumes
    DocumentSource; a no-op stage would violate the no-placeholder rule;
    rationale in adapt/doc.go) · T2d adapters
-   batch 3 (priority/detect/report) · T3 stage events · T4 determinism
+   batch 3 (priority/detect/report) · T3a stage events DONE (this
+   session: kind+payload+validate, ScanConfig.Observer seam, synchronous
+   in-order started/finished on every path incl. pre-cancelled, panic-
+   contained emission, 7 pipeline tests + event table rows, gates green;
+   see the T3a record below) · T3b results channel · T4 determinism
    (discovery clock seam) · T5 hermetic E2E · T6 CLI+docs.
 - SESSION-LOSS AUDIT (2026-08-19, NEW OS — previous machine wiped; all prior
   local gate evidence gone; re-verified fresh with Go 1.26.6):
@@ -286,6 +291,107 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
     dispatched to reviewer for closure confirmation.
 - Verification: per-task gates (gofmt/test/vet/-race/build); final wave:
   full-suite gates + reviewer sign-off + TODO close.
+- T3a IMPLEMENTED (this session, builder): pipeline stage events on the
+  existing v1.2 event layer, exactly per orchestrator contract — no
+  deviations. internal/event: KindStageStarted ("stage_started") +
+  KindStageFinished ("stage_finished") after KindScanStopped in kind.go
+  (+ Kind.Valid), StageStarted{Name}/StageFinished{Name,Outcome,Truncated,
+  ItemsProcessed,ItemsFailed,Duration,Err} payloads + bounded
+  NewStageFinished constructor (Err via the package's truncateMessage at
+  the construction site), validatePayload cases (exact type, non-empty
+  Name, Outcome in the fixed AGENTS §0.6 vocabulary as literal strings via
+  unexported stageOutcomeValid — no internal/pipeline import, negative
+  counts/duration and over-bound Err rejected mirroring TaskTerminal.
+  Message). internal/pipeline: ScanConfig.Observer event.Observer field
+  (nil = off, zero behavior change, matching internal/event/observer.go's
+  documented convention; package-doc milestone line updated: stage
+  eventing real, report rendering still separate); Run emits exactly one
+  started + one finished per stage entry on ALL paths (pre-cancelled
+  entries recorded cancelled, unresolvable entries recorded failed,
+  normal path), synchronous, in stage order, before Run returns — no
+  goroutines, no buffering; At = injected clock Now, Identity = stage
+  name, Phase = "stage", Severity default, Sequence 0 (Bus assigns on
+  publish — documented in the Run doc comment); finished mirrors the
+  recorded StageRecord field for field (Err = recorded error text, empty
+  when nil, bounded); observer.Observe wrapped in deferred-recover
+  containment (copy of the runtime pool's observer-path containment — a
+  hostile panicking observer can never crash the run). No changes to
+  engines, Stage/StageResult/StageInput shapes, caching, or the runtime
+  pool. Tests: event table rows (nil payload ×2, wrong-type via mismatch
+  list, empty Name ×2, invalid/empty Outcome, negative processed/failed,
+  negative Duration, over-bound Err, constructor bounding + validation)
+  and internal/pipeline/run_events_test.go (7 tests: order+payload
+  equality+field pins, pre-cancelled, per-stage timeout, panicking
+  observer contained with later events flowing, nil observer = identical
+  report, >512-byte Err truncated with marker + post-truncation Validate,
+  unresolvable entry). Gates run this session, verbatim: gofmt -l clean
+  (repo-wide), go test -count=1 ./internal/event/... ./internal/pipeline/...
+  ok, go vet ./... ok, go build ./... ok, go test -race -count=1
+  ./internal/event/... ./internal/pipeline/... ok, full suite
+  go test -count=1 ./... ok (25 packages). Existing pipeline tests pass
+  unmodified (nil-observer zero change). No new issues opened. Reviewer
+  round pending; orchestrator moves to VERIFIED. T3b (results channel)
+  observations below — none implemented.
+- T3a REVIEW-FIX ROUND applied (this session, builder), per the T3a
+  review findings — FIND-1 through FIND-7, nothing else:
+  - FIND-1 (MEDIUM): negative ItemsProcessed/ItemsFailed were copied
+    verbatim by normalizeResult (internal/pipeline/run.go:457-458
+    pre-fix), which could produce a StageRecord whose mirrored
+    stage_finished event fails event.ValidatePayload (negative counts
+    are rejected there by design). FIX: normalizeResult now treats
+    negative counters as a stage contract violation — recorded failed
+    with a structured error (matching the existing violation shape for
+    invalid outcomes), and counters are clamped to >= 0 on EVERY outcome
+    path so a record and its emitted event always validate. Semantics
+    documented in the normalizeResult doc comment (run.go), the
+    StageRecord counter fields (run.go), and the StageResult counter
+    fields (stage.go). Regression test: run_events_test.go
+    TestRunStageEventsNegativeCounters (violation path + error-return
+    clamp path), asserting the emitted finished event validates and the
+    recorded/report counters are clamped.
+  - FIND-2 (MEDIUM): stale Tier C docs fixed — ARCHITECTURE.md:3012
+    "27 values" -> 29 values with stage lifecycle named; 3060
+    Instrumentation contract and 3125 Known limitations now list the
+    pipeline runner as instrumented; v0.3 boundary implemented list
+    gained a "pipeline stage eventing" entry; README.md instrumented
+    list + "27 typed Kind values" -> 29; internal/event/doc.go Role and
+    Instrumentation-contract lists now include internal/pipeline.
+  - FIND-3 (LOW): TODO.md test count corrected 8 -> 7 (the parenthetical
+    already listed 7).
+  - FIND-4 (LOW): run.go observeStageEvent doc comment no longer cites
+    the runtime pool as the containment source (runtime/observer.go is a
+    bare nil-check call with no recovery); it now describes the honest
+    shape: recover in the same goroutine as the Observe call, matching
+    event.deriveSafe and the pipeline's runStage recovery.
+  - FIND-5 (LOW): event_test.go gained TestValidateAcceptsEveryStageOutcome
+    (all five outcomes validate); run_events_test.go gained
+    TestStageFinishedVocabulariesDriftPin mapping every pipeline.Outcome
+    constant through the event payload.
+  - FIND-6 (INFO): config.go ScanConfig group doc now states Observer —
+    unlike Cache and Clock — is operative in config (nil = off).
+  - FIND-7 (INFO): run_events_test.go gained
+    TestRunStageEventsCrossRunDeterminism (same cfg/clock/stages run
+    twice, recorded event streams DeepEqual).
+  Status: still IN PROGRESS — fixes applied, gates re-run below;
+  orchestrator verifies and closes (never self-closed).
+- T3b OBSERVATIONS (no implementation): (1) the stage_started/finished
+  events are emitted from the stage LOOP, which is also where T3b's
+  per-stage results aggregation will live (run.go:154-235) — the finished
+  payload's counters come straight from the finalized StageRecord, so
+  whatever T3b adds to StageRecord (e.g. a Results field) will need an
+  explicit decision on whether/how it surfaces in stage_finished or stays
+  report-only; the current event carries no results, and the contract's
+  out-of-scope list treats RunReport.Results as future. (2) The Observer
+  seam is config-carried (ScanConfig.Observer), synchronous and inline —
+  a results channel would be a NEW seam (config field + delivery), not a
+  variant of this one; nothing here constrains that design. (3) Emission
+  happens before the corpus merge (finished is emitted right after the
+  StageRecord is appended), so if T3b results are derived from the merged
+  corpus the emit point may need to move after the merge — flagged now so
+  the orchestrator can decide placement deliberately. (4) The stage_finished
+  Err field is bounded to 512 bytes and validated; any future results
+  payloads added to events must respect the same per-payload bounds in
+  validatePayload (hand-built hostile events re-validated by consumers).
 
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED

@@ -3009,7 +3009,7 @@ are later v1.2 items.
 ### Canonical event model
 
 Every observability event is a structured, typed `Event`: a canonical
-`Kind` (27 values: scan/worker/task lifecycle, cache hit/miss, asset
+`Kind` (29 values: scan/worker/task/stage lifecycle, cache hit/miss, asset
 discovered, relationship/evidence/finding/recommendation created, request
 observed, rule executed, warning, error, progress, phase transition,
 shutdown, run metadata, summary ready), a bus-assigned strictly increasing
@@ -3058,8 +3058,9 @@ fails.
 ### Instrumentation contract
 
 `Observer` is the single seam: instrumented packages (the runtime pool,
-the cache, stage result bridges) accept an optional `Observer` via their
-configuration; nil means zero behavior change. The `Bus` satisfies
+the cache, the pipeline runner, stage result bridges) accept an optional
+`Observer` via their configuration; nil means zero behavior change. The
+`Bus` satisfies
 `Observer` (`Observe` is `Publish`), so instrumented code publishes
 straight into a bus. Derived events — asset discovered, finding created,
 relationship created — are produced only at the pool-job boundary by the
@@ -3121,10 +3122,10 @@ classification semantics are unchanged by instrumentation.
 ### Known limitations
 
 - No CLI or replay consumes the bus yet; the TUI controller does (see
-  "Terminal observability" below). The runtime pool and the cache are
-  instrumented (see "Runtime pool instrumentation" above and "Cache
-  instrumentation" under "Cache and resume"); loggers and replays are
-  later v1.2 items.
+  "Terminal observability" below). The runtime pool, the pipeline runner,
+  and the cache are instrumented (see "Runtime pool instrumentation" above
+  and "Cache instrumentation" under "Cache and resume"); loggers and
+  replays are later v1.2 items.
 - `Publish` is O(subscribers): fan-out cost grows linearly with
   subscribers, by design (the TUI controller, loggers, and replays are a
   small fixed set).
@@ -3312,6 +3313,14 @@ Implemented:
   `WithObserver` option, with every payload field grounded in the real
   lookup outcome (key digest, `Outcome.State`, `Outcome.IsHit()`), and a
   nil observer as the zero-change off switch (`internal/cache`)
+* pipeline stage eventing (see "Event bus" above; roadmap v1.2): the
+  pipeline runner emits exactly one `stage_started` and one
+  `stage_finished` event per stage entry — on every path (normal,
+  pre-cancelled, unresolvable), synchronously in stage order, before Run
+  returns, with the finished payload mirroring the recorded `StageRecord`
+  field for field (outcome, truncation, clamped non-negative counters,
+  duration, bounded error text) and a nil `Observer` as the zero-change
+  off switch (`internal/pipeline`)
 
 Planned, not yet implemented:
 

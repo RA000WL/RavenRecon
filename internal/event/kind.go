@@ -21,6 +21,17 @@ const (
 	// one).
 	KindScanStopped Kind = "scan_stopped"
 
+	// KindStageStarted: one pipeline stage entry began. The pipeline
+	// runner emits it synchronously, in stage order, immediately before
+	// invoking or recording the stage; the payload carries the stage name.
+	KindStageStarted Kind = "stage_started"
+
+	// KindStageFinished: one pipeline stage entry concluded. The pipeline
+	// runner emits it synchronously, in stage order, once the stage's
+	// StageRecord is finalized; the payload carries the recorded outcome,
+	// counters, duration, and bounded error text.
+	KindStageFinished Kind = "stage_finished"
+
 	// KindWorkerStarted: one pool worker goroutine began its loop.
 	KindWorkerStarted Kind = "worker_started"
 
@@ -121,7 +132,8 @@ const (
 // Valid reports whether k is a known event kind.
 func (k Kind) Valid() bool {
 	switch k {
-	case KindScanStarted, KindScanStopped, KindWorkerStarted, KindWorkerStopped,
+	case KindScanStarted, KindScanStopped, KindStageStarted, KindStageFinished,
+		KindWorkerStarted, KindWorkerStopped,
 		KindTaskSubmitted, KindTaskStarted, KindTaskRunning, KindTaskCompleted,
 		KindTaskCancelled, KindTaskFailed, KindTaskTimedOut,
 		KindCacheHit, KindCacheMiss, KindAssetDiscovered,

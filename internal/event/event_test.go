@@ -14,6 +14,10 @@ func validPayloadFor(kind Kind) Payload {
 		return ScanStarted{Concurrency: 4, QueueSize: 64, Timeout: 30 * time.Second, Rate: 1}
 	case KindScanStopped:
 		return ScanStopped{State: "completed"}
+	case KindStageStarted:
+		return StageStarted{Name: "discover"}
+	case KindStageFinished:
+		return StageFinished{Name: "discover", Outcome: "completed", ItemsProcessed: 1}
 	case KindWorkerStarted:
 		return WorkerStarted{Worker: 0}
 	case KindWorkerStopped:
@@ -72,7 +76,8 @@ func validPayloadFor(kind Kind) Payload {
 func TestValidateAcceptsEveryKind(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	for _, kind := range []Kind{
-		KindScanStarted, KindScanStopped, KindWorkerStarted, KindWorkerStopped,
+		KindScanStarted, KindScanStopped, KindStageStarted, KindStageFinished,
+		KindWorkerStarted, KindWorkerStopped,
 		KindTaskSubmitted, KindTaskStarted, KindTaskRunning, KindTaskCompleted,
 		KindTaskCancelled, KindTaskFailed, KindTaskTimedOut,
 		KindCacheHit, KindCacheMiss, KindAssetDiscovered,
@@ -112,6 +117,8 @@ func TestValidateRejectsCoreContractViolations(t *testing.T) {
 		{"oversized identity", Event{Kind: KindTaskSubmitted, At: at, Payload: TaskSubmitted{}, Identity: oversized}},
 		{"oversized value", Event{Kind: KindTaskSubmitted, At: at, Payload: TaskSubmitted{}, Value: oversized}},
 		{"nil payload required", New(KindTaskSubmitted, at, nil)},
+		{"stage_started nil payload", New(KindStageStarted, at, nil)},
+		{"stage_finished nil payload", New(KindStageFinished, at, nil)},
 	}
 	for _, tc := range cases {
 		if err := tc.ev.Validate(); err == nil {
@@ -129,7 +136,8 @@ func TestValidateRejectsPayloadMismatches(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	foreign := func() Payload { return SummaryReady{} }
 	for _, kind := range []Kind{
-		KindScanStarted, KindScanStopped, KindWorkerStarted, KindWorkerStopped,
+		KindScanStarted, KindScanStopped, KindStageStarted, KindStageFinished,
+		KindWorkerStarted, KindWorkerStopped,
 		KindTaskSubmitted, KindTaskStarted, KindTaskRunning, KindTaskCompleted,
 		KindTaskCancelled, KindTaskFailed, KindTaskTimedOut,
 		KindCacheHit, KindCacheMiss, KindAssetDiscovered,
@@ -153,6 +161,24 @@ func TestValidateRejectsPayloadMismatches(t *testing.T) {
 	}
 }
 
+// TestValidateAcceptsEveryStageOutcome pins the acceptance side of the
+// stage_finished outcome vocabulary: every one of the five fixed AGENTS
+// §0.6 values (completed/partial/failed/cancelled/incomplete) validates.
+// The rejection tests above cover the other side (empty, unknown, and
+// structurally invalid outcomes); together they freeze the vocabulary so
+// a stage emitting any of the five can never be dropped by the bus.
+func TestValidateAcceptsEveryStageOutcome(t *testing.T) {
+	at := time.Unix(1_700_000_000, 0)
+	for _, outcome := range []string{"completed", "partial", "failed", "cancelled", "incomplete"} {
+		t.Run(outcome, func(t *testing.T) {
+			ev := New(KindStageFinished, at, NewStageFinished("discover", outcome, false, 1, 0, time.Second, ""))
+			if err := ev.Validate(); err != nil {
+				t.Fatalf("stage_finished outcome %q must validate: %v", outcome, err)
+			}
+		})
+	}
+}
+
 // TestValidateRejectsPayloadFieldRules pins the per-payload field contracts.
 func TestValidateRejectsPayloadFieldRules(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
@@ -165,6 +191,14 @@ func TestValidateRejectsPayloadFieldRules(t *testing.T) {
 		ev   Event
 	}{
 		{"scan_stopped bad state", New(KindScanStopped, at, ScanStopped{State: "partial"})},
+		{"stage_started empty name", New(KindStageStarted, at, StageStarted{Name: ""})},
+		{"stage_finished empty name", New(KindStageFinished, at, StageFinished{Name: "", Outcome: "completed"})},
+		{"stage_finished invalid outcome", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: "skipped"})},
+		{"stage_finished empty outcome", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: ""})},
+		{"stage_finished negative processed", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: "completed", ItemsProcessed: -1})},
+		{"stage_finished negative failed", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: "completed", ItemsFailed: -1})},
+		{"stage_finished negative duration", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: "completed", Duration: -time.Second})},
+		{"stage_finished oversized err", New(KindStageFinished, at, StageFinished{Name: "discover", Outcome: "failed", Err: big})},
 		{"worker_stopped bad state", New(KindWorkerStopped, at, WorkerStopped{Worker: 0, State: WorkerState("bogus")})},
 		{"task_completed oversized message", New(KindTaskCompleted, at, TaskCompleted{TaskTerminal: term(big)})},
 		{"task_cancelled oversized message", New(KindTaskCancelled, at, TaskCancelled{TaskTerminal: term(big)})},
@@ -251,6 +285,13 @@ func TestPayloadConstructorsBound(t *testing.T) {
 	if len(term.Category) > maxLabelBytes || !strings.HasSuffix(term.Category, messageTruncationMarker) {
 		t.Fatalf("NewTaskTerminal category not bounded: %d bytes", len(term.Category))
 	}
+	fin := NewStageFinished("discover", "failed", true, 1, 1, time.Second, big)
+	if len(fin.Err) > maxMessageBytes || !strings.HasSuffix(fin.Err, messageTruncationMarker) {
+		t.Fatalf("NewStageFinished err not bounded: %d bytes", len(fin.Err))
+	}
+	if got := NewStageFinished("discover", "completed", false, 0, 0, 0, "").Err; got != "" {
+		t.Fatalf("NewStageFinished empty err altered: %q", got)
+	}
 	// Constructed payloads validate under their kinds.
 	at := time.Unix(1_700_000_000, 0)
 	for _, ev := range []Event{
@@ -260,6 +301,8 @@ func TestPayloadConstructorsBound(t *testing.T) {
 		New(KindTaskCancelled, at, NewTaskCancelled(term)),
 		New(KindTaskTimedOut, at, NewTaskTimedOut(term)),
 		New(KindTaskCompleted, at, NewTaskCompleted(term, "result")),
+		New(KindStageStarted, at, StageStarted{Name: "discover"}),
+		New(KindStageFinished, at, NewStageFinished("discover", "completed", false, 1, 0, time.Second, "")),
 	} {
 		if err := ev.Validate(); err != nil {
 			t.Fatalf("constructed event %s: Validate: %v", ev.Kind, err)

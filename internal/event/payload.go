@@ -38,6 +38,44 @@ type ScanStopped struct {
 
 func (ScanStopped) isPayload() {}
 
+// StageStarted identifies one pipeline stage entry invocation. Field
+// grounding: Name is the pipeline StageName of the stage (the selection
+// entry in ScanConfig.Stages order), emitted by the pipeline runner
+// (internal/pipeline).
+type StageStarted struct {
+	// Name: the stage name (pipeline StageName string).
+	Name string `json:"name"`
+}
+
+func (StageStarted) isPayload() {}
+
+// StageFinished carries one pipeline stage entry's recorded outcome. Field
+// grounding: every field mirrors the recorded pipeline.StageRecord:
+// Name/Outcome/Truncated/ItemsProcessed/ItemsFailed/Duration come straight
+// from the record (Outcome is the fixed AGENTS §0.6 vocabulary;
+// ItemsProcessed/ItemsFailed are >= 0; Duration is >= 0), and Err is the
+// record's error message (empty when the record carries none), bounded to
+// the message bound.
+type StageFinished struct {
+	// Name: the stage name (pipeline StageName string).
+	Name string `json:"name"`
+	// Outcome: the fixed run-outcome vocabulary (AGENTS §0.6):
+	// "completed", "partial", "failed", "cancelled", "incomplete".
+	Outcome string `json:"outcome"`
+	// Truncated: the stage cut its retained set at a cap.
+	Truncated bool `json:"truncated"`
+	// ItemsProcessed: the stage's recorded processed count (>= 0).
+	ItemsProcessed int `json:"items_processed"`
+	// ItemsFailed: the stage's recorded failed count (>= 0).
+	ItemsFailed int `json:"items_failed"`
+	// Duration: the stage's recorded duration (>= 0).
+	Duration time.Duration `json:"duration"`
+	// Err: the recorded error's message (empty when none), bounded.
+	Err string `json:"err,omitempty"`
+}
+
+func (StageFinished) isPayload() {}
+
 // WorkerStarted identifies one pool worker.
 type WorkerStarted struct {
 	// Worker: the worker index (0 .. Concurrency-1).
@@ -418,4 +456,19 @@ func NewTaskFailed(term TaskTerminal) TaskFailed {
 // NewTaskTimedOut builds a TaskTimedOut payload from a bounded terminal.
 func NewTaskTimedOut(term TaskTerminal) TaskTimedOut {
 	return TaskTimedOut{TaskTerminal: term}
+}
+
+// NewStageFinished builds a bounded StageFinished payload: the error text
+// is bounded as a message. errMsg is the recorded error's message (empty
+// when the stage recorded no error).
+func NewStageFinished(name, outcome string, truncated bool, itemsProcessed, itemsFailed int, duration time.Duration, errMsg string) StageFinished {
+	return StageFinished{
+		Name:           name,
+		Outcome:        outcome,
+		Truncated:      truncated,
+		ItemsProcessed: itemsProcessed,
+		ItemsFailed:    itemsFailed,
+		Duration:       duration,
+		Err:            truncateMessage(errMsg),
+	}
 }
