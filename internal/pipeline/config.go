@@ -15,8 +15,9 @@
 // Results), the runner merges them (first-seen dedup, deterministic
 // order, per-channel MaxOutput caps recording the <channel>_truncated
 // sticky flags) into the shared Results channel handed to later stages
-// and the final RunReport.Results — but no adapter PRODUCES results yet
-// (T3d). Stage eventing (T3a) is real: the runner emits canonical
+// and the final RunReport.Results — the secrentel adapter (T3c) is the
+// first Results producer; the remaining production is T3d. Stage
+// eventing (T3a) is real: the runner emits canonical
 // stage_started/stage_finished events when configured with an Observer.
 // Report rendering is a separate milestone.
 package pipeline

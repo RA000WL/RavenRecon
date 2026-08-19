@@ -42,7 +42,7 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Terminal observability (TUI) | 3139-3195 | single-goroutine controller, deterministic frames; library only |
 | Configuration precedence | 3196-3209 | CLI flags → environment → config file → defaults |
 | Safety boundary | 3210-3222 | recon-only: what must never be added |
-| v0.3 boundary | 3224-3356 | implemented-vs-planned inventory of every subsystem |
+| v0.3 boundary | 3224-3388 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -3340,11 +3340,43 @@ Implemented:
   Stages receive the merged PRIOR state via `StageInput.Results`
   (read-only, identical contract to the corpus slices) and never see
   their own additions. Planned, not yet implemented: adapter-side
-  production and the report stage's consumption of the full `Context`
-  from this struct (T3d), and secrentel's adapter consuming the
-  channel's `JavaScript` documents as its document source (T3c;
-  document-content carrier undecided — see TODO.md NEW-15)
+  production by the remaining stage families and the report stage's
+  consumption of the full `Context` from this struct (T3d)
   (`internal/pipeline`)
+* pipeline document channel + secrentel adapter (see "Pipeline
+  requirements" and "Secret intelligence" above; v1.3 T3c): the
+  pipeline-internal document channel (`StageResult.Documents` /
+  `StageInput.Documents` / `RunReport.Documents`) carries bounded retained
+  script bodies (`pipeline.Document{Identity, URL, Content, Truncated}`,
+  content bounded by `pipeline.MaxDocumentBytes` = 2 MiB — the secrentel
+  engine's own ingest cap — merged by reference, never copied, and never
+  exposed on the report `Context`), merged by the runner exactly like the
+  corpus/results channels: first-seen dedup keyed by the canonical
+  identity string, deterministic first-seen order, merged regardless of
+  the stage's outcome, per-stage `MaxOutput` cap at the merge with the
+  `documents_truncated` sticky flag + `Truncated` on a cut (AGENTS §0.6
+  carve-out), and a hostile-producer guard at the merge: over-cap content
+  is dropped WHOLE (`Content` nil + `Truncated`), never a partial prefix.
+  The secrentel adapter (`NewSecretIntelStage`, `internal/pipeline/adapt/
+  secrentel.go`) consumes the channel as its document source — every
+  pipeline document becomes one `secrentel.Document` (`KindJS`,
+  `SourceAsset` = the pipeline document's canonical identity, `Source`
+  left to the engine default "secrentel"), truncated and nil-content
+  documents are skipped (nothing honest to scan), the engine's per-
+  document analysis caps stay at their defaults (64 candidates / 8
+  evidence), and the engine's overflow signal (≥ 64 candidates) maps to
+  `Truncated` + the `secrentel_overflow` sticky flag — with the engine's
+  §0.6 truncation chain verified intact end-to-end (record write →
+  replay → sticky merge → report exposure), so the flags replay from
+  cache hits and completed+flag is the legal carve-out; `secrentel_
+  truncated` is mapped too, though unreachable through this adapter
+  (bounded pipeline content, truncated documents skipped). Counters and
+  outcome fold mirror the T2c adapters exactly; the engine's offline
+  verification queue is never executed or propagated (T6). No adapter
+  produces documents yet (T3d: the jsintel stage family — NEW-15
+  resolved: the document channel is pipeline-internal, separate from the
+  Results channel; secrentel consumes the channel, never the
+  `Results.JavaScript` field) (`internal/pipeline`)
 
 Planned, not yet implemented:
 

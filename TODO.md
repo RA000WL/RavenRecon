@@ -78,7 +78,8 @@ orchestrator; every agent may append or update its own entries.
   VERIFIED — review APPROVE (7/7 findings closed, gates re-run), committed
   ad791c3; T3b results channel VERIFIED — review APPROVE WITH NITS
   (FIND-1 LOW + 3 INFO closed in a nit round, gates re-run), committed
-  this session)
+  this session; T3c document channel + secrentel adapter IMPLEMENTED —
+  awaiting review, see the T3c IMPLEMENTED record below)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -480,6 +481,87 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   emitStageFinished and BEFORE the next stage — placement documented in
   run.go; the finished event therefore never reflects the merged results
   (by design, per (1)). (4) No results payloads were added to events.
+- T3c IMPLEMENTED (this session, builder): pipeline-internal document
+  channel + secrentel adapter, exactly per orchestrator contract — no
+  deviations. New internal/pipeline/document.go: `MaxDocumentBytes` =
+  2 << 20 (2 MiB, mirroring the secrentel engine's ingest cap) and the
+  `Document{Identity, URL, Content, Truncated}` type (content bounded,
+  merged by reference, never copied; never reaches the report Context),
+  plus `mergeDocuments` — the runner-side document merge reusing
+  mergeChannel with the "documents" namespace and the canonical identity
+  string as the dedup key, per-stage MaxOutput cap with the
+  "documents" cut-name, and a defensive hostile-producer re-bound BEFORE
+  dedup: over-cap content is dropped WHOLE (Content nil + Truncated),
+  never a partial prefix, the caller's slice never mutated (a fresh
+  normalized copy is built only when a document needs the cut), and the
+  document still merges (identity/URL remain). StageResult.Documents
+  (additions semantics, mirroring Results), StageInput.Documents (read-only
+  merged PRIOR state, identical contract to the corpus/results slices),
+  RunReport.Documents (final merged state). Run merges each stage's
+  Documents in the same block as the results merge, unconditionally
+  (failed-stage documents still merge), and records the
+  `documents_truncated` sticky flag + report.Truncated on a cut (AGENTS
+  §0.6 carve-out; stage outcome untouched). New
+  internal/pipeline/adapt/secrentel.go: `NewSecretIntelStage(db
+  *patterns.DB)` (constructor test seam; nil = patterns.Load), consuming
+  the document channel as its document source — every pipeline document
+  becomes one secrentel.Document (KindJS, Content/URL passed through,
+  SourceAsset = the pipeline document's canonical Identity — the engine's
+  jsintel dedup contract — Source "" = the engine default "secrentel"),
+  truncated/nil-content documents SKIPPED (nothing honest to scan; not
+  counted), no scope filtering (the channel is the pipeline's own,
+  in-scope by construction), per-document analysis caps at engine defaults
+  (64 candidates / 8 evidence — deliberately not configurable), the
+  engine's Overflow signal (≥ 64 candidates) mapped to Truncated +
+  StickyFlags["secrentel_overflow"] and the engine's Truncated signal to
+  StickyFlags["secrentel_truncated"] (unreachable through this adapter —
+  bounded pipeline content + truncated documents skipped — but never
+  swallowed), counters mirroring techintel exactly (ItemsProcessed =
+  Completed+Incomplete+Cancelled+Failed; ItemsFailed = Failed+Malformed),
+  outcome fold in the unified adapter precedence (cancelled > failed&&
+  !completed > incomplete&&!completed > completed-vacuous > completed-
+  mixed > unknown→failed), engine errors wrapped "stage %s: %w" with the
+  errors.Join cancellation path, empty-input short-circuit gated on
+  targetCanonical (non-canonical falls through to the engine with an
+  empty source), nil-ctx guard first, no event emission (the runner owns
+  stage events; Config.Emit deliberately ignored), queue never executed
+  and never propagated (T6). §0.6 chain verification performed for the
+  completed+flag carve-out: engine record write (engine.go:376 +
+  record.go:89-90; truncated → StatusIncomplete record.go:130-132),
+  replay (record.go:359-360; truncated records never served —
+  record.go:172, 198-202 — so only Overflow replays from hits), sticky
+  merge (report.go:243-244), report exposure (report.go:377-378) — chain
+  INTACT. Tests: internal/pipeline/document_test.go (merge unit tests —
+  first-seen dedup, cap tail-drop + ["documents"] cut-name, cut
+  permanence across larger later caps, smaller-later-cap re-cut,
+  over-cap content dropped whole with input never mutated, in-bound
+  content merged by reference, nil/empty/truncated-document edges — plus
+  run-level: propagation + visibility at stage turn, cap + flag +
+  outcome-untouched carve-out, failed-stage documents still merged,
+  pre-cancelled empty/no-flags, cross-run determinism incl. Documents,
+  no aliasing) and internal/pipeline/adapt/secrentel_test.go (13 tests:
+  name, happy path with counters + source-asset identity + evidence, skip
+  truncated/nil-content, empty short-circuit with zero cache reads,
+  non-canonical fall-through, nil-ctx, engine config error → failed,
+  pre-cancelled → cancelled + ctx err, engine error + fired ctx →
+  errors.Join cancelled, overflow flags with exactly the capped 64
+  candidates, overflow cache-hit regression over a real FS cache
+  (2nd run: zero Puts, flags replayed — never swallowed), fold table all
+  rows incl. unknown→failed and malformed-only vacuous, full
+  pipeline.Run integration with a jsDocProducer fake (RunReport.Documents
+  + Results.Secrets + cross-run determinism)). Docs: adapt/doc.go gained
+  the T3c conventions section (document channel semantics, secrentel
+  mapping, flag vocabulary, chain reference; T3b section updated —
+  secrentel is the first Results producer); ARCHITECTURE.md v0.3 boundary
+  gained the "pipeline document channel + secrentel adapter" bullet and
+  the results-channel bullet's planned list now names only the remaining
+  T3d production (NEW-15 resolved); README.md: no changes needed
+  (verified — no line becomes false). NEW-15 → RESOLVED above. Existing
+  pipeline tests pass unmodified. Gates run this session, verbatim:
+  gofmt -l clean (repo-wide), go test -count=1 ./internal/pipeline/... ok
+  (pipeline 0.159s, adapt 17.273s), go vet ./... ok, go build ./... ok,
+  go test -race -count=1 ./internal/pipeline/... (see Results below),
+  full suite go test -count=1 ./... (see Results below).
 
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED
@@ -532,7 +614,8 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
 - Verification: n/a while deferred.
 
 ### NEW-15 (INFO) — T3c secrentel adapter: the JavaScript channel carries no document content (internal/asset)
-- Status: OPEN
+- Status: RESOLVED (T3c session — decision: pipeline-internal document
+  channel; no asset change)
 - Reporter: builder (T3b round)
 - Owner: (none)
 - Problem: the T3b contract documents secrentel's T3c adapter as consuming
@@ -545,12 +628,23 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   bounded content (the engine never fetches); with no body in the
   channel, a T3c adapter has nothing to scan without re-fetching
   (violates the caller-composed contract) or a new content carrier.
-- Fix (when T3c is scoped): decide the document-content source before
-  wiring the secrentel adapter — e.g. a pipeline document channel or a
-  content-bearing JavaScript field (bounded, honestly truncated) produced
-  by the T3d jsintel adapter; the T3b channel shape is final and should
-  not be re-opened for this.
-- Verification: n/a while open.
+- Resolution (implemented in T3c): a NEW pipeline-internal document
+  channel (`internal/pipeline/document.go`) — `StageResult.Documents` /
+  `StageInput.Documents` / `RunReport.Documents`, bounded retained script
+  bodies (`pipeline.Document{Identity, URL, Content, Truncated}`, content
+  ≤ `pipeline.MaxDocumentBytes` = 2 MiB = the secrentel engine's own
+  ingest cap), merged by the runner exactly like the corpus/results
+  channels (first-seen dedup keyed by the canonical identity string,
+  deterministic order, per-stage MaxOutput cap → `documents_truncated`
+  sticky flag + Truncated, hostile over-cap content dropped whole with
+  the document marked Truncated — never a partial prefix). `asset.
+  JavaScript` stays observation-only (NEW-15's original finding stands);
+  the secrentel adapter (`internal/pipeline/adapt/secrentel.go`) consumes
+  the document channel, never the Results.JavaScript field. Production is
+  T3d (the jsintel stage family) — no adapter produces documents yet.
+- Verification: full T3c gates (see the T3c IMPLEMENTED record below);
+  `documents_truncated` flag, truncation-skip, and overflow-flag
+  cache-hit regression pinned by tests.
 
 ## Operational warnings (all agents)
 

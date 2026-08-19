@@ -72,6 +72,19 @@ type StageInput struct {
 	// the runner only copies at the merge.
 	Results Results
 
+	// Documents is the merged document channel accumulated by the earlier
+	// stages (first-seen dedup by the canonical source-asset identity
+	// string, deterministic order, MaxOutput cap at each merge): the
+	// bounded retained bodies the jsintel stage will produce (T3d — no
+	// adapter produces documents yet) and the secrentel stage consumes.
+	// Stages must treat the slice as read-only, with the identical
+	// contract as the corpus and results slices: the runner passes its
+	// live slice, so an in-place write corrupts the channel handed to
+	// later stages and the final report; the runner only copies at the
+	// merge. Content is pipeline-internal currency, merged by reference
+	// (never copied) and never reaches the report Context.
+	Documents []Document
+
 	// Bounds is the resolved per-stage bound set (defaults applied).
 	Bounds StageConfig
 
@@ -158,9 +171,25 @@ type StageResult struct {
 	// flag (the existing AGENTS §0.6 discipline). This milestone only
 	// merges what stages report — the runner-side per-channel MaxOutput
 	// cap is the runner's cut and records the <channel>_truncated sticky
-	// flags itself; adapter-side production of these channels comes later
-	// (T3d).
+	// flags itself; adapter-side production of the remaining channels
+	// comes later (T3d — the secrentel T3c adapter already produces the
+	// secrets, evidence, and relationships channels).
 	Results Results
+
+	// Documents are the stage's ADDITIONS to the document channel: the
+	// bounded retained bodies it produced (the jsintel stage will be the
+	// producer — T3d; no adapter produces documents yet). Nil or empty is
+	// legal and means "nothing added" (the secrentel stage consumes the
+	// channel and never produces documents). The runner merges them into
+	// the shared channel handed to the remaining stages (first-seen dedup
+	// by the canonical identity string, deterministic order, MaxOutput cap
+	// at the merge) and never aliases this slice; content is merged by
+	// reference, never copied. Documents are merged even from a failed or
+	// partial stage, with the same rule and rationale as Additions and
+	// Results. Over-cap content (> MaxDocumentBytes) is dropped whole and
+	// the document marked Truncated by the merge — never a partial prefix
+	// (see mergeDocuments).
+	Documents []Document
 
 	// Err is the failure detail for Outcome failed. For cancelled,
 	// return a nil Err: the outcome, not the error field, carries

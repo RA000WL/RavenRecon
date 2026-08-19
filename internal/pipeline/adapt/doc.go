@@ -132,11 +132,59 @@
 //   - StageInput.Results is read-only: the runner passes its live merged
 //     slices, so an adapter that mutates them corrupts later stages and
 //     the final report (identical contract to the corpus slices).
-//   - No adapter produces or consumes Results yet: production (and the
-//     report stage's consumption of the full Context) is wired in T3d;
-//     secrentel's T3c adapter consumes JavaScript documents from the
-//     channel's JavaScript field as its document source (document-content
-//     carrier undecided — see TODO.md NEW-15).
+//   - The secrentel adapter (T3c) is the first Results producer — secret
+//     candidates, evidence, and relationships (never rebuilt; the engine
+//     report's canonical assets are copied into the channel). The
+//     remaining producers (and the report stage's consumption of the full
+//     Context) are wired in T3d.
+//
+// T3c conventions (the document channel and the secrentel adapter):
+//
+//   - The pipeline-internal document channel (StageResult.Documents /
+//     StageInput.Documents / RunReport.Documents) carries bounded retained
+//     script bodies: Document{Identity, URL, Content, Truncated}, content
+//     bounded by pipeline.MaxDocumentBytes (2 MiB, the secrentel engine's
+//     own ingest cap), merged by the runner like the corpus/results
+//     channels (first-seen dedup keyed by the canonical identity string,
+//     deterministic order, per-stage MaxOutput cap; a cut records the
+//     documents_truncated sticky flag + report.Truncated — AGENTS §0.6
+//     carve-out). Content is merged BY REFERENCE, never copied, and is
+//     never exposed on the report Context (only the derived secret
+//     candidates/evidence are).
+//   - Hostile-producer guard at the merge: over-cap content (>
+//     MaxDocumentBytes) is dropped WHOLE — Content nil + Truncated — never
+//     a partial prefix; the document still merges (identity/URL remain).
+//   - No adapter produces documents yet: production is T3d (the jsintel
+//     stage family — NEW-15 resolved: a pipeline-internal document
+//     channel, separate from the Results channel; secrentel consumes the
+//     channel, never the Results.JavaScript field).
+//   - secrentel (NewSecretIntelStage) consumes the document channel as
+//     its document source: every pipeline document becomes one
+//     secrentel.Document with Kind KindJS, Content/URL passed through,
+//     SourceAsset = the pipeline document's canonical Identity (the
+//     engine's jsintel dedup contract — candidates whose Source is that
+//     identity deduplicate against jsintel's own), Source left "" (the
+//     engine's default "secrentel"). Truncated and nil-content documents
+//     are SKIPPED — nothing honest to scan (never silently completed).
+//     No scope filtering: the channel is the pipeline's own, in-scope by
+//     construction (contrast with the corpus-consuming adapters).
+//   - Per-document analysis caps stay at the engine defaults (64
+//     candidates, 8 evidence per candidate) — deliberately not
+//     configurable. Overflow (a document with >= 64 candidates) maps to
+//     Truncated + the secrentel_overflow sticky flag; the engine's
+//     Truncated signal is unreachable through this adapter (bounded
+//     pipeline content, truncated documents skipped) but maps to
+//     secrentel_truncated anyway so no engine signal is ever swallowed.
+//     The flags replay from cache hits end-to-end (the engine's §0.6
+//     chain is verified intact: record write → replay → sticky merge →
+//     report exposure), so completed + flag is the legal carve-out.
+//   - Outcome/counters/error mapping mirrors the T2c adapters exactly
+//     (fold: cancelled > failed&&!completed > incomplete&&!completed >
+//     completed-vacuous > completed-mixed > unknown→failed; ItemsProcessed
+//     = completed+incomplete+cancelled+failed; ItemsFailed =
+//     failed+malformed). The engine's offline verification queue is never
+//     executed and never propagated (T6). No events are emitted — the
+//     runner owns stage events.
 //
 // T2d conventions (priority / detect / report):
 //

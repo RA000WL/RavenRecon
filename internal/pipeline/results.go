@@ -12,10 +12,13 @@ import (
 // (internal/report/context.go) — the report stage will consume the full
 // Context from this struct in a later milestone.
 //
-// Producers: NO adapter produces Results yet. The stage families named
-// per field below are the documented intended producers; the T3d
-// adapters will fill the fields. A stage that has nothing to add leaves
-// its fields nil or empty — that is legal and means "nothing added".
+// Producers: the secrentel T3c adapter is the first Results producer —
+// secret candidates, evidence, and relationships (the engine report's
+// canonical assets, copied into the channel, never rebuilt). The stage
+// families named per field below are the documented producers for the
+// remaining channels; the T3d adapters will fill those fields. A stage
+// that has nothing to add leaves its fields nil or empty — that is legal
+// and means "nothing added".
 //
 // The channel is assembled by the runner: every stage receives the
 // merged state of the EARLIER stages via StageInput.Results (read-only),
@@ -59,15 +62,17 @@ type Results struct {
 	Technologies []asset.Technology
 
 	// Secrets are the canonical secret candidates
-	// (asset.SecretCandidate). Producer: the secrentel and jsintel
-	// stage families (the T3d adapters — not yet wired; secrentel's
-	// T3c adapter consumes the JavaScript documents of this channel's
-	// JavaScript field as its document source).
+	// (asset.SecretCandidate). Producer: the secrentel stage family —
+	// its T3c adapter is wired and produces — and the jsintel stage
+	// family (the T3d adapters — not yet wired). The secrentel adapter
+	// consumes the pipeline-internal document channel as its document
+	// source, never this channel's JavaScript field.
 	Secrets []asset.SecretCandidate
 
 	// Evidence are the canonical evidence observations
 	// (asset.Evidence). Producer: the techintel stage family (the T3d
-	// adapters — not yet wired).
+	// adapters — not yet wired) and the secrentel T3c adapter (wired —
+	// the engine's evidence passes through the adapter, never rebuilt).
 	Evidence []asset.Evidence
 
 	// Findings are the detection findings (asset.Finding). Producer:
@@ -86,7 +91,9 @@ type Results struct {
 
 	// Relationships are the typed, directed asset-graph edges
 	// (asset.Relationship). Producer: the dns/httpprobe, urlintel, and
-	// jsintel stage families (the T3d adapters — not yet wired).
+	// jsintel stage families (the T3d adapters — not yet wired) and the
+	// secrentel T3c adapter (wired — the engine's relationships pass
+	// through the adapter, never rebuilt).
 	Relationships []asset.Relationship
 
 	// Surfaces are the scored surfaces of the priority engine

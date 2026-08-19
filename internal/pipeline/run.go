@@ -61,6 +61,17 @@ type RunReport struct {
 	// completed).
 	Results Results
 
+	// Documents is the final merged document channel after all stages
+	// (first-seen dedup by the canonical source-asset identity string,
+	// deterministic order, MaxOutput cap at each merge): the bounded
+	// retained bodies the jsintel stage will produce (T3d — no adapter
+	// produces documents yet) and the secrentel stage consumes. Content
+	// is pipeline-internal currency — it never reaches the report
+	// Context (only the derived secrets/evidence do). A cut at a cap
+	// carries the documents_truncated sticky flag below, marking the
+	// retained set incomplete (never silently completed).
+	Documents []Document
+
 	// StickyFlags names the runner-level cuts — "corpus_capped" when a
 	// per-stage MaxCorpusSize cut the corpus at a merge, plus one
 	// "<channel>_truncated" flag per results channel a per-stage
@@ -184,8 +195,10 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	var hosts []asset.Host
 	var urls []asset.URL
 	var results Results
+	var documents []Document
 	seen := make(map[asset.Identity]struct{})
 	resultsSeen := make(map[string]struct{})
+	documentsSeen := make(map[string]struct{})
 
 	for i, entry := range entries {
 		name := cfg.Stages[i]
@@ -216,6 +229,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			Hosts:     hosts,
 			URLs:      urls,
 			Results:   results,
+			Documents: documents,
 			Bounds:    eff,
 			Config:    effectiveStageParams(cfg, name),
 			Clock:     clock,
@@ -272,6 +286,30 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags[ch+"_truncated"] = true
 		}
+		// Documents propagation: merge this stage's document-channel
+		// additions into the shared channel handed to the remaining stages
+		// (first-seen dedup keyed by the canonical source-asset identity
+		// string, deterministic order), then enforce this stage's MaxOutput
+		// cap. The merge runs regardless of the stage's outcome — a failed
+		// stage's retained documents are still merged (mirroring the
+		// Additions/results semantics above) — and hostile over-cap content
+		// is re-bound inside the merge (dropped whole, the document marked
+		// Truncated — never a partial prefix; see mergeDocuments). A cut
+		// records the documents_truncated sticky flag at the report level
+		// (AGENTS §0.6 carve-out, mirroring corpus_capped and the results
+		// channels): the stage's own outcome is untouched, but the flag and
+		// Truncated mark the retained set incomplete. A stage never sees
+		// its own documents: StageInput.Documents is the merged state
+		// before this stage's turn.
+		var documentsCut []string
+		documents, documentsCut = mergeDocuments(documents, res.Documents, documentsSeen, eff.MaxOutput)
+		for _, ch := range documentsCut {
+			report.Truncated = true
+			if report.StickyFlags == nil {
+				report.StickyFlags = make(map[string]bool)
+			}
+			report.StickyFlags[ch+"_truncated"] = true
+		}
 	}
 
 	report.EndAt = clock.Now()
@@ -285,6 +323,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	report.Hosts = hosts
 	report.URLs = urls
 	report.Results = results
+	report.Documents = documents
 	for _, sr := range report.Stages {
 		report.ItemsProcessed += sr.ItemsProcessed
 		report.ItemsFailed += sr.ItemsFailed
