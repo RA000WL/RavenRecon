@@ -23,336 +23,59 @@ Every phase must satisfy these before it is complete:
 - Every subsystem must have tests, docs, and fixture-based acceptance.
 - No phase is complete until it passes `gofmt`, `go vet`, `go build`, `go test`, and `go test -race`.
 - Public interfaces should only be stabilized after pipeline integration or real-world validation.
+- Milestones own features, not files: supporting infrastructure strictly required by a phase may touch any subsystem (AGENTS.md §5); later milestones' user-facing functionality stays out.
 
 ---
 
 ## Status overview
 
-| Version | Phase | Status |
-|--------:|-------|:------:|
-| v0.1 | Foundation | ✅ Complete |
-| v0.2 | Asset Model | ✅ Complete |
-| v0.3 | Runtime Engine | ✅ Complete |
-| v0.4 | Cache and Resume | ✅ Complete |
-| v0.5 | Passive Discovery | ✅ Complete |
-| v0.6 | Active Infrastructure | ✅ Complete |
-| v0.6.5 | Technology Intelligence | ✅ Complete |
-| v0.7 | URL Intelligence | ✅ Complete |
-| v0.8 | JavaScript Intelligence | ✅ Complete |
-| v0.9 | Secret Intelligence | ✅ Complete |
-| v1.0 | Attack Surface Intelligence / Detection Framework | ✅ Complete |
-| v1.1 | Reporting Framework | ✅ Complete |
-| v1.2 | Eventing, observability, operator feedback | ✅ Complete |
-| v1.2.5 | SDK and extension API stabilization | ⏳ Implemented — final review pending |
-| v1.3 | End-to-end pipeline | ⏳ Planned |
-| v1.4 | CLI surface area | ⏳ Planned |
-| v1.5 | Robustness and hostile-input hardening | ⏳ Planned |
-| v1.6 | Integration and acceptance testing | ⏳ Planned |
-| v1.7 | Real-world validation | ⏳ Planned |
-| v2.0 | Detection packs | ⏳ Planned |
+| Version | Phase | Status | Summary / commits |
+|--------:|-------|:------:|---|
+| v0.1 | Foundation | ✅ Complete | Bootstrap: go.mod, CLI (`--help`, version, doctor), config foundation, unit-test + CI baseline, agent instructions, architecture docs (2d491b1). |
+| v0.2 | Asset Model | ✅ Complete | Domain/Host/IP/Port/Service/URL/Endpoint/JS(minimal) models, normalized representations, namespaced deterministic identity, provenance, merge + relationship primitives, JSON serialization (ae3911f). |
+| v0.3 | Runtime Engine | ✅ Complete | internal/runtime: bounded pool, central token-bucket rate limiter, cancellation, graceful/forced shutdown, lossless event subscriptions; cache-independent by design (8c82e64). |
+| v0.4 | Cache and Resume | ✅ Complete | internal/cache (filesystem-backed, no DB): schema versioning, resume, invalidation, deterministic keys; hardened lifecycle (cec152f, 5d9c2b0). |
+| v0.5 | Passive Discovery | ✅ Complete | subfinder/assetfinder/amass adapters via runtime with cache-before-execute + Phase 2 normalization; `ravenrecon discover` CLI + doctor detection section (ea8589e). |
+| v0.6 | Active Infrastructure | ✅ Complete | DNS (5A), HTTP probing (5B), TLS metadata (5C) — library-only pipelines, no CLI (00dc622, 0baf664, eb8b156). |
+| v0.6.5 | Technology Intelligence | ✅ Complete | internal/techintel: header/HTML/cookie/CDN/WAF/framework/infra/auth/API/cloud/build-tool analyzers, fingerprint DB, weighted confidence scoring, tech.detect cache (f074ad4). |
+| v0.7 | URL Intelligence | ✅ Complete | internal/urlintel (6B): canonical-URL streaming, Parameter asset, url→parameter + endpoint→parameter edges; gau/waybackurls/waymore adapters (454dc5f). |
+| v0.8 | JavaScript Intelligence | ✅ Complete | internal/jsintel (Phase 7): script discovery, bounded truncated fetch, stdlib-only parser, import graph, source maps, endpoint extraction, secret candidates; subjs/LinkFinder/SecretFinder adapters (e8cc0da). |
+| v0.9 | Secret Intelligence | ✅ Complete | internal/secrentel (Phase 8): evidence engine over bounded docs, 43 patterns / 35-type vocabulary, entropy+context+multi-evidence+multi-factor confidence, secret.scan cache, offline verification queue (46e2a54). |
+| v1.0 | Attack Surface Intelligence / Detection Framework | ✅ Complete | internal/priority + internal/detect landed (ef0e219, 717df6b); 14 audit findings closed (0865b66). Deferred: vulnerability-specific rules, framework CLI wiring, non-identity correlation. |
+| v1.1 | Reporting Framework | ✅ Complete | Presentation-only (never rescans, never mutates): JSON/CSV/Markdown/HTML exporters, run/error summaries, statistics, export validation, atomic writes, report.render cache record (a8b1587). |
+| v1.2 | Eventing, observability, operator feedback | ✅ Complete | Observer-only event bus + pool events via Config.Observer + cache events via WithObserver (one per Get; nil observer = zero change) + internal/tui first consumer (single-goroutine controller, deterministic frames); no CLI wiring yet (a8b3cee). |
+| v1.2.5 | SDK and extension API stabilization | ✅ Complete | SDK v1 (Core): frozen Level-1 surface, API 1.0, surface golden + 9 behavior contracts + semantic compat golden, examples pack (internal/detect/examples), stability policy + reopening criteria (bbf23c8, db7a00c). |
+| v1.3 | End-to-end pipeline | ⏳ Planned | — |
+| v1.4 | CLI surface area | ⏳ Planned | — |
+| v1.5 | Robustness and hostile-input hardening | ⏳ Planned | — |
+| v1.6 | Integration and acceptance testing | ⏳ Planned | — |
+| v1.7 | Real-world validation | ⏳ Planned | — |
+| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | — |
+| v2.0 | Detection packs | ⏳ Planned | — |
 
 ---
 
-## v0.1 — Foundation
-
-Status: complete
-
-- [x] Go module
-- [x] CLI
-- [x] `--help`
-- [x] version command
-- [x] doctor command
-- [x] configuration foundation
-- [x] unit-test baseline
-- [x] CI baseline
-- [x] agent instructions
-- [x] architecture documentation
-
----
-
-## v0.2 — Asset Model
-
-Status: complete
-
-- [x] Domain model
-- [x] Host model
-- [x] IP model
-- [x] Port model
-- [x] Service model
-- [x] URL model
-- [x] Endpoint model
-- [x] JavaScript model (minimal)
-- [x] normalized representations
-- [x] namespaced deterministic identity
-- [x] provenance
-- [x] deterministic merge primitives
-- [x] relationship primitive
-- [x] JSON serialization
-- [x] normalization tests
-- [x] identity/deduplication tests
-- [x] serialization tests
-- [ ] persistent asset store
-- [x] correlation engine — landed as the deterministic identity-anchor `Correlate` grouping in `internal/priority` (relationship-traversal correlation stays deferred)
-- [ ] asset graph storage/traversal
-
-Deferred: Technology, SecretCandidate, Finding (introduced with the phases that consume them).
-
----
-
-## v0.3 — Runtime Engine
-
-Status: complete
-
-Implemented in `internal/runtime` as a generic, cache-independent runtime engine: bounded worker pool, central token-bucket rate limiter, cancellation, graceful/forced shutdown, and lossless event subscriptions. It is generic infrastructure and deliberately does not import `internal/cache`; its consumer stages compose cache-before-execute around runtime jobs.
-
-- [x] Context-aware scheduler
-- [x] Bounded worker pool
-- [x] Configurable concurrency
-- [x] Central rate limiter
-- [x] Graceful shutdown
-- [x] Progress events
-- [x] Structured errors
-- [x] Cancellation tests
-- [x] Concurrency tests
-- [x] Race tests
-
-No reconnaissance tools are implemented in this milestone.
-
----
-
-## v0.4 — Cache and Resume
-
-Status: complete
-
-Implemented in `internal/cache` (persistent, filesystem-backed; no database):
-
-- [x] Persistent cache
-- [x] Cache schema versioning
-- [x] Resume support
-- [x] Cache invalidation
-- [x] Deterministic cache keys
-
-Details, semantics, and known limitations: see `ARCHITECTURE.md` (“Cache and resume”).
-
----
-
-## v0.5 — Passive Discovery
-
-Status: complete
-
-Implemented in `internal/discovery`: three external-tool adapters (subfinder, assetfinder, amass passive mode) orchestrated through the runtime engine with Phase 3 cache-before-execute composition and Phase 2 asset normalization/deduplication, plus the `ravenrecon discover` CLI command, the doctor's per-source detection section, and the Discovery configuration section.
-
-Initial adapters:
-
-- [x] subfinder
-- [x] assetfinder
-- [x] amass
-
-Requirements:
-
-- [x] normalized output
-- [x] timeout
-- [x] cancellation
-- [x] tool detection
-- [x] parser tests
-- [x] integration fixtures
-- [x] passive-only invocations with asserted argv
-- [x] bounded output capture
-- [x] provenance and cross-source merge
-- [x] cache-before-execute with statused records
-- [x] discover CLI command and doctor detection section
-
-Details, semantics, and known limitations: see `ARCHITECTURE.md` (“Passive discovery”).
-
----
-
-## v0.6 — Active Infrastructure
-
-DNS lands as sub-milestone 5A of Active Infrastructure: the `internal/dns` pipeline exists as a library capability — A/AAAA/CNAME resolution into typed, cached Phase 2 observations with host→address and host→CNAME relationships (see `ARCHITECTURE.md`, “DNS pipeline”). HTTP probing lands as sub-milestone 5B (`internal/httpprobe`, see `ARCHITECTURE.md`, “HTTP probing”) and covers the HTTP metadata normalization work items. Technology detection lands as Phase 6.5 (`internal/techintel` — the technology and evidence asset models, the fingerprint database, and the detection engine; see `ARCHITECTURE.md`, “Technology detection”). TLS metadata lands as sub-milestone 5C, an extension of `internal/httpprobe` — v0.6 is complete. None of the pipelines has a CLI command yet.
-
-- [x] DNS pipeline
-- [x] HTTP probing
-- [x] TLS metadata — captured as sub-milestone 5C through the HTTPS probe handshake
-- [x] HTTP metadata normalization
-- [x] technology detection — landed as Phase 6.5 `internal/techintel`
-
----
-
-## v0.7 — URL Intelligence
-
-URL intelligence lands as sub-milestone 6B of the pipeline stages: the `internal/urlintel` library exists as a capability — canonical-URL streaming into typed, cached Phase 2 observations with query-parameter extraction, GET endpoint classification, per-(URL, adapter) cache records, cross-adapter emit merging, and typed graph edges (see `ARCHITECTURE.md`, “URL intelligence”). The Phase 2 asset model gained the Parameter asset (identity = name within location, capped observed values) and the url→parameter and endpoint→parameter relationship kinds. There is no CLI command yet. Historical URLs land as sub-milestone 6C: `internal/urlintel/adapt` presents the external tools as line streams into the engine.
-
-Status: complete
-
-- [x] Historical URLs
-- [x] URL normalization
-- [x] parameter extraction
-- [x] deduplication
-- [x] endpoint classification
-
-Implemented as urlintel tool adapters: gau, waybackurls, and waymore; katana and paramspider are deferred as documented future work.
-
----
-
-## v0.6.5 — Technology Intelligence
-
-Technology detection lands as phase 6.5: `internal/techintel` is a library-level detection engine that consumes typed observations (headers, body, cookies, TLS metadata, DNS metadata, endpoint paths) and produces typed technology assets, evidence records, and asset-graph edges against the compiled fingerprint database (`internal/techintel/fingerprints`, 145 fingerprints / 296 indicators across 21 categories), with weight-based confidence scoring and Phase 3 cache integration (`tech.detect`). It mirrors the urlintel pipeline shape: an observation source seam, a bounded runtime pool, cache-before-execute, merge-at-emit, bounded diagnostics, and cancellation with honest statuses. See `ARCHITECTURE.md` (“Technology detection”). There is no CLI command yet.
-
-- [x] technology asset model
-- [x] fingerprint engine
-- [x] header analyzer
-- [x] HTML fingerprinting
-- [x] cookie analyzer
-- [x] CDN detection
-- [x] WAF detection
-- [x] framework detection
-- [x] infrastructure detection
-- [x] authentication provider detection
-- [x] API technology detection
-- [x] cloud detection
-- [x] build tool detection
-- [x] confidence scoring
-- [x] cache integration
-- [x] technology relationships
-- [x] evidence model
-- [x] fingerprint database
-- [x] benchmarks
-- [x] documentation
-
----
-
-## v0.8 — JavaScript Intelligence
-
-JavaScript intelligence lands as Phase 7: `internal/jsintel` is a library-level engine that discovers script URLs from raw lines, HTML observations, and tool adapters (`internal/jsintel/adapt`), fetches them with bounded, honestly truncated content retention, parses them through the stdlib-only parser abstraction, and analyzes them into typed Phase 2 assets — JavaScript observations, an import graph with bounded expansion and third-party (bare-specifier) identification, source map detection, endpoint extraction, secret candidates (detection only, never verification), and JS technology detection — with `js.fetch` and `js.analyze` cache-before-execute records. See `ARCHITECTURE.md`, “JavaScript intelligence”. There is no CLI command yet.
-
-Status: complete
-
-- [x] JS discovery
-- [x] JS retrieval
-- [x] endpoint extraction
-- [x] source-map detection
-- [x] secret candidate detection
-- [x] third-party library identification
-
-Implemented as jsintel tool adapters: subjs, LinkFinder, and SecretFinder. Deferred as documented future work: Katana's JS output (optional adapter) and source-map content parsing.
-
----
-
-## v0.9 — Secret Intelligence
-
-Status: complete
-
-Secret intelligence lands as Phase 8: `internal/secrentel` is the Evidence & Secret Intelligence Engine — deliberately an evidence engine, not a secret scanner. Bounded documents (JavaScript, source maps, HTML, JSON, environment files, configuration, YAML, XML, GraphQL, OpenAPI, HTTP responses) are scanned against the compile-once, anchor-gated pattern database (`internal/secrentel/patterns`, 43 fingerprints across the 35-type vocabulary extended in the Phase 2 asset model), and every candidate is classified into a structured evidence model: pattern fingerprints, entropy assessment, extracted context, multi-evidence correlation, and a multi-factor confidence score with explicit false-positive suppression. A `secret.scan` cache-before-execute record with strict decode re-validation covers rescans; an offline verification queue (never cached, never executed) records what the future verification phase should consume. See `ARCHITECTURE.md`, “Secret intelligence”. There is no CLI command yet.
-
-- [x] secret asset model (35-type vocabulary extension)
-- [x] evidence model
-- [x] pattern engine and fingerprint database
-- [x] entropy engine
-- [x] context engine
-- [x] multi-evidence correlation
-- [x] confidence scoring
-- [x] false-positive reduction
-- [x] cache integration (`secret.scan`)
-- [x] runtime reuse
-- [x] verification queue (offline only)
-- [x] tests, race tests, and benchmarks
-
-Deferred as documented future work: online secret verification and dedicated source-map semantics.
-
----
-
-## v1.0 — Attack Surface Intelligence / Detection Framework
-
-Status: complete
-
-Implemented in `internal/priority` and `internal/detect` — the attack-surface prioritization engine and the reusable detection framework. Phase 9 (Attack Surface Intelligence) landed the canonical model types, the data-driven interestingness/risk catalogs, the pure scoring engine, deterministic correlation grouping, evidence-tied attack paths, recommendation catalog, cache-before-execute execution, and benchmarks. Phase 10 (Detection Framework) landed the canonical Finding model, rule registration with validation, the dependency system, the fixed detection context, execution on the shared runtime pool, the `detect.rule` cache-before-execute record, execution metrics, and benchmarking.
-
-- [x] asset scoring
-- [x] technology-aware prioritization
-- [x] API/admin classification
-- [x] confidence scoring
-- [x] interesting-asset ranking
-- [x] Detection Framework
-- [x] Finding model
-- [x] Rule registration and validation
-- [x] Rule dependencies
-- [x] Rule execution metrics
-- [x] Rule result cache
-- [x] Detector benchmarking
-
-Deferred to future phases: vulnerability-specific rules, CLI wiring for the framework, and any correlation beyond identity-derived anchors.
-
----
-
-## v1.1 — Reporting Framework
-
-Status: complete
-
-Implemented in `internal/report` — the Reporting Framework & Evidence Export. Reporting is presentation only: the framework never rescans a target and never mutates the data it is given. It landed with: the canonical report context and model, the report registry, the four built-in exporters (JSON, CSV, Markdown, HTML), the run summary, the error summary, the statistics engine, export validation, and atomic file writes. The engine runs on the shared runtime pool and includes an optional `report.render` cache-before-execute record with strict decode re-validation and eviction.
-
-- [x] JSON
-- [x] CSV
-- [x] Markdown
-- [x] HTML
-- [x] run summaries
-- [x] error summaries
-
----
-
-## v1.2 — Eventing, observability, operator feedback
-
-Status: complete
-
-Goal: make runs visible, debuggable, and measurable in real time.
-
-The event bus lands first (`internal/event`, Phase 12): the canonical
-runtime event model — typed, validated, severity-marked, clock-stamped
-events with sealed payloads projected from the Phase 2 asset model, the
-runtime engine, and the report framework — fanned out through a concurrent,
-bounded, non-blocking bus (per-subscriber bounded buffers, drop counters,
-bus-assigned sequences preserved in per-subscriber order, zero-timestamp
-stamping, closed-bus drop semantics), plus the Observer contract and the
-`Deriver`/`Deriving` pool-job-boundary bridge that converts job results
-into derived events. It is observer-only: no engine consumes or mutates it
-yet. The runtime pool is already instrumented (the pool emits canonical
-scan/worker/task lifecycle, phase-transition, honest-progress, and shutdown
-events through its optional `Config.Observer`), and the cache is
-instrumented too (every `Get` emits exactly one canonical
-`cache_hit`/`cache_miss` event through its optional `WithObserver`
-option, nil observer = zero behavior change). The terminal observability
-library (`internal/tui`) landed
-as the first bus consumer and delivers the observability surface below:
-a single-goroutine controller replays a subscriber's stream into
-sanitized, bounded state and renders live frames plus one deterministic
-final summary frame, with all rendering hermetic and deterministic (no
-CLI wiring yet).
-
-- [x] Event bus
-- [x] Structured runtime events (runtime pool instrumentation)
-- [x] Cache instrumentation (cache hit/miss events)
-- [x] Progress reporting (TUI library: progress, phase, in-flight,
-  honest totals/ETA)
-- [x] Worker health/status (TUI library: per-worker dashboard)
-- [x] Throughput and ETA (TUI library: fixed-window rates)
-- [x] Resource monitoring (TUI library: sampled heap/goroutines/FDs/queue)
-- [x] Interesting-asset feed (TUI library: rate-limited, deduplicated)
-- [x] Error feed (TUI library: grouped, severity-ranked)
-- [x] Final execution summary (TUI library: `RenderFinal` block)
-
-Acceptance criteria:
-
-- Every stage emits structured events.
-- The TUI can reconstruct a live run from events alone.
-- Metrics are consistent across repeated runs.
-- Errors are visible without breaking execution flow.
-- Tests cover event ordering, progress aggregation, and summary generation.
-- Benchmarks show the event layer does not materially slow discovery.
+## Legacy notes (v0.1–v0.9)
+
+Facts retained from the collapsed milestone sections (not derivable from the commit refs alone):
+- v0.1: bootstrap milestone — foundation checklist only; CI baseline and agent instructions landed here.
+- v0.2: correlation engine landed differently than planned — as the deterministic identity-anchor `Correlate` grouping in `internal/priority`; relationship-traversal correlation stays deferred. Persistent asset store and asset graph storage/traversal were never landed (still open). Technology, SecretCandidate, and Finding asset models were deferred to the phases that consume them.
+- v0.3: runtime is deliberately cache-independent — consumer stages compose cache-before-execute around pool jobs (now AGENTS.md §0.4). No reconnaissance tools shipped in this milestone.
+- v0.4: implementation details, semantics, and known limitations live in ARCHITECTURE.md (“Cache and resume”).
+- v0.5: `ravenrecon discover` + the doctor's per-source detection section are the only CLI wiring to date; adapters invoke tools in passive-only mode with asserted argv, bounded output capture, statused cache-before-execute records, and cross-source provenance merge.
+- v0.6: HTTP metadata normalization landed with 5B; DNS (5A), HTTP probing (5B), and TLS metadata (5C) remain library-only pipelines — none has a CLI command yet (still true).
+- v0.6.5: fingerprint database ships 145 fingerprints / 296 indicators across 21 categories; the engine mirrors the urlintel pipeline shape (observation seam, bounded pool, cache-before-execute, merge-at-emit, honest statuses).
+- v0.7: Parameter asset identity = name within location, with capped observed values; per-(URL, adapter) cache records with cross-adapter emit merging; katana and paramspider adapters deferred as documented future work.
+- v0.8: content retention is bounded and honestly truncated; secret candidates are detection-only, never verification; `js.fetch`/`js.analyze` cache-before-execute records; Katana JS output and source-map content parsing deferred.
+- v0.9: deliberately an evidence engine, not a secret scanner; `secret.scan` cache record enforces strict decode re-validation; the verification queue is offline-only (never cached, never executed); online verification and dedicated source-map semantics deferred.
+- v1.2: acceptance criteria — every stage emits structured events, the TUI reconstructs a live run from events alone, metrics are consistent across repeated runs, errors are visible without breaking execution flow; bus semantics (per-subscriber bounded buffers, drop counters, bus-assigned sequence preservation, zero-timestamp stamping, closed-bus drop behavior, Deriver/Deriving bridge) live in ARCHITECTURE.md "Event bus".
 
 ---
 
 ## v1.2.5 — SDK and extension API stabilization
 
-Status: implemented — final review pending (all items landed; milestone stays open until reviewer sign-off)
+Status: ✅ Complete — SDK v1 (Core) frozen and committed (bbf23c8, db7a00c); contract
+gates (surface golden, behavior contracts, semantic compat golden) enforce it.
 
 Goal: freeze the contracts that v2.0 packs will depend on, but only after the data flow is real enough to validate.
 
@@ -507,6 +230,81 @@ Acceptance criteria:
 
 ---
 
+## v1.8 — Universal Asset Ingestion Framework
+
+Status: planned
+
+Goal: consume reconnaissance artifacts from any source — RavenRecon itself or
+external tools — normalize them into the canonical asset graph, preserve
+provenance, and enrich them through the existing pipeline so the framework
+becomes a recon intelligence platform: ingest, normalize, correlate, enrich,
+and report on data regardless of where it came from. Most recon tools stop at
+collecting; v1.8 makes RavenRecon an analysis platform over other tools'
+output (subdomains.txt, alive.txt, urls.txt, js.txt, burp.xml, nuclei.json,
+...), reconstructing the asset graph and producing the same reports as if
+RavenRecon had discovered the assets itself.
+
+Prerequisite: the v1.3 pipeline is stable — ingestion feeds the same stages,
+it does not create a parallel execution path.
+
+Design rules:
+
+- Importers are adapters behind one interface (`internal/importer`):
+  `Name()`, `CanImport(...)`, `Import(...)`; no importer owns runtime, cache,
+  reporting, or asset identities — everything is reused from the existing
+  frameworks.
+- Every imported record becomes canonical Phase 2 assets through the single
+  normalization point (`asset.NewDomain`/`NewHost`/`ParseURL`, ...); importers
+  never write their own normalizers.
+- Import is passive data ingestion only: imported findings (e.g. nuclei JSON)
+  are evidence to be reported and enriched, never re-executed or verified.
+- Provenance is first-class: every imported asset records importer, original
+  tool, filename, import time, original record, confidence, metadata.
+- Streaming only: bounded memory, progress events, cancellation, resume —
+  targets 10MB/100MB/1GB+ files without whole-file loads.
+
+Checklist:
+
+- [ ] `internal/importer` package: importer interface, registry, format
+      detection, streaming readers, validation, normalization, progress events
+- [ ] Automatic format detection — extension, MIME, structure, content
+      signature; no `--type` flag (files/folders only)
+- [ ] Plain-text importers: domains, subdomains, urls, alive, js, ips, cidrs
+- [ ] JSON importers: httpx, dnsx, naabu, katana, nuclei
+- [ ] XML importers: Burp sitemap/issues, OWASP ZAP
+- [ ] Crawl-output importers: katana, hakrawler, gospider, waymore, gau
+- [ ] Archive sources: wayback (Common Crawl future)
+- [ ] Streaming parsers: bounded memory, incremental parsing, progress events,
+      cancellation, resume
+- [ ] Provenance preserved on every imported asset (importer, original tool,
+      filename, import time, original record, confidence, metadata)
+- [ ] Deduplication reuses the existing identity/merge/provenance/relationship
+      logic — no duplicate systems
+- [ ] Cache integration: content hash + import config + schema version +
+      importer version; repeat imports of unchanged files become cache hits
+- [ ] Imported assets flow through the standard pipeline
+      (DNS → HTTP → Tech → JS → Secrets → Priority → Detection → Reporting)
+- [ ] `ravenrecon ingest` CLI: single files, multiple files, folders
+- [ ] Reporting distinguishes Discovered / Imported / Enriched / Generated with
+      source attribution
+- [ ] Tests: empty files, malformed input, duplicates, huge files, cancellation,
+      resume, cache, streaming, mixed imports
+
+Acceptance criteria:
+
+- Every supported format imports without a `--type` hint.
+- Imported assets carry full provenance and deduplicate against existing
+  assets via the shared identity/merge logic.
+- Imports are streaming with bounded memory; a 1 GB input does not spike
+  memory.
+- Repeat imports of unchanged files are cache hits.
+- Imported data produces reports structurally identical to pipeline-discovered
+  data (provenance aside).
+- All gates pass (gofmt, vet, build, test, race); benchmarks recorded for
+  large imports.
+
+---
+
 ## v2.0 — Detection packs
 
 Status: planned
@@ -517,57 +315,13 @@ Design rule: core packages stay stable. New detection capabilities should be imp
 
 ### Pack families
 
-**Web**
-
-- [ ] Security headers
-- [ ] CSP
-- [ ] CORS
-- [ ] Source maps
-- [ ] Robots
-- [ ] Backup files
-- [ ] Debug endpoints
-
-**Authentication**
-
-- [ ] JWT
-- [ ] OAuth
-- [ ] Session handling
-- [ ] Cookie analysis
-
-**Authorization**
-
-- [ ] IDOR heuristics
-- [ ] Privilege boundaries
-- [ ] Role relationships
-
-**APIs**
-
-- [ ] REST
-- [ ] GraphQL
-- [ ] OpenAPI
-- [ ] Endpoint clustering
-
-**JavaScript**
-
-- [ ] DOM XSS indicators
-- [ ] postMessage analysis
-- [ ] Prototype pollution indicators
-- [ ] Dangerous API usage
-
-**Cloud**
-
-- [ ] AWS
-- [ ] Azure
-- [ ] GCP
-- [ ] Firebase
-- [ ] Buckets
-- [ ] IAM indicators
-
-**Business logic**
-
-- [ ] Workflow mapping
-- [ ] State transitions
-- [ ] Multi-step process analysis
+- **Web** — security headers, CSP, CORS, source maps, robots, backup files, debug endpoints
+- **Authentication** — JWT, OAuth, session handling, cookie analysis
+- **Authorization** — IDOR heuristics, privilege boundaries, role relationships
+- **APIs** — REST, GraphQL, OpenAPI, endpoint clustering
+- **JavaScript** — DOM XSS indicators, postMessage analysis, prototype pollution indicators, dangerous API usage
+- **Cloud** — AWS, Azure, GCP, Firebase, buckets, IAM indicators
+- **Business logic** — workflow mapping, state transitions, multi-step process analysis
 
 Acceptance criteria:
 
@@ -604,4 +358,5 @@ A phase is only complete when all of the following are true:
 - Documentation is updated.
 - Outputs are reproducible.
 - Backward compatibility impact is understood.
+- Supporting changes are classified (infrastructure/refactor) and documented, not future-feature creep.
 - A reviewer confirms the phase does not introduce hidden coupling.

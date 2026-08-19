@@ -49,90 +49,127 @@ orchestrator; every agent may append or update its own entries.
     - Fix: <actionable steps>
     - Verification: <tests/gates that prove it done>
 
-## Recently closed — v1.2.5 SDK freeze (uncommitted, pending merge)
+## Recently closed
 
-Wave-1 + T5 work closed by the orchestrator with evidence from this session's
-actual gate runs. Final full-milestone re-review happens at T9 before commit.
+### v1.2.5 SDK freeze (bbf23c8, db7a00c)
+- T1-T9 VERIFIED (bbf23c8, db7a00c): SDK freeze landed — ValidateRule/ParseRuleVersion/12 bounds consts (rule.go), Registry.Seal (registry.go), APIMajor=1/APIMinor=0/CheckAPIVersion (api.go), sdk_test.go, T4 examples pack (internal/detect/examples), T5a surface_snapshot_test.go, T5b behavior_contract_test.go, T6 semantic compat (compat_test.go), T7/T8 docs.
+- Review chain: APPROVE WITH NITS, all closed — NEW-6 registry readonly race (atomic.Bool + re-check under write lock, registry_race_test.go, proven failing pre-fix), degree-rule observed-set guard, variadic newRule deps, explicit version param (degree rule 1.0.1); orchestrator gates (test/vet/-race) green after each round.
+- Goldens regenerable only via explicit `-update`: api_v1.golden (7216B, sha256 034f292a; de-overpinned in db7a00c) + api_v1_report.golden (13,853B). Incident: rule.go briefly restored from HEAD during a drift demo — restore byte-exact verified (sha256 0b6829a6).
+- Docs-compaction wave (L4/L5/L3): AGENTS.md diet, TODO.md closed-section compaction, ROADMAP.md v0.x collapse — orchestrator-verified, reviewer APPROVE (2 INFOs fixed), gates green; kept UNCOMMITTED by maintainer decision (agent-workflow docs, not project code). Follow-ups in the same uncommitted docs set: (a) v1.8 Universal Asset Ingestion Framework milestone (ROADMAP.md, user-specified, orchestrator-written); (b) Phase Ownership Policy — AGENTS.md §5 rewritten (Primary/Infrastructure/Refactor/Future Feature classification; "modify any subsystem if strictly required, never implement the future milestone's user-facing functionality") + ROADMAP rules & phase-review checklist bullets (user-specified, orchestrator-written). Reviewer sign-off pending on (a)+(b) with the next review round.
 
-- NEW-5 (HIGH) — VERIFIED: T1-T3 landed (ValidateRule/ParseRuleVersion/12
-  bounds consts in rule.go; Registry.Seal() in registry.go; APIMajor=1,
-  APIMinor=0, CheckAPIVersion in api.go; sdk_test.go). Reviewer APPROVE WITH
-  NITS; the nit (NEW-6) fixed and verified. Orchestrator ran
-  `go test ./internal/detect/` (ok), `go vet` (ok), `-race` (ok) after all
-  wave-1 changes.
-- NEW-6 (MED) — VERIFIED: readonly race closed (atomic.Bool + re-check under
-  the write lock in registry.go; registry_race_test.go regression). Builder
-  proved the test fires on pre-fix code; orchestrator ran
-  `go test -race ./internal/detect/` (ok) and
-  `-run 'TestRegistrySealRegisterRace|TestRegistrySeal' -count=3` (ok).
-  Note: internal/report/registry.go carries the same inherited pattern —
-  follow-up scheduled when report is next touched (out of milestone scope).
-- NEW-8 (HIGH) — VERIFIED: T5a surface_snapshot_test.go (790 lines) +
-  testdata/api_v1.golden — stdlib-only AST snapshot of the Level-1 surface
-  with Level-2/3 exclusions documented and drift demonstrated (const value
-  change, symbol rename) during development; T5b behavior_contract_test.go
-  pins all 9 contracts. Builder gates all green; orchestrator re-ran the
-  package (`-count=1` ok), the snapshot test (PASS), and the race suite
-  (ok). Golden regenerable only via explicit `-update` flag. Incident note:
-  T5a's builder briefly restored rule.go from HEAD during a drift demo;
-  restore verified byte-exact via sha256 (0b6829a6) against the pre-demo
-  state. FINAL-REVIEW FIX (post-sign-off, in same changeset): golden
-  de-overpinned — now pins only exported symbols, exported fields
-  (name+type+tag), const values, and signature TYPES (param/result names and
-  unexported fields dropped, arity preserved); regenerated in the same
-  change (7216 bytes, sha256 034f292a; old: 7301 bytes, abe5dd3e). Proven by
-  live demos: cosmetic param rename (dctx→c) and internal-field rename
-  (readonly→frozen) PASS; exported-symbol rename still FAILS.
+### TODO board sweep (0865b66)
+- M-1 (tests) — VERIFIED: rawResponder e2e spoof regressions (hostile `tls:fake` status line + no-colon header-line abort) classify ProbeFailed/ReasonOther on the REAL transport; spoof string asserted in surfaced error (fails pre-fix by construction).
+- M-2 (tests) — VERIFIED: probeKey domain pinning — key inequality across declared domains, equality for identical inputs, exact-shape pin, and a broader-scope run re-executes instead of being served the narrow record.
+- NEW-1 (LOW) — VERIFIED: decodeStoredURL refuses any stored URL asset whose Original is non-empty and non-canonical (parseable + unparseable credential-bearing forms; canonical-form refusal corner); regression rows + end-to-end self-heal subtest.
+- NF-1 (INFO) — WON'T FIX: `admin/openapi.yaml` never existed (no dir, no git history, not gitignored); repo-wide `0.5.0` grep already clean — stale entry.
+- NF-2 (INFO) — VERIFIED: techintel/doc.go cache section now lists operation, identity, SchemaVersion, db_digest, and the sources bitmask, matching techKey (record.go:26-36) — fixed in the audit changeset itself.
+- NF-3 (INFO) — VERIFIED: MaxHeaderBytes comment (run.go:36-43) documents the strict-exceed abort and exact-equality isHeaderCapAbort classification (never substring). Left open by design: NEW-3 (DEFERRED), NEW-4 (OPEN) — see Open items.
 
-- NEW-7 (HIGH) — VERIFIED: T4 examples pack (internal/detect/examples:
-  doc.go, rules.go, rules_test.go + internal/detect/example_test.go).
-  Review chain: first review APPROVE WITH NITS (MEDIUM: degree rule could
-  emit unobserved relationship-node subjects — fixed with observed-set
-  guard mirroring normalizeSnapshot, regression
-  TestDegreeIndexSkipsUnobservedNodes proven failing pre-fix; LOW:
-  index-coupled dependency wiring — fixed via variadic newRule deps; doc
-  NITs applied). Re-review APPROVE WITH NITS (LOW: degree rule logic
-  changed without version bump — fixed via explicit version parameter,
-  degree rule now 1.0.1; INFO doc phrasing applied). All gates green incl.
-  TestSDKAPISurfaceSnapshot (pack not part of the golden) and
-  TestPackRulesValidate. Orchestrator verified gates after each round.
-
-- NEW-9 (MED) — VERIFIED: T6 semantic compat regression landed —
-  examples/compat_test.go (TestSemanticCompat, LCS-bounded unified diff,
-  opt-in `-update` regeneration, atomic golden writes, assertColdRunShape
-  guard preventing broken runs from being promoted) + examples/testdata/
-  api_v1_report.golden (13,853 bytes, pins outcome + all 6 rule results +
-  all 12 findings with every field + status counts + levels + audit-rule
-  logs). Drift demonstrated (evidence-value change → clean per-line FAIL)
-  and reverted byte-exactly (sha256-verified); golden byte-stable across
-  two `-update` runs. All gates green incl. `-race` and the surface
-  snapshot.
-- NEW-10 (MED) — VERIFIED: T7 docs landed — ARCHITECTURE.md "Detection
-  framework → SDK contract": lifecycle diagram (lines 2477-2521, Rule →
-  Registry → Run → normalizeSnapshot → cache-before-execute → Report,
-  honest note: priority is never a severity claim), Rule authoring
-  contract (real bounds, Version-bump citing rule.go), Finding contract
-  (validateFinding's five checks, observed-corpus rule with both pack
-  demonstrations), pack story (explicit loading, auto-detects nothing),
-  executable documentation naming real tests.
-- NEW-11 (MED) — VERIFIED: T8 policy landed — ARCHITECTURE.md "SDK
-  stability policy" (line 2672): 3-level policy (L1 frozen forever with
-  named symbols; L2 after pipeline validation; L3 experimental incl.
-  BenchmarkDetector/BenchResult), versioning contract (api.go semantics),
-  reopening criteria (concrete failing need → proposal naming symbols →
-  maintainer approval → BOTH goldens regenerated + CheckAPIVersion bump in
-  the same change) naming the mechanically-enforced gates.
-  ROADMAP.md:367 ticked. Note: T7's docs reference the semantic-compat
-  test honestly as landing with this milestone.
+### v1.0 audit changeset (0865b66)
+- H-1..L-21 — all 14 findings closed (0865b66), senior review APPROVE with 12/14 fully closed + failing-on-pre-fix regressions: H-1 credential echo (sanitizeLocation both raw-echo branches; observe.go Location redaction); H-2 outcome-vocabulary amendment (AGENTS §0 item 6, verified against techintel/urlintel sticky flag chains end-to-end); M-1 typed TLS classification (tlsHandshakeError sentinel at DialTLSContext, tls.RecordHeaderError, exact-equality header-cap abort, no text fallback — code-verified at commit, regression tests landed later in the sweep above); M-2 probeKey declared-domain pinning (code-verified, tests in sweep); M-3 urlintel userinfo redacted at single ingest construction point; M-4 secrentel redactedCandidateID at all four rejection sites; M-5 jsintel content binding (AnalyzedHash cross-validated, stale never served, silent self-heal); M-6 jsintel redirects — non-http(s) targets observed-not-followed; M-7 detect fingerprints full field coverage + provenance, SchemaVersion 2, old records self-invalidate; M-8 techintel NaN rejected at load and decode, neutralized in deriveConfidence; M-9 techintel fingerprint-DB content digest in cache keys (computed once per run); L-10 report zero-byte render parts rejected + self-heal; L-11 mdEscape doubles backslashes before pipes; L-20 version 1.0.0 + UA bump; L-21 CI pinned to go.mod; README/ARCHITECTURE/AGENTS synced.
+- NEW-12 (MED) — VERIFIED + CLOSED: T9 sync (ROADMAP ticks + status, README SDK paragraph, AGENTS §2 footnote), final-review NITs (golden de-overpinned, ROADMAP table row, schema-bump carve-out), full-milestone reviewer sign-off APPROVE WITH NITS, committed (bbf23c8, db7a00c); ROADMAP v1.2.5 flipped to ✅ Complete at docs-wave close.
 
 ## Open items
 
-### NEW-12 (MED) — v1.2.5 T9: roadmap/README/AGENTS sync + final verification
-- Status: IN PROGRESS (T9 landed — ROADMAP checklist fully ticked, README
-  SDK paragraph, AGENTS §2 footnote; final-review NITs closed by builder:
-  golden de-overpinned, ROADMAP table row, schema-bump carve-out sentence;
-  full-milestone reviewer sign-off APPROVE WITH NITS. Remaining: commit
-  pending user decision; close this entry at commit time)
+### NEW-13 (HIGH) — v1.3 End-to-end pipeline: `ravenrecon scan` (internal/pipeline)
+- Status: IN PROGRESS (T1 complete pending 3 non-blocking INFOs; T2 next)
+- Reporter: master
+- Owner: builder (per-task dispatches)
+- Problem: ten library engines exist but nothing composes them; v1.3
+  (ROADMAP) requires one deterministic workflow discover→dns→httpprobe→
+  urlintel→techintel→jsintel→secrentel→priority→detect→report with
+  shared runtime/cache/asset-graph, pipeline-level error handling, and
+  hermetic E2E tests (success/partial-failure/retry).
+- Fix (locked decisions D1-D5): internal/pipeline package; empty-registry
+  detect stage by default (no rules ship with the framework); Level-2
+  detect freeze deferred (pipeline consumes Report fields only); techintel
+  observations header/TLS/DNS-only (no bodies — documented limitation);
+  secrentel offline queue surfaced as count, never executed; scan CLI in
+  T9.
+- T1 skeleton (config/stage/run/scope + 25 tests): landed; review round 1
+  APPROVE WITH NITS (1 MEDIUM + 2 LOW + 4 INFO) — all fixed; re-review
+  APPROVE WITH NITS (3 INFO). Gates green after both rounds
+  (gofmt/test/vet/-race/build/full-suite; my own verification re-run).
+  Runner semantics pinned: stage contract w/ truncation discipline
+  (completed+Truncated+empty flags → incomplete), fold precedence table
+  (25 pairs), panic isolation incl. Name(), pre-cancelled+empty →
+  cancelled, cancelled+ctx-error stays cancelled, Burst:0 default
+  semantics, StageParams seam (validated, never aliased).
+- T1 INFOs folded into T2 dispatch (non-blocking, do not lose):
+  (1) pin OutcomeFailed + ctx.Err() still folds failed — one subtest in
+  TestRunStageContractViolations; (2) rephrase resolution-failure message
+  when a provided stage's Name() panicked ("could not resolve: no matching
+  stage provided (note: a provided stage's Name() panicked)") — run.go
+  ~116-135; (3) cosmetic StageInput field naming (Config vs Bounds) —
+  accepted as-is, no churn.
+- Status per task: T1 done (above) · T2a corpus propagation DONE —
+  runner merge (first-seen dedup by asset.Identity, deterministic order,
+  defensive copy), per-stage MaxCorpusSize cap at merge (hosts-first
+  tail-drop; cut entries stay first-seen, cannot re-enter — documented),
+  corpus_capped sticky flag + Truncated (AGENTS §0.6 carve-out), RunReport
+  final corpus + StickyFlags, failed-stage additions retained (honest
+  output), INFO-1 (failed+ctx.Err stays failed) + INFO-2 (resolution
+  message) pinned; review APPROVE WITH NITS (LOW-1 semantics documented,
+  LOW-2 pinned ×4 subtests, INFO-3/4/5 documented); gates green incl.
+  full suite. Implemented by master orchestrator (builder unavailable —
+  stuck at thinking; user override) · T2b httpprobe adapter DONE (this
+  session): internal/pipeline/adapt/httpprobe.go + httpprobe_test.go (13
+  tests: alive additions, out-of-domain input filtered pre-engine,
+  out-of-domain URL-host output filter, all-failed, mixed-partial,
+  pre-cancelled + in-flight cancellation, cache pass-through via FS cache
+  zero-request second run, empty-filtered short-circuit ± cancelled ctx,
+  request_timeout parsing table + e2e 50 ms deadline, header-cap truncation
+  flag); mapping Status{Completed,Incomplete,Failed,Cancelled} →
+  pipeline{completed,partial,failed,cancelled}, truncation →
+  Truncated+StickyFlags["probe_truncated"], params: request_timeout only
+  (invalid/absent/≤0 → 0 = engine 10 s default), ips=nil per doc.go v1.3
+  note; gates green (gofmt/test/vet/-race/build + full suite). T2b
+  discovery adapter DONE (this session): internal/pipeline/adapt/
+  discovery.go + discovery_test.go (13 tests: name, happy path w/ clock
+  bridge + counts, out-of-domain output filtered via FilterHosts, sources
+  param parsing table (absent/empty/comma-only/selection/whitespace/
+  unknown-params), truncation flag → Truncated+StickyFlags["truncated"]
+  (engine's documented Truncated marker), partial-without-truncation,
+  engine error → failed + wrapped "stage %s: %w", per-source failure fold
+  → partial, skipped (tool MISSING) → incomplete (no pipeline "skipped"
+  value; documented), pre-cancelled + in-flight cancellation →
+  cancelled+ctx err, cache pass-through (puts counted; assetfinder never
+  cached), full pipeline.Run integration); config-from-StageInput only,
+  clock bridge Now=in.Clock.Now, bounds pass-through per engine semantics;
+  test identifiers discovery* prefixed; gates green (gofmt/test/vet/
+  -race/build + full suite). T2b dns adapter in progress by its builder
+  (file present in internal/pipeline/adapt/ — a transient helper-name
+  collision between the three concurrent test files was resolved) · T2b
+  REVIEW-FIX ROUND 1 (this session): applied the T2b CHANGES-REQUIRED
+  findings across all three adapters (dns/httpprobe/discovery) — MEDIUM-1
+  outcome-mapping unification: per-host fold is now cancelled > failed&&
+  !completed > completed > partial in both dns.go and httpprobe.go
+  (engine-incomplete folds into partial; adapters never emit incomplete;
+  dns truncation test + httpprobe fold-corner test updated/pinned),
+  LOW-1 httpprobe empty-filtered short-circuit gated on targetCanonical
+  (non-canonical target falls through to the engine's scope error; mirror
+  subtest added), LOW-2 discovery error-path additions preserved
+  (discoveryAdditions helper on success + both error branches; ~17 s
+  forced-pool-shutdown regression test added), LOW-3 sticky flag renamed
+  "truncated" → "discovery_truncated" (literal pinned in test; naming
+  convention documented in adapt/doc.go), INFO-1 discovery cancellation
+  now joins ctx.Err()+engine error (isContextError traverses the join;
+  mirrors httpprobe), INFO-2 unified mapping table + fold precedence
+pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
+   full suite) · T2b RE-REVIEW (master): APPROVE WITH NITS — all six
+   CHANGES-REQUIRED findings verified fixed (mapping table matches code,
+   incomplete reserved to discovery OutSkipped, fold reorder equivalent
+   across inputs w/ corner pinned, 17 s drain test justified); INFO
+   (testing.Short() gate on the 17 s test) applied by orchestrator;
+   full + race suites green after gate (17.1 s / 18.1 s) · T2c
+   adapters batch 2: urlintel + techintel + jsintel (SECRENTEL DEFERRED
+   to T3 — the corpus carries no document content, its engine consumes
+   DocumentSource; a no-op stage would violate the no-placeholder rule;
+   rationale in adapt/doc.go) · T2d adapters
+   batch 3 (priority/detect/report) · T3 stage events · T4 determinism
+   (discovery clock seam) · T5 hermetic E2E · T6 CLI+docs.
+- Verification: per-task gates (gofmt/test/vet/-race/build); final wave:
+  full-suite gates + reviewer sign-off + TODO close.
 
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED
@@ -173,75 +210,3 @@ actual gate runs. Final full-milestone re-review happens at T9 before commit.
   (synthetic values only).
 - External tools are adapters behind interfaces; core pipelines never branch
   on tool names.
-
-## Recently closed — TODO board sweep (uncommitted, pending merge)
-
-The six open board items from the v1.0 audit changeset were researched,
-fixed, and closed this session; reviewer APPROVE after one re-review cycle
-(MEDIUM NEW-1 corner closed: canonical-form refusal). Summary:
-
-- M-1 (tests) — VERIFIED: rawResponder wired into two end-to-end spoof
-  regressions (audit_test.go): hostile `tls:fake` status line and a
-  no-colon `server response headers exceeded` header line both classify
-  ProbeFailed/ReasonOther on the REAL transport; each test asserts the
-  spoof string is present in the surfaced error (fails on pre-fix
-  text-matching code by construction). Positive controls unchanged.
-- M-2 (tests) — VERIFIED: probeKey domain pinning — key inequality across
-  declared domains, equality for identical inputs, exact-shape pin, and a
-  behavioral test proving a broader-scope run re-executes
-  (Executed=true/Cached=false, followed hop in chain, request count 3)
-  instead of being served the narrow-scope record.
-- NEW-1 (LOW) — VERIFIED: decodeStoredURL refuses any stored URL asset
-  (record URL + every endpoint URL) whose Original is non-empty and
-  non-canonical (covers parseable AND unparseable credential-bearing
-  Originals; parseRawURL guarantees no legitimate path stores non-canonical
-  Originals). Regression table rows + end-to-end self-heal subtest; the
-  unparseable-form row was proven to fail on the pre-fix parse-only check.
-- NF-1 (INFO) — WON'T FIX: `admin/openapi.yaml` never existed in this repo
-  (no directory, no git history, not gitignored); repo-wide grep for
-  `0.5.0`/`v0.5.0` (excluding this file) is already clean. Nothing to
-  change; entry was stale.
-- NF-2 (INFO) — VERIFIED: already fixed in the audit changeset itself —
-  techintel/doc.go's Cache section now lists operation, identity,
-  SchemaVersion, db_digest, and the sources bitmask, matching techKey
-  (record.go:26-36); the entry's ~25-34 line ref predates the fix.
-- NF-3 (INFO) — VERIFIED: MaxHeaderBytes comment (run.go:36-43) now
-  acknowledges the strict-exceed abort and the exact-equality
-  isHeaderCapAbort classification (never substring; safe degradation).
-
-Left open by design: NEW-3 (DEFERRED) and NEW-4 (new INFO flake entry —
-TestProbeCompletedHTTPS rare pre-existing flake seen once under -race,
-reproduced at HEAD; follow-up tracked).
-
-## Recently closed — v1.0 audit changeset (committed)
-
-All 14 audit findings closed; senior review APPROVE with 12/14 fully closed
-and failing-on-pre-fix regressions. M-1 and M-2 were code-verified (reviewer
-traced the sentinel wiring and the domain key plumbing); their audit-mandated
-regression tests were missing at commit time and landed later in the TODO
-board sweep — see "Recently closed — TODO board sweep" above. Summary:
-
-- H-1 credential echo — sanitizeLocation covers both raw-echo branches;
-  terminal-response Location also redacted in observe.go.
-- H-2 outcome-vocabulary amendment — AGENTS.md §0 item 6, verified against
-  the techintel/urlintel sticky flag chains end-to-end.
-- M-1 classification — tlsHandshakeError sentinel at DialTLSContext, typed
-  TLS set incl. tls.RecordHeaderError, exact-equality header-cap abort,
-  no text fallback.
-- M-2 cache key — declared domain in probeKey; narrow records unreachable
-  by broader-scope runs.
-- M-3 urlintel userinfo — redacted at the single ingest construction point.
-- M-4 secrentel diagnostics — redactedCandidateID at all four rejection sites.
-- M-5 jsintel content binding — AnalyzedHash cross-validated; stale never
-  served; silent self-heal.
-- M-6 jsintel redirects — non-http(s) targets observed-not-followed.
-- M-7 detect fingerprints — full field coverage + provenance, SchemaVersion 2,
-  old records self-invalidate.
-- M-8 techintel NaN — rejected at load and decode, neutralized in
-  deriveConfidence.
-- M-9 techintel digest — fingerprint-DB content digest in cache keys,
-  computed once per run.
-- L-10 report — zero-byte render parts rejected + self-heal.
-- L-11 report — mdEscape doubles backslashes before pipes.
-- L-20 version 1.0.0 + UA bump; L-21 CI pinned to go.mod; README/
-  ARCHITECTURE/AGENTS synced.

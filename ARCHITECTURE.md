@@ -1,5 +1,53 @@
 # RavenRecon Architecture
 
+## Reader's map (agents, read this first)
+
+This file is a reference, not a novel — never read it in full. Read only
+the sections relevant to the task at hand (typically one or two); the map
+below is the index. Line ranges describe the current file state — if an
+edit shifts them, re-grep the `^#` headings and refresh the table.
+
+| Section | Lines | What's inside |
+|---|---:|---|
+| Purpose | 51-72 | what the framework is: layer split; adapters are not the architecture |
+| Planned architecture | 72-174 | historical target diagram — read only for context on why, never as current state |
+| Asset model | 175-222 | typed asset model, identity/dedup, provenance, merge — the one normalization point |
+| Pipeline requirements | 223-236 | cross-cutting stage requirements: cancellation, bounding, caching, determinism |
+| External tools | 237-252 | adapter rules: structured args, context, safe output capture; no shell interpolation |
+| Concurrency | 253-267 | bounded-concurrency rules; context.Context for long-running operations |
+| Rate limiting | 268-282 | central token-bucket limiter in the runtime; what stages must add themselves |
+| Cache and resume | 283-426 | persistent fs cache: crash-safe writes, self-healing, schema-versioned keys |
+| Cache and resume — keys | 291-312 | key composition: schema version, config, tool version, operation, normalized target |
+| Cache and resume — records | 313-321 | record shape, statuses, strict decode re-validation |
+| Cache and resume — backend | 322-349 | filesystem backend layout, atomic writes, self-healing |
+| Cache and resume — outcomes | 350-358 | per-key outcome vocabulary and metrics |
+| Cache and resume — TTL | 359-364 | expiration semantics |
+| Cache and resume — resume semantics | 365-375 | how cache hits resume runs; partial/incomplete never served from cache |
+| Cache and resume — concurrency model | 376-392 | bounded cache access under the runtime pool |
+| Cache and resume — instrumentation | 393-426 | observer option: exactly one canonical hit/miss event per Get |
+| Runtime engine | 427-505 | bounded pool, central rate limiter, cancellation/shutdown, observer bridge; cache-independent |
+| Passive discovery | 506-723 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
+| DNS pipeline | 724-910 | A/AAAA/CNAME resolution into typed observations; library only |
+| HTTP probing | 911-1251 | root-path probes, TLS metadata capture, observations/relationships; library only |
+| URL intelligence | 1252-1464 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
+| Technology detection | 1465-1656 | fingerprint engine + database, analyzers, confidence scoring |
+| JavaScript intelligence | 1657-1865 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
+| Secret intelligence | 1866-2092 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
+| Priority engine | 2093-2295 | scoring catalogs, correlation, attack paths, recommendations |
+| Detection framework | 2296-2810 | Finding model, rule registration, dependency scheduling, execution, metrics |
+| Detection framework — SDK contract | 2515-2719 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story |
+| Detection framework — SDK stability policy | 2720-2810 | versioning contract, reopening criteria |
+| Reporting framework | 2811-2995 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes |
+| Event bus | 2996-3138 | canonical event model + bounded non-blocking bus; observer-only |
+| Terminal observability (TUI) | 3139-3195 | single-goroutine controller, deterministic frames; library only |
+| Configuration precedence | 3196-3209 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3210-3222 | recon-only: what must never be added |
+| v0.3 boundary | 3223-3324 | implemented-vs-planned inventory of every subsystem |
+
+**Before Tier C work on package X: read only its section(s) from this map.**
+
+**Design history lives in the narrative sections; current-state facts are in the per-subsystem sections.**
+
 ## Purpose
 
 RavenRecon is designed as a reconnaissance framework rather than a collection of shell commands.
