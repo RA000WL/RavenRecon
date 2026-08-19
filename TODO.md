@@ -72,7 +72,8 @@ orchestrator; every agent may append or update its own entries.
 ## Open items
 
 ### NEW-13 (HIGH) — v1.3 End-to-end pipeline: `ravenrecon scan` (internal/pipeline)
-- Status: IN PROGRESS (T1 complete pending 3 non-blocking INFOs; T2 next)
+- Status: IN PROGRESS (T1/T2a/T2b VERIFIED; T2c VERIFIED — review APPROVE
+  WITH NITS, all nits closed + gates re-run; T2d next)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -168,6 +169,65 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
    rationale in adapt/doc.go) · T2d adapters
    batch 3 (priority/detect/report) · T3 stage events · T4 determinism
    (discovery clock seam) · T5 hermetic E2E · T6 CLI+docs.
+- SESSION-LOSS AUDIT (2026-08-19, NEW OS — previous machine wiped; all prior
+  local gate evidence gone; re-verified fresh with Go 1.26.6):
+  - Repo state = origin/main @ ec4b7e7 "T2C midwork" (working tree clean).
+    That ONE snapshot commit bundles ALL of internal/pipeline (T1 skeleton +
+    T2a corpus + T2b adapters + T2c adapters) AND the previously-uncommitted
+    docs-compaction wave (AGENTS.md diet, TODO.md compaction, ROADMAP.md
+    v0.x collapse) — a mixed snapshot, not a conventional commit.
+  - T2c was SAVED MID-EDIT. Present: urlintel.go + urlintel_test.go (668
+    lines, 19 tests), jsintel.go + jsintel_test.go (43 tests), techintel.go
+    (346 lines, complete). Gaps: (1) urlintel_test.go:222 one-char syntax
+    typo — `error}{` must be `error) {` — the adapt package does NOT
+    compile (gofmt/vet/test all fail on it; cascade errors at 223-226, 427);
+    (2) techintel_test.go MISSING — the techintel adapter has ZERO test
+    coverage; (3) techintel.go not gofmt-clean (comment-block indent at
+    lines 140-144 + missing trailing newline); (4) no T2c review round was
+    recorded. TODO board was not updated for T2c (still said "T2 next").
+  - FRESH GATE RUN (this machine, workspace as-committed): go build ./...
+    OK; gofmt/vet/test fail ONLY on the urlintel_test.go typo. On a /tmp
+    copy with the typo fixed + gofmt -w: gofmt clean, vet clean, FULL
+    suite passes (all 22 packages), go test -race ./internal/pipeline/...
+    passes (adapt 18.3s incl. the 17s drain test). Test inventory on the
+    copy: discovery 24 / dns 16 / httpprobe 17 / urlintel 19 / jsintel 43
+    (= 119 tests; techintel 0). T1/T2a/T2b code + all T2c adapter code is
+    therefore SOUND — only the three gaps above block green.
+  - ROADMAP.md v1.3 is stale: "Status: planned", zero ticks, despite
+    T1/T2a/T2b/T2c code landed. Also the v1.8 milestone + §5 Phase
+    Ownership Policy (added in the docs wave) are now committed (they were
+    previously deliberately uncommitted — flag if that was unintended).
+  - NEXT ACTIONS: builder fixes the typo (one char), writes
+    techintel_test.go (mirror the discovery/urlintel test shape; adapter
+    documents its contract exhaustively — unit tests must cover the fold
+    table, truncation flags, malformed-vs-failed counting, cancellation
+    joins, non-canonical target fall-through, empty short-circuit), gofmt
+    -w techintel.go; tester runs gates; reviewer round for T2c; then T2d.
+  - T2c IMPLEMENTED (this session, master override — builder agent
+    unavailable again, 2 failed dispatches; precedent: T2a): typo fixed
+    (urlintel_test.go:222 `error}{`→`error) {`), techintel.go gofmt-clean,
+    internal/pipeline/adapt/techintel_test.go added (15 tests: Name, happy
+    path w/ cache-before-execute proof, production-DB default, out-of-
+    domain input filter, empty short-circuit, non-canonical target fall-
+    through, malformed observation → failed + ItemsFailed + diagnostic
+    surfaced, engine config error → failed, cache-diagnostic surfaced,
+    pre-cancelled → cancelled + res.Err=ctx err (Go error nil — adapter
+    convention), engine error + fired ctx → cancelled + errors.Join,
+    nil cache, truncation/overflow mapping table w/ literal flag pin,
+    foldTechOutcome table (9 rows), counters table (6 rows)). Gates run on
+    this machine: gofmt clean, build OK, vet OK, full suite OK, -race
+    ./internal/pipeline/... OK (18.3s). T2c REVIEW (this session):
+    reviewer APPROVE WITH NITS (2 LOW + 3 INFO + 1 accepted INFO). ALL
+    closed: LOW-1 doc clarification added (techintel.go Run malformed
+    paragraph — stage-level failed via the error path vs fold-level
+    never-folded, both pinned); LOW-2 nil-ctx guard added mirroring
+    urlintel.go:203 (Run returns failed + "stage techintel: context must
+    not be nil") + regression TestTechIntelStageNilContext; INFO-3/4
+    test-comment fixes; INFO-5 status line updated; INFO-6 warm cache-hit
+    path accepted as engine-tested, not hermetically forceable through
+    the stage. Gates re-run after nits: gofmt clean, build OK, vet OK,
+    full suite OK, -race ./internal/pipeline/... OK (18.3s). T2c
+    VERIFIED — next: T2d adapters batch 3 (priority/detect/report).
 - Verification: per-task gates (gofmt/test/vet/-race/build); final wave:
   full-suite gates + reviewer sign-off + TODO close.
 

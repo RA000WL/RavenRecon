@@ -219,7 +219,7 @@ func TestURLIntelStageToolSelection(t *testing.T) {
 	}
 	for _, tt := range tests {
 		// Script whichever tool the case selects: "path arg1 arg2 ...".
-		script := map[string]func(discovery.Cmd) (discovery.RunResult, error}{
+		script := map[string]func(discovery.Cmd) (discovery.RunResult, error){
 			tt.key: func(discovery.Cmd) (discovery.RunResult, error) {
 				return discovery.RunResult{Stdout: []byte("https://example.com/a\n")}, nil
 			},

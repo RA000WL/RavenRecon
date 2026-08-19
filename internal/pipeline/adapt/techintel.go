@@ -123,6 +123,14 @@ func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIn
 // outcome (a malformed observation is a diagnostic, exactly as the discovery
 // adapter treats malformed lines). This is pinned by a unit test.
 //
+// Note on the stage level: the engine surfaces its bounded malformed
+// diagnostic as a joined run error, so a run that CONTAINS a malformed
+// observation reports failed through the adapter's error path (the outcome
+// the stage-level test pins) — the "never folded" claim above applies to the
+// pure fold over the report's counts (foldTechOutcome), not to the error
+// path. The engine's own behavior never changes either way: the observation
+// is counted, never analyzed.
+//
 // Outcome mapping (engine observation status → pipeline outcome; the engine
 // folds its per-observation statuses into Report.Observations counts):
 //
@@ -137,11 +145,11 @@ func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIn
 // precedence (adapt/doc.go "Unified outcome mapping", MEDIUM-1 review
 // unification): cancelled > failed&&!completed > completed > partial —
 //
-//	1. any cancelled entry                                -> cancelled
-//	2. any failed entry and no completed entry            -> failed
-//	3. no failed and no cancelled entry                   -> completed
-//	   (vacuously true for an empty report)
-//	4. otherwise (completed mixed with failed entries)    -> partial
+//  1. any cancelled entry                                -> cancelled
+//  2. any failed entry and no completed entry            -> failed
+//  3. no failed and no cancelled entry                   -> completed
+//     (vacuously true for an empty report)
+//  4. otherwise (completed mixed with failed entries)    -> partial
 //
 // Cancellation note: per-entry cancellations with a still-live stage context
 // mean the ENGINE's own teardown cut the entries (for example the engine's
@@ -176,6 +184,10 @@ func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIn
 // Truncated+empty-flags downgrade never fires because the flag is always set
 // alongside Truncated.
 func (s *techIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
+	if ctx == nil {
+		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
+			fmt.Errorf("stage %s: context must not be nil", s.Name())
+	}
 	// Boundary filter, input side (adapt/doc.go): the corpus may carry URLs
 	// outside the declared scope (other root domains, IP literals, zero
 	// URLs). filterURLs operates on canonical hostnames only — the single
