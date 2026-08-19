@@ -107,4 +107,51 @@
 //     document content, so a meaningful adapter requires the
 //     results/document channel (T3); a no-op stage would violate the
 //     no-placeholder rule (AGENTS §5).
+//
+// T2d conventions (priority / detect / report):
+//
+//   - priority consumes the in-scope corpus (domains, hosts, URLs) as one
+//     priority.Signal per asset — domains/hosts contribute their canonical
+//     name as the hostname field, URLs contribute path, hostname, and the
+//     parameter names derived from the canonical query string (the corpus
+//     URL asset carries the query; the derivation is deterministic because
+//     the canonical query's keys are sorted). Catalogs come from the
+//     constructor seam: nil/nil = production tables; a single provided
+//     catalog is completed with an explicit EMPTY counterpart (the engine
+//     digests the pair and rejects a nil catalog). Produces NO corpus
+//     additions: surfaces/groups/attack-paths are results (T3).
+//   - detect consumes the in-scope corpus as core-graph asset identities in
+//     the engine snapshot (domains/hosts/URLs only — every other snapshot
+//     channel needs the results/document channel, T3). The registry comes
+//     from the constructor seam: nil = the EMPTY registry (D2 — no rules
+//     ship with the framework). The empty-input short-circuit fires only
+//     when BOTH the filtered corpus AND the registry are empty: rules
+//     without RequiredAssetTypes genuinely execute against an empty corpus,
+//     so an empty corpus alone never skips the engine. Produces NO corpus
+//     additions: findings are results (T3). FindingsTruncated (the engine's
+//     fixed maxFindingsPerRun cap) maps to Truncated + the
+//     detect_findings_truncated sticky flag; the engine reports the
+//     truncated run's outcome as incomplete, so the stage reports partial
+//     with the flag set.
+//   - report consumes the in-scope corpus into the engine Context
+//     (Target/StartedAt/EndedAt/Domains/Hosts/URLs — StartedAt and EndedAt
+//     are both the stage's single honest clock "now", because the pipeline
+//     tracks no run bracket yet; every other Context channel needs the
+//     results/document channel, T3). The registry comes from the
+//     constructor seam: nil = the engine's default registry (json, csv,
+//     markdown, html). The stage NEVER short-circuits: rendering the
+//     (possibly empty) report is its work, so the engine always runs.
+//     OutputDir passes straight through (in.OutputDir); an empty OutputDir
+//     is the engine's validation error → failed. The report engine has no
+//     Rate/Burst configuration, so those bounds are unused by this stage.
+//     Produces NO corpus additions (it writes files).
+//   - Truncation absence, pinned: the priority and report engines report
+//     no truncation/overflow signals through these adapters' input paths
+//     (priority's report has no retention caps; the report renderer has
+//     none either), so those two adapters never set Truncated or a sticky
+//     flag — a future engine cap must surface there (AGENTS §0.6).
+//   - The declared target itself is never added to any engine input: the
+//     engines run over the corpus as the earlier stages produced it — the
+//     target domain is scored/detected/reported only when the corpus
+//     carries it.
 package adapt
