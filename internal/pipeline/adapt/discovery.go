@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,17 @@ import (
 // which could collide across engines in the report's StickyFlags map
 // (LOW-3 review finding).
 const discoveryTruncatedFlag = "discovery_truncated"
+
+// discoveryQualityFlag is the sticky-flag name this adapter sets when the
+// discovery data-quality gate fires (NEW-22). It mirrors the
+// priority_groups_truncated flag's chain: the engine's applied gate writes the
+// issues into the cache record (quality_issues), a warm cache hit replays them
+// verbatim (sticky), the adapter maps any issue to this flag (flagged≠failed),
+// and the runner/exposers preserve it (stage flags → summary → JSON). The
+// completed-with-flag carve-out is legal per AGENTS §0.6.
+//
+// discovery_quality_flagged is a stage-level sticky flag (like priority_groups_truncated) — it lives in StageRecord.StickyFlags, survives cache replay, and is not auto-merged to RunReport.StickyFlags; consumers must check stage flags.
+const discoveryQualityFlag = "discovery_quality_flagged"
 
 // discoveryStage adapts the passive-subdomain-discovery engine
 // (internal/discovery) to the pipeline Stage contract.
@@ -157,6 +169,7 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		Now: func() time.Time {
 			return in.Clock.Now()
 		},
+		Quality: qualityConfigFromParams(in.Config),
 	}
 
 	report, err := discovery.Run(ctx, in.Target, cfg)
@@ -165,8 +178,19 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// observations into Additions (LOW-2 review finding): the only
 		// populated-report+error path is a forced pool shutdown, whose report
 		// carries the sources that did run, and the runner merges a failed
-		// stage's additions anyway.
+		// stage's additions anyway. The quality flag is preserved even on
+		// error paths: a gate abort (qualityGateError) returns a populated
+		// report with QualityIssues alongside the error.
 		additions := discoveryAdditions(in, report)
+		var qflags map[string]bool
+		if len(report.QualityIssues) > 0 {
+			qflags = map[string]bool{discoveryQualityFlag: true}
+			if anyTruncated(report.Results) {
+				qflags[discoveryTruncatedFlag] = true
+			}
+		} else if anyTruncated(report.Results) {
+			qflags = map[string]bool{discoveryTruncatedFlag: true}
+		}
 		if ctx.Err() != nil {
 			// The stage context fired (the engine surfaces it as a wrapped
 			// context error, or the pool was forced down after cancellation).
@@ -176,16 +200,23 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 			// join and keeps the cancelled classification (INFO-1 review
 			// finding, mirroring the httpprobe adapter).
 			joined := fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), err))
-			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: joined, Additions: additions}, nil
+			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: joined, Additions: additions, StickyFlags: qflags, Truncated: len(qflags) > 0 && qflags[discoveryTruncatedFlag]}, nil
 		}
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
-		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: additions}, wrapped
+		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: additions, StickyFlags: qflags, Truncated: len(qflags) > 0 && qflags[discoveryTruncatedFlag]}, wrapped
 	}
 
 	truncated := anyTruncated(report.Results)
+	qualityFlagged := len(report.QualityIssues) > 0
 	var flags map[string]bool
-	if truncated {
-		flags = map[string]bool{discoveryTruncatedFlag: true}
+	if truncated || qualityFlagged {
+		flags = make(map[string]bool)
+		if truncated {
+			flags[discoveryTruncatedFlag] = true
+		}
+		if qualityFlagged {
+			flags[discoveryQualityFlag] = true
+		}
 	}
 	res := pipeline.StageResult{
 		Outcome:        foldReportOutcome(report.Results),
@@ -243,6 +274,42 @@ func sourcesParam(params map[string]string) []string {
 		return nil // empty selection: engine default, every built-in source
 	}
 	return out
+}
+
+// qualityConfigFromParams reads the data-quality gate StageParams keys
+// defensively (NEW-22). Recognized keys (all optional, unknown keys ignored):
+//
+//	quality_max_per_source        int   (>0)
+//	quality_divergence_ratio      float (>0)
+//	quality_divergence_min_count  int   (>0)
+//	quality_abort_on_flag         bool  ("1", "true", "yes" — case-insensitive)
+//
+// Zero or absent values normalize to DefaultQualityConfig via
+// NormalizeQualityConfig; parse failures are ignored (the default wins).
+func qualityConfigFromParams(params map[string]string) discovery.QualityConfig {
+	var qc discovery.QualityConfig
+	if v, ok := params["quality_max_per_source"]; ok {
+		if iv, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			qc.MaxPerSource = iv
+		}
+	}
+	if v, ok := params["quality_divergence_ratio"]; ok {
+		if fv, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			qc.DivergenceRatio = fv
+		}
+	}
+	if v, ok := params["quality_divergence_min_count"]; ok {
+		if iv, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			qc.DivergenceMinCount = iv
+		}
+	}
+	if v, ok := params["quality_abort_on_flag"]; ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			qc.AbortOnFlag = true
+		}
+	}
+	return discovery.NormalizeQualityConfig(qc)
 }
 
 // foldReportOutcome reduces the per-source report statuses to one pipeline

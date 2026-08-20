@@ -1424,7 +1424,18 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   commit → NEW-18/NEW-21 VERIFIED + archived. DO NOT self-close.
 
 ### NEW-22 (HIGH) — Discovery data-quality gate: passive-source pollution cascade (internal/discovery, internal/pipeline)
-- Status: OPEN (addressed in v1.5 refinement)
+- Status: IN PROGRESS — builder round 1 (2026-08-20)
+- ORCHESTRATOR NOTE (transport + scope incident): builder dispatch for
+  the locked contract failed twice at the transport layer (decode error;
+  resume session completed without report). The partial session wrote
+  internal/discovery/quality.go (gate core — kept, tree does NOT compile
+  until wiring lands) then produced an out-of-contract
+  OPTIMIZATION.md audit backlog + ROADMAP status-table rewiring (OPT-P*
+  IDs) and zero wiring. Both discarded (git checkout ROADMAP.md; rm
+  OPTIMIZATION.md) 2026-08-20 by orchestrator — not on any board, not
+  user-requested. Re-dispatch in progress with tightened constraints.
+- Status history: OPEN (addressed in v1.5 refinement) → IN PROGRESS
+  (builder round 1, 2026-08-20)
 - Reporter: master (field-trial evidence, NEW-19 cold run)
 - Owner: (unassigned) | builder at v1.5 dispatch
 - Problem: cold trial on example.com — subfinder v2.15.0 (config clean;
@@ -1447,6 +1458,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: reproduction test with a fake source returning wordlist
   junk → gate trips with an honest flag/abort; real-target rerun shows a
   sane host count for a 1-subdomain domain; gates green.
+- Builder round 1 (2026-08-20): quality.go kept (verified: defaults, Normalize, over_cap, divergence, median, error); fixed pipeline.go compile (storedResult QualityIssues, runSource 3-ret, no double-store, sticky replay) and cache.go; wired adapter (discovery_quality_flagged, qualityConfigFromParams, abort) and cli doctor line; ROADMAP ticked; tests: quality_test.go (cap, divergence, median, old-schema, sticky, abort, determinism) + discovery_quality_test.go (poisoned flag, divergence, abort, pipeline E2E); gates: gofmt clean, go test ./... ok (discovery 78s adapt 17s), vet ok, build ok, race ok, doctor grep quality ok.
 
 ## Operational warnings (all agents)
 

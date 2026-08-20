@@ -47,6 +47,10 @@ type storedResult struct {
 	Malformed int `json:"malformed,omitempty"`
 	// Truncated reports that stdout hit the capture cap at execution time.
 	Truncated bool `json:"truncated,omitempty"`
+	// QualityIssues records the data-quality gate findings for this source
+	// at the time the producing run stored the record (flag-and-continue by
+	// default). Missing in old records decodes as nil — no issues.
+	QualityIssues []QualityIssue `json:"quality_issues,omitempty"`
 }
 
 // decodeStored validates and decodes a stored payload before it may be served

@@ -81,10 +81,20 @@ type Config struct {
 	// defaultDetectTimeout.
 	DetectTimeout time.Duration
 
+	// Quality configures the per-source discovery data-quality gate
+	// (applyQualityGate, v1.5/NEW-22): per-source output caps and
+	// cross-source burst divergence, evaluated at the run join point after
+	// tool output and BEFORE the report is assembled. Zero values normalize
+	// to DefaultQualityConfig via NormalizeQualityConfig. The gate is
+	// deterministic: thresholds are constants, no wall-clock reading, no
+	// burst/anomaly detection (framework-assigned timestamps are
+	// meaningless — documented out of scope).
+	Quality QualityConfig
+
 	// Cache, when non-nil, enables cache-before-execute: each job first
 	// derives the Phase 3 key and returns the stored result on a usable hit;
-	// on a miss it executes the adapter and stores a statused record. Nil
-	// disables caching.
+	// on a miss it executes the adapter and the run stores a statused record
+	// after the quality gate. Nil disables caching.
 	Cache cache.Cache
 
 	// Runner executes tool commands. Nil means ExecRunner (real execution);
@@ -228,6 +238,14 @@ type SourceResult struct {
 	Truncated bool
 	Cached    bool
 	Err       error
+
+	// QualityIssues lists the data-quality gate findings for this source
+	// (SignalOverCap/SignalDivergence; see QualityConfig). Fresh results are
+	// evaluated at the run join point; replayed cache hits re-emit the
+	// issues the producing run recorded (sticky — a flagged record replays
+	// flagged, AGENTS §0.6). Nil means the gate found nothing for this
+	// source.
+	QualityIssues []QualityIssue
 }
 
 // Report is the complete outcome of a discovery run.
@@ -236,6 +254,12 @@ type Report struct {
 	// Results holds one entry per selected source, in selection order. It is
 	// safe to read after Run returns; Run's Shutdown is the join point.
 	Results []SourceResult
+
+	// QualityIssues aggregates the data-quality gate findings across every
+	// per-source result, in selection order (per slot, over_cap before
+	// divergence — the gate never reorders results, T4 selection-order
+	// pin). Replayed cache-hit issues are included. Nil when nothing fired.
+	QualityIssues []QualityIssue
 }
 
 // All merges every source's hosts across the report. Hosts sharing a Phase 2
@@ -324,7 +348,14 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 	}
 
 	// Submit one cache-before-execute job per runnable source. Each job
-	// writes only its own slot, so the results slice is race-free.
+	// writes only its own slot, so the results slice is race-free. runSource
+	// no longer stores the record itself: it returns the pending cache key
+	// and store flag, and Run persists the POST-GATE record below, so the
+	// stored payload carries the gated retained set and the issues the
+	// producing run recorded (the sticky-flag chain's "record written" link,
+	// AGENTS §0.6).
+	keys := make([]cache.Key, len(results))
+	stores := make([]bool, len(results))
 	for i, s := range sources {
 		if results[i].Status == OutSkipped {
 			continue
@@ -344,7 +375,7 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 					}
 				}
 			}()
-			results[i] = runSource(jctx, target, s, results[i].Detection, cfg)
+			results[i], keys[i], stores[i] = runSource(jctx, target, s, results[i].Detection, cfg)
 			return nil, nil
 		}}); err != nil {
 			results[i] = SourceResult{
@@ -370,9 +401,73 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 	shutdownErr := pool.Shutdown(shutCtx)
 	cancel()
 
-	report := Report{Target: target, Results: results}
+	// Data-quality gate (v1.5/NEW-22) — the join point: every per-source
+	// result is complete here, and the gate runs before the report is
+	// assembled or merged. Pass 1 caps fresh sources in place (cached slots
+	// are never re-truncated — their stored data reflects the run that
+	// produced it); pass 2 flags cross-source burst divergence (>= 3
+	// producing sources, strictly-greater ratio boundary; see
+	// applyQualityGate). The gate never reorders results (T4
+	// selection-order pin).
+	qc := NormalizeQualityConfig(cfg.Quality)
+	issues := applyQualityGate(results, qc)
+
+	// Persist the gated record for every slot that executed under a
+	// cacheable identity — AFTER the gate, so the stored payload carries
+	// the retained (post-cap) set and the issues. A cancelled run still
+	// persists its terminal record: the store uses a detached, bounded
+	// context so the write cannot wedge shutdown. Only completed,
+	// unexpired records are ever served as hits; failed, cancelled,
+	// incomplete, and schema-incompatible entries stay distinct miss states.
+	if cfg.Cache != nil {
+		storeCtx := ctx
+		if ctx.Err() != nil {
+			var scancel context.CancelFunc
+			storeCtx, scancel = context.WithTimeout(context.Background(), storeTimeout)
+			defer scancel()
+		}
+		for i := range results {
+			if !stores[i] {
+				continue
+			}
+			res := &results[i]
+			rec := cache.Record{
+				Operation: Operation,
+				Target:    target.Identity().String(),
+				Tool:      cache.ToolInfo{Name: res.Source, Version: res.Version},
+				Status:    statusToCache(res.Status),
+				Meta:      map[string]string{"source": res.Source},
+			}
+			sr := storedResult{
+				Source:        res.Source,
+				Version:       res.Version,
+				Target:        target.Identity().String(),
+				Hosts:         res.Hosts,
+				Malformed:     res.Malformed,
+				Truncated:     res.Truncated,
+				QualityIssues: res.QualityIssues,
+			}
+			if b, merr := json.Marshal(sr); merr == nil {
+				rec.Data = b
+			} else {
+				res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: encode result: %w", res.Source, merr))
+			}
+			if perr := cfg.Cache.Put(storeCtx, keys[i], rec); perr != nil {
+				res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: cache put: %w", res.Source, perr))
+			}
+		}
+	}
+
+	report := Report{Target: target, Results: results, QualityIssues: issues}
 	if shutdownErr != nil {
 		return report, fmt.Errorf("discovery: pool shutdown: %w", shutdownErr)
+	}
+	if qc.AbortOnFlag && len(issues) > 0 {
+		// Abort policy: any gate issue fails the run with a structured
+		// error naming every source+signal (default policy is flag +
+		// continue: the report above carries the issues and the run outcome
+		// is unchanged by flags).
+		return report, fmt.Errorf("discovery: %w", qualityGateError(issues, qc))
 	}
 	return report, nil
 }
@@ -404,14 +499,19 @@ func resolveSourceNames(sel []string) ([]string, error) {
 
 // runSource is one cache-before-execute job body: for known-version tools,
 // derive the Phase 3 key, return the stored result on a usable hit, otherwise
-// execute the adapter, classify, and store a statused record. A record that
-// fails decodeStored is never served as a hit: it is deleted (best-effort)
-// and the job falls through to a fresh execution, so the canonical result of
-// this run replaces the stale record (self-healing). Tools with an unknown
-// version (det.Version == "") are never cached at all — no key, no Get, no
-// Put — and execute fresh on every run (see the policy note at the cache
-// gate below).
-func runSource(ctx context.Context, target asset.Domain, src Source, det Detection, cfg Config) SourceResult {
+// execute the adapter and classify the outcome. It does NOT persist the
+// record itself: the second return value carries the pending cache key and
+// the third whether a store is due; Run writes the record AFTER the
+// data-quality gate so the stored payload carries the gated retained set and
+// the issues the producing run recorded (the sticky-flag chain's "record
+// written" link, AGENTS §0.6 — a later cache hit replays them verbatim).
+// A record that fails decodeStored is never served as a hit: it is deleted
+// (best-effort) and the job falls through to a fresh execution, so the
+// canonical result of this run replaces the stale record (self-healing).
+// Tools with an unknown version (det.Version == "") are never cached at all
+// — no key, no Get, no Put — and execute fresh on every run (see the policy
+// note at the cache gate below).
+func runSource(ctx context.Context, target asset.Domain, src Source, det Detection, cfg Config) (SourceResult, cache.Key, bool) {
 	res := SourceResult{Source: src.Name(), Detection: det, Version: det.Version, Status: OutCompleted}
 	var key cache.Key
 	haveKey := false
@@ -428,7 +528,7 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 		if err != nil {
 			res.Status = OutFailed
 			res.Err = fmt.Errorf("discovery: %s: build cache key: %w", src.Name(), err)
-			return res
+			return res, key, haveKey
 		}
 		key, haveKey = k, true
 		out := cfg.Cache.Get(ctx, key)
@@ -458,7 +558,7 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 				res.Status = OutFailed
 				res.Err = fmt.Errorf("discovery: %s: cached record tool identity %q/%q does not match %q/%q",
 					src.Name(), out.Record.Tool.Name, out.Record.Tool.Version, src.Name(), det.Version)
-				return res
+				return res, key, false
 			}
 			sr, err := decodeStored(out.Record.Data, target, src.Name())
 			if err != nil {
@@ -480,7 +580,8 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 				res.Hosts = sr.Hosts
 				res.Malformed = sr.Malformed
 				res.Truncated = sr.Truncated
-				return res
+				res.QualityIssues = sr.QualityIssues
+				return res, key, false
 			}
 		}
 	}
@@ -494,40 +595,7 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 		res.Err = err
 	}
 
-	if haveKey {
-		rec := cache.Record{
-			Operation: Operation,
-			Target:    target.Identity().String(),
-			Tool:      cache.ToolInfo{Name: src.Name(), Version: det.Version},
-			Status:    statusToCache(res.Status),
-			Meta:      map[string]string{"source": src.Name()},
-		}
-		sr := storedResult{
-			Source:    src.Name(),
-			Version:   det.Version,
-			Target:    target.Identity().String(),
-			Hosts:     dres.Hosts,
-			Malformed: dres.Malformed,
-			Truncated: dres.Truncated,
-		}
-		if b, merr := json.Marshal(sr); merr == nil {
-			rec.Data = b
-		} else {
-			res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: encode result: %w", src.Name(), merr))
-		}
-		// A cancelled run still persists its terminal record: the store uses
-		// a detached, bounded context so the write cannot wedge shutdown.
-		storeCtx := ctx
-		if ctx.Err() != nil {
-			var scancel context.CancelFunc
-			storeCtx, scancel = context.WithTimeout(context.Background(), storeTimeout)
-			defer scancel()
-		}
-		if perr := cfg.Cache.Put(storeCtx, key, rec); perr != nil {
-			res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: cache put: %w", src.Name(), perr))
-		}
-	}
-	return res
+	return res, key, haveKey
 }
 
 // classify maps an adapter outcome plus its context to a run outcome.

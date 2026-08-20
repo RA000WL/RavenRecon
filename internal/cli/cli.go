@@ -423,6 +423,7 @@ Cache:
   TTL:         %s (0 = no expiration)
 Discovery:
   Sources:     %s
+  Quality gate: cap %d, divergence %gx over median (>%d) (defaults; no recent run flag data)
 `,
 		cfg.Concurrency,
 		cfg.Timeout,
@@ -432,6 +433,9 @@ Discovery:
 		cacheDir,
 		cfg.Cache.TTL,
 		sources,
+		discovery.DefaultQualityConfig().MaxPerSource,
+		discovery.DefaultQualityConfig().DivergenceRatio,
+		discovery.DefaultQualityConfig().DivergenceMinCount,
 	); err != nil {
 		return err
 	}

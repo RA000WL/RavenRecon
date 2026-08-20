@@ -305,7 +305,7 @@ func TestRunCancellationDuringSelfHeal(t *testing.T) {
 		defer close(done)
 		src := registry["subfinder"](cfg.env("subfinder"))
 		det := Detection{Source: "subfinder", Status: StatusOK, Version: "v2.6.3", Capable: true}
-		res = runSource(ctx, target, src, det, cfg)
+		res, _, _ = runSource(ctx, target, src, det, cfg)
 	}()
 	<-r.blockStarted
 	cancel()
