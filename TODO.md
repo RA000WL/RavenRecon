@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-17).
+  next free `NEW-n` (currently NEW-22).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1188,6 +1188,265 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   reportFiles so interrupted-render temp files never appear in the summary.
 - Verification: extend TestReportFiles/TestPrintScanSummary with a temp
   file present in the output directory and assert it is not listed.
+
+### NEW-18 (HIGH) — v1.4 Live terminal observability: `ravenrecon scan --tui` (internal/cli)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-20)
+- Reporter: master
+- Owner: builder
+- Problem: v1.2's acceptance criterion "the TUI reconstructs a live run
+  from events alone" has no CLI surface — `internal/tui` is a landed
+  library nobody reaches; ROADMAP v1.4 (user-approved re-scope) is now
+  live terminal observability for `scan`, with the per-engine standalone
+  commands deferred until after v1.5 hardening.
+- Fix (locked decisions): `--tui` + `--tui-compact` flags on
+  `ravenrecon scan` (compact requires tui; tui and --verbose mutually
+  exclusive — one event sink per run); in runScan, one
+  `event.NewBus(nil)` + one bounded subscriber (64) + a controller
+  goroutine (seam `tuiNew func(config.TUIConfig, *event.Subscriber,
+  io.Writer) (tuiRunner, error)`, production adapter `newScanTUI`
+  wrapping tui.NewController, injected at the cli.Run call site);
+  `cfg.Observer = bus` on the --tui path (nil otherwise — zero change);
+  TUIConfig {Enabled, Compact, Color=resolveTUIColor(os.Stderr)} with the
+  rest zero → library defaults; defer after construction: sub.Close →
+  `<-tuiDone` (bounded join) → bus.Close on EVERY return path; a non-nil
+  Run result is a stderr "tui: %v" warning only — exit semantics + summary
+  unchanged; construction errors return before the stages run.
+- Verification: hermetic wiring tests (fake tuiRunner draining its
+  subscriber: 20 events for 10 stages, sequence order, observer wired,
+  summary byte-identical with/without --tui, failed-run semantics
+  unchanged, pre-cancelled promptness + join, write-failure warning,
+  Run-returned-before-runScan-returned ordering); parse rows; pipe → color
+  "off"; gates (gofmt/test/vet/build/-race) + `scan --help` smoke;
+  docs wave (ROADMAP re-scope + deferred list, README, ARCHITECTURE,
+  AGENTS §2, version/UA 1.4.0). Fulfills v1.2's live-reconstruction
+  acceptance note. Orchestrator verifies and closes — never self-closed.
+- IMPLEMENTED (this session, builder; claimed IN PROGRESS at dispatch,
+  never self-closed): the full locked-decision implementation landed —
+  flags (`--tui`, `--tui-compact`; mutual exclusion with `--verbose`
+  listing both flags; compact requires tui), `resolveTUIColor`
+  (ModeCharDevice via Stat; pipe/file/non-*os.File → "off", TTY → "on"),
+  the `tuiRunner` + `scanTUIFactory` seams with the production adapter
+  `newScanTUI` (wraps tui.NewController; wired at the cli.Run scan call
+  site) and a defensive nil-seam guard, and the runScan wiring: after
+  parse → config → cache construction, `event.NewBus(nil)` + one bounded
+  subscriber (64 — ~20 stage events per run documented) + controller
+  goroutine (`go func(){ tuiDone <- ctl.Run(ctx) }()`, buffered result
+  channel); `cfg.Observer = bus` on the --tui path (nil otherwise); a
+  defer registered right after construction runs on EVERY return path:
+  `sub.Close()` (deterministic termination — the controller's loop selects
+  on Done) → `<-tuiDone` (bounded join) → warning `tui: %v` on stderr for
+  any non-nil result (write failure OR the controller reporting
+  ctx.Err() — exit semantics and summary never change) → `bus.Close()`.
+  Construction errors return before the stages run. TUIConfig passed to
+  the seam: {Enabled: true, Compact: <flag>, Color: resolveTUIColor(
+  os.Stderr)} — all other fields zero → library defaults. NEW TESTS
+  (internal/cli/scan_test.go, all hermetic, channels only — no sleeps, no
+  TTY hacks): parse rows (tui, tui+compact, both exclusivity orders,
+  compact-without-tui), TestResolveTUIColor (os.Pipe writer → "off"),
+  TestRunScanTUIWiring (observer wired on the seam capture; 20 events in
+  started/finished alternation with bus sequences 1..20; seam cfg
+  Enabled/Compact from flags; writer == os.Stderr; summary byte-identical
+  to the no-flag run; fake Run returned before runScan returned — the
+  structural join assertion; compact variant), TestRunScanNoFlagObserverNil
+  (zero behavior change), TestRunScanTUIOutcomeUnchanged (failed run:
+  same error + honest summary + joined), TestRunScanTUIWriteFailureIsWarning
+  (stderr captured via os.Pipe swap — no t.Parallel in this package —
+  warning contains "tui:", exit nil, summary printed, joined),
+  TestRunScanTUICancelled (pre-cancelled ctx: prompt return, cancelled
+  summary, seam consulted exactly once, joined, the controller's ctx.Err()
+  surfaced as the honest `tui:` stderr note), TestRunScanTUIRunnerRequired
+  (nil seam + --tui errors before the stages run). Docs wave: ROADMAP v1.4
+  re-scoped (goal + checklist + deferred per-engine commands line,
+  Status stays planned; v1.2 table row notes the later wiring); README
+  Status 1.4.0 + scan flags + TUI wiring paragraph; ARCHITECTURE
+  Terminal-observability "CLI wiring" paragraph + reader's map + event-bus
+  known-limitations + v0.3 boundary + scan-command bullet; AGENTS §2
+  parenthetical + tui bullet; version.go → 1.4.0, config.go UA →
+  RavenRecon/1.4.0 (doctor output coherent — verified). Forced test
+  touch-up: the 9 pre-existing runScan call sites in scan_test.go gained
+  the 5th seam arg (nil) — the only existing-test change, required by the
+  locked signature growth; ALL pre-existing assertions unchanged and green.
+- GATE RECORD (this session, verbatim, in sequence): gofmt -l $(find .
+  -name '*.go' -type f) → clean (empty). go test -count=1
+  ./internal/cli/... ./internal/tui/... ./internal/event/... → ok (cli
+  0.534s, tui 0.036s, event 0.415s). go vet ./... → ok. go build ./... →
+  ok. go build -o /tmp/opencode/ravenrecon ./cmd/ravenrecon && /tmp/
+  opencode/ravenrecon scan --help → full usage incl. --tui/--tui-compact/
+  exclusivity/exit-semantics note; binary smoke: `scan example.com --tui
+  --verbose` → "scan: --tui and --verbose are mutually exclusive" exit 1;
+  `--tui-compact` alone → "requires --tui" exit 1; `--tui --tui-compact`
+  real run completed without hanging (subscriber close/join exercised in
+  production); `version` → 1.4.0; `doctor` → User-Agent RavenRecon/1.4.0
+  (coherent). go test -race -count=1 ./internal/cli/... ./internal/tui/...
+  ./internal/event/... → ok (cli, tui, event all ok, no races). go test
+  -count=1 ./... → ok (25 packages, discovery 75.6s, adapt 17.5s). No
+  production behavior changes outside the locked decisions; working tree
+  left uncommitted.
+- REVIEW ROUND (this session, reviewer; APPROVE WITH NITS — no
+  CRITICAL/HIGH/MEDIUM; 8 INFO findings): FIND-1 (TUI final frame renders
+  after the stdout summary — defer placement; accepted: summary byte-
+  identical + separate streams + strictly sequential writes), FIND-2
+  (resolveTUIColor = char-device probe, canonical stdlib-only isatty
+  approximation; accepted, /dev/null gets harmless color codes), FIND-3
+  ("tui: context canceled" honest warning; accepted; 3a fix below),
+  FIND-4 (nil-seam guard asymmetry vs --verbose; accepted, pinned by
+  test), FIND-5 (FIXED), FIND-6 (join can block on a stuck stderr pipe
+  writer — same exposure as --verbose; accepted), FIND-7/FIND-8 (buffer
+  64 budget + future instrumented stages; accepted, documented drift).
+  FIND-5 FIXED (nit round): bus.Subscribe error path now bus.Close()es
+  before returning (uniform with the ctl-construction path; unreachable
+  on the current API — consistency only). FIND-3a FIXED: scan usage
+  prose now covers both `tui:` warning triggers ("a TUI write failure
+  (for example a broken pipe) or shutdown reason (for example the run
+  context's cancellation) is a 'tui:' warning on stderr only") — matches
+  ARCHITECTURE. NIT-ROUND GATES (verbatim): gofmt clean; go test
+  -count=1 ./internal/cli/... ./internal/tui/... ./internal/event/... →
+  ok; go vet ./... → ok; go build ./... → ok; go build -o
+  /tmp/opencode/ravenrecon ./cmd/ravenrecon → ok; go test -race -count=1
+  ./internal/cli/... → ok. Diff: +3/−1 (scan.go only).
+- ORCHESTRATOR: full-suite gate + field trial + commit + close sequence
+  pending (see NEW-19). DO NOT self-close.
+
+### NEW-19 (INFO) — Field trial: first real-target validation run (cmd/ravenrecon)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-20)
+- Reporter: master
+- Owner: master (orchestrator-run validation; no implementation)
+- Problem: the entire automated suite is hermetic by design (AGENTS §13) —
+  no real-world validation (live DNS/TLS, real discovery tools, real
+  cache behavior, live TUI) has ever been exercised. User requested a
+  real-target taste (2026-08-20).
+- Fix (locked): `scan example.com` (IANA-reserved smoke target), all 10
+  stages, real subfinder/assetfinder/amass (installed); gau/waybackurls/
+  waymore ABSENT → urlintel degrades honestly (adapt/source.go:508-510
+  ErrExecutableNotFound, recorded per-source errors); fresh cache
+  /tmp/opencode/ravenrecon-cache-example; --tui exercises the v1.4 wiring
+  on a long real run; report → /tmp/opencode/ravenrecon-report-example;
+  --timeout 10m per stage. Two passes: cold (population), then warm
+  (cache-hit parity + zero re-execution — the T5 contract at real scale).
+- Verification: cold log (summary/outcomes/errors/timing) + report files
+  + warm-run comparison; any real-world defect found → file NEW-2x
+  finding (severity + file:line + fix), do not fix silently.
+- Status notes: cold run launched in background (binary at launch = pre-
+  micro-fix image; reachable-path behavior identical to final — the
+  micro-fix touched only an unreachable error path + usage prose).
+- FINDING (28m in, user-flagged): NOT hung — pipeline progressing
+  (discovery incl. ~20 min amass, then dns/httpprobe, then urlintel: gau
+  child observed 7+ min in network I/O; cache entries growing). The TUI
+  frames were empty because of NEW-21 (stage events ignored by the TUI
+  state machine), not because the run stalled. Tools gau/waybackurls/
+  waymore confirmed installed (user) — full-stack trial in progress.
+
+### NEW-20 (HIGH) — v1.5 URL-hunting refinement (formerly v1.7): live attack-surface mapping (internal/httpprobe, internal/pipeline/adapt)
+- Status: OPEN (dispatch pending v1.4 close + field-trial evidence NEW-19)
+- Reporter: master
+- Owner: (unassigned) | builder at dispatch
+- Problem: framework misses most bug-bounty-relevant URLs — httpprobe
+  probes hosts never URLs (httpprobe.go:87-88); jsintel analyzer endpoints
+  are results-only, zero corpus additions (jsintel.go:100-102); no
+  per-URL liveness triage; URL corpus = 0 while gau/waybackurls/waymore
+  absent. Full drafted milestone: ROADMAP v1.5 "Refinement deliverable —
+  URL hunting" (2026-08-20, orchestrator).
+- Fix: ProbeURLs engine + `urllive` stage (between secrentel and priority)
+  + jsintel filtered URL additions + new results entity (not asset.URL
+  field) + report URL-status section + AllStages/vocabulary/T4/T5/T6 pins
+  + cache op + ops precondition (install the three urlintel binaries).
+- Verification: as ROADMAP v1.5 acceptance (live statuses end-to-end,
+  JS-extracted → corpus → urllive → priority → report, zero recursion,
+  determinism/cache parity/race/gates, real-target field trial with tools
+  installed).
+- Execution priority: NEXT milestone after v1.4 closes (orchestrator
+  decision 2026-08-20, user delegated "do what is best"); v1.5/v1.6 slide
+  after, content unchanged.
+
+### NEW-21 (HIGH) — TUI renders empty frame on real runs: pipeline stage events ignored by TUI state machine (internal/tui/state.go, internal/pipeline)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-20) — builder fix round records kept below
+  adaptation implemented (state.go maps StageStarted/StageFinished with the
+  event payload fields; render.go gates the worker/throughput sections on
+  their data sources and adds the stage-feed line; summary gains the
+  bounded stage list; render-content tests added in
+  internal/tui/stages_test.go incl. a controller fake-clock live-frame
+  test; internal/cli/scan_test.go gains an additive production-adapter
+  type assertion). Pipeline/event vocabulary/CLI wiring untouched.
+  Reviewer round + field-trial rerun + gates still required before close;
+  fix NOT verified, do NOT self-close.
+- Reporter: master (field-trial evidence)
+- Owner: builder (fix round) | orchestrator (review + verification + close)
+- Problem: field-trial evidence (NEW-19, cold run on example.com): the
+  TUI rendered "phase —" in 7,024/7,024 frames across 28+ minutes while
+  the pipeline progressed through discover → dns → httpprobe → urlintel
+  (gau child observed; cache entries growing to 258 records). The
+  pipeline emits ONLY KindStageStarted/KindStageFinished (T3a). The TUI's
+  State.Apply (internal/tui/state.go:88-130) handles KindScanStarted/
+  Stopped, KindPhaseTransition, KindRunMetadata, KindProgress, KindWorker*,
+  KindTask* — NO case matches a stage event, so every consumed event is
+  ignored: title stays "untitled run", phase —, worker/task/throughput
+  widgets stay empty. Controller.finish also renders an empty final state.
+  The v1.4 hermetic wiring tests asserted transport (event count/order at
+  the subscriber, summary byte-identity) but never rendered frame CONTENT,
+  so the gap was invisible to the suite. v1.4's acceptance ("the TUI
+  reconstructs a live run from events alone") is NOT met in production.
+- Fix (recommended direction): adapt the TUI side, keep the pipeline's
+  stage-event vocabulary stable (it is pinned by T3a tests, event
+  validation, wiring tests, docs): (a) State.Apply maps KindStageStarted →
+  setPhase(stage name) + stage-start timing, KindStageFinished → stage
+  progress/task counting; (b) the worker/throughput/queue widgets have NO
+  data source in production (pipeline emits no task/worker events) —
+  degrade honestly: omit/blank those sections when no task events exist
+  instead of rendering misleading zeros; (c) NEW render-content assertion
+  in the wiring tests: a fake stage-event stream must produce a frame
+  whose phase/title/progress reflect the events (assert rendered text via
+  the controller's writer buffer, not just transport counts). Reviewer
+  round required before v1.4 can close as verified.
+- Verification: TUI wiring test asserting rendered content from stage
+  events; field-trial rerun shows a live phase/progress frame; gates
+  (gofmt/test/vet/build/-race/full suite) green; v1.4 acceptance then
+  VERIFIED → close.
+- NIT ROUND (reviewer, APPROVE WITH NITS): FIND-1 LOW FIXED — summary
+  stage block gate now symmetric (`StagesStarted > 0 || StagesCompleted
+  > 0`, render.go); FIND-2 INFO FIXED — TestStateProgressOnlyKeepsRate
+  GateClosed pins KindProgress-only streams keep the throughput gate
+  closed (stages_test.go); FIND-3 INFO FIXED — docs wave (ARCHITECTURE
+  terminal-observability section + reader's map, README TUI paragraph,
+  ROADMAP v1.4 checklist line); FIND-4/FIND-5 INFO accepted as designed
+  (sanitize preserves LF/CR/TAB by documented contract; lone
+  stage_started renders "stages 0/unknown" under honest-unknown).
+  NIT-ROUND GATES (verbatim): gofmt clean; tui+cli tests ok; vet ok;
+  build ok; race tui ok; event ok; full suite ok (25 pkgs).
+- ORCHESTRATOR DECISION (doc-drift candidates flagged by docs agent,
+  accepted as non-issues): (a) README State-components paragraph reads
+  always-present but describes the MODEL (the model tracks
+  worker/throughput fields); the render-level gating is documented in
+  the TUI paragraph — no change; (b) ARCHITECTURE resource-line
+  ambiguity ("queue depth, active workers" among sampled values) —
+  resources.go carries those fields, render shows heap/goroutines/fds —
+  ambiguous-not-wrong, no change. Both recorded here for history.
+- ORCHESTRATOR: warm-trial evidence (NEW-19) → final gates → v1.4
+  commit → NEW-18/NEW-21 VERIFIED + archived. DO NOT self-close.
+
+### NEW-22 (HIGH) — Discovery data-quality gate: passive-source pollution cascade (internal/discovery, internal/pipeline)
+- Status: OPEN (addressed in v1.5 refinement)
+- Reporter: master (field-trial evidence, NEW-19 cold run)
+- Owner: (unassigned) | builder at v1.5 dispatch
+- Problem: cold trial on example.com — subfinder v2.15.0 (config clean;
+  no bruteforce/wordlist/permutation settings) returned 37,248 wordlist-
+  shaped hosts in one burst (0.0.1.example.com, 0000-forbidden.example.com,
+  zzzzzzzzzzzz.example.com; 31,180 rows with 4-label names; all rows
+  timestamped 13:58:01Z, source=subfinder; assetfinder: 2 rows, amass: 0
+  after 20 min). The framework accepted the entire set → 12,366 probe URLs,
+  1,024 priority groups (truncated flag fired), 32 attack paths, 755
+  recommendations computed over garbage; jsintel 500/500 fetches failed
+  (dead junk hosts). Passive-only contract likely violated at the tool/
+  binary level OR a poisoned source — either way the framework gated
+  nothing.
+- Fix (v1.5 item): per-source output caps + burst-anomaly detection +
+  suspicious-source decision point (flag/abort/continue) before corpus
+  ingestion; hostname sanity validation where syntax-gated (RFC 1035
+  checks); tool-identity verification (binary hash/version pin per
+  discovery source); document per-source normality baselines. Include in
+  the v1.5 checklist (ROADMAP) alongside URL hunting.
+- Verification: reproduction test with a fake source returning wordlist
+  junk → gate trips with an honest flag/abort; real-target rerun shows a
+  sane host count for a 1-subdomain domain; gates green.
 
 ## Operational warnings (all agents)
 
