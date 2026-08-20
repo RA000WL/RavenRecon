@@ -72,7 +72,13 @@ orchestrator; every agent may append or update its own entries.
 ## Open items
 
 ### NEW-13 (HIGH) — v1.3 End-to-end pipeline: `ravenrecon scan` (internal/pipeline)
-- Status: IN PROGRESS (T1/T2a/T2b VERIFIED; T2c VERIFIED — review APPROVE
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-20): v1.3 complete —
+  T6 CLI+docs VERIFIED — review APPROVE WITH NITS (FIND-1 LOW +
+  FIND-2..8 INFO all closed in a fix round, closure re-verified APPROVE,
+  gates re-run), committed 382e218; ROADMAP v1.3 flipped ✅ Complete;
+  this entry CLOSED by the orchestrator (the milestone owns it; all
+  sub-milestones T1..T6 are VERIFIED above)
+- History: T1/T2a/T2b VERIFIED; T2c VERIFIED — review APPROVE
   WITH NITS, all nits closed + gates re-run; T2d VERIFIED — re-review
   APPROVE WITH NITS, all findings closed, gates re-run; T3a stage events
   VERIFIED — review APPROVE (7/7 findings closed, gates re-run), committed
@@ -90,6 +96,9 @@ orchestrator; every agent may append or update its own entries.
   closure re-verified, gates re-run; NEW-3 board header restored),
   committed with this board pass; T6 CLI+docs IMPLEMENTED — see the T6
   record + fix-round record below)
+  (Note: the tail of the History paragraph retains the pre-closure
+  wording "T6 CLI+docs IMPLEMENTED" as written at the time; the closure
+  state is the Status line above.)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
