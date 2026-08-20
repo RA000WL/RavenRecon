@@ -483,8 +483,8 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 			t.Errorf("host %s provenance source = %q, want %q", name, p.Source, src)
 		}
 	}
-	if len(r1.URLs) != 9 {
-		t.Errorf("URLs = %d, want 9 (6 probed roots + 3 urlintel additions, unchanged)", len(r1.URLs))
+	if len(r1.URLs) != 12 {
+		t.Errorf("URLs = %d, want 12 (6 probed roots + 3 urlintel additions + 3 jsintel feedback, unchanged)", len(r1.URLs))
 	}
 	urlSet := make(map[string]bool)
 	for _, u := range r1.URLs {
@@ -560,9 +560,9 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		t.Errorf("finding subject = %s, want a technology identity from the snapshot", res.Findings[0].Subject)
 	}
 	// Surfaces and group members follow the T4-pinned real-discovery
-	// shape: 12 = 3 hosts + 9 URLs (discovery adds no domain surface).
-	if got := len(res.Surfaces); got != 12 {
-		t.Errorf("Surfaces = %d, want 12 (3 hosts + 9 URLs — no domain surface; discovery reports hosts only)", got)
+	// shape: 15 = 3 hosts + 12 URLs (discovery adds no domain surface, jsintel feedback adds 3).
+	if got := len(res.Surfaces); got != 15 {
+		t.Errorf("Surfaces = %d, want 15 (3 hosts + 12 URLs — no domain surface; discovery reports hosts only)", got)
 	}
 	if got := len(res.Groups); got != 1 {
 		t.Fatalf("Groups = %d, want 1 (every surface anchors at example.com)", got)
@@ -570,8 +570,8 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	if got := res.Groups[0].Anchor.String(); got != "domain:example.com" {
 		t.Errorf("group anchor = %s, want domain:example.com", got)
 	}
-	if got := len(res.Groups[0].Members); got != 12 {
-		t.Errorf("group members = %d, want 12", got)
+	if got := len(res.Groups[0].Members); got != 15 {
+		t.Errorf("group members = %d, want 15", got)
 	}
 	if got := len(res.AttackPaths); got != 1 {
 		t.Fatalf("AttackPaths = %d, want 1 (the admin host is a factor-carrying group member)", got)
@@ -620,8 +620,8 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	if !model.StartedAt.Equal(fixedTime) || !model.EndedAt.Equal(fixedTime) {
 		t.Errorf("model bracket = %v..%v, want %v..%v", model.StartedAt, model.EndedAt, fixedTime, fixedTime)
 	}
-	if len(model.Domains) != 0 || len(model.Hosts) != 3 || len(model.URLs) != 9 {
-		t.Errorf("model corpus = %d domains / %d hosts / %d URLs, want 0/3/9 (the real-discovery shape)",
+	if len(model.Domains) != 0 || len(model.Hosts) != 3 || len(model.URLs) != 12 {
+		t.Errorf("model corpus = %d domains / %d hosts / %d URLs, want 0/3/12 (the real-discovery shape with jsintel feedback)",
 			len(model.Domains), len(model.Hosts), len(model.URLs))
 	}
 	if got := len(model.IPs); got != 2 {

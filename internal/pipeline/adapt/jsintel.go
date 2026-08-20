@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/jsintel"
@@ -32,6 +34,143 @@ import (
 // definition and folds the stage to partial, so this adapter never records
 // completed-with-truncation.
 const jsFetchTruncated = "js_fetch_truncated"
+
+// jsURLOverflowFlag is the sticky-flag name this adapter records when the
+// analyzer-derived URL feedback loop hit its per-run cap. Flag is
+// jsintel_url_overflow (overflow, not truncated) per spec — intentional
+// _overflow exception to the <engine>_<what>_truncated convention
+// (adapt/doc.go); distinct from the probe_truncated family; still sets
+// Truncated=true for the honest incomplete carve-out (AGENTS §0.6).
+// Preserved end-to-end (result → RunReport → report), never swallowed.
+// The flag maps the bounded per-run cap on URLs derived from the jsintel
+// analyzer output (endpoints and external URL observations); excess beyond
+// the cap is truncated to the cap deterministically (sorted by canonical
+// URL), Truncated is set, and the stage outcome stays completed (the flag,
+// not the outcome, marks the retained set incomplete).
+const jsURLOverflowFlag = "jsintel_url_overflow"
+
+// jsURLCapDefault is the default per-run cap for analyzer-derived URL
+// additions (endpoint URLs that become corpus URLs). Zero in StageParams
+// means this default (mirroring other adapters' zero-means-default).
+const jsURLCapDefault = 500
+
+// jsURLCap parses the "jsintel_url_cap" StageParam. Absent, empty,
+// unparseable, zero, or negative values resolve to the default (500),
+// mirroring other adapters' zero-means-default normalization.
+func jsURLCap(params map[string]string) int {
+	v, ok := params["jsintel_url_cap"]
+	if !ok {
+		return jsURLCapDefault
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return jsURLCapDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return jsURLCapDefault
+	}
+	return n
+}
+
+// jsCollectURLs derives the in-domain corpus URL additions from the
+// jsintel analyzer output (endpoints and external URL observations).
+// It is the JS → URL feedback loop (OPT-P0-2): endpoint URLs that survive
+// the in-domain filter become corpus URLs for urlintel/urllive/priority.
+//
+// Steps (locked design):
+//
+//  1. Parse via asset.ParseURL (single normalization point) — drop
+//     unparseable (endpoints are already canonical via NewEndpoint, so this
+//     is a re-validation).
+//  2. Keep only in-domain: host is subdomain of target domain (via
+//     filterURLs which uses pipeline.InDomain) — drop evil.com, IP literals,
+//     zero URLs.
+//  3. Dedup against incoming corpus URLs (in.URLs) and within the new set.
+//  4. Bounded per-run cap (configurable via StageParams "jsintel_url_cap",
+//     default 500). Excess beyond cap triggers honest overflow: truncate to
+//     cap, set overflow flag and Truncated.
+//
+// Determinism: dedup keeps first-seen (incoming first), then the survivors
+// are sorted by canonical URL string (deterministic regardless of observation
+// order), then capped deterministically. No new cache operation — URLs are
+// derived from already-cached fetch+analysis. No mutation of input corpus.
+//
+// The source fields are the report's endpoint URLs and external URL
+// observations (the same output at record_analyze.go:176 — analysisData.URLs
+// and JSEntry.Endpoints/URLs). Both are collected so a same-host relative
+// endpoint (e.g. /api/v1/users resolved to http://www.example.com/api/v1/users)
+// and a different-host in-domain endpoint (https://other.example.com/x) are
+// covered. Out-of-domain candidates are dropped by the in-domain filter.
+func jsCollectURLs(report jsintel.Report, target asset.Domain, incoming []asset.URL, cap int) ([]asset.URL, bool) {
+	if cap <= 0 {
+		cap = jsURLCapDefault
+	}
+	if len(report.Entries) == 0 {
+		return nil, false
+	}
+	var candidates []asset.URL
+	for _, e := range report.Entries {
+		for _, ep := range e.Endpoints {
+			if ep.URL.IsZero() {
+				continue
+			}
+			u, err := asset.ParseURL(ep.URL.String(), ep.URL.Prov)
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, u)
+		}
+		for _, u := range e.URLs {
+			if u.IsZero() {
+				continue
+			}
+			pu, err := asset.ParseURL(u.String(), u.Prov)
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, pu)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	filtered := filterURLs(target, candidates)
+	if len(filtered) == 0 {
+		return nil, false
+	}
+	// Dedup against incoming corpus and within the new set.
+	incomingSeen := make(map[asset.Identity]struct{}, len(incoming))
+	for _, u := range incoming {
+		incomingSeen[u.Identity()] = struct{}{}
+	}
+	seen := make(map[asset.Identity]struct{}, len(filtered))
+	var deduped []asset.URL
+	for _, u := range filtered {
+		id := u.Identity()
+		if _, ok := incomingSeen[id]; ok {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		deduped = append(deduped, u)
+	}
+	if len(deduped) == 0 {
+		return nil, false
+	}
+	sort.Slice(deduped, func(i, j int) bool { return deduped[i].String() < deduped[j].String() })
+	overflow := false
+	if len(deduped) > cap {
+		overflow = true
+		deduped = deduped[:cap]
+	}
+	if len(deduped) == 0 {
+		return nil, overflow
+	}
+	return deduped, overflow
+}
 
 // jsIntelStage adapts the JavaScript intelligence engine (internal/jsintel)
 // to the pipeline.Stage contract (internal/pipeline/adapt/doc.go).
@@ -77,6 +216,12 @@ const jsFetchTruncated = "js_fetch_truncated"
 //	unparseable, zero, and negative values resolve to 0, which the engine
 //	treats as its 10 s default; the key name is consistent with the
 //	httpprobe stage.
+//	"jsintel_url_cap" — decimal integer naming the per-run cap for
+//	analyzer-derived URL additions (the JS → URL feedback loop, OPT-P0-2).
+//	Absent, empty, unparseable, zero, and negative values resolve to 500
+//	(the default per-run cap). The cap is enforced after in-domain
+//	filtering, dedup, and sorting; excess beyond the cap is truncated and
+//	reported with Truncated=true and the jsintel_url_overflow sticky flag.
 //
 // Input (in.URLs → Source of candidate Items): every corpus URL maps to ONE
 // Item of kind ItemLine with Line = the URL's canonical string. ItemHTML is
@@ -97,12 +242,14 @@ const jsFetchTruncated = "js_fetch_truncated"
 // cross-domain observation an earlier stage retained — are pre-filtered with
 // the shared URL filter (filterURLs: canonical host via the asset model, IP
 // literals and zero URLs dropped — IPs are never in scope and are not yet in
-// the corpus). The output side: this adapter produces NO corpus additions —
-// scripts, endpoints, and secret candidates are results, propagated through
-// the results channel (T3d, adapt/doc.go) — and it IS the pipeline's
-// document-channel producer: the engine's retained bodies
-// (Config.RetainContent is always enabled here) become pipeline.Documents
-// (jsDocuments).
+// the corpus). The output side: the adapter IS the pipeline's document-channel
+// producer (Config.RetainContent is always enabled here — the engine's
+// retained bodies become pipeline.Documents (jsDocuments)) and the URL corpus
+// feedback producer (analyzer-derived endpoint URLs that survive the in-domain
+// filter become corpus URL additions via Additions.URLs, bounded by the
+// jsintel_url_cap StageParam, sorted deterministically; see jsCollectURLs).
+// Scripts, endpoints, and secret candidates remain results-channel additions
+// (T3d, adapt/doc.go).
 //
 // Empty filtered input short-circuits to completed with zero work (honest
 // no-op) — but only for a canonical target (targetCanonical, the dns/httpprobe
@@ -245,14 +392,39 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 	}
 
 	report, engineErr := jsintel.Run(ctx, cfg, jsintel.SliceSource(items))
-	return s.mapResult(ctx, report, engineErr)
+	cap := jsURLCap(in.Config)
+	urlAdds, urlOverflow := jsCollectURLs(report, in.Target, in.URLs, cap)
+	res, err := s.mapResult(ctx, report, engineErr)
+	// Merge analyzer-derived URL corpus additions (JS → URL feedback loop,
+	// OPT-P0-2): URLs are derived from already-cached fetch+analysis, so no
+	// new cache operation; they are corpus additions (Additions.URLs) and flow
+	// through the same merge path as the corpus (mergeCorpus), deterministic
+	// and deduped. Only report-present paths (success and cancelled-in-flight)
+	// carry additions — engine-error branches return a bare failed/cancelled
+	// result with no usable report (T2c documented), so they carry none.
+	if engineErr == nil {
+		if len(urlAdds) > 0 {
+			res.Additions.URLs = urlAdds
+		}
+		if urlOverflow {
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = map[string]bool{}
+			}
+			res.StickyFlags[jsURLOverflowFlag] = true
+		}
+	}
+	return res, err
 }
 
 // mapResult translates the engine's report and error into the pipeline's
-// fixed outcome vocabulary, counters, and truncation flags. Additions are
-// always empty: scripts, endpoints, and secret candidates are results,
-// propagated through the results channel; the retained bodies flow through
-// the document channel (T3d, adapt/doc.go).
+// fixed outcome vocabulary, counters, and truncation flags. Results-channel
+// additions (scripts, endpoints, secrets) are results, propagated through the
+// results channel; retained bodies flow through the document channel
+// (T3d, adapt/doc.go); analyzer-derived URL additions (the JS → URL feedback
+// loop) flow through Additions.URLs (corpus) and are merged in Run after
+// mapResult — mapResult itself handles only the fetch-truncation flag
+// (js_fetch_truncated); the url-overflow flag is layered in Run.
 func (s *jsIntelStage) mapResult(ctx context.Context, report jsintel.Report, engineErr error) (pipeline.StageResult, error) {
 	// Engine error paths. Errors are wrapped with context and returned;
 	// cancellation is reported through Outcome cancelled with the context
@@ -296,13 +468,14 @@ func (s *jsIntelStage) mapResult(ctx context.Context, report jsintel.Report, eng
 // document-channel additions (the engine's retained bodies — the stage is
 // the pipeline's document producer, T3d), the results-channel additions
 // (the engine report's canonical assets, copied — never rebuilt — per the
-// one-normalization-point rule), and the outcome. Additions stay empty
-// (scripts/endpoints/secrets are results, never corpus values). It is
-// used on the paths where a report exists to merge: the success path and
-// the cancelled-in-flight path (the report's honest retained entries
-// still merge). The engine-error branches return early with a bare
-// failed/cancelled StageResult (T2c behavior — the engine returned no
-// usable report on those paths).
+// one-normalization-point rule), and the outcome. Corpus URL additions
+// (the JS → URL feedback loop) are layered in Run after this function —
+// buildJSResult handles only the fetch-truncation flag (js_fetch_truncated);
+// the url-overflow flag is added in Run. It is used on the paths where a
+// report exists to merge: the success path and the cancelled-in-flight path
+// (the report's honest retained entries still merge). The engine-error
+// branches return early with a bare failed/cancelled StageResult (T2c
+// behavior — the engine returned no usable report on those paths).
 func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,

@@ -371,8 +371,8 @@ func TestT3dEndToEndRun(t *testing.T) {
 	if res.Findings[0].Subject.Kind != asset.KindTechnology {
 		t.Errorf("finding subject = %s, want a technology identity from the snapshot", res.Findings[0].Subject)
 	}
-	if got := len(res.Surfaces); got != 13 {
-		t.Errorf("Surfaces = %d, want 13 (1 domain + 3 hosts + 9 URLs, one surface per completed asset)", got)
+	if got := len(res.Surfaces); got != 16 {
+		t.Errorf("Surfaces = %d, want 16 (1 domain + 3 hosts + 12 URLs — 9 urlintel + 3 jsintel feedback, one surface per completed asset)", got)
 	}
 	if got := len(res.Groups); got != 1 {
 		t.Fatalf("Groups = %d, want 1 (every surface anchors at example.com)", got)
@@ -380,8 +380,8 @@ func TestT3dEndToEndRun(t *testing.T) {
 	if got := res.Groups[0].Anchor.String(); got != "domain:example.com" {
 		t.Errorf("group anchor = %s, want domain:example.com", got)
 	}
-	if got := len(res.Groups[0].Members); got != 13 {
-		t.Errorf("group members = %d, want 13", got)
+	if got := len(res.Groups[0].Members); got != 16 {
+		t.Errorf("group members = %d, want 16", got)
 	}
 	if got := len(res.AttackPaths); got != 1 {
 		t.Fatalf("AttackPaths = %d, want 1 (the admin host is a factor-carrying group member)", got)

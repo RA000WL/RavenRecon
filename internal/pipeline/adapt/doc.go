@@ -103,11 +103,13 @@
 //     additions: its technology/evidence/relationship outputs flow through
 //     the results channel (T3d). Truncation/overflow flags are preserved
 //     honestly (AGENTS §0.6).
-//   - jsintel consumes in.URLs as candidates and produces NO corpus
-//     additions: scripts/endpoints/secret candidates flow through the
-//     results channel, and the retained bodies flow through the document
-//     channel (T3d — the stage is the pipeline's document producer).
-//     Bounded truncated fetches report truncation honestly.
+//   - jsintel consumes in.URLs as candidates and produces bounded
+//     Additions.URLs (jsintel → Additions.URLs feedback edge,
+//     jsintel_url_overflow, via filterURLs) plus results/documents:
+//     scripts/endpoints/secret candidates flow through the results channel,
+//     and the retained bodies flow through the document channel (T3d — the
+//     stage is the pipeline's document producer). Bounded truncated fetches
+//     and URL overflow report truncation honestly.
 //   - secrentel is NOT in this batch: the pipeline corpus carries no
 //     document content, so a meaningful adapter requires the
 //     results/document channel (T3); a no-op stage would violate the
@@ -214,7 +216,8 @@
 //     AttackPaths       priority                                      report
 //
 //     (The document channel is the pipeline-internal jsintel → secrentel
-//     flow; see T3c.)
+//     flow; see T3c. The corpus edge is jsintel → Additions.URLs feedback edge
+//     (bounded via filterURLs, jsintel_url_overflow); see T2c.)
 //
 //   - Consumer adapters apply NO additional scope filtering on the results
 //     channels: results are pipeline-composed (each producer filtered its

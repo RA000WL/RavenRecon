@@ -1032,7 +1032,16 @@ func TestJSIntelStageResultsAndDocumentsProduction(t *testing.T) {
 	if res.ItemsProcessed != 3 || res.ItemsFailed != 0 {
 		t.Fatalf("counters = %d/%d, want 3/0 (app.js + lib.js + the resolved import shared.js)", res.ItemsProcessed, res.ItemsFailed)
 	}
-	assertJSAdditionsEmpty(t, res)
+	// JS → URL feedback loop: in-domain analyzer-derived endpoint URLs become
+	// corpus URL additions (sorted, deduped, filtered). The synthetic bodies
+	// carry 6 endpoints but only the in-domain ones (3 REST + 1 WS, cdn
+	// dropped) survive the filter.
+	requireEqualStrings(t, "Additions.URLs (filtered, sorted)", urlStrings(res.Additions.URLs), []string{
+		"http://api.example.com/api/v2/orders",
+		"http://www.example.com/api/v1/users",
+		"http://www.example.com/shared.js",
+		"wss://example.com/socket",
+	})
 
 	// Results.JavaScript: exactly the three fetched files, canonical assets
 	// copied from the report (never rebuilt — pinned below against a direct

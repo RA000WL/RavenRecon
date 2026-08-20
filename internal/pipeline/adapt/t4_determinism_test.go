@@ -332,8 +332,8 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 	if got := t4HostNames(r1.Hosts); !reflect.DeepEqual(got, wantHosts) {
 		t.Errorf("Hosts = %v, want %v (merged in the sorted All() order)", got, wantHosts)
 	}
-	if len(r1.URLs) != 9 {
-		t.Errorf("URLs = %d, want 9 (6 probed roots + 3 urlintel additions)", len(r1.URLs))
+	if len(r1.URLs) != 12 {
+		t.Errorf("URLs = %d, want 12 (6 probed roots + 3 urlintel additions + 3 jsintel feedback)", len(r1.URLs))
 	}
 
 	// --- Provenance: every corpus host's DiscoveredAt is the injected
@@ -375,8 +375,8 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 	if got := len(res.Findings); got != 1 {
 		t.Errorf("Findings = %d, want 1 (the technology-listing rule)", got)
 	}
-	if got := len(res.Surfaces); got != 12 {
-		t.Errorf("Surfaces = %d, want 12 (3 hosts + 9 URLs; discovery adds no domain surface)", got)
+	if got := len(res.Surfaces); got != 15 {
+		t.Errorf("Surfaces = %d, want 15 (3 hosts + 12 URLs; discovery adds no domain surface)", got)
 	}
 	if got := len(res.Groups); got != 1 {
 		t.Fatalf("Groups = %d, want 1 (every surface anchors at example.com)", got)
@@ -384,8 +384,8 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 	if got := res.Groups[0].Anchor.String(); got != "domain:example.com" {
 		t.Errorf("group anchor = %s, want domain:example.com", got)
 	}
-	if got := len(res.Groups[0].Members); got != 12 {
-		t.Errorf("group members = %d, want 12", got)
+	if got := len(res.Groups[0].Members); got != 15 {
+		t.Errorf("group members = %d, want 15", got)
 	}
 	if got := len(res.AttackPaths); got != 1 {
 		t.Errorf("AttackPaths = %d, want 1 (the admin host is a factor-carrying member)", got)
