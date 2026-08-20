@@ -3348,6 +3348,32 @@ Implemented:
   → Findings — and the report stage consumes the full `Context` from
   this struct (corpus + every results channel, copied whole)
   (`internal/pipeline`)
+* pipeline full-run determinism + the discovery clock seam (see
+  "Pipeline requirements" above; v1.3 T4): the full ten-stage pipeline
+  with the REAL discovery adapter is pinned deterministic at any pool
+  concurrency — per-source discovery result order is selection order
+  (the engine pre-allocates the Results slot array; each job writes only
+  its own slot, never pool-completion order), per-source host lists are
+  deduped and sorted by canonical name, `Report.All()` merges + sorts,
+  the adapter's `discoveryAdditions = FilterHosts(in.Target, All())`
+  preserves that order, and the corpus merge is first-seen — so racing
+  runs produce byte-identical RunReports (three-run DeepEqual at
+  Concurrency 4, incl. provenance at the injected clock with
+  earliest-wins tool-name sources). Cache-hit vs execute parity holds
+  end-to-end over a real filesystem cache: known-version sources are
+  served from cache (zero executions) while the NON-CACHEABLE
+  unknown-version source (assetfinder) executes fresh, and the warm
+  RunReport DeepEquals the cold one with zero new dns/http/jsintel
+  work. T4 also fixed the one cache-parity break the full-run test
+  caught: `asset.NewFinding` normalizes an absent
+  `RelatedAssets`/`Relationships` set to nil (never an empty-but-non-nil
+  slice), so findings replayed from detect cache records DeepEqual
+  freshly normalized ones. The discovery engine's only clocks are the
+  injected seam and nil-clock defaults — the adapter always bridges
+  `Now = in.Clock.Now`, so no wall clock reaches the report; the pool's
+  rate-limiter wall clock gates job starts only and never changes an
+  outcome at the default Timeout 0 (`internal/discovery`,
+  `internal/pipeline/adapt`, `internal/asset`)
 * pipeline document channel + secrentel adapter (see "Pipeline
   requirements" and "Secret intelligence" above; v1.3 T3c): the
   pipeline-internal document channel (`StageResult.Documents` /

@@ -119,6 +119,44 @@
 // faked for external processes. Tool detection runs before the pool, once
 // per selected source, each bounded by DetectTimeout.
 //
+// # Determinism
+//
+// One Run is deterministic in its report for identical inputs — the same
+// target, Config, injected Now clock, cache state, and tool payloads
+// produce a DeepEqual Report. The mechanisms that guarantee it:
+//
+//   - Detection runs sequentially, once per selected source, in selection
+//     order, before any job is submitted.
+//   - Report.Results is pre-allocated in selection order and every pool
+//     job writes only its own slot (pipeline.go Run: the results slice is
+//     sized up front and job i writes results[i]), so the per-source
+//     report order is the SELECTION order at any pool concurrency — never
+//     pool-completion order. Consumers may rely on selection order; they
+//     must never rely on the order in which jobs completed.
+//   - Every per-source host list is deduplicated by Phase 2 identity and
+//     sorted by canonical name (parse.go). Report.All merges across
+//     sources (earliest observation's provenance wins; ties resolve to
+//     the first-encountered source in the deterministic report order) and
+//     sorts the merged list by canonical name (pipeline.go). No
+//     pipeline-consumed ordered output depends on scheduling.
+//   - Provenance timestamps come exclusively from the injected Now seam
+//     (Config.Now; nil defaults to time.Now for standalone and CLI use,
+//     where the wall clock is the honest value). Through the pipeline
+//     adapter the seam is bridged to the pipeline's injected clock, so no
+//     wall clock can reach a pipeline report.
+//   - Cache hits replay the same per-source host set a fresh execution
+//     would produce: the stored payload is the normalized, deduplicated,
+//     sorted result model, and decodeStored re-validates it. Only the
+//     SourceResult.Cached flag differs between the hit and execute paths.
+//
+// Job-start rate limiting and the pool's internal (wall) clock gate START
+// timing only: they can never reorder the report (fixed slots) and never
+// change the contents of a completed job (a job's result is a pure
+// function of the target, the source, and the environment). Run outcomes
+// can depend on real timing only through the documented per-job Timeout
+// and context cancellation, which classify honestly (cancelled) rather
+// than nondeterministically.
+//
 // # Known limitations
 //
 //   - Discovery is passive and stdout-based; tools that write results only

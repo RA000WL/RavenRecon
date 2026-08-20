@@ -339,4 +339,41 @@
 //     engines run over the corpus as the earlier stages produced it — the
 //     target domain is scored/detected/reported only when the corpus
 //     carries it.
+//
+// # T4 — determinism, discovery clock seam
+//
+// The full ten-stage pipeline with the REAL discovery adapter (T3d3 used a
+// seed stage under the discover name by contract) is pinned deterministic:
+//
+//   - Per-source discovery result order is selection order at ANY pool
+//     concurrency: the engine pre-allocates the Results slot array and each
+//     job writes only its own slot (internal/discovery/pipeline.go) — never
+//     pool-completion order. The merged corpus therefore is byte-identical
+//     across racing runs, and the nine downstream stages consume it
+//     identically. Proven by TestT4FullRunDeterminismWithRealDiscovery:
+//     three identical runs (discovery at Concurrency 4) DeepEqual pairwise,
+//     every corpus host's provenance DiscoveredAt is the injected clock
+//     instant with the tool-name source (earliest-wins provenance merge;
+//     ties resolve to the first-encountered source in selection order).
+//   - The discovery stage's clock bridge is the ONLY clock the engine can
+//     see: the adapter passes Now = in.Clock.Now, and the engine's
+//     time.Now defaults fire only when the seam is nil (never, through
+//     this adapter). No wall clock reaches the report; the pool's own
+//     rate-limiter wall clock (runtime/pool.go) only gates job starts and
+//     with the pipeline's default Timeout 0 never changes an outcome.
+//   - Cache-hit vs execute parity holds end-to-end: a warm run over the
+//     same filesystem cache serves the known-version discovery sources
+//     (subfinder, amass) from cache — zero discovery executions — while
+//     the NON-CACHEABLE unknown-version source (assetfinder, capability-
+//     probed with -h) executes fresh; the RunReport DeepEquals the cold
+//     run, with zero new dns queries, http probes, and jsintel fetches on
+//     the warm run (each stage's own cache-before-execute). The urlintel
+//     stage's tool invocation is NOT cached by design (its per-URL
+//     extraction records are), so gau runs once per run.
+//   - Cache parity regression fixed in T4: asset.NewFinding normalizes an
+//     absent RelatedAssets/Relationships set to nil (never an
+//     empty-but-non-nil slice), so a finding replayed from a detect cache
+//     record (decoded, never re-normalized) DeepEquals a freshly
+//     normalized one — the detect engine's cache-hit vs execute
+//     representation mismatch the full-run parity test caught.
 package adapt

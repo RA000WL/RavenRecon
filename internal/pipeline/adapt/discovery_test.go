@@ -52,10 +52,89 @@ type fakeRunner struct {
 	mu     sync.Mutex
 	calls  []fakeCall
 	script map[string]func(discovery.Cmd) (discovery.RunResult, error)
+
+	// barrier, when non-nil, makes Run gate each discovery EXECUTION after
+	// recording the call and before running its script: the invocation
+	// blocks until arm(total) executions have arrived, then proceeds. Nil
+	// (the default) is a no-op — every other test is unaffected. Detections
+	// ("-version"/"-h") never gate.
+	barrier *runnerBarrier
 }
 
 func newFakeRunner(script map[string]func(discovery.Cmd) (discovery.RunResult, error)) *fakeRunner {
 	return &fakeRunner{script: script}
+}
+
+// isDiscoveryExecution classifies invocations the same way the engine's
+// detection probes do: exactly the "-version"/"-h" argv forms are
+// detections; every other invocation is a discovery execution. The runner
+// barrier must gate only executions — detections run sequentially up front
+// and must never block.
+func isDiscoveryExecution(cmd discovery.Cmd) bool {
+	return len(cmd.Args) > 0 && cmd.Args[0] != "-version" && cmd.Args[0] != "-h"
+}
+
+// runnerBarrier is a channel gate a fakeRunner can hold. arm(total)
+// starts a fresh phase; wait blocks a gated invocation until total gated
+// invocations have arrived, then passes. The fakeRunner records the call
+// BEFORE wait, so when the gate opens every gated invocation is already
+// inside Run — the overlap is structural, never by scheduler luck (a
+// pre-entry wrapper cannot do this: the last arriver closes the gate and
+// races ahead, and the woken goroutines sit on its P's runqueue until a
+// lazy steal, so the closer's instant run completes first). Unarmed
+// (total 0) wait passes through; arm(total) must not exceed the pool's
+// worker count (a smaller pool would wait forever for arrivals that stay
+// queued). The gate is a channel, never a sleep.
+type runnerBarrier struct {
+	mu      sync.Mutex
+	total   int
+	arrived int
+	gate    chan struct{}
+}
+
+func (b *runnerBarrier) arm(total int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.total = total
+	b.arrived = 0
+	b.gate = make(chan struct{})
+}
+
+// wait blocks until every gated invocation has arrived, or returns
+// ctx.Err() when the caller's context fires first. Ungated invocations
+// and unarmed barriers pass through.
+func (b *runnerBarrier) wait(ctx context.Context, gated bool) error {
+	if !gated {
+		return nil
+	}
+	b.mu.Lock()
+	if b.total <= 0 {
+		b.mu.Unlock()
+		return nil
+	}
+	b.arrived++
+	if b.arrived == b.total {
+		close(b.gate)
+	}
+	gate := b.gate
+	b.mu.Unlock()
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// armBarrier starts a fresh barrier phase on f: the next total gated
+// (non-detection) invocations all block inside Run until every one has
+// arrived. Runners never armed keep a nil barrier and behave exactly as
+// before.
+func (f *fakeRunner) armBarrier(total int) {
+	if f.barrier == nil {
+		f.barrier = &runnerBarrier{}
+	}
+	f.barrier.arm(total)
 }
 
 // Run implements discovery.Runner.
@@ -70,6 +149,11 @@ func (f *fakeRunner) Run(ctx context.Context, cmd discovery.Cmd, limits discover
 	f.mu.Lock()
 	f.calls = append(f.calls, fakeCall{cmd: cmd, limits: limits})
 	f.mu.Unlock()
+	if f.barrier != nil {
+		if err := f.barrier.wait(ctx, isDiscoveryExecution(cmd)); err != nil {
+			return discovery.RunResult{}, err
+		}
+	}
 	fn, ok := f.script[key]
 	if !ok {
 		return discovery.RunResult{}, fmt.Errorf("fake runner: no script entry for %q", key)

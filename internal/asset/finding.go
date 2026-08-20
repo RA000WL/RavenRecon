@@ -239,7 +239,14 @@ func dedupeEvidence(list []Evidence) []Evidence {
 }
 
 // dedupeFindingIdentities removes duplicates and sorts by identity string.
+// An empty input yields nil, never an empty-but-non-nil slice: the
+// canonical empty-set representation must match what a JSON round-trip
+// (omitempty omits empty slices) produces, so cache-hit replays of stored
+// findings are DeepEqual to freshly normalized ones.
 func dedupeFindingIdentities(list []Identity) []Identity {
+	if len(list) == 0 {
+		return nil
+	}
 	sorted := make([]Identity, len(list))
 	copy(sorted, list)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].String() < sorted[j].String() })
@@ -254,7 +261,12 @@ func dedupeFindingIdentities(list []Identity) []Identity {
 }
 
 // dedupeFindingRelationships removes duplicate edges and sorts by edge ID.
+// An empty input yields nil for the same cache-parity reason as
+// dedupeFindingIdentities.
 func dedupeFindingRelationships(list []Relationship) []Relationship {
+	if len(list) == 0 {
+		return nil
+	}
 	sorted := make([]Relationship, len(list))
 	copy(sorted, list)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID() < sorted[j].ID() })

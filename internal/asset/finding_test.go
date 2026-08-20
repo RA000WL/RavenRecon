@@ -3,6 +3,7 @@ package asset
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -156,6 +157,69 @@ func TestNewFindingDedupesAndSorts(t *testing.T) {
 	}
 	if len(f.Relationships) != 1 {
 		t.Fatalf("relationships not deduplicated: %d", len(f.Relationships))
+	}
+}
+
+// TestFindingEmptySetsAreNil is the T4 cache-parity regression pin: an
+// absent RelatedAssets/Relationships set must normalize to nil, never an
+// empty-but-non-nil slice. The canonical empty-set representation must
+// match what a JSON round-trip produces (omitempty drops empty slices), or
+// a cache-hit replay of a stored finding (decoded, never re-normalized)
+// would differ from a freshly normalized one under DeepEqual — the exact
+// cache-hit vs execute parity break the T4 full-run test caught.
+func TestFindingEmptySetsAreNil(t *testing.T) {
+	base := findingFixture(t)
+	subject := base.Subject
+	ev, err := NewEvidence(MethodDetection, "demo.rule", "signal a", subject, Provenance{})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	f, err := NewFinding(Finding{
+		RuleID:   base.RuleID,
+		RuleName: base.RuleName,
+		Category: base.Category,
+		Subject:  subject,
+		Evidence: []Evidence{ev},
+		Priority: base.Priority,
+		Status:   base.Status,
+		Created:  base.Created,
+		Metadata: map[string]string{"note": "synthetic"},
+		// RelatedAssets and Relationships deliberately absent.
+	})
+	if err != nil {
+		t.Fatalf("NewFinding: %v", err)
+	}
+	if f.RelatedAssets != nil {
+		t.Errorf("RelatedAssets = %#v, want nil (empty sets normalize to the JSON round-trip representation)", f.RelatedAssets)
+	}
+	if f.Relationships != nil {
+		t.Errorf("Relationships = %#v, want nil (empty sets normalize to the JSON round-trip representation)", f.Relationships)
+	}
+	// The JSON round-trip of the normalized finding must be byte-identical
+	// to itself — the storage/replay contract the detect engine's cache
+	// hits rely on.
+	raw, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var back Finding
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(f, back) {
+		t.Errorf("JSON round-trip of a normalized finding is not DeepEqual to itself:\noriginal: %+v\nreplayed: %+v", f, back)
+	}
+	// MergeFindings (the other normalization point) must keep the same
+	// representation for findings whose related sets are empty.
+	m, err := MergeFindings(f, f)
+	if err != nil {
+		t.Fatalf("MergeFindings: %v", err)
+	}
+	if m.RelatedAssets != nil {
+		t.Errorf("merged RelatedAssets = %#v, want nil", m.RelatedAssets)
+	}
+	if m.Relationships != nil {
+		t.Errorf("merged Relationships = %#v, want nil", m.Relationships)
 	}
 }
 

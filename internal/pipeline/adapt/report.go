@@ -174,9 +174,12 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 
 	// The run bracket: the pipeline tracks no per-run timestamps yet, so
 	// the stage's single honest "now" fills both ends (equal values are
-	// valid). The injected clock keeps the result deterministic through
-	// the runner; a nil clock (direct caller) falls back to the wall
-	// clock — the report content itself never carries these timestamps.
+	// valid). On the pipeline path the injected clock always wins and the
+	// bracket is always deterministic — pipeline.Run rejects a nil clock
+	// (run.go:160-161), so the wall-clock fallback below is
+	// DIRECT-CALLER-ONLY: a nil clock can reach this stage only when the
+	// stage is invoked outside the runner. The report content itself never
+	// carries these timestamps.
 	now := time.Now()
 	if in.Clock != nil {
 		now = in.Clock.Now()

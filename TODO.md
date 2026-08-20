@@ -83,7 +83,10 @@ orchestrator; every agent may append or update its own entries.
   fix rounds, closure verified, gates re-run), committed 9da5793; T3d
   adapters results production/consumption VERIFIED — review APPROVE WITH
   NITS (FIND-1..4 LOW/INFO doc fixes closed in a fix round, closure
-  re-verified, gates re-run), committed 9abe2d3; T4 determinism next)
+  re-verified, gates re-run), committed 9abe2d3; T4 determinism VERIFIED —
+  review APPROVE WITH NITS (FIND-1..4 closed in a nit round, closure
+  re-verified, gates re-run), committed with this board pass; T5 hermetic
+  E2E next)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -770,9 +773,78 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   the Google secret candidate value is retained at the engine's bounded
   candidate cap (assert by type, not exact value); the report engine
   validates group members and path steps (shape fixed in the fixture).
-  Existing pipeline tests pass unmodified — the T3d3 delta adds one new
-  test file (t3d_integration_test.go), extends detect_test.go and
-  report_test.go, and changes one doc line in detect.go. No new issues
+Existing pipeline tests pass unmodified — the T3d3 delta adds one new
+   test file (t3d_integration_test.go), extends detect_test.go and
+   report_test.go, and changes one doc line in detect.go. No new issues
+   opened.
+- T4 IMPLEMENTED (this session, builder; claimed IN PROGRESS at session
+  start, never self-closed): full-pipeline determinism + the discovery
+  clock seam, exactly per the orchestrator contract — no deviations.
+  AUDIT RESULT (evidence-complete, no engine/adapter code change
+  warranted): per-source discovery result order is selection order at any
+  pool concurrency (Results slot array pre-allocated in selection order,
+  each job writes only its own slot — internal/discovery/pipeline.go:302,
+  332-355; never pool-completion order — the Concurrency=1 comments in
+  pipeline_test.go are about clock-advance provenance and cancellation,
+  not order); per-source host lists deduped + sorted by canonical name
+  (parse.go:41); Report.All() merges + sorts (pipeline.go:244-260);
+  discoveryAdditions = FilterHosts(in.Target, report.All()) order-
+  preserving (adapt/discovery.go:217-223; scope.go:41-49); mergeCorpus
+  first-seen (corpus.go:17-32); the only time.Now in discovery are the
+  nil-clock defaults (pipeline.go:98,127; detect.go:105) — the adapter
+  always bridges Now = in.Clock.Now (adapt/discovery.go:157-159) and
+  cache CreatedAt never reaches RunReport; the pool/rate-limiter wall
+  clock (runtime/pool.go:190-192) gates job starts only, Timeout 0 →
+  no timing-dependent outcomes; maps (StickyFlags, StageParams, cacheKey
+  Config) never serialized into ordered structures on the RunReport path.
+  PINS LANDED: internal/discovery/pipeline_determinism_test.go (3 tests:
+  TestRunDeterministicAcrossRunsConcurrency — two runs at Concurrency 4
+  DeepEqual the whole report, TestRunDeterministicProvenanceAcrossRuns —
+  fixed-clock DiscoveredAt + earliest-wins tool-name sources,
+  TestRunPerSourceHostsSorted — scrambled tool output → sorted deduped
+  per-source lists, malformed never counted); internal/pipeline/adapt/
+  t4_determinism_test.go (2 tests: TestT4FullRunDeterminismWithRealDiscovery
+  — THREE full ten-stage runs with the REAL discovery adapter at
+  Concurrency 4 DeepEqual pairwise, provenance DiscoveredAt == fixedTime
+  with sources, corpus shapes (0 domains, 3 hosts, 9 URLs, 12 surfaces,
+  1 group anchored domain:example.com with 12 members, 1 attack path, 1
+  finding, documents carry the synthetic key, report model bracket),
+  TestT4FullRunCacheHitParity — warm run over a real FS cache DeepEquals
+  the cold run, discovery executions 3 → 4 (assetfinder only re-executes;
+  subfinder/amass served from cache), zero new dns queries / http probes /
+  jsintel requests, gau runs once per run by design). CACHE-PARITY BUG
+  FOUND + FIXED (the only production change; evidence-based, root-caused
+  via a temporary field-level diff): the detect engine's cache-hit replay
+  decoded stored findings WITHOUT re-normalization, so a finding whose
+  RelatedAssets/Relationships were empty came back nil after the JSON
+  round-trip (omitempty) while a freshly executed finding carried
+  empty-but-non-nil slices (asset.NewFinding's dedupe normalizers always
+  returned non-nil) — DeepEqual broke between cold and warm runs. FIX:
+  dedupeFindingIdentities/dedupeFindingRelationships (internal/asset/
+  finding.go) now return nil for empty input, matching the JSON round-trip
+  representation at the normalization point; Regression test
+  TestFindingEmptySetsAreNil (internal/asset/finding_test.go) pins nil
+  normalization + byte-identical round-trip + MergeFindings parity. No
+  existing test changed. Docs: internal/discovery/doc.go gained a
+  Determinism section (selection-order mechanism, sorted lists, clock
+  seam, cache parity, pool start-gating note); internal/pipeline/adapt/
+  doc.go gained the T4 section (selection order, clock bridge, cache-hit
+  parity incl. the asset finding normalization fix).
+- T4 GATE RECORD (this session, verbatim, all commands actually run):
+  gofmt -l $(find . -name '*.go' -type f) → clean (empty output). go test
+  -count=1 ./internal/pipeline/... ./internal/discovery/... → ok (adapt
+  incl. the two T4 tests; discovery incl. the three new pins — the
+  determinism tests take ~2 s each by design; T4 fix round (FIND-1..4
+  closed in a nit round: Rate 0 + runnerBarrier overlap proof +
+  maxConcurrent>1 assertions + per-run model assertions + report.go
+  comment; determinism tests now ~0 s / full-run ~1.1 s, not ~2 s; gates
+  re-run green — reviewer closure APPROVE)). go vet ./... → ok. go build
+  ./... → ok. go test -race -count=1 ./internal/pipeline/...
+  ./internal/discovery/... ./internal/asset/... ./internal/detect/... →
+  ok (no races; discovery 81.7s under race). Full suite go test -count=1
+  ./... → ok. The T4 parity test failed pre-fix on the finding
+  representation mismatch, passed after the internal/asset fix; the
+  full-run determinism test passed from the first run. No new issues
   opened.
 - Status: DEFERRED
 - Reporter: reviewer
