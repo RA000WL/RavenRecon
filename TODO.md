@@ -1424,7 +1424,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   commit → NEW-18/NEW-21 VERIFIED + archived. DO NOT self-close.
 
 ### NEW-22 (HIGH) — Discovery data-quality gate: passive-source pollution cascade (internal/discovery, internal/pipeline)
-- Status: IN PROGRESS — builder round 1 (2026-08-20)
+- Status: VERIFIED — gate landed (builder round 1 + nits, reviewer CHANGES REQUIRED → nits fixed, gates green, committed b46a110)
 - ORCHESTRATOR NOTE (transport + scope incident): builder dispatch for
   the locked contract failed twice at the transport layer (decode error;
   resume session completed without report). The partial session wrote
