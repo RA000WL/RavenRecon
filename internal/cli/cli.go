@@ -144,7 +144,7 @@ func Run(ctx context.Context, args []string) error {
 		return runDiscover(ctx, os.Stdout, args[1:])
 
 	case "scan":
-		return runScan(ctx, os.Stdout, args[1:], newScanStages)
+		return runScan(ctx, os.Stdout, args[1:], newScanStages, newScanTUI)
 
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)

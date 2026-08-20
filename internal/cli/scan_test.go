@@ -23,6 +23,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/pipeline/adapt"
+	"github.com/RA000WL/RavenRecon/internal/tui"
 )
 
 // The scan command tests below are hermetic: no external tools, no
@@ -124,6 +125,34 @@ func TestParseScanArgs(t *testing.T) {
 			name:     "default output dir",
 			args:     []string{"example.com", "--no-cache"},
 			wantOpts: scanOptions{target: "example.com", noCache: true, outputDir: defaultOutputDir},
+		},
+		{
+			name:     "tui flag",
+			args:     []string{"example.com", "--tui"},
+			wantOpts: scanOptions{target: "example.com", tui: true, outputDir: defaultOutputDir},
+		},
+		{
+			name:     "tui compact flag requires tui",
+			args:     []string{"example.com", "--tui", "--tui-compact"},
+			wantOpts: scanOptions{target: "example.com", tui: true, tuiCompact: true, outputDir: defaultOutputDir},
+		},
+		{
+			name:     "tui and verbose mutually exclusive",
+			args:     []string{"example.com", "--tui", "--verbose"},
+			wantErr:  true,
+			wantErrf: "--tui and --verbose are mutually exclusive",
+		},
+		{
+			name:     "verbose and tui mutually exclusive in either order",
+			args:     []string{"example.com", "--verbose", "--tui"},
+			wantErr:  true,
+			wantErrf: "--tui and --verbose are mutually exclusive",
+		},
+		{
+			name:     "tui compact without tui",
+			args:     []string{"example.com", "--tui-compact"},
+			wantErr:  true,
+			wantErrf: "--tui-compact requires --tui",
 		},
 		{
 			name:     "raw target preserved for normalization",
@@ -627,7 +656,7 @@ func TestRunScanOutcomeMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			err := runScan(context.Background(), &buf, tc.args, fakeScanStages(tc.results, nil))
+			err := runScan(context.Background(), &buf, tc.args, fakeScanStages(tc.results, nil), nil)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("runScan: %v", err)
@@ -648,7 +677,7 @@ func TestRunScanOutcomeMapping(t *testing.T) {
 func TestRunScanFailedStillSummarized(t *testing.T) {
 	var buf bytes.Buffer
 	results := []pipeline.StageResult{{}, {Outcome: pipeline.OutcomeFailed, ItemsFailed: 1, Err: errors.New("boom")}}
-	err := runScan(context.Background(), &buf, []string{"example.com", "--stages", "dns"}, fakeScanStages(results, nil))
+	err := runScan(context.Background(), &buf, []string{"example.com", "--stages", "dns"}, fakeScanStages(results, nil), nil)
 	if err == nil || !strings.Contains(err.Error(), "run outcome failed") {
 		t.Fatalf("want run-outcome-failed error, got %v", err)
 	}
@@ -684,7 +713,7 @@ func TestRunScanValidationErrorsNeverInvokeStages(t *testing.T) {
 				return nil
 			}
 			var buf bytes.Buffer
-			err := runScan(context.Background(), &buf, tc.args, seam)
+			err := runScan(context.Background(), &buf, tc.args, seam, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErrf) {
 				t.Fatalf("want error containing %q, got %v", tc.wantErrf, err)
 			}
@@ -703,7 +732,7 @@ func TestRunScanValidationErrorsNeverInvokeStages(t *testing.T) {
 func TestRunScanTargetNormalized(t *testing.T) {
 	var cfgSink pipeline.ScanConfig
 	var buf bytes.Buffer
-	err := runScan(context.Background(), &buf, []string{" EXAMPLE.COM. "}, fakeScanStages(nil, &cfgSink))
+	err := runScan(context.Background(), &buf, []string{" EXAMPLE.COM. "}, fakeScanStages(nil, &cfgSink), nil)
 	if err != nil {
 		t.Fatalf("runScan: %v", err)
 	}
@@ -746,7 +775,7 @@ func TestRunScanCacheState(t *testing.T) {
 				args[2] = t.TempDir()
 			}
 			var buf bytes.Buffer
-			if err := runScan(context.Background(), &buf, args, fakeScanStages(nil, nil)); err != nil {
+			if err := runScan(context.Background(), &buf, args, fakeScanStages(nil, nil), nil); err != nil {
 				t.Fatalf("runScan: %v", err)
 			}
 			if !strings.Contains(buf.String(), tc.want) {
@@ -772,7 +801,7 @@ func TestRunScanInterrupted(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	start := time.Now()
-	err := runScan(ctx, &buf, []string{"example.com"}, seam)
+	err := runScan(ctx, &buf, []string{"example.com"}, seam, nil)
 	if err == nil {
 		t.Fatal("a cancelled run must return an error")
 	}
@@ -794,6 +823,386 @@ func TestRunScanInterrupted(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TUI wiring (--tui) harness and tests. Hermetic: the fake TUI mirrors the
+// real Controller.Run contract — consume the subscriber's events until it
+// closes or the context is cancelled, then return — so the join assertions
+// below are real ordering guarantees, not sleeps or polls.
+
+// fakeTUI is a hermetic tuiRunner mirroring tui.Controller.Run's contract:
+// it consumes the subscriber's events until the subscriber closes or the
+// context is cancelled, then records its return. cfg/sub/w capture what the
+// seam handed it; events records the consumed stream. err is the injected
+// Run result returned when the subscriber closes (the write-failure path);
+// a cancelled context returns ctx.Err(), exactly like the real controller.
+type fakeTUI struct {
+	mu     sync.Mutex
+	sub    *event.Subscriber
+	cfg    config.TUIConfig
+	w      io.Writer
+	events []event.Event
+	err    error // injected Run result on subscriber close
+
+	// returned records that Run returned; every --tui test asserts it is
+	// true once runScan has returned (the structural bounded-join
+	// guarantee — a missing join leaves the goroutine blocked forever).
+	returned  bool
+	returnErr error
+}
+
+// tuiSeamSnapshot is the immutable capture of what the seam handed the fake
+// and what the fake observed while it ran.
+type tuiSeamSnapshot struct {
+	cfg      config.TUIConfig
+	sub      *event.Subscriber
+	w        io.Writer
+	events   []event.Event
+	returned bool
+}
+
+// newFakeTUIFactory returns the scanTUIFactory seam that hands the fake to
+// runScan and captures the constructed subscription on it.
+func newFakeTUIFactory(f *fakeTUI) scanTUIFactory {
+	return func(cfg config.TUIConfig, sub *event.Subscriber, w io.Writer) (tuiRunner, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.cfg = cfg
+		f.sub = sub
+		f.w = w
+		return f, nil
+	}
+}
+
+// Run implements tuiRunner.
+func (f *fakeTUI) Run(ctx context.Context) error {
+	// An already-cancelled context wins before the loop starts, mirroring
+	// the real controller's documented precedence.
+	if err := ctx.Err(); err != nil {
+		f.recordReturn(err)
+		return err
+	}
+	for {
+		select {
+		case ev := <-f.sub.Events():
+			f.recordEvent(ev)
+		case <-f.sub.Done():
+			f.drainEvents()
+			f.recordReturn(f.err)
+			return f.err
+		case <-ctx.Done():
+			f.drainEvents()
+			f.recordReturn(ctx.Err())
+			return ctx.Err()
+		}
+	}
+}
+
+// drainEvents consumes whatever remains buffered on the subscriber
+// (non-blocking), mirroring the real controller's finish() drain.
+func (f *fakeTUI) drainEvents() {
+	for {
+		select {
+		case ev := <-f.sub.Events():
+			f.recordEvent(ev)
+		default:
+			return
+		}
+	}
+}
+
+func (f *fakeTUI) recordEvent(ev event.Event) {
+	f.mu.Lock()
+	f.events = append(f.events, ev)
+	f.mu.Unlock()
+}
+
+func (f *fakeTUI) recordReturn(err error) {
+	f.mu.Lock()
+	f.returned = true
+	f.returnErr = err
+	f.mu.Unlock()
+}
+
+func (f *fakeTUI) snapshot() tuiSeamSnapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return tuiSeamSnapshot{
+		cfg:      f.cfg,
+		sub:      f.sub,
+		w:        f.w,
+		events:   append([]event.Event(nil), f.events...),
+		returned: f.returned,
+	}
+}
+
+// assertTUIReturned fails the test unless the fake's Run had already
+// returned: after runScan returns, the bounded join (subscriber Close →
+// <-tuiDone) must have completed. A missing join leaves the goroutine
+// blocked on the subscriber forever — the leak this assertion catches.
+func assertTUIReturned(t *testing.T, f *fakeTUI) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.returned {
+		t.Fatal("TUI Run did not return before runScan returned — the join is missing or the fake is still blocked")
+	}
+}
+
+// TestResolveTUIColor pins the color resolution: a pipe writer is not a
+// character device, so --tui renders without color when stderr is piped or
+// redirected (hermetic — no TTY simulation attempted).
+func TestResolveTUIColor(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if got := resolveTUIColor(w); got != "off" {
+		t.Fatalf("resolveTUIColor(os.Pipe writer) = %q, want %q", got, "off")
+	}
+	var buf bytes.Buffer
+	if got := resolveTUIColor(&buf); got != "off" {
+		t.Fatalf("resolveTUIColor(non-file writer) = %q, want %q", got, "off")
+	}
+}
+
+// TestRunScanTUIWiring pins the full --tui wiring end to end: the bus is
+// the run's single event sink (ScanConfig.Observer non-nil on the seam
+// capture), all 20 stage events (10 stages × started+finished) reach the
+// controller's subscriber in order with bus-assigned sequences, the seam
+// receives Enabled/Compact from the flags and os.Stderr as the writer,
+// Controller.Run returns before runScan returns, and the summary is
+// byte-identical to the no-flag run.
+func TestRunScanTUIWiring(t *testing.T) {
+	dir := t.TempDir() // pre-created so both summaries list no report files identically
+	var plain bytes.Buffer
+	if err := runScan(context.Background(), &plain, []string{"example.com", "--output", dir}, fakeScanStages(nil, nil), nil); err != nil {
+		t.Fatalf("no-flag run: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		args        []string
+		wantCompact bool
+	}{
+		{name: "full frame", args: []string{"--tui"}, wantCompact: false},
+		{name: "compact frame", args: []string{"--tui", "--tui-compact"}, wantCompact: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfgSink pipeline.ScanConfig
+			fake := &fakeTUI{}
+			args := append([]string{"example.com", "--output", dir}, tc.args...)
+			var buf bytes.Buffer
+			if err := runScan(context.Background(), &buf, args, fakeScanStages(nil, &cfgSink), newFakeTUIFactory(fake)); err != nil {
+				t.Fatalf("runScan %v: %v", tc.args, err)
+			}
+
+			if cfgSink.Observer == nil {
+				t.Fatal("--tui must wire ScanConfig.Observer to the bus (seam capture saw nil)")
+			}
+			snap := fake.snapshot()
+			if snap.sub == nil {
+				t.Fatal("the TUI seam must receive the subscriber")
+			}
+			if snap.w != os.Stderr {
+				t.Fatalf("the TUI seam writer = %v, want os.Stderr (frames are stderr diagnostics)", snap.w)
+			}
+			if !snap.cfg.Enabled {
+				t.Fatal("seam config Enabled = false, want true")
+			}
+			if snap.cfg.Compact != tc.wantCompact {
+				t.Fatalf("seam config Compact = %v, want %v", snap.cfg.Compact, tc.wantCompact)
+			}
+			if len(snap.events) != 20 {
+				t.Fatalf("controller consumed %d events, want 20 (10 stages × started+finished)", len(snap.events))
+			}
+			for i, ev := range snap.events {
+				wantKind := event.KindStageStarted
+				if i%2 == 1 {
+					wantKind = event.KindStageFinished
+				}
+				if ev.Kind != wantKind {
+					t.Fatalf("event %d kind = %s, want %s (started/finished alternating)", i, ev.Kind, wantKind)
+				}
+				if want := uint64(i + 1); ev.Sequence != want {
+					t.Fatalf("event %d sequence = %d, want %d (bus-assigned, no drops)", i, ev.Sequence, want)
+				}
+			}
+			assertTUIReturned(t, fake)
+			if buf.String() != plain.String() {
+				t.Fatalf("--tui summary differs from the no-flag summary\n--tui:\n%s\nplain:\n%s", buf.String(), plain.String())
+			}
+		})
+	}
+}
+
+// TestNewScanTUIProductionAdapter pins that the production TUI seam
+// returns a real *tui.Controller, not a stub: every render-content
+// contract exercised in internal/tui applies verbatim to the --tui CLI
+// path. (The wiring test above exercises transport through the fake seam;
+// this pins the production adapter itself.)
+func TestNewScanTUIProductionAdapter(t *testing.T) {
+	bus := event.NewBus(nil)
+	sub, err := bus.Subscribe(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { sub.Close(); bus.Close() }()
+
+	ctl, err := newScanTUI(config.TUIConfig{Enabled: true}, sub, io.Discard)
+	if err != nil {
+		t.Fatalf("newScanTUI: %v", err)
+	}
+	if _, ok := ctl.(*tui.Controller); !ok {
+		t.Fatalf("newScanTUI must return a real *tui.Controller, got %T", ctl)
+	}
+}
+
+// TestRunScanNoFlagObserverNil pins the zero-change contract: without
+// --verbose or --tui the ScanConfig.Observer stays nil, so the no-flag
+// path emits nothing and behaves byte-identically to pre-TUI versions.
+func TestRunScanNoFlagObserverNil(t *testing.T) {
+	var cfgSink pipeline.ScanConfig
+	var buf bytes.Buffer
+	if err := runScan(context.Background(), &buf, []string{"example.com"}, fakeScanStages(nil, &cfgSink), nil); err != nil {
+		t.Fatalf("runScan: %v", err)
+	}
+	if cfgSink.Observer != nil {
+		t.Fatalf("no-flag run wired Observer = %v, want nil (zero behavior change)", cfgSink.Observer)
+	}
+}
+
+// TestRunScanTUIOutcomeUnchanged pins that --tui never changes the exit
+// semantics or the summary content: a failed run still returns the
+// run-outcome-failed error with the honest failed summary, and the TUI is
+// joined before runScan returns.
+func TestRunScanTUIOutcomeUnchanged(t *testing.T) {
+	dnsFailed := pipeline.StageResult{Outcome: pipeline.OutcomeFailed, ItemsFailed: 1, Err: errors.New("boom")}
+	fake := &fakeTUI{}
+	var buf bytes.Buffer
+	err := runScan(context.Background(), &buf,
+		[]string{"example.com", "--stages", "dns", "--tui"},
+		fakeScanStages([]pipeline.StageResult{{}, dnsFailed}, nil),
+		newFakeTUIFactory(fake))
+	if err == nil || !strings.Contains(err.Error(), "run outcome failed") {
+		t.Fatalf("want run-outcome-failed error, got %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Outcome: failed") {
+		t.Fatalf("the summary must state the honest failed outcome:\n%s", out)
+	}
+	if !strings.Contains(out, `error="boom"`) {
+		t.Fatalf("the stage failure detail must render:\n%s", out)
+	}
+	assertTUIReturned(t, fake)
+}
+
+// TestRunScanTUIWriteFailureIsWarning pins the TUI failure contract: a
+// non-nil Run result (e.g. a broken frame writer) is a "tui: ..." warning
+// on stderr only; scan's exit semantics and summary are unchanged.
+func TestRunScanTUIWriteFailureIsWarning(t *testing.T) {
+	fake := &fakeTUI{err: errors.New("frame write failed")}
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	var buf bytes.Buffer
+	runErr := runScan(context.Background(), &buf, []string{"example.com", "--tui"}, fakeScanStages(nil, nil), newFakeTUIFactory(fake))
+	w.Close()
+	stderr, _ := io.ReadAll(r)
+	r.Close()
+	if runErr != nil {
+		t.Fatalf("a TUI write failure must not fail the run: %v", runErr)
+	}
+	if !strings.Contains(string(stderr), "tui: frame write failed") {
+		t.Fatalf("stderr missing the tui warning, got: %q", string(stderr))
+	}
+	if !strings.Contains(buf.String(), "Outcome: completed") {
+		t.Fatalf("the summary must still be printed:\n%s", buf.String())
+	}
+	assertTUIReturned(t, fake)
+}
+
+// TestRunScanTUICancelled pins the --tui cancellation path: a pre-cancelled
+// run context returns promptly (the bounded join never hangs), the
+// cancelled summary still prints, the TUI's Run returned (mirroring the
+// real controller's already-cancelled precedence), and the controller's
+// ctx.Err() result surfaces as the documented stderr note — exit semantics
+// unchanged.
+func TestRunScanTUICancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &fakeTUI{}
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	calls := 0
+	seam := func(cfg pipeline.ScanConfig) []pipeline.Stage {
+		calls++
+		return fakeScanStages(nil, nil)(cfg)
+	}
+	var buf bytes.Buffer
+	start := time.Now()
+	err = runScan(ctx, &buf, []string{"example.com", "--tui"}, seam, newFakeTUIFactory(fake))
+	w.Close()
+	stderr, _ := io.ReadAll(r)
+	r.Close()
+	if err == nil {
+		t.Fatal("a cancelled run must return an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want a context.Canceled-wrapped error", err)
+	}
+	if !strings.Contains(err.Error(), "run interrupted") {
+		t.Fatalf("error = %v, want the interrupted-run framing", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cancelled --tui run took %s to return; want prompt cancellation (bounded join)", elapsed)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Outcome: cancelled") {
+		t.Fatalf("the cancelled summary must still be printed:\n%s", out)
+	}
+	if calls != 1 {
+		t.Fatalf("stages seam consulted %d times; want exactly 1 (stages constructed, none invoked)", calls)
+	}
+	assertTUIReturned(t, fake)
+	// The controller reports the cancelled context; the CLI surfaces it as
+	// an honest stderr note, never a changed exit code.
+	if !strings.Contains(string(stderr), "tui:") {
+		t.Fatalf("stderr missing the tui note for the cancelled context, got: %q", string(stderr))
+	}
+}
+
+// TestRunScanTUIRunnerRequired pins the defensive seam guard: --tui without
+// a TUI factory is a usage error that returns before the stages run
+// (construction order: parse → config → cache → TUI → run).
+func TestRunScanTUIRunnerRequired(t *testing.T) {
+	calls := 0
+	seam := func(pipeline.ScanConfig) []pipeline.Stage {
+		calls++
+		return nil
+	}
+	var buf bytes.Buffer
+	err := runScan(context.Background(), &buf, []string{"example.com", "--tui"}, seam, nil)
+	if err == nil || !strings.Contains(err.Error(), "no TUI runner available") {
+		t.Fatalf("want the no-TUI-runner error, got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("stages seam consulted %d times on a --tui construction error; want 0", calls)
+	}
+}
+
 // TestRunScanHelp pins the help paths: runScan prints the usage and
 // returns cleanly for -h, and the CLI dispatcher routes scan help the
 // same way as discover help. The dispatcher-level scan cases below
@@ -801,7 +1210,7 @@ func TestRunScanInterrupted(t *testing.T) {
 // construction): no external tools or networks are involved.
 func TestRunScanHelp(t *testing.T) {
 	var buf bytes.Buffer
-	if err := runScan(context.Background(), &buf, []string{"-h"}, nil); err != nil {
+	if err := runScan(context.Background(), &buf, []string{"-h"}, nil, nil); err != nil {
 		t.Fatalf("scan -h must print usage and succeed, got %v", err)
 	}
 	if !strings.Contains(buf.String(), "RavenRecon scan - end-to-end reconnaissance pipeline") {
@@ -984,7 +1393,7 @@ func TestRunScanSmokeE2E(t *testing.T) {
 		t.Helper()
 		var buf bytes.Buffer
 		args := []string{"example.com", "--output", dir}
-		if err := runScan(context.Background(), &buf, args, stages); err != nil {
+		if err := runScan(context.Background(), &buf, args, stages, nil); err != nil {
 			t.Fatalf("runScan: %v", err)
 		}
 		return buf.String()
@@ -1088,7 +1497,7 @@ func TestRunScanUnknownSourcePassThrough(t *testing.T) {
 			runner := newSmokeRunner()
 			var buf bytes.Buffer
 			args := append(append([]string{}, tc.args...), "--output", t.TempDir())
-			err := runScan(context.Background(), &buf, args, smokeScanStages(runner, tr, &cfgSink))
+			err := runScan(context.Background(), &buf, args, smokeScanStages(runner, tr, &cfgSink), nil)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("runScan: %v", err)

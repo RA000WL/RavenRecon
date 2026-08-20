@@ -4,7 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v1.3.0**
+**v1.4.0**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -15,7 +15,8 @@ for subfinder, assetfinder, and amass (passive mode only).
 An end-to-end pipeline (`internal/pipeline`) composes
 discover → dns → httpprobe → urlintel → techintel → jsintel → secrentel →
 priority → detect → report into one deterministic, cancellable run, exposed
-as the `ravenrecon scan <domain>` command (v1.3).
+as the `ravenrecon scan <domain>` command (v1.3) with live terminal
+observability (`scan --tui`, v1.4) driven by the run's canonical events.
 
 Active infrastructure is landing incrementally: the DNS pipeline
 (`internal/dns`, roadmap v0.6 sub-milestone 5A) and the HTTP probing
@@ -672,9 +673,29 @@ rings, a 64-item interesting feed, a 32-group error feed, 200-byte
 lines, 64 KiB frames) with drop counters exposed on the components that
 drop — loss is measurable, never silent. The package is hermetic: no
 terminal probing, no public Internet, deterministic fake-clock tests
-with an injected resource sampler. There is no CLI command yet — the
-library is a capability for the eventual dashboard command. See
-`ARCHITECTURE.md` ("Terminal observability").
+with an injected resource sampler.
+
+The TUI is wired into `ravenrecon scan` as `--tui` (v1.4): the scan
+command constructs one bus and one bounded subscriber per run, sets the
+bus as the run's single event sink (`ScanConfig.Observer`), and runs the
+controller on one goroutine that renders frames to **stderr** on the
+configured refresh interval — a live stage feed driven by the pipeline's
+stage events (the phase follows the current stage, a `stages N/unknown`
+progress line, and per-stage processed/failed/duration counters in the
+final summary frame), worker dashboard and throughput sections that
+render only when their event sources exist (a stage-only event stream
+carries no worker/task/rate events to feed them), plus interesting
+assets, errors, and one deterministic final summary frame. The frame is
+stderr diagnostics only: the summary on stdout, the output report, and
+the exit codes never change. Color is resolved at the CLI from whether
+stderr is a character device (TTY → `on`; pipes and redirects → `off`);
+`--tui-compact` renders the condensed frame. Termination is
+deterministic: when the run concludes the CLI closes the subscriber, the
+controller's loop returns promptly, the goroutine is joined before the
+command returns, and a TUI write failure (for example a broken pipe) is
+a stderr warning only — it never changes the summary on stdout or the
+exit codes. `--tui` and `--verbose` are mutually exclusive (one event
+sink per run). See `ARCHITECTURE.md` ("Terminal observability").
 
 ## Runtime engine
 
@@ -738,10 +759,12 @@ writes the report into the output directory (default `ravenrecon-report`),
 and exits 0 on completed and partial runs and 1 on failed, cancelled, and
 incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources
 <a,b>` (discovery sources), `--request-timeout <d>`, `--concurrency <n>`,
-`--timeout <d>`, `--cache <dir>`, `--no-cache`, `--output <dir>`, and
-`--verbose` (one line per stage event on stderr). The default run carries no
-detection rules and no active enumeration is ever performed. See
-`ravenrecon scan --help` for the full contract.
+`--timeout <d>`, `--cache <dir>`, `--no-cache`, `--output <dir>`,
+`--verbose` (one line per stage event on stderr), `--tui` (live
+observability frame on stderr — mutually exclusive with `--verbose`), and
+`--tui-compact` (condensed `--tui` frame; requires `--tui`). The default
+run carries no detection rules and no active enumeration is ever
+performed. See `ravenrecon scan --help` for the full contract.
 
 Build:
 

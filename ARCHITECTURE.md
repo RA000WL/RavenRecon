@@ -39,10 +39,10 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Detection framework — SDK stability policy | 2720-2810 | versioning contract, reopening criteria |
 | Reporting framework | 2811-2995 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes |
 | Event bus | 2996-3138 | canonical event model + bounded non-blocking bus; observer-only |
-| Terminal observability (TUI) | 3139-3195 | single-goroutine controller, deterministic frames; library only |
-| Configuration precedence | 3196-3209 | CLI flags → environment → config file → defaults |
-| Safety boundary | 3210-3222 | recon-only: what must never be added |
-| v0.3 boundary | 3224-3388 | implemented-vs-planned inventory of every subsystem |
+| Terminal observability (TUI) | 3141-3233 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
+| Configuration precedence | 3234-3247 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3248-3260 | recon-only: what must never be added |
+| v0.3 boundary | 3261-3487 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -3121,7 +3121,8 @@ classification semantics are unchanged by instrumentation.
 
 ### Known limitations
 
-- No CLI or replay consumes the bus yet; the TUI controller does (see
+- No replay consumes the bus yet; the TUI controller does, and
+  `ravenrecon scan --tui` wires the bus as the run's event sink (see
   "Terminal observability" below). The runtime pool, the pipeline runner,
   and the cache are instrumented (see "Runtime pool instrumentation" above
   and "Cache instrumentation" under "Cache and resume"); loggers and
@@ -3161,28 +3162,43 @@ failed or partial write (including EPIPE) disables rendering for the rest
 of the run while events keep flowing; the controller never panics.
 
 The state machine is single-consumer (the Run goroutine, or a test) and
-projects the stream into the documented components: progress (phase,
-in-flight, honest totals — unknown renders as "unknown", never a faked
-percentage), the worker dashboard (per-worker idle/waiting/running/stopped
-with current task and duration), fixed-window throughput rates over a 10 s
-window (assets, urls, requests, js, rules, relationships, cache hits and
-misses, plus an internal task rate backing the ETA), an ETA estimator
-honest about unknown totals and zero rates, best-effort resource sampling
-on render ticks only (heap, goroutines, open FDs via `/proc/self/fd` on
-Linux, queue depth, active workers — any failure degrades to "—"), a
+projects the stream into the documented components: progress (phase —
+fed by the pipeline's stage events in a scan run, so the live phase is
+the current stage and survives stage_finished, keeping the last stage
+name until the next one starts — in-flight, honest totals — unknown
+renders as "unknown", never a faked percentage), the live stage feed — a
+`stages N/unknown` line (the stream never declares the stage total, so a
+denominator is never fabricated) plus the ordered list of concluded
+stages, bounded to 64 records keeping the run's beginning — the worker
+dashboard (per-worker idle/waiting/running/stopped with current task and
+duration), fixed-window throughput rates over a 10 s window (assets,
+urls, requests, js, rules, relationships, cache hits and misses, plus an
+internal task rate backing the ETA), an ETA estimator honest about
+unknown totals and zero rates, best-effort resource sampling on render
+ticks only (heap, goroutines, open FDs via `/proc/self/fd` on Linux,
+queue depth, active workers — any failure degrades to "—"), a
 rate-limited and deduplicated interesting-asset feed, a severity-ranked
 grouped error feed, and the final run summary derived only from the
-consumed stream. A bounded replay history carries the stream tail in
-sequence order (`MaxEventHistory`, hard cap 4096), so the tail is fully
-replayable.
+consumed stream. The worker dashboard (including queue depth) and the
+throughput section render only when their event sources exist: a stream
+with no Worker*/Task* events shows no dashboard, and one with no
+throughput-recording events shows no rates — honest degradation instead
+of fabricated zeros — while a mixed stream renders all of them. The final
+summary closes with a per-stage block — a `stages completed N · current
+X` header naming the last started stage, then one bounded line per
+concluded stage (`name outcome · N processed · M failed · dur`, plus
+`· truncated` and `· err: …` markers when set). A bounded replay history
+carries the stream tail in sequence order (`MaxEventHistory`, hard cap
+4096), so the tail is fully replayable.
 
 `config.TUIConfig` flows in through `OptionsFromConfig`, which normalizes
 zero fields to the documented defaults (250 ms refresh interval,
 1024-event history, 10 events/s interesting rate) and resolves `Color`
 only for exactly `"on"` — `"auto"` is the caller's terminal detection, and
 the library never probes the terminal, never enters raw mode, never reads
-keys, and never touches signals. Every dynamic string is sanitized at the
-controller boundary (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8
+keys, and never touches signals. Every dynamic string — stage names,
+outcomes, and stage error text included — is sanitized at the controller
+boundary (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8
 stripped; the renderer adds only its own fixed ANSI codes), and every
 structure is bounded — subscriber buffer, history ring, throughput sample
 rings (128 samples per metric), a 64-item interesting feed, a 32-group
@@ -3190,9 +3206,30 @@ error feed, 200-byte lines, 64 KiB frames — with drop counters exposed
 (`History.Dropped`, `InterestingFeed.Dropped`, `ErrorFeed.Dropped`) so
 loss is measurable, never silent. The package is hermetic: deterministic
 fake-clock tests with an injected resource sampler, no terminal probing,
-no public Internet; race and leak tests pin the Run teardown paths. It is
-a library capability only — no CLI command wires it yet (the eventual
-dashboard command is a later item).
+no public Internet; race and leak tests pin the Run teardown paths.
+
+### CLI wiring (`ravenrecon scan --tui`, v1.4)
+
+The scan command wires the controller as the run's live observability
+surface: one `event.NewBus(nil)` (wall clock) and one bounded subscriber
+(64 events) are built after config/cache construction, the bus becomes the
+run's single event sink (`ScanConfig.Observer` — the only observer the
+pipeline runner consults), and the controller runs on exactly one goroutine
+for the run's lifetime. The frame renders to stderr (the summary on stdout
+is the machine-facing result); color is resolved at the CLI from stderr's
+character-device state (`resolveTUIColor`: TTY → `on`, pipe/redirect →
+`off`) and the flags supply `Enabled`/`Compact` (`--tui`, `--tui-compact`).
+Termination is deterministic: after `pipeline.Run` returns on every path,
+a defer closes the subscriber (its `Done` channel ends the controller
+loop), joins the goroutine with a bounded receive (the loop returns
+promptly on `Done`), and closes the bus last (subsequent publishes are
+dropped and counted). A non-nil controller result — a write failure (e.g. a
+broken pipe), or the controller reporting the run context's cancellation —
+is printed as a `tui: ...` warning on stderr, never changing the exit
+codes or the summary. `--tui` and `--verbose` are mutually exclusive (one
+event sink per run), `--tui-compact` requires `--tui`, and controller
+construction errors return before the stages run, mirroring usage errors
+(`internal/cli`).
 
 ## Configuration precedence
 
@@ -3306,7 +3343,9 @@ Implemented:
   consuming a `Subscriber` into sanitized, bounded `State`, live and
   final deterministic frames, `OptionsFromConfig` normalization, bounded
   replay history, and drop counters on every dropping component
-  (`internal/tui`; library only, no CLI wiring yet)
+  (`internal/tui`; library only until v1.4, when `ravenrecon scan --tui`
+  wired it as the run's live stderr surface — see "CLI wiring" under
+  "Terminal observability")
 * cache instrumentation (see "Cache instrumentation" under "Cache and
   resume"; roadmap v1.2): the cache emits exactly one canonical
   `cache_hit`/`cache_miss` event per `Get` through its optional
@@ -3416,9 +3455,13 @@ Implemented:
   `--request-timeout` (httpprobe param), `--concurrency`/`--timeout`
   (per-stage bounds for every selected stage), `--cache`/`--no-cache`
   (mirroring the discover command's cache semantics), `--output` (report
-  directory, default `ravenrecon-report`), and `--verbose` (one line per
-  stage event on stderr via a synchronous `event.Observer`; diagnostics
-  stay off the summary stream). The target is normalized through
+  directory, default `ravenrecon-report`), `--verbose` (one line per
+  stage event on stderr via a synchronous `event.Observer`), and
+  `--tui`/`--tui-compact` (the live observability frame on stderr via the
+  same v1.2 event layer — see "CLI wiring" under "Terminal
+  observability"; `--tui` and `--verbose` are mutually exclusive and
+  `--tui-compact` requires `--tui`; diagnostics stay off the summary
+  stream). The target is normalized through
   `asset.NewDomain` — the single normalization point (uppercase, whitespace,
   and a trailing dot are normalized away; IP literals are rejected).
   Exit semantics: completed/partial → 0 (the summary states the outcome
@@ -3440,7 +3483,5 @@ Planned, not yet implemented:
 * asset store, graph, and graph correlation engine (the priority
   engine's identity-anchored Correlate is landed; relationship traversal
   is not)
-* standalone reporting CLI front-end and terminal UI wiring (report
-  rendering is reachable today only through the scan command's embedded
-  report stage; the TUI itself is a landed library — `internal/tui`, no
-  CLI command yet)
+* standalone reporting CLI front-end (report rendering is reachable today
+  only through the scan command's embedded report stage)

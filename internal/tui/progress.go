@@ -11,7 +11,8 @@ import (
 // totalKnown=false and are rendered as "unknown"/"—"; a percentage is
 // never faked.
 //
-// Event sources: PhaseTransition (phase), Progress (totals), TaskStarted /
+// Event sources: PhaseTransition or StageStarted (phase — the pipeline's
+// stage events name the current stage), Progress (totals), TaskStarted /
 // terminal task events (in-flight count), ScanStarted / ScanStopped (run
 // bounds and outcome), RunMetadata (target).
 type progressState struct {

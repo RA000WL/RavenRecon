@@ -43,15 +43,15 @@ Every phase must satisfy these before it is complete:
 | v0.9 | Secret Intelligence | ✅ Complete | internal/secrentel (Phase 8): evidence engine over bounded docs, 43 patterns / 35-type vocabulary, entropy+context+multi-evidence+multi-factor confidence, secret.scan cache, offline verification queue (46e2a54). |
 | v1.0 | Attack Surface Intelligence / Detection Framework | ✅ Complete | internal/priority + internal/detect landed (ef0e219, 717df6b); 14 audit findings closed (0865b66). Deferred: vulnerability-specific rules, framework CLI wiring, non-identity correlation. |
 | v1.1 | Reporting Framework | ✅ Complete | Presentation-only (never rescans, never mutates): JSON/CSV/Markdown/HTML exporters, run/error summaries, statistics, export validation, atomic writes, report.render cache record (a8b1587). |
-| v1.2 | Eventing, observability, operator feedback | ✅ Complete | Observer-only event bus + pool events via Config.Observer + cache events via WithObserver (one per Get; nil observer = zero change) + internal/tui first consumer (single-goroutine controller, deterministic frames); no CLI wiring yet (a8b3cee). |
+| v1.2 | Eventing, observability, operator feedback | ✅ Complete | Observer-only event bus + pool events via Config.Observer + cache events via WithObserver (one per Get; nil observer = zero change) + internal/tui first consumer (single-goroutine controller, deterministic frames); no CLI wiring yet at the time (wired into `scan --tui` in v1.4) (a8b3cee). |
 | v1.2.5 | SDK and extension API stabilization | ✅ Complete | SDK v1 (Core): frozen Level-1 surface, API 1.0, surface golden + 9 behavior contracts + semantic compat golden, examples pack (internal/detect/examples), stability policy + reopening criteria (bbf23c8, db7a00c). |
-| v1.3 | End-to-end pipeline | ⏳ Planned | — |
-| v1.4 | CLI surface area | ⏳ Planned | — |
-| v1.5 | Robustness and hostile-input hardening | ⏳ Planned | — |
-| v1.6 | Integration and acceptance testing | ⏳ Planned | — |
-| v1.7 | Real-world validation | ⏳ Planned | — |
-| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | — |
-| v2.0 | Detection packs | ⏳ Planned | — |
+| v1.3 | End-to-end pipeline | ✅ Complete | T2d–T6 landed (ad791c3, f31cf3a, 9da5793, 9abe2d3, df3672d, 91074ff, 382e218); ROADMAP/NEW-13 closed. |
+| v1.4 | Live terminal observability | ⏳ In flight | `scan --tui` wired; review APPROVE WITH NITS; NEW-21 (TUI render) fix pending; uncommitted. |
+| v1.5 | Real-world validation, URL hunting, discovery data quality | ⏳ Planned | Next after v1.4 closes (formerly v1.7; re-scoped + renumbered 2026-08-20 so order == execution order). |
+| v1.6 | Robustness and hostile-input hardening | ⏳ Planned | Formerly v1.5 — fuzzing + parser hardening (renumbered 2026-08-20). |
+| v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). |
+| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. |
+| v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. |
 
 ---
 
@@ -133,38 +133,149 @@ Acceptance criteria:
 
 ---
 
-## v1.4 — CLI surface area
+## v1.4 — Live terminal observability
 
-Status: planned
+Status: planned (re-scoped 2026-08-20, user-approved)
 
-Goal: expose each engine as an independently usable command while keeping the UX consistent.
+Goal: wire the terminal observability library (`internal/tui`, v1.2) into
+`ravenrecon scan`: a live frame on stderr driven by the run's canonical
+stage events, terminating deterministically, with scan's exit semantics
+and summary unchanged. This fulfills v1.2's acceptance criterion "the TUI
+reconstructs a live run from events alone" at the CLI level.
 
-- [ ] `ravenrecon discover`
-- [ ] `ravenrecon dns`
-- [ ] `ravenrecon http`
-- [ ] `ravenrecon tech`
-- [ ] `ravenrecon js`
-- [ ] `ravenrecon secrets`
-- [ ] `ravenrecon priority`
-- [ ] `ravenrecon detect`
-- [ ] `ravenrecon report`
-- [ ] Shared flags
-- [ ] Shared configuration
-- [ ] Consistent output modes
+- [ ] `ravenrecon scan --tui` — live observability frame on stderr while
+      the run progresses (stage lifecycle, worker dashboard, throughput,
+      errors, one deterministic final summary frame); color resolved from
+      os.Stderr's character-device state (TTY → on, pipe/redirect → off);
+      never changes the summary (stdout) or the exit codes
+- [ ] `ravenrecon scan --tui-compact` — condensed frame (no per-worker or
+      resource sections); requires --tui (usage error alone)
+- [ ] `--tui`/`--verbose` mutual exclusion — usage error listing both
+      flags; one event sink per run (the bus or the line observer)
+- [ ] Deterministic termination + bounded join — subscriber Close ends the
+      controller loop, the goroutine is joined before runScan returns on
+      every path, and a TUI write failure is a stderr warning only
+- [ ] Exit semantics and summary unchanged with and without --tui;
+      hermetic wiring tests (event flow, cancellation, write failure,
+      leak-regression ordering)
+- [ ] NEW-21 close-out: TUI consumes the pipeline's real stage events —
+      live stage feed, honest widget degradation, bounded stage list,
+      sanitized strings (fix + render-content tests, reviewer APPROVE
+      WITH NITS)
+
+Deferred (user-approved re-scope): per-engine standalone commands (dns,
+http, tech, js, secrets, priority, detect, report — reconsider after v1.6
+hardening).
 
 Acceptance criteria:
 
-- Every command runs independently with documented flags.
-- Common options behave identically across commands.
-- Output formats are consistent and machine-readable where expected.
-- The CLI uses the same runtime, cache, and asset graph as the pipeline.
-- Help output and example invocations are complete and tested.
+- `scan --tui` renders the live run on stderr while the pipeline runs,
+  driven by stage events alone (proven hermetically through the wiring
+  tests: the bus is the run's event sink and every event reaches the
+  controller's subscriber).
+- The TUI terminates deterministically on run conclusion and joins
+  leak-free on every path (including cancellation), with write failures
+  surfaced as warnings.
+- Exit codes and the summary are identical with and without `--tui`.
+- `--tui` and `--verbose` are mutually exclusive; `--tui-compact` requires
+  `--tui`.
 
 ---
 
-## v1.5 — Robustness and hostile-input hardening
+## v1.5 — Real-world validation, URL hunting, and discovery data quality
 
-Status: planned
+Status: planned (re-scoped 2026-08-20, user-approved; formerly v1.7 —
+renumbered so roadmap order == execution order; NEXT after v1.4 closes)
+
+Goal: validate the system against authorized real targets (the field trial
+running against example.com is this milestone's opening activity) and use
+the evidence to land the two high-value URL-hunting refinements the field
+trial motivates: JS-extracted endpoints must enter the corpus and get
+live-checked, and every corpus URL gains a bounded live-status triage.
+
+Validation checklist:
+
+- [ ] Output quality
+- [ ] False positive rate
+- [ ] False negative rate
+- [ ] Priority scoring accuracy
+- [ ] Technology identification accuracy
+- [ ] Secret suppression quality
+- [ ] Relationship quality in the asset graph
+- [ ] Limited contract revision only if real-world data proves it necessary
+
+Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator):
+
+- [ ] `internal/httpprobe`: new `ProbeURLs(ctx, domain, urls, cfg)` —
+      per-URL headers/status only, redirects observed-not-followed (M-6
+      consistency), TLS metadata reuse, per-URL timeout, bounded pool,
+      existing ProbeFailed/ReasonOther error taxonomy, results sorted by
+      URL (determinism)
+- [ ] jsintel corpus feedback: the adapter additionally emits filtered URL
+      additions (shared `filterURLs`, canonical-host/in-domain, dedupe
+      against incoming corpus, bounded per-run cap with honest overflow
+      reporting) from the analyzer URL output (record_analyze.go:176)
+- [ ] Discovery data-quality gate (field-trial-driven, NEW-22): a single
+      passive source burst of 37,248 wordlist-shaped hosts for
+      example.com (subfinder v2.15.0, config clean) cascaded into
+      12,366 probe URLs, 1,024 priority groups, 32 attack paths, 755
+      recommendations and 500/500 jsintel fetch failures — all garbage.
+      Gate: per-source output caps + burst-anomaly detection + a
+      suspicious-source decision point (flag/abort/continue) BEFORE the
+      corpus is poisoned; verify the local subfinder binary/config
+      (possible tampered build) as part of the fix
+- [ ] urlintel tool hardening (field-trial-driven): per-tool timeouts
+      separate from the stage deadline (gau burned the full 10m stage
+      budget on the trial run; 3 tools × caps stack up); amass opt-in
+      decision (20 min for 0 results on example.com — make it opt-in or
+      hard-timeout by default); jsintel health-based early stop when
+      fetch failures dominate the first batch (500/500 failed on the
+      trial run)
+- [ ] Report-status nit: summary.started_at == ended_at and duration_ms 0
+      (report timestamps the summary write, not the run) — honest run
+      duration in the JSON report
+- [ ] New stage `urllive` inserted between secrentel and priority:
+      discover → dns → httpprobe → urlintel → techintel → jsintel →
+      secrentel → urllive → priority → detect → report; consumes corpus
+      URLs (historical + jsintel-fed), produces live-status records
+- [ ] Live records as a NEW results-channel entity (URL + status + redirect
+      observed + TLS summary) — NOT a field on `asset.URL` (avoids
+      asset-model churn and schema bump); report renderers gain a
+      URL-status section (presentation-only)
+- [ ] Pins updated: AllStages + stage vocabulary, T4 determinism,
+      T5 full-run E2E, T6 --stages rows, cache op type for per-URL liveness
+      (key = schema/op/config-digest/URL)
+- [ ] Precondition (ops, not code): install gau/waybackurls/waymore — the
+      URL corpus is 0 without them
+
+Acceptance criteria:
+
+- Real runs produce actionable, reviewable findings.
+- False positives are measured and reduced.
+- Priority scoring correlates with manual triage value.
+- The system remains stable under messy or contradictory target data.
+- Any SDK reopening is backed by concrete evidence, not preference.
+- Every corpus URL (historical or JS-fed) ends the run with a bounded live
+  status (2xx/4xx/5xx/timeout/refused) in the report.
+- JS-extracted endpoints provably flow analyzer → corpus → urllive →
+  priority → report.
+- Zero recursion; bounded concurrency; honest truncation (per-run URL cap +
+  per-URL caps + flags); fixed outcome vocabulary.
+- Determinism preserved (updated pins); cold/warm cache parity; race-clean;
+  full gate suite green; real-target field trial with the URL tools
+  installed shows live URL counts + statuses + cold/warm parity.
+
+Explicitly out of scope: crawling/spidering or HTML-body link extraction;
+robots.txt/sitemap ingestion (later milestone); active brute force/fuzzing
+(out of charter); new passive URL sources; per-engine commands; asset.URL
+schema change.
+
+---
+
+## v1.6 — Robustness and hostile-input hardening
+
+Status: planned (formerly v1.5; renumbered 2026-08-20 so roadmap order ==
+execution order)
 
 Goal: treat all parsers and ingestion paths as untrusted-input boundaries.
 
@@ -187,9 +298,10 @@ Acceptance criteria:
 
 ---
 
-## v1.6 — Integration and acceptance testing
+## v1.7 — Integration and acceptance testing
 
-Status: planned
+Status: planned (formerly v1.6; renumbered 2026-08-20 so roadmap order ==
+execution order)
 
 Goal: prove the platform works reliably across realistic fixture targets.
 
@@ -211,30 +323,6 @@ Acceptance criteria:
 
 ---
 
-## v1.7 — Real-world validation
-
-Status: planned
-
-Goal: validate the system against authorized targets and use those results to refine existing engines.
-
-- [ ] Output quality
-- [ ] False positive rate
-- [ ] False negative rate
-- [ ] Priority scoring accuracy
-- [ ] Technology identification accuracy
-- [ ] Secret suppression quality
-- [ ] Relationship quality in the asset graph
-- [ ] Limited contract revision only if real-world data proves it necessary
-
-Acceptance criteria:
-
-- Real runs produce actionable, reviewable findings.
-- False positives are measured and reduced.
-- Priority scoring correlates with manual triage value.
-- The system remains stable under messy or contradictory target data.
-- Any SDK reopening is backed by concrete evidence, not preference.
-
----
 
 ## v1.8 — Universal Asset Ingestion Framework
 

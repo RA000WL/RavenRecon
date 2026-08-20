@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/RA000WL/RavenRecon/internal/event"
@@ -109,7 +110,7 @@ func TestHistoryReplayReconstructsTailState(t *testing.T) {
 	}
 
 	a, b := original.Summary(), replay.Summary()
-	if a != b {
+	if !reflect.DeepEqual(a, b) {
 		t.Fatalf("replayed state diverges:\n original %+v\n replay  %+v", a, b)
 	}
 }

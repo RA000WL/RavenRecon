@@ -14,9 +14,11 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/config"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/pipeline/adapt"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
+	"github.com/RA000WL/RavenRecon/internal/tui"
 )
 
 const scanUsage = `RavenRecon scan - end-to-end reconnaissance pipeline
@@ -53,6 +55,14 @@ Options (after the target):
                           working directory).
   --verbose               Print one line per stage event (stage_started /
                           stage_finished) to stderr as the run progresses.
+                          Mutually exclusive with --tui.
+  --tui                   Render a live observability frame on stderr while
+                          the run progresses: stage lifecycle, progress,
+                          worker dashboard, throughput, interesting assets,
+                          errors, and one deterministic final summary
+                          frame. Mutually exclusive with --verbose.
+  --tui-compact           Condense the --tui frame (no per-worker or
+                          resource sections). Requires --tui.
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
@@ -70,6 +80,12 @@ Exit codes:
   1   usage/validation errors, cache open failures, and runs that ended
       failed, cancelled, or incomplete (see the summary); also any run
       interrupted by Ctrl-C/SIGTERM, which is still summarized first.
+
+--tui renders on stderr as the run progresses and never changes the summary
+(stdout) or the exit codes: the frame is live diagnostics, the summary is
+the machine-facing result, and a TUI write failure (for example a broken
+pipe) or shutdown reason (for example the run context's cancellation) is
+a 'tui:' warning on stderr only.
 
 Signals: Ctrl-C or SIGTERM cancels the run gracefully — the partial summary
 is still printed and the exit code is 1. A second signal forces an immediate
@@ -124,6 +140,12 @@ type scanOptions struct {
 	noCache   bool
 	outputDir string
 	verbose   bool
+
+	// tui enables the live observability frame on stderr (--tui); it is
+	// mutually exclusive with verbose. tuiCompact condenses the frame
+	// (--tui-compact) and requires tui.
+	tui        bool
+	tuiCompact bool
 }
 
 // parseScanArgs parses "scan" arguments: exactly one target domain,
@@ -153,6 +175,8 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	outputDir := fs.String("output", "", "report output directory")
 	verbose := fs.Bool("verbose", false, "print stage events to stderr")
+	tuiFlag := fs.Bool("tui", false, "render a live observability frame on stderr")
+	tuiCompact := fs.Bool("tui-compact", false, "condense the --tui frame (requires --tui)")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return scanOptions{}, errScanHelp
@@ -164,11 +188,13 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	}
 
 	opts := scanOptions{
-		target:    args[0],
-		noCache:   *noCache,
-		verbose:   *verbose,
-		cacheDir:  *cacheDir,
-		outputDir: *outputDir,
+		target:     args[0],
+		noCache:    *noCache,
+		verbose:    *verbose,
+		tui:        *tuiFlag,
+		tuiCompact: *tuiCompact,
+		cacheDir:   *cacheDir,
+		outputDir:  *outputDir,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -244,6 +270,18 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		}
 		opts.timeout = d
 	}
+	// --tui and --verbose are mutually exclusive: the frame is the live
+	// observability surface, the one-line-per-event sink is the other; a
+	// run has exactly one event sink (ScanConfig.Observer) and the flags
+	// must never silently pick one. --tui-compact only modifies the frame,
+	// so it requires --tui (a compact frame without a frame is a usage
+	// error, never a silent no-op).
+	if opts.tui && opts.verbose {
+		return scanOptions{}, fmt.Errorf("scan: --tui and --verbose are mutually exclusive")
+	}
+	if opts.tuiCompact && !opts.tui {
+		return scanOptions{}, fmt.Errorf("scan: --tui-compact requires --tui")
+	}
 	// An explicitly empty --cache "" is treated as "no cache directory
 	// flag": scanCache then falls back to the configured/default cache
 	// directory (mirroring an absent flag). An explicitly empty --output
@@ -310,7 +348,7 @@ func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig
 		cfg.StageBounds = bounds
 	}
 
-	// Observer is wired by runScan (only with --verbose), not here.
+	// Observer is wired by runScan (with --verbose or --tui), not here.
 	return cfg, nil
 }
 
@@ -379,6 +417,55 @@ func newScanStages(cfg pipeline.ScanConfig) []pipeline.Stage {
 	}
 }
 
+// tuiSubscriberBuffer is the --tui subscriber buffer size. A full scan run
+// emits exactly ~20 stage events (one started + one finished per stage,
+// synchronously, on every path), so 64 gives comfortable headroom for the
+// controller's drain-at-close and for future instrumented stages (pool and
+// cache events) while staying a small fixed bound — the bus drops (and
+// counts) rather than blocks on a full buffer.
+const tuiSubscriberBuffer = 64
+
+// tuiRunner is the runnable live-observability seam: the production
+// implementation is *tui.Controller (constructed by newScanTUI); tests
+// inject fakes that mirror Controller.Run's contract — consume the
+// subscriber's events until it closes or the context is cancelled, then
+// return promptly.
+type tuiRunner interface {
+	Run(ctx context.Context) error
+}
+
+// scanTUIFactory constructs the TUI runner for a --tui run. It is the
+// constructor seam for the live observability layer, mirroring the stages
+// seam: production call sites pass newScanTUI (cli.go); tests inject
+// fakes. The factory is consulted only when --tui is set.
+type scanTUIFactory func(cfg config.TUIConfig, sub *event.Subscriber, w io.Writer) (tuiRunner, error)
+
+// newScanTUI is the production TUI seam: it adapts tui.NewController to
+// the scanTUIFactory shape. *tui.Controller satisfies tuiRunner.
+func newScanTUI(cfg config.TUIConfig, sub *event.Subscriber, w io.Writer) (tuiRunner, error) {
+	return tui.NewController(cfg, sub, w)
+}
+
+// resolveTUIColor resolves the --tui color mode from the writer the frame
+// renders to: a character device (a real terminal) means "on"; pipes,
+// files, and redirects mean "off". The TUI library renders color only when
+// the resolved mode is exactly "on" — this is the caller-side "auto"
+// resolution, and the library never probes the terminal itself.
+func resolveTUIColor(w io.Writer) string {
+	f, ok := w.(*os.File)
+	if !ok {
+		return "off"
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return "off"
+	}
+	if st.Mode()&os.ModeCharDevice != 0 {
+		return "on"
+	}
+	return "off"
+}
+
 // runScan parses the scan arguments, normalizes the target through
 // asset.NewDomain (the single normalization point), builds the pipeline
 // configuration from the flags, runs the provided stages through
@@ -397,13 +484,16 @@ func newScanStages(cfg pipeline.ScanConfig) []pipeline.Stage {
 //
 // The stages parameter is the hermetic test seam: production call sites
 // pass newScanStages; tests inject fake stage sets. Seams are constructor
-// parameters, never environment or globals.
+// parameters, never environment or globals. tuiNew is the same seam for
+// the live observability layer (--tui): production call sites pass
+// newScanTUI; tests inject fakes.
 //
 // Verbose events go to os.Stderr directly, independent of w (the summary
 // writer): stage events are diagnostics, the summary is the machine-facing
 // output (mirroring how discover separates per-source reports from
-// warnings).
-func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeline.ScanConfig) []pipeline.Stage) error {
+// warnings). The TUI frame also renders to os.Stderr for the same reason
+// (with color resolved from os.Stderr's character-device state).
+func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeline.ScanConfig) []pipeline.Stage, tuiNew scanTUIFactory) error {
 	opts, err := parseScanArgs(args)
 	if err != nil {
 		if errors.Is(err, errScanHelp) {
@@ -427,6 +517,58 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 		// Stage events are emitted synchronously in stage order as the
 		// runner proceeds; the observer prints each one as it arrives.
 		cfg.Observer = &stageObserver{w: os.Stderr}
+	}
+	if opts.tui {
+		// Live observability: one bus, one bounded subscriber, one
+		// controller goroutine. Construction errors return before the
+		// stages run, mirroring every other usage error.
+		if tuiNew == nil {
+			return fmt.Errorf("scan: --tui: no TUI runner available")
+		}
+		bus := event.NewBus(nil) // nil clock = the wall clock
+		sub, err := bus.Subscribe(tuiSubscriberBuffer)
+		if err != nil {
+			bus.Close() // the bus is owned here; no goroutine was started
+			return fmt.Errorf("scan: --tui: subscribe: %w", err)
+		}
+		// Enabled + Compact come from the flags; Color is resolved from
+		// os.Stderr (a character device renders color, pipes/redirects do
+		// not). Every other field stays zero and the library normalizes it
+		// to its documented defaults (250 ms refresh, 1024-event history,
+		// 10/s interesting rate).
+		ctl, err := tuiNew(config.TUIConfig{
+			Enabled: true,
+			Compact: opts.tuiCompact,
+			Color:   resolveTUIColor(os.Stderr),
+		}, sub, os.Stderr)
+		if err != nil {
+			bus.Close() // releases the subscriber; no goroutine was started
+			return fmt.Errorf("scan: --tui: %w", err)
+		}
+		// The bus is the run's single event sink (ScanConfig.Observer is
+		// the only observer the pipeline runner consults) and the
+		// controller consumes the run's stage events through it.
+		cfg.Observer = bus
+		tuiDone := make(chan error, 1) // buffered: Run's result never blocks
+		go func() { tuiDone <- ctl.Run(ctx) }()
+		// Lifecycle (bounded, leak-free): the goroutine above is joined on
+		// EVERY return path via this defer, registered right after
+		// construction. sub.Close() is the deterministic termination — the
+		// controller's Run loop selects on the subscriber's Done channel,
+		// so closing the subscriber ends the stream and Run returns
+		// promptly; the bounded join then guarantees the goroutine is gone
+		// before runScan returns. bus.Close() runs last: with no
+		// subscribers left it drops (and counts) any straggler publishes.
+		// A non-nil Run result (a write failure, or the controller
+		// reporting the run context's cancellation) is a warning on stderr
+		// only — it never changes scan's exit semantics or the summary.
+		defer func() {
+			sub.Close()
+			if terr := <-tuiDone; terr != nil {
+				fmt.Fprintf(os.Stderr, "tui: %v\n", terr)
+			}
+			bus.Close()
+		}()
 	}
 	rep, err := pipeline.Run(ctx, cfg, c, wallClock{}, stages(cfg))
 	if err != nil {

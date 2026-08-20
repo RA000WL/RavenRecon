@@ -45,6 +45,22 @@ type State struct {
 	// tests inject a fixed sampler for deterministic frames).
 	sample func() Resources
 
+	// stages is the live stage feed projected from KindStageStarted /
+	// KindStageFinished events (empty in streams that carry none).
+	stages stageState
+
+	// taskEvents is true once any Worker*/Task* event has been consumed:
+	// the worker/queue widget's data source. False (e.g. a stage-only
+	// pipeline stream) → the renderer omits the widget instead of showing
+	// a fabricated zero dashboard and queue.
+	taskEvents bool
+
+	// rateEvents is true once any throughput-recording event has been
+	// consumed (asset/relationship/request/rule/cache events — the
+	// displayed metrics); false → the throughput widget is omitted,
+	// never rendered as all-zero rates.
+	rateEvents bool
+
 	lastCompleted int // Progress.Completed seen so far (task-rate deltas)
 }
 
@@ -93,6 +109,24 @@ func (s *State) Apply(ev event.Event) {
 			s.progress.outcome = pl.State
 		}
 		s.progress.endedAt = ev.At
+	case event.KindStageStarted:
+		// The stage name becomes the phase (the pipeline's live stage
+		// feed; the current phase is the stage in flight). The start time
+		// is recorded so the final frame and tests can reference it.
+		if pl, ok := ev.Payload.(event.StageStarted); ok {
+			s.stages.started(pl.Name, ev.At)
+			s.progress.setPhase(pl.Name)
+		}
+	case event.KindStageFinished:
+		// One stage entry concluded: the completed counter advances and
+		// the record joins the ordered stage list. The phase is NOT
+		// cleared — the runner emits started→finished pairs in order, and
+		// after the last finished the final frame must still name the
+		// last stage (the next started replaces it).
+		if pl, ok := ev.Payload.(event.StageFinished); ok {
+			s.stages.finished(pl.Name, pl.Outcome, pl.Truncated,
+				pl.ItemsProcessed, pl.ItemsFailed, pl.Duration, pl.Err)
+		}
 	case event.KindPhaseTransition:
 		if pl, ok := ev.Payload.(event.PhaseTransition); ok {
 			s.progress.setPhase(pl.Phase)
@@ -113,38 +147,47 @@ func (s *State) Apply(ev event.Event) {
 	case event.KindWorkerStarted:
 		if pl, ok := ev.Payload.(event.WorkerStarted); ok {
 			s.workers.started(pl.Worker)
+			s.taskEvents = true
 		}
 	case event.KindWorkerStopped:
 		if pl, ok := ev.Payload.(event.WorkerStopped); ok {
 			s.workers.stopped(pl.Worker, pl.State)
+			s.taskEvents = true
 		}
 	case event.KindTaskSubmitted:
 		s.counts.submitted++
+		s.taskEvents = true
 	case event.KindTaskStarted:
 		if pl, ok := ev.Payload.(event.TaskStarted); ok {
 			s.workers.taskStarted(pl.Worker, pl.JobID, ev.At)
 			s.progress.taskStarted(pl.JobID)
 			s.counts.started++
+			s.taskEvents = true
 		}
 	case event.KindTaskRunning:
 		if pl, ok := ev.Payload.(event.TaskRunning); ok {
 			s.workers.taskRunning(pl.Worker, pl.JobID)
+			s.taskEvents = true
 		}
 	case event.KindTaskCompleted:
 		if pl, ok := ev.Payload.(event.TaskCompleted); ok {
 			s.taskTerminal(pl.Worker, pl.JobID, ev.At, false, "", pl.StartedAt)
+			s.taskEvents = true
 		}
 	case event.KindTaskCancelled:
 		if pl, ok := ev.Payload.(event.TaskCancelled); ok {
 			s.taskTerminal(pl.Worker, pl.JobID, ev.At, true, pl.Message, pl.StartedAt)
+			s.taskEvents = true
 		}
 	case event.KindTaskFailed:
 		if pl, ok := ev.Payload.(event.TaskFailed); ok {
 			s.taskTerminal(pl.Worker, pl.JobID, ev.At, true, pl.Message, pl.StartedAt)
+			s.taskEvents = true
 		}
 	case event.KindTaskTimedOut:
 		if pl, ok := ev.Payload.(event.TaskTimedOut); ok {
 			s.taskTerminal(pl.Worker, pl.JobID, ev.At, true, pl.Message, pl.StartedAt)
+			s.taskEvents = true
 		}
 	case event.KindAssetDiscovered:
 		if pl, ok := ev.Payload.(event.AssetDiscovered); ok {
@@ -158,10 +201,12 @@ func (s *State) Apply(ev event.Event) {
 				s.rates.record(metricJS, ev.At)
 			}
 			s.feed.add(ev)
+			s.rateEvents = true
 		}
 	case event.KindRelationshipCreated:
 		s.counts.relationships++
 		s.rates.record(metricRelationships, ev.At)
+		s.rateEvents = true
 	case event.KindFindingCreated:
 		s.counts.findings++
 		s.feed.add(ev)
@@ -170,17 +215,21 @@ func (s *State) Apply(ev event.Event) {
 	case event.KindRequestObserved:
 		s.counts.requests++
 		s.rates.record(metricRequests, ev.At)
+		s.rateEvents = true
 	case event.KindRuleExecuted:
 		if pl, ok := ev.Payload.(event.RuleExecuted); ok {
 			s.counts.rules += pl.Executions
 			s.rates.record(metricRules, ev.At)
+			s.rateEvents = true
 		}
 	case event.KindCacheHit:
 		s.counts.cacheHits++
 		s.rates.record(metricCacheHits, ev.At)
+		s.rateEvents = true
 	case event.KindCacheMiss:
 		s.counts.cacheMisses++
 		s.rates.record(metricCacheMisses, ev.At)
+		s.rateEvents = true
 	case event.KindWarning:
 		if pl, ok := ev.Payload.(event.Warning); ok {
 			s.counts.warnings++
@@ -247,6 +296,19 @@ func sanitizeEvent(ev event.Event) event.Event {
 	switch p := ev.Payload.(type) {
 	case event.ScanStopped:
 		p.State = Sanitize(p.State)
+		ev.Payload = p
+	case event.StageStarted:
+		// The stage name is rendered (phase line, stage list), so it is
+		// sanitized like every other dynamic string.
+		p.Name = Sanitize(p.Name)
+		ev.Payload = p
+	case event.StageFinished:
+		// Name/Outcome/Err are all rendered (stage list, summary);
+		// Outcome normally comes from the fixed vocabulary, but hostile
+		// hand-built events must not smuggle control bytes either.
+		p.Name = Sanitize(p.Name)
+		p.Outcome = Sanitize(p.Outcome)
+		p.Err = Sanitize(p.Err)
 		ev.Payload = p
 	case event.WorkerStopped:
 		p.State = event.WorkerState(Sanitize(string(p.State)))

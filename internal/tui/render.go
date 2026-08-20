@@ -107,6 +107,14 @@ func progressSection(s *State, now time.Time, opts Options, b *strings.Builder) 
 	}
 	line(b, opts, "phase "+phase)
 
+	// The live stage feed: once any stage event has been consumed, the
+	// stage progress line renders the completed-stage count over the
+	// honest unknown total — the stream never declares the total, so a
+	// denominator is never fabricated.
+	if s.stages.startedCount > 0 || s.stages.completedCount > 0 {
+		line(b, opts, fmt.Sprintf("stages %d/unknown", s.stages.completedCount))
+	}
+
 	var tasks string
 	if p.totalKnown {
 		tasks = fmt.Sprintf("tasks %d/%d", p.completed, p.total)
@@ -136,6 +144,13 @@ func progressSection(s *State, now time.Time, opts Options, b *strings.Builder) 
 }
 
 func workerSection(s *State, now time.Time, opts Options, b *strings.Builder) {
+	// No task/worker event has been consumed (e.g. a stage-only pipeline
+	// stream): the dashboard and queue have no data source, so the whole
+	// section is omitted rather than rendering a fabricated zero
+	// dashboard and queue depth.
+	if !s.taskEvents {
+		return
+	}
 	running, waiting, idle, cancelled, failed, completed := s.workers.counts()
 	line(b, opts, fmt.Sprintf(
 		"workers running %d · waiting %d · idle %d · cancelled %d · failed %d · completed %d · active %d",
@@ -161,6 +176,13 @@ func workerSection(s *State, now time.Time, opts Options, b *strings.Builder) {
 }
 
 func throughputSection(s *State, now time.Time, opts Options, b *strings.Builder) {
+	// No throughput-recording event has been consumed: the widget has no
+	// data source, so it is omitted — never rendered as an all-zero rate
+	// line. (The task metric backing the ETA is not a displayed rate, so
+	// Progress events alone do not open this gate.)
+	if !s.rateEvents {
+		return
+	}
 	var sb strings.Builder
 	sb.WriteString("throughput ")
 	for i, m := range displayedMetrics {
@@ -225,6 +247,31 @@ func summarySection(s *State, opts Options) string {
 		outcome = "—"
 	}
 	line(&b, opts, "duration "+dur+" · outcome "+outcome)
+
+	// The stage list (the run's concluded stage entries in pipeline
+	// order) renders only when the stream carried stage events; a
+	// current stage is named while one is in flight. This is what makes
+	// the final frame of a stage-only run reflect the pipeline's
+	// progress instead of an empty state.
+	if sum.StagesStarted > 0 || sum.StagesCompleted > 0 {
+		cur := sum.CurrentStage
+		if cur == "" {
+			cur = "—"
+		}
+		line(&b, opts, fmt.Sprintf("stages completed %d · current %s", sum.StagesCompleted, cur))
+		for _, st := range sum.Stages {
+			row := fmt.Sprintf("  %s %s · %d processed · %d failed · %s",
+				st.Name, st.Outcome, st.ItemsProcessed, st.ItemsFailed, formatDuration(st.Duration))
+			if st.Truncated {
+				row += " · truncated"
+			}
+			if st.Err != "" {
+				row += " · err: " + st.Err
+			}
+			line(&b, opts, row)
+		}
+	}
+
 	line(&b, opts, fmt.Sprintf("assets %d · hosts %d · urls %d · endpoints %d · technologies %d · secrets %d",
 		sum.Assets, sum.Hosts, sum.URLs, sum.Endpoints, sum.Technologies, sum.Secrets))
 	line(&b, opts, fmt.Sprintf("findings %d · rules %d · relationships %d",
