@@ -10,6 +10,10 @@ Each phase must be stable before the next major subsystem is added.
 
 Implementation order is fixed by the phase instructions; milestones are numbered to match the order work actually happens.
 
+> **Optimization companion:** `OPTIMIZATION.md` is the prioritized audit backlog for this roadmap.
+> Every milestone below links to its `OPT-*` items there (with `file:line` evidence). The roadmap
+> owns *what* ships and *when*; `OPTIMIZATION.md` owns the *evidence, fix, and verification* for each.
+
 ---
 
 ## Roadmap rules
@@ -46,12 +50,12 @@ Every phase must satisfy these before it is complete:
 | v1.2 | Eventing, observability, operator feedback | ✅ Complete | Observer-only event bus + pool events via Config.Observer + cache events via WithObserver (one per Get; nil observer = zero change) + internal/tui first consumer (single-goroutine controller, deterministic frames); no CLI wiring yet at the time (wired into `scan --tui` in v1.4) (a8b3cee). |
 | v1.2.5 | SDK and extension API stabilization | ✅ Complete | SDK v1 (Core): frozen Level-1 surface, API 1.0, surface golden + 9 behavior contracts + semantic compat golden, examples pack (internal/detect/examples), stability policy + reopening criteria (bbf23c8, db7a00c). |
 | v1.3 | End-to-end pipeline | ✅ Complete | T2d–T6 landed (ad791c3, f31cf3a, 9da5793, 9abe2d3, df3672d, 91074ff, 382e218); ROADMAP/NEW-13 closed. |
-| v1.4 | Live terminal observability | ⏳ In flight | `scan --tui` wired; review APPROVE WITH NITS; NEW-21 (TUI render) fix pending; uncommitted. |
-| v1.5 | Real-world validation, URL hunting, discovery data quality | ⏳ Planned | Next after v1.4 closes (formerly v1.7; re-scoped + renumbered 2026-08-20 so order == execution order). |
-| v1.6 | Robustness and hostile-input hardening | ⏳ Planned | Formerly v1.5 — fuzzing + parser hardening (renumbered 2026-08-20). |
-| v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). |
-| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. |
-| v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. |
+| v1.4 | Live terminal observability | ⏳ In flight | `scan --tui` wired; review APPROVE WITH NITS; NEW-21 (TUI render) fix pending; uncommitted. Optimizations: `OPT-P2-3` + `OPT-P1-1`/`OPT-P1-5` hardening allowed in-flight. |
+| v1.5 | Real-world validation, URL hunting, discovery data quality | ⏳ Planned | Next after v1.4 closes (formerly v1.7; re-scoped + renumbered 2026-08-20). Optimizations: `OPT-P0-1`…`OPT-P0-5` + `OPT-P1-6` + `OPT-P2-1`/`OPT-P2-2` (see `OPTIMIZATION.md:3`). |
+| v1.6 | Robustness and hostile-input hardening | ⏳ Planned | Formerly v1.5 — fuzzing + parser hardening (renumbered 2026-08-20). Optimizations: `OPT-P1-3`/`OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5`. |
+| v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). Optimizations: `OPT-P3-1` + `OPT-P2-4` bench baselines. |
+| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-2`. |
+| v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-3` + `OPT-P1-2` isolation for third-party packs. |
 
 ---
 
@@ -163,9 +167,21 @@ reconstructs a live run from events alone" at the CLI level.
       sanitized strings (fix + render-content tests, reviewer APPROVE
       WITH NITS)
 
+Optimizations in scope for v1.4 (see `OPTIMIZATION.md:5`):
+
+- [ ] `OPT-P2-3` — TUI fidelity: bounded stage list, real `StageStarted/Finished`
+      from `pipeline/run.go:341`, sanitized strings (`tui/sanitize.go`), honest
+      `unknown` totals; `cli/scan.go:454` color `auto` + deterministic
+      `sub.Close() → <-tuiDone → bus.Close()` join.
+- [ ] `OPT-P1-1` (allowed in-flight) — `report/writer.go:334` + `cache/cache.go:292`
+      durability: `fsync(dir)` after `Rename` (best-effort, `ENOSYS` ignored).
+- [ ] `OPT-P1-5` (allowed in-flight) — `jsintel/fetch.go:678` → structural
+      `tlsHandshakeError` sentinel mirroring `httpprobe/run.go:371,912`; remove
+      `strings.Contains(...,"tls:")` text fallback.
+
 Deferred (user-approved re-scope): per-engine standalone commands (dns,
 http, tech, js, secrets, priority, detect, report — reconsider after v1.6
-hardening).
+hardening; `OPT-P2-5`).
 
 Acceptance criteria:
 
@@ -193,6 +209,9 @@ the evidence to land the two high-value URL-hunting refinements the field
 trial motivates: JS-extracted endpoints must enter the corpus and get
 live-checked, and every corpus URL gains a bounded live-status triage.
 
+> Audit companion: `OPTIMIZATION.md:3` — `OPT-P0-1`…`OPT-P0-5` plus `OPT-P1-6`/`OPT-P2-1`/`OPT-P2-2`.
+> Each refinement below cites its `OPT-*` entry with `file:line` evidence.
+
 Validation checklist:
 
 - [ ] Output quality
@@ -204,18 +223,18 @@ Validation checklist:
 - [ ] Relationship quality in the asset graph
 - [ ] Limited contract revision only if real-world data proves it necessary
 
-Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator):
+Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator; revised 2026-08-20 from audit):
 
 - [ ] `internal/httpprobe`: new `ProbeURLs(ctx, domain, urls, cfg)` —
       per-URL headers/status only, redirects observed-not-followed (M-6
       consistency), TLS metadata reuse, per-URL timeout, bounded pool,
       existing ProbeFailed/ReasonOther error taxonomy, results sorted by
-      URL (determinism)
+      URL (determinism) — `OPT-P0-3`
 - [ ] jsintel corpus feedback: the adapter additionally emits filtered URL
       additions (shared `filterURLs`, canonical-host/in-domain, dedupe
       against incoming corpus, bounded per-run cap with honest overflow
-      reporting) from the analyzer URL output (record_analyze.go:176)
-- [ ] Discovery data-quality gate (field-trial-driven, NEW-22): a single
+      reporting) from the analyzer URL output (record_analyze.go:176) — `OPT-P0-2`
+- [x] Discovery data-quality gate (field-trial-driven, NEW-22): a single
       passive source burst of 37,248 wordlist-shaped hosts for
       example.com (subfinder v2.15.0, config clean) cascaded into
       12,366 probe URLs, 1,024 priority groups, 32 attack paths, 755
@@ -223,28 +242,33 @@ Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator):
       Gate: per-source output caps + burst-anomaly detection + a
       suspicious-source decision point (flag/abort/continue) BEFORE the
       corpus is poisoned; verify the local subfinder binary/config
-      (possible tampered build) as part of the fix
+      (possible tampered build) as part of the fix — `OPT-P0-1` (CRITICAL, must land before next field trial)
 - [ ] urlintel tool hardening (field-trial-driven): per-tool timeouts
       separate from the stage deadline (gau burned the full 10m stage
       budget on the trial run; 3 tools × caps stack up); amass opt-in
       decision (20 min for 0 results on example.com — make it opt-in or
       hard-timeout by default); jsintel health-based early stop when
       fetch failures dominate the first batch (500/500 failed on the
-      trial run)
+      trial run) — `OPT-P0-4` + `OPT-P2-1`/`OPT-P2-2`
 - [ ] Report-status nit: summary.started_at == ended_at and duration_ms 0
       (report timestamps the summary write, not the run) — honest run
-      duration in the JSON report
+      duration in the JSON report — `OPT-P0-5` (`report/model.go:142`)
 - [ ] New stage `urllive` inserted between secrentel and priority:
       discover → dns → httpprobe → urlintel → techintel → jsintel →
       secrentel → urllive → priority → detect → report; consumes corpus
-      URLs (historical + jsintel-fed), produces live-status records
+      URLs (historical + jsintel-fed), produces live-status records — `OPT-P0-3`
 - [ ] Live records as a NEW results-channel entity (URL + status + redirect
       observed + TLS summary) — NOT a field on `asset.URL` (avoids
       asset-model churn and schema bump); report renderers gain a
-      URL-status section (presentation-only)
+      URL-status section (presentation-only) — `OPT-P0-3` (`pipeline/results.go`)
 - [ ] Pins updated: AllStages + stage vocabulary, T4 determinism,
       T5 full-run E2E, T6 --stages rows, cache op type for per-URL liveness
-      (key = schema/op/config-digest/URL)
+      (key = schema/op/config-digest/URL) — `OPT-P0-3`
+- [ ] `OPT-P1-6` — `jsintel/fetch.go:480` fetch truncation counted in
+      `Report.Metrics` + `StickyFlags["js_fetch_truncated"]`
+      (mirrors `httpprobe` `probe_truncated`); `OPT-P2-1` — `scan --help`
+      documents per-tool timeouts + `--amass` opt-in + `scan --dry-run`
+      for effective timeouts
 - [ ] Precondition (ops, not code): install gau/waybackurls/waymore — the
       URL corpus is 0 without them
 
@@ -264,6 +288,10 @@ Acceptance criteria:
 - Determinism preserved (updated pins); cold/warm cache parity; race-clean;
   full gate suite green; real-target field trial with the URL tools
   installed shows live URL counts + statuses + cold/warm parity.
+- `OPT-P0-1` E2E: synthetic `37k` burst → `discovery_truncated` flagged,
+  downstream probe URLs capped not `12k`; `OPT-P0-2` E2E: JS URLs filtered
+  in-domain only + overflow flag; `OPT-P0-3` hermetic `ProbeURLs` with
+  canned `200/404/500/timeout/refused` → sorted `LiveRecords`, cold/warm parity.
 
 Explicitly out of scope: crawling/spidering or HTML-body link extraction;
 robots.txt/sitemap ingestion (later milestone); active brute force/fuzzing
@@ -279,14 +307,29 @@ execution order)
 
 Goal: treat all parsers and ingestion paths as untrusted-input boundaries.
 
-- [ ] Go fuzzing harnesses
-- [ ] Property tests
-- [ ] JS fuzzing for `internal/jsintel`
-- [ ] Secret fuzzing for `internal/secrentel`
-- [ ] URL fuzzing for `internal/urlintel`
-- [ ] Cache fuzzing for `internal/cache`
-- [ ] Report fuzzing
-- [ ] Parser hardening based on fuzz results
+> Audit companion: `OPTIMIZATION.md:4` — `OPT-P1-3`/`OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5`.
+
+- [ ] Go fuzzing harnesses — `OPT-P1-3` (`asset/ParseURL`, `discovery/parse.go:21`,
+      `urlintel/engine.go:554`, `jsintel/lex.go+parse.go+fetch.go`, `secrentel/scan.go:61`,
+      `cache/cache.go:407`, `report/*`, `dns/resolver.go`; seeded from `internal/asset/testdata`
+      + field-trial samples)
+- [ ] Property tests — `parse→Identity→parse` round-trip, `merge` idempotence, dedup invariants
+      (`testing/quick` + hand-rolled; `OPT-P1-3`)
+- [ ] JS fuzzing for `internal/jsintel` — `OPT-P1-3`
+- [ ] Secret fuzzing for `internal/secrentel` — `OPT-P1-3`
+- [ ] URL fuzzing for `internal/urlintel` — `OPT-P1-3`
+- [ ] Cache fuzzing for `internal/cache` — `OPT-P1-3`
+- [ ] Report fuzzing — `OPT-P1-3`
+- [ ] Parser hardening based on fuzz results — `OPT-P1-3`
+- [ ] Silent-truncation hardening — `OPT-P1-4` (`asset/tls_certificate.go:334` `32` DNSNames +
+      `asset/finding.go:313` `16/32` caps → `Truncated` flag / `StickyFlags`)
+- [ ] TLS classification hardening — `OPT-P1-5` (`jsintel/fetch.go:678` → `tlsHandshakeError`
+      sentinel mirroring `httpprobe/run.go:371,912`, remove `strings.Contains(,"tls:")` fallback)
+      if not already landed in v1.4
+- [ ] Hot-path allocation pass — `OPT-P2-4` (`techintel/analyze.go:580` cached lowercasing,
+      `priority/score.go:614` `json.Marshal` → tuple compare, `httpprobe/run.go:387` TLS config reuse,
+      `event/bus.go:97` snapshot-then-fan-out)
+- [ ] Scope/version dedup refactor — `OPT-P2-6` (`asset/scope.go` `InDomain`, single `versionPattern`)
 
 Acceptance criteria:
 
@@ -295,6 +338,8 @@ Acceptance criteria:
 - Crashers, hangs, and memory blowups are eliminated.
 - Property tests cover normalization, deduplication, and invariants.
 - Regression tests exist for every confirmed issue.
+- `OPT-P1-4`/`OPT-P1-5`/`OPT-P2-6` landed with `go test -race` green; `OPT-P2-4` `go test -bench` before/after
+  shows no regression (bus `~0.5 µs/publish` held, feed `1024` not regressed).
 
 ---
 
@@ -305,13 +350,15 @@ execution order)
 
 Goal: prove the platform works reliably across realistic fixture targets.
 
-- [ ] Fixture targets
-- [ ] Expected outputs
-- [ ] Snapshot tests
-- [ ] Performance baselines
-- [ ] Memory baselines
-- [ ] CI integration
-- [ ] Regression suite for core engine interactions
+> Audit companion: `OPTIMIZATION.md:6` — `OPT-P3-1` + `OPT-P2-4` bench baselines; metrics in `OPTIMIZATION.md:9`.
+
+- [ ] Fixture targets — `fixtures/<target>/` (`OPT-P3-1`)
+- [ ] Expected outputs — `testdata/*.golden` snapshot tests (`go test -update` regenerates; `OPT-P3-1`)
+- [ ] Snapshot tests — stage-regressed failure names the stage (`OPT-P3-1`)
+- [ ] Performance baselines — `go test -bench` + `benchstat` recorded (`OPT-P2-4` before/after)
+- [ ] Memory baselines — `benchmem` + bounded-memory assertions (`discovery 4 MiB`, `jsintel 2 MiB`, etc.; `OPTIMIZATION.md:7 C-4`)
+- [ ] CI integration — output drift + perf regression gates (`OPT-P3-1`)
+- [ ] Regression suite for core engine interactions — `OPT-P3-1`
 
 Acceptance criteria:
 
@@ -320,6 +367,7 @@ Acceptance criteria:
 - The suite covers common and edge-case recon scenarios.
 - Baselines are documented and reproducible locally.
 - A failing snapshot clearly identifies which stage regressed.
+- `OPT-P3-1` gates green: `gofmt`, `go vet`, `go build`, `go test`, `go test -race`, `go test -bench` recorded.
 
 ---
 
@@ -337,6 +385,9 @@ collecting; v1.8 makes RavenRecon an analysis platform over other tools'
 output (subdomains.txt, alive.txt, urls.txt, js.txt, burp.xml, nuclei.json,
 ...), reconstructing the asset graph and producing the same reports as if
 RavenRecon had discovered the assets itself.
+
+> Audit companion: `OPTIMIZATION.md:6` — `OPT-P3-2`. Cross-cutting invariants in `OPTIMIZATION.md:7`
+> (`C-1`…`C-5`) remain in force. Upgrade sequencing in `OPTIMIZATION.md:8`.
 
 Prerequisite: the v1.3 pipeline is stable — ingestion feeds the same stages,
 it does not create a parallel execution path.
@@ -405,6 +456,10 @@ Status: planned
 
 Goal: shift new detection logic into stable, versioned packs built on the frozen SDK.
 
+> Audit companion: `OPTIMIZATION.md:6` — `OPT-P3-3` + `OPT-P1-2` (`detect/context.go:68` isolation for
+> third-party packs). Sequencing in `OPTIMIZATION.md:8`: standalone CLIs (`OPT-P2-5`) remain deferred
+> until after `v1.6` hardening; see `OPTIMIZATION.md:5`.
+
 Design rule: core packages stay stable. New detection capabilities should be implemented as packs unless they require a fundamental platform change.
 
 ### Pack families
@@ -424,6 +479,24 @@ Acceptance criteria:
 - Pack output is normalized into the same evidence model as core engines.
 - Pack failures are isolated and do not crash the platform.
 - Pack behavior is covered by pack-level tests and fixtures.
+- `OPT-P1-2` landed: `detect/context.go:68` `Context` per-rule cloning (or getter-only view) +
+  `report/model.go:147` `Model` per-render isolation; `go test -race` `TestContextIsolation` green.
+
+---
+
+## Optimization index
+
+All audit optimizations live in `OPTIMIZATION.md` with `file:line` evidence. Summary mapping:
+
+| Roadmap | Optimizations |
+|---------|---------------|
+| v1.4 | `OPT-P2-3` TUI fidelity + `OPT-P1-1`/`OPT-P1-5` allowed in-flight |
+| v1.5 | `OPT-P0-1`…`OPT-P0-5` + `OPT-P1-6` + `OPT-P2-1`/`OPT-P2-2` |
+| v1.6 | `OPT-P1-3` fuzzing + `OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5` |
+| v1.7 | `OPT-P3-1` fixtures/snapshots/baselines + `OPT-P2-4` bench |
+| v1.8 | `OPT-P3-2` ingestion |
+| v2.0 | `OPT-P3-3` packs + `OPT-P1-2` isolation + `OPT-P3-4` logger/replay |
+| Cross-cutting | `OPTIMIZATION.md:7` `C-1`…`C-5` concurrency/cache/trust/bounding invariants; `OPTIMIZATION.md:9` metrics |
 
 ---
 
