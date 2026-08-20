@@ -14,6 +14,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/config"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/version"
 )
 
@@ -26,6 +27,7 @@ Commands:
   version       Show version information
   doctor        Check the local RavenRecon environment
   discover      Run passive subdomain discovery for a domain
+  scan          Run the full end-to-end reconnaissance pipeline for a domain
 
 Options:
   -h, --help    Show this help message
@@ -35,10 +37,15 @@ Examples:
   ravenrecon doctor
   ravenrecon discover example.com
   ravenrecon discover example.com --sources subfinder,amass
+  ravenrecon scan example.com
+  ravenrecon scan example.com --stages discover,dns,httpprobe --output out/
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
   amass enum -passive -d <domain>.
+The scan command runs discover → dns → httpprobe → urlintel → techintel →
+jsintel → secrentel → priority → detect → report and writes the report
+into an output directory (default ravenrecon-report).
 No active enumeration, brute force, or intel modes are ever run.
 
 RavenRecon is intended for authorized security testing and
@@ -77,6 +84,42 @@ bug bounty programs where the target is explicitly in scope.
 // discover help; runDiscover prints the discover usage and exits cleanly.
 var errDiscoverHelp = errors.New("discover: help requested")
 
+// errScanHelp is returned by parseScanArgs when the user asked for scan
+// help; runScan prints the scan usage and exits cleanly. It mirrors
+// errDiscoverHelp.
+var errScanHelp = errors.New("scan: help requested")
+
+// stageObserver is the scan command's --verbose sink: it prints one
+// compact line per stage event to its writer as the pipeline runner emits
+// them (synchronously, in stage order). It observes only the stage
+// lifecycle kinds the pipeline emits — anything else is ignored, and a
+// hostile or invalid event can never panic the writer path (the payload
+// assertions are checked).
+type stageObserver struct {
+	w io.Writer
+}
+
+// Observe implements event.Observer.
+func (o *stageObserver) Observe(ev event.Event) {
+	switch ev.Kind {
+	case event.KindStageStarted:
+		p, _ := ev.Payload.(event.StageStarted)
+		fmt.Fprintf(o.w, "stage_started %s\n", p.Name)
+	case event.KindStageFinished:
+		p, _ := ev.Payload.(event.StageFinished)
+		var b strings.Builder
+		fmt.Fprintf(&b, "stage_finished %s outcome=%s processed=%d failed=%d",
+			p.Name, p.Outcome, p.ItemsProcessed, p.ItemsFailed)
+		if p.Truncated {
+			b.WriteString(" truncated")
+		}
+		if p.Err != "" {
+			fmt.Fprintf(&b, " err=%q", p.Err)
+		}
+		fmt.Fprintln(o.w, b.String())
+	}
+}
+
 // Run executes the RavenRecon CLI.
 func Run(ctx context.Context, args []string) error {
 	if ctx == nil {
@@ -99,6 +142,9 @@ func Run(ctx context.Context, args []string) error {
 
 	case "discover":
 		return runDiscover(ctx, os.Stdout, args[1:])
+
+	case "scan":
+		return runScan(ctx, os.Stdout, args[1:], newScanStages)
 
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)

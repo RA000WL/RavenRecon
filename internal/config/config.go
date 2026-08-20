@@ -171,7 +171,7 @@ func Default() Config {
 		// command's --timeout flag, or Discovery.Timeout in configuration.
 		Timeout:   120 * time.Second,
 		Rate:      5,
-		UserAgent: "RavenRecon/1.0.0",
+		UserAgent: "RavenRecon/1.3.0",
 		Cache: CacheConfig{
 			Enabled: false,
 			Dir:     "",

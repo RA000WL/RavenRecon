@@ -4,13 +4,18 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v1.0.0**
+**v1.3.0**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
 cancellable, rate-limited runtime engine (`internal/runtime`), and its first
 consumer: passive subdomain discovery (`internal/discovery`) with adapters
 for subfinder, assetfinder, and amass (passive mode only).
+
+An end-to-end pipeline (`internal/pipeline`) composes
+discover → dns → httpprobe → urlintel → techintel → jsintel → secrentel →
+priority → detect → report into one deterministic, cancellable run, exposed
+as the `ravenrecon scan <domain>` command (v1.3).
 
 Active infrastructure is landing incrementally: the DNS pipeline
 (`internal/dns`, roadmap v0.6 sub-milestone 5A) and the HTTP probing
@@ -720,6 +725,23 @@ go run ./cmd/ravenrecon discover example.com --sources subfinder,amass
 
 `discover` options (after the domain): `--sources <a,b>` restricts the
 sources, `--no-cache` disables the cache for the run.
+
+Run the full end-to-end pipeline:
+
+```bash
+go run ./cmd/ravenrecon scan example.com
+go run ./cmd/ravenrecon scan example.com --stages discover,dns,httpprobe --output out/
+```
+
+`scan` runs all ten stages in pipeline order (or the `--stages` selection),
+writes the report into the output directory (default `ravenrecon-report`),
+and exits 0 on completed and partial runs and 1 on failed, cancelled, and
+incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources
+<a,b>` (discovery sources), `--request-timeout <d>`, `--concurrency <n>`,
+`--timeout <d>`, `--cache <dir>`, `--no-cache`, `--output <dir>`, and
+`--verbose` (one line per stage event on stderr). The default run carries no
+detection rules and no active enumeration is ever performed. See
+`ravenrecon scan --help` for the full contract.
 
 Build:
 

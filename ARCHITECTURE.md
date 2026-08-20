@@ -3408,6 +3408,30 @@ Implemented:
   document channel is pipeline-internal, separate from the Results
   channel; secrentel consumes the channel, never the
   `Results.JavaScript` field) (`internal/pipeline`)
+* pipeline scan command (see "Pipeline requirements" above; v1.3 T6): the
+  `ravenrecon scan <domain>` CLI command wires the full ten-stage pipeline
+  — discover → dns → httpprobe → urlintel → techintel → jsintel →
+  secrentel → priority → detect → report — with `--stages` selection
+  (validated against the fixed vocabulary), `--sources` (discovery),
+  `--request-timeout` (httpprobe param), `--concurrency`/`--timeout`
+  (per-stage bounds for every selected stage), `--cache`/`--no-cache`
+  (mirroring the discover command's cache semantics), `--output` (report
+  directory, default `ravenrecon-report`), and `--verbose` (one line per
+  stage event on stderr via a synchronous `event.Observer`; diagnostics
+  stay off the summary stream). The target is normalized through
+  `asset.NewDomain` — the single normalization point (uppercase, whitespace,
+  and a trailing dot are normalized away; IP literals are rejected).
+  Exit semantics: completed/partial → 0 (the summary states the outcome
+  explicitly); failed/cancelled/incomplete, usage/validation errors, cache
+  open failures, and Ctrl-C/SIGTERM → 1, with the summary always printed
+  first (partial results are never lost). The summary is stable across
+  runs — no durations or timestamps (the CLI runs on the real wall clock;
+  determinism is a pipeline property). The report file listing is read
+  honestly from the output directory itself. All production seams are the
+  adapters' documented nil defaults (external tools via PATH, engine
+  default resolver/transport, compiled-in fingerprint/pattern databases,
+  the EMPTY detect registry per D2, the four builtin reporters)
+  (`internal/cli`, `internal/pipeline/adapt`)
 
 Planned, not yet implemented:
 
@@ -3416,5 +3440,7 @@ Planned, not yet implemented:
 * asset store, graph, and graph correlation engine (the priority
   engine's identity-anchored Correlate is landed; relationship traversal
   is not)
-* reporting CLI front-end and terminal UI wiring (the TUI itself is a
-  landed library — `internal/tui`, no CLI command yet)
+* standalone reporting CLI front-end and terminal UI wiring (report
+  rendering is reachable today only through the scan command's embedded
+  report stage; the TUI itself is a landed library — `internal/tui`, no
+  CLI command yet)

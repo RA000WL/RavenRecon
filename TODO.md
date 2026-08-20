@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-13).
+  next free `NEW-n` (currently NEW-17).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -88,7 +88,8 @@ orchestrator; every agent may append or update its own entries.
   re-verified, gates re-run), committed with this board pass; T5 hermetic
   E2E VERIFIED — review APPROVE WITH NITS (FIND-1 closed in a fix round,
   closure re-verified, gates re-run; NEW-3 board header restored),
-  committed with this board pass; T6 CLI+docs next)
+  committed with this board pass; T6 CLI+docs IMPLEMENTED — see the T6
+  record + fix-round record below)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -307,6 +308,126 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
     (repo-wide, `gofmt -l` empty), vet OK, build OK, full suite OK (24
     packages), -race ./internal/pipeline/... OK (18.3s). Re-review
     dispatched to reviewer for closure confirmation.
+- T6 CLI+docs IMPLEMENTED (this session, builder; claimed IN PROGRESS at
+  session start, never self-closed): the `ravenrecon scan` command and its
+  hermetic test suite. The command (internal/cli/scan.go + cli.go wiring,
+  inherited mid-flight from the prior session and verified line-by-line
+  against the T6 contract) parses `scan <target> [options]` with --stages
+  (fixed vocabulary), --sources, --request-timeout, --concurrency,
+  --timeout, --cache, --no-cache, --output (default ravenrecon-report),
+  --verbose (one line per stage event on stderr via a synchronous
+  stageObserver on the T3a event layer); maps flags onto
+  pipeline.ScanConfig (StageParams for sources/request_timeout, StageBounds
+  for every SELECTED stage); normalizes the target through asset.NewDomain
+  (single normalization point — uppercase/whitespace/trailing dot
+  normalized, IP literals rejected via normalizeHost); opens the cache
+  mirroring discover's semantics; runs the ten production adapters via the
+  newScanStages seam (all nil production defaults incl. the EMPTY detect
+  registry per D2); prints a deterministic summary (no timestamps/durations
+  — the T4 determinism property) with the report files listed honestly from
+  the output directory; maps outcomes to exit codes (completed/partial →
+  0; failed/cancelled/incomplete + validation/cache errors + Ctrl-C → 1,
+  summary always printed first). NEW TESTS (internal/cli/scan_test.go, 19
+  test functions, all hermetic — fake stages seam, temp dirs, no tools):
+  parseScanArgs table (24 rows incl. help forms, empty/unknown stages,
+  vocabulary naming, empty sources, invalid/empty/negative durations,
+  concurrency < 1, stray args, default output dir, raw target preserved for
+  normalization), buildScanConfig defaults + selections (selection order,
+  params, bounds only for selected stages), scanCache wiring (default off,
+  config-enabled, --cache override, --no-cache force-off), stageObserver
+  unit (started/finished lines, truncation/error suffixes, unknown kinds
+  ignored, kind-mismatched + nil payloads contained), printScanSummary
+  (header/cache state, sorted flags, stage lines with flags+quoted errors,
+  sorted report file listing, no-files and unreadable-dir honest notes),
+  reportFiles (sorted non-dir entries, missing-dir error),
+  TestScanStageVocabularyMatchesPipeline (stageVocabularyCLI pinned to
+  pipeline.AllStages — the scan.go comment requires it), runScan outcome
+  mapping (all five outcomes → documented exit semantics, summary always
+  states the honest outcome), failed-still-summarized, validation errors
+  never invoke the stages seam (incl. IP-target rejection via
+  normalizeHost), target normalization through the seam (canonical Name +
+  raw Original + default OutputDir), cache on/off rendering through the
+  real runScan path, pre-cancelled ctx → prompt context.Canceled-wrapped
+  "run interrupted" error with the cancelled summary still printed (stages
+  never invoked), scan help via runScan and via the Run dispatcher. DOCS
+  (T6 "docs" half): README.md Status header v1.0.0 → v1.3.0 (version.go is
+  already bumped in this tree) + scan command section under "Current
+  commands" + intro paragraph naming the pipeline/scan; ARCHITECTURE.md
+  implemented-list bullet for the scan command (wiring, exit semantics,
+  normalization, seams) + planned-item reworded ("standalone reporting CLI
+  front-end" — report rendering is reachable through scan's embedded report
+  stage); ROADMAP.md v1.3 checklist ticked `ravenrecon scan` (per-item tick
+  precedent, evidence on the board). GATES RUN THIS SESSION, verbatim:
+  gofmt -l $(find . -name '*.go' -type f) → clean (empty); go test
+  -count=1 ./internal/cli/ → ok; go vet ./... → ok; go build ./... → ok;
+  go test -count=1 ./... → ok (25 packages; discovery 75.6s, adapt 17.4s);
+  go test -race -count=1 ./internal/cli/ → ok (1.5s). One test-only fix
+  round during development: zero-value StageResult{} is a contract
+  violation (empty outcome → recorded failed), so the partial-outcome row
+  needed an explicit completed first result; the normalization assertion
+  checked the canonical form uppercased (self-defeating — "example.com" IS
+  "EXAMPLE.COM" uppercased) and now checks the raw " EXAMPLE.COM. " form
+  never appears. No production code changed this session. No new issues
+  opened. Remaining for T6: reviewer round, orchestrator verification, and
+  the commit decision (working tree currently uncommitted).
+- T6 locked-item follow-up (this session, builder): the working tree at session
+  start did NOT compile — internal/cli/scan_test.go carried eight unused imports
+  (fmt, io, net, net/http, sync, discovery, dns, adapt) and the head-comment-
+  referenced smoke E2E (TestRunScanSmokeE2E) did not exist. Step 0 + Item 1:
+  implemented TestRunScanSmokeE2E (hermetic — drives runScan with the
+  PRODUCTION stage shape via the stages seam; only the exec- and network-
+  capable seams substituted: scripted discovery/urlintel runner + fake
+  LookupFunc + fake resolver (one A record for www.example.com) + canned
+  http.RoundTripper (200 on http and https, also served to jsintel — NEW-16);
+  non-exec stages at their production nil defaults incl. the empty detect
+  registry + the four builtin report reporters); the previously-unused imports
+  are consumed by it. Asserts: outcome line (completed), all ten completed
+  stage lines, ravenrecon-report.json/.md existing AND listed in the summary,
+  hermeticity (canned transport serves >= 4 round trips: 2 httpprobe + 2
+  jsintel), and a second run into a fresh temp dir matching modulo the
+  output-dir path. Item 2: ROADMAP.md v1.3 completed (six pipeline-integration
+  bullets ticked, Status: planned → Status: ✅ Complete, completion note citing
+  T3a ad791c3, T3b f31cf3a, T3c 9da5793, T3d 9abe2d3, T4 df3672d, T5 91074ff,
+  T6 uncommitted at writing; acceptance state: all met). Gates final state:
+  gofmt clean, go vet OK, go build OK, go test ./internal/cli/ OK, go test
+  -race ./internal/cli/ OK, full per-package suite OK. No production code
+  changed. No staged commit. New issue opened: NEW-16 (below).
+- T6 REVIEW FIX ROUND (this session, builder): applied the reviewer's T6
+  findings exactly, everything left uncommitted — FIND-1 (LOW, code+tests):
+  negative `--request-timeout` rejected with "must be >= 0" instead of being
+  silently absorbed to the engine default (0 and absent stay valid = engine
+  default, matching requestTimeoutFromParams); parse-table rows pin `-5s`
+  rejection and `0` acceptance (internal/cli/scan.go parseScanArgs +
+  scan_test.go). FIND-2 (INFO, tests): unknown-source pass-through pinned as
+  a REAL passthrough — `scan example.com --sources nmap` runs the production
+  discovery adapter/engine over the smoke fixtures; the seam capture asserts
+  StageParams[discover]["sources"] == "nmap", the discover stage records
+  failed (`unknown source "nmap"` named), and two rows pin the run-level
+  semantics: the full ten-stage run fail-CONTINUES (remaining stages
+  complete → fold rule 5 → Outcome partial, exit 0) and the
+  `--stages discover` run ends Outcome failed with the named "run outcome
+  failed" error — the review finding's expected "run outcome failed" applies
+  to the stage-restricted form; the full run honestly folds partial
+  (TestRunScanUnknownSourcePassThrough in internal/cli/scan_test.go).
+  FIND-3: ROADMAP.md v1.3 acceptance bullets
+  ticked (single-run discovery→report; cross-stage asset/evidence identity —
+  both met by the smoke E2E + T3d/T4/T5 pins); the "all met" completion note
+  now matches the checklist. FIND-4: NEW-16 fix text reworded — techintel has
+  no HTTP fetch surface at all (reviewer-verified), now "httpprobe, jsintel
+  (and any future body-fetching stage)". FIND-5: scan_test.go comment now
+  cites the actual rule — report.Run (engine.go:251-258) + sanitizeBaseName
+  (writer.go:26-68); the cited ReportBaseName never existed. FIND-6: AGENTS.md
+  §2 — internal/pipeline + internal/pipeline/adapt bullet added; the footnote
+  now states the pipeline IS reachable via `ravenrecon scan` while those
+  engines still have no standalone commands and the TUI is still unwired.
+  FIND-7: NEW-17 opened (INFO, no owner — evidence + proposal only, below).
+  FIND-8: status tail appended above — this entry NOT self-closed
+  (orchestrator verifies). GATES RE-RUN THIS ROUND, verbatim: gofmt -l
+  $(find . -name '*.go' -type f) → clean (empty); go test -count=1
+  ./internal/cli/... → ok (0.534s); go vet ./internal/cli/ ./internal/report/
+  → ok; go build ./... → ok; go test -race -count=1 ./internal/cli/ → ok
+  (1.618s); go test -count=1 ./... → ok (25 packages; discovery 75.6s,
+  adapt 17.5s).
 - Verification: per-task gates (gofmt/test/vet/-race/build); final wave:
   full-suite gates + reviewer sign-off + TODO close.
 - T3a IMPLEMENTED (this session, builder): pipeline stage events on the
@@ -963,6 +1084,29 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: 20+ consecutive `go test -race -count=1 -run
   'TestProbeCompletedHTTPS' ./internal/httpprobe/` runs pass.
 
+### NEW-16 (INFO) — a nil jsintel transport dials the network once httpprobe recorded probe targets; hermetic run-level tests must substitute the transport (internal/pipeline/adapt/httpprobe.go, jsintel.go, internal/cli/scan_test.go)
+- Status: OPEN
+- Reporter: builder (T6 locked-item session)
+- Owner: (none)
+- Problem: the httpprobe engine records the probe-target URL on the result
+  regardless of probe outcome, so the URL corpus handed to the jsintel stage
+  is non-empty whenever a host was probed. jsintel's nil transport seam equals
+  the engine's bounded default transport (a real dial): a run-level test that
+  constructs NewJSIntelStage(nil) with a probed host therefore reaches the
+  network — violating AGENTS §13 hermeticity. The T6 smoke E2E
+  (TestRunScanSmokeE2E) substitutes the canned RoundTripper for jsintel in its
+  stages seam so no socket is dialed; production behavior is unchanged
+  (newScanStages keeps NewJSIntelStage(nil) = the engine default transport,
+  correct for the real CLI).
+- Fix (if ever scoped): route an http.RoundTripper through the stages seam to
+  every network-capable stage — httpprobe, jsintel (and any future
+  body-fetching stage) — instead of relying on nil semantics, or document
+  that a nil jsintel transport dials the network and keep hermetic run-level
+  tests on the substituted transport.
+- Verification: TestRunScanSmokeE2E passes with the canned transport serving
+  >= 4 round trips (2 httpprobe + 2 jsintel); go test -race
+  ./internal/cli/ OK.
+
 ### NEW-14 (INFO) — priority stage parameter-name derivation diverges from urlintel's extraction (internal/pipeline/adapt)
 - Status: DEFERRED
 - Reporter: reviewer (T2d round, INFO-2)
@@ -1019,6 +1163,22 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: full T3c gates (see the T3c IMPLEMENTED record below);
   `documents_truncated` flag, truncation-skip, and overflow-flag
   cache-hit regression pinned by tests.
+
+### NEW-17 (INFO) — scan summary may list interrupted-render temp files (internal/cli scan.go reportFiles)
+- Status: OPEN
+- Reporter: reviewer (T6 fix round)
+- Owner: (none)
+- Problem: printScanSummary lists every non-directory entry of the output
+  directory via reportFiles (internal/cli/scan.go:541-554) with no
+  filtering, so a ".ravenrecon-report-*" temp file left behind by an
+  interrupted report render would appear in the summary as if it were a
+  report — the report writer's tmpPrefix (internal/report/writer.go:20-23)
+  exists precisely so aborted renders "can be identified and never look
+  like reports".
+- Fix: filter out entries with the tmpPrefix (".ravenrecon-report-") in
+  reportFiles so interrupted-render temp files never appear in the summary.
+- Verification: extend TestReportFiles/TestPrintScanSummary with a temp
+  file present in the output directory and assert it is not listed.
 
 ## Operational warnings (all agents)
 

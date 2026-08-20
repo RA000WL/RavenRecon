@@ -101,7 +101,13 @@ Acceptance criteria:
 
 ## v1.3 — End-to-end pipeline
 
-Status: planned
+Status: ✅ Complete — all six pipeline-integration criteria met; the `ravenrecon scan`
+command (T6 CLI wiring, uncommitted at writing) drives the ten production stages
+end-to-end. Milestone commit refs: T3a ad791c3, T3b f31cf3a, T3c 9da5793, T3d 9abe2d3,
+T4 df3672d, T5 91074ff, T6 (uncommitted at writing). Acceptance state: all met —
+hermetic smoke E2E (TestRunScanSmokeE2E drives the production stage shape over
+substituted exec/network seams), full-run determinism and partial-failure/retry pins;
+gates green (gofmt, go vet, go build, go test, go test -race).
 
 Goal: turn the disconnected engines into one deterministic workflow.
 
@@ -109,18 +115,18 @@ Pipeline:
 
 `discover → dns → httpprobe → urlintel → techintel → jsintel → secrentel → priority → detect → report`
 
-- [ ] `ravenrecon scan`
-- [ ] Pipeline orchestration
-- [ ] Shared runtime wiring
-- [ ] Shared asset graph propagation
-- [ ] Shared cache and report flow
-- [ ] End-to-end execution paths
-- [ ] Pipeline-level error handling
+- [x] `ravenrecon scan`
+- [x] Pipeline orchestration
+- [x] Shared runtime wiring
+- [x] Shared asset graph propagation
+- [x] Shared cache and report flow
+- [x] End-to-end execution paths
+- [x] Pipeline-level error handling
 
 Acceptance criteria:
 
-- A single run can move from discovery to report without manual stitching.
-- Assets and evidence retain identity across all stages.
+- [x] A single run can move from discovery to report without manual stitching.
+- [x] Assets and evidence retain identity across all stages.
 - [x] Intermediate failures do not corrupt the final report.
 - [x] Pipeline runs are deterministic for the same input and config.
 - [x] End-to-end tests cover success, partial failure, and retry paths.

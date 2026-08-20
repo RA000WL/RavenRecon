@@ -71,7 +71,8 @@ When in doubt, round up a tier. Never round down to skip §0.
 - `internal/report` — Reporting Framework & Evidence Export (library only; presentation only — never rescans, never mutates data)
 - `internal/event` — canonical runtime event model + concurrent, bounded, non-blocking event bus (observer-only, library only)
 - `internal/tui` — terminal observability (library only; no CLI wiring yet)
-Most pipelines (dns, httpprobe, urlintel, techintel, jsintel) and the TUI have **no CLI command yet** — do not add CLI wiring outside the milestone that calls for it.
+- `internal/pipeline`, `internal/pipeline/adapt` — end-to-end pipeline orchestration (runner, stages, params, events) and the adapters that wrap each engine as a stage (library only; wired into the CLI by `ravenrecon scan`)
+Most pipelines (dns, httpprobe, urlintel, techintel, jsintel) and the TUI have **no standalone CLI command yet** — do not add CLI wiring outside the milestone that calls for it. (The pipeline as a whole IS reachable via `ravenrecon scan`; those engines still have no standalone commands, and the TUI is still unwired.)
 ## 3. Common commands
 
 ```bash
