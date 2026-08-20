@@ -94,6 +94,15 @@ func (f *fakeResolver) callCount() int {
 	return len(f.seen)
 }
 
+// seenCount reports how many queries were issued for one host (the seen
+// map counts per host, one entry per (host, type) lookup). T5 uses it to
+// prove cache-warm runs re-attempt only the failed host's queries.
+func (f *fakeResolver) seenCount(host string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seen[host]
+}
+
 // Lookup implements dns.Resolver.
 func (f *fakeResolver) Lookup(ctx context.Context, host string, rt dns.RecordType) ([]string, error) {
 	f.mu.Lock()

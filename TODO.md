@@ -86,7 +86,9 @@ orchestrator; every agent may append or update its own entries.
   re-verified, gates re-run), committed 9abe2d3; T4 determinism VERIFIED —
   review APPROVE WITH NITS (FIND-1..4 closed in a nit round, closure
   re-verified, gates re-run), committed with this board pass; T5 hermetic
-  E2E next)
+  E2E VERIFIED — review APPROVE WITH NITS (FIND-1 closed in a fix round,
+  closure re-verified, gates re-run; NEW-3 board header restored),
+  committed with this board pass; T6 CLI+docs next)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -846,6 +848,96 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   representation mismatch, passed after the internal/asset fix; the
   full-run determinism test passed from the first run. No new issues
   opened.
+- T5 IMPLEMENTED (this session, builder; claimed IN PROGRESS at session
+  start, never self-closed): hermetic full-run E2E across success,
+  partial failure, and retry — WITH the REAL discovery stage, exactly per
+  the orchestrator contract and its discovery-inclusion directive. The
+  inherited working tree (from a cancelled session) excluded discovery by
+  contract (t3dSeedStage under the discover name, mirroring T3d3); that
+  exclusion was WRONG for T5 and has been REWORKED: all three T5 tests
+  now drive the REAL NewDiscoveryStage over the T4 seam (scripted fake
+  discovery.Runner + fake LookupFunc — t4_determinism_test.go's shapes,
+  no barrier, plain fixed-output fakes). REUSE, not new code: the T4
+  helpers (t4DiscoveryScript/t4DiscoveryExecutions/t4ScanConfig/t4JSLoopback/
+  t4GauExecutions/t4HostNames) drive the discovery, JS, gau, and host-name
+  assertions; only the failure-injection seam (resolver), run mode (fresh
+  vs cache-warm), and per-test assertions differ from T4's wiring.
+  REWORKED ASSERTIONS (corpus shapes follow T4's real-discovery pins, not
+  T3d3's seed pins): Domains 0 (the discovery adapter reports hosts only —
+  adapt/discovery.go) instead of 1; hosts in the engine's sorted merge
+  order [admin, api, www] with injected-clock tool-name provenance
+  (earliest-wins) instead of seed order; Surfaces 12 (= 3 hosts + 9 URLs,
+  no domain surface) and group members 12 instead of 13; report model
+  corpus 0/3/9 instead of 1/3/9; captured models 2 (one per run) instead
+  of 1; discovery StageRecord pinned completed with ItemsProcessed 5
+  (subfinder 2 + assetfinder 2 + amass 1) + 3 executions + host
+  provenance; discovery executions counted through the retry runs exactly
+  like T4's cache-parity pin (cold 3 → warm 4 — only the NON-CACHEABLE
+  unknown-version assetfinder re-executes, internal/discovery/pipeline.go
+  :418-426; subfinder/amass served from cache; the healed-cold third run
+  adds 3 more → 7 total). UNCHANGED (verified correct in the inherited
+  file): the failure-injection pattern (typed per-host resolver failure
+  for exactly ONE discovered host on all of A/AAAA/CNAME → dns
+  StatusFailed → stage partial with ItemsFailed 1 → run partial with
+  ItemsFailed 1); failure ≠ truncation asserts (no sticky flags, no
+  Truncated anywhere); honest retained sets (IPs = exactly the two
+  surviving hosts' addresses; every surviving host's downstream work
+  present — jsintel/secrentel document flow with the synthetic key,
+  techintel technologies, urlintel parameters, detect finding, priority
+  12-surface group/attack-path shapes); the report model complete and
+  internally consistent; 20 stage events per run with the failing stage's
+  finished payload mirroring its StageRecord field for field (plus a new
+  discovery finished-payload completed assert) and the second run's event
+  stream DeepEqual; the healing resolver (first-call-per-(host,type)
+  fails, mutex-guarded) with 9 cold / 12 warm resolver-call counts, 3
+  re-attempted admin wire queries, zero re-execution of succeeded work
+  (http/jsintel counts flat, gau +1 by design) and the healed warm run
+  DeepEqual a fresh cold healed run; the persistent-failure resolver with
+  9 → 12 query counts, admin 3 → 6, surviving hosts flat 6, warm run
+  same partial + ItemsFailed 1, and the two RunReports DeepEqual.
+  Docs: adapt/doc.go T5 section rewritten (discovery INCLUDED via the T4
+  seam; the exclusion rationale gone; failure-injection pattern; the
+  observed cache contract for failed jobs with file:line evidence; the
+  discovery NON-CACHEABLE re-execute note on the retry counts; the
+  real-discovery corpus shapes); ROADMAP.md ticked "Pipeline runs are
+  deterministic for the same input and config." (pinned by T4's
+  TestT4FullRunDeterminismWithRealDiscovery + TestT4FullRunCacheHitParity,
+  t4_determinism_test.go:278/443 — cited here in the board per the
+  orchestrator directive, not in the roadmap). Production code: ZERO
+  changes (no engine/adapter/cache/asset code touched; the inherited
+  dns_test.go seenCount fixture helper kept). The cancelled session's
+  surface was verified line-by-line against the brief before rework (see
+  the gate record for what passed from the first run).
+- T5 GATE RECORD (this session, verbatim, all commands actually run, in
+  sequence): gofmt -l $(find . -name '*.go' -type f) → clean (empty
+  output). go test -count=1 ./internal/pipeline/... ./internal/discovery/
+  ... → ok (pipeline 0.160s, adapt 17.5s incl. the reworked T5 tests,
+  discovery 75.7s; the T5 tests pass from the second run — one fix round
+  for the model-count assertion placement, test-side only). go vet ./...
+  → ok. go build ./... → ok. go test -race -count=1 ./internal/pipeline/
+  ... ./internal/discovery/... → ok (no races; adapt 18.6s, discovery
+  81.4s under race). Full suite go test -count=1 ./... → ok (25
+  packages). No new issues opened; NEW-13 stays IN PROGRESS (owner:
+  builder; orchestrator verifies and closes — never self-closed). No
+  commits made (working tree left uncommitted per directive; .gitignore
+  and .opencode/ untouched).
+- T5 REVIEW FIX ROUND (this session, builder; claimed and completed, never
+  self-closed): FIND-1 (LOW, T5 review round) — adapt/doc.go
+  over-generalized: "The other engines follow the same Phase 3 convention
+  (completed-only hits; partial/incomplete never served), which is what
+  makes the full-run warm parity hold" implied every engine's FAILURE-path
+  retry contract is pinned by T5, but only the dns engine's failed-job
+  retry contract (stored-but-never-served: dns/run.go storeType, cache.go
+  typeStatusToCache, cache evaluate — the file:line citations above
+  storeType:558-601 / cache.go:133-143 / evaluate:207-209) is pinned HERE
+  by the retry tests (TestT5FullRunRetryHealing / Persistent); the
+  remaining engines' warm parity is pinned on the SUCCESS path by T4's
+  cache-parity test (TestT4FullRunCacheHitParity, t4_determinism_test.go
+  :443). REWORDED accordingly — the section's scope now matches what it
+  actually pins; no other change, no new issues opened. Gates re-run
+  verbatim below. T5 stays IN PROGRESS (owner: builder; orchestrator
+  verifies and closes — never self-closed).
+### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED
 - Reporter: reviewer
 - Owner: (none)

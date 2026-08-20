@@ -121,9 +121,9 @@ Acceptance criteria:
 
 - A single run can move from discovery to report without manual stitching.
 - Assets and evidence retain identity across all stages.
-- Intermediate failures do not corrupt the final report.
-- Pipeline runs are deterministic for the same input and config.
-- End-to-end tests cover success, partial failure, and retry paths.
+- [x] Intermediate failures do not corrupt the final report.
+- [x] Pipeline runs are deterministic for the same input and config.
+- [x] End-to-end tests cover success, partial failure, and retry paths.
 
 ---
 

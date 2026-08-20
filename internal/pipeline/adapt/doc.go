@@ -376,4 +376,95 @@
 //     record (decoded, never re-normalized) DeepEquals a freshly
 //     normalized one — the detect engine's cache-hit vs execute
 //     representation mismatch the full-run parity test caught.
+//
+// # T5 — hermetic full-run E2E (partial failure and retry)
+//
+// The v1.3 acceptance criteria "End-to-end tests cover success, partial
+// failure, and retry paths" (success pinned by T3d3) and "Intermediate
+// failures do not corrupt the final report" are pinned at the FULL-RUN
+// level in t5_hermetic_e2e_test.go, through the REAL adapters over
+// hermetic fixtures — INCLUDING the real discovery stage (NewDiscoveryStage
+// over the T4 seam: a scripted fake discovery.Runner plus the fake
+// LookupFunc constructor hook, exactly t4_determinism_test.go's harness;
+// no executables, no network). The T3d3 seed-stage exclusion is gone: the
+// discovery stage genuinely runs on every T5 run, reports hosts-only
+// additions (Additions.Domains stays empty — the declared target lives in
+// StageInput.Target, adapt/discovery.go), and must report completed so the
+// injected failure stays where the retry contract puts it: the dns
+// per-host resolver failure for exactly ONE host.
+//
+//   - Failure injection (deterministic, hermetic): a typed per-host
+//     resolver failure for exactly ONE of the three discovered hosts, on
+//     every record type the dns engine queries (A/AAAA/CNAME). A plain
+//     error classifies as TypeFailed (dns.applyAnswers default branch),
+//     so all three types fail -> the host is dns.StatusFailed ("no
+//     usable observations") -> the adapter folds partial
+//     (anyFailed && anyCompleted) with ItemsFailed = 1 -> the runner
+//     folds partial + 9 completed to a PARTIAL run (never failed, never
+//     completed). The failure is a failure, never a truncation: no
+//     Truncated marker, no sticky flags — asserted explicitly
+//     (AGENTS §0.6).
+//   - Corpus shapes with real discovery (T4-pinned): 0 domains, 3 hosts
+//     (admin/api/www, merged in the discovery engine's sorted All()
+//     order, with injected-clock tool-name provenance), 9 URLs (6 probed
+//     roots + 3 urlintel additions), 12 priority surfaces (3 hosts + 9
+//     URLs — discovery adds no domain surface), one group of 12 members
+//     anchored at domain:example.com, one attack path. The failing host
+//     stays in the corpus (a failed host is still a reported host); only
+//     its observations disappear (IPs = 2).
+//   - Partial-failure E2E (TestT5FullRunPartialFailure): run outcome
+//     partial; the discovery stage's own record is completed (5 processed
+//     per-source hosts, 3 executions); the failing stage's record is
+//     honest (partial, ItemsFailed 1, nil Err — per-host failures fold
+//     into the outcome); every later stage completes and the report is
+//     produced; the retained sets are honest (the failed host contributes
+//     no IP — the IPs channel carries exactly the two surviving hosts'
+//     addresses — and every surviving host's downstream work is present
+//     and complete); the captured report model is complete and internally
+//     consistent; stage events fire for every stage with the failing
+//     stage's finished payload mirroring its StageRecord; a second
+//     identical run DeepEquals the first, including the event stream.
+//   - Retry E2E (TestT5FullRunRetryHealing / TestT5FullRunRetryPersistent):
+//     the healing scenario uses a stateful resolver fixture (first call
+//     per (host, type) fails, later calls succeed — race-free via a
+//     mutex), the persistent scenario a plain scripted per-host error.
+//     Both run twice over the SAME filesystem cache and count resolver
+//     invocations / transport requests / jsintel fetches / gau runs /
+//     discovery executions to prove the split: succeeded units are served
+//     from cache with ZERO re-execution, and the failed units are
+//     RE-ATTEMPTED (exactly the failed host's 3 type queries — nothing
+//     else). Discovery re-executes exactly its NON-CACHEABLE source on a
+//     warm run (3 executions after the cold run, 4 after the warm run,
+//     mirroring T4's cache-parity count — see below). The healed run
+//     completes and DeepEquals a fresh cold run of the healed state; the
+//     persistent-failure run repeats the same partial outcome and
+//     DeepEquals run 1 (cache metadata is not part of RunReport).
+//
+// OBSERVED CACHE CONTRACT FOR FAILED JOBS (evidence; the retry
+// assertions match it exactly): the dns engine stores EVERY terminal type
+// classification as a statused Phase 3 record, failed ones included
+// (internal/dns/run.go storeType:558-601; typeStatusToCache maps
+// TypeFailed/TypeTimedOut -> cache.StatusFailed, internal/dns/cache.go
+// :133-143), but the Phase 3 cache NEVER serves a non-completed record as
+// a hit (internal/cache/cache.go evaluate:207-209 — anything whose Status
+// is not StatusCompleted resolves to StateIncomplete), and the dns
+// engine's lookupType (internal/dns/run.go:434-443) treats every non-hit
+// as "execute". A failed job is therefore re-attempted on the next run —
+// never cached as success, never skipped — while a completed job is
+// served with zero queries. The dns engine's failed-job retry contract
+// (stored-but-never-served: dns/run.go storeType, cache.go
+// typeStatusToCache, cache evaluate — cited above) is pinned HERE by the
+// retry tests; the remaining engines' warm parity is pinned on the
+// success path only, by T4's cache-parity test (TestT4FullRunCacheHitParity).
+//
+// DISCOVERY NON-CACHEABLE NOTE (evidence; the retry execution counts
+// match it exactly): a discovery tool whose version is unknown
+// (det.Version == "") is never cached — no key, no Get, no Put — and
+// executes fresh on every run (internal/discovery/pipeline.go:418-426).
+// assetfinder's capability probe (-h) yields no version, so it is the ONE
+// source that re-executes on a warm run; subfinder and amass (detected
+// versions) are served from cache. The detection probes themselves
+// ("-version"/"-h" argv forms) are detections, not discovery executions,
+// and are never counted by T4's t4DiscoveryExecutions helper, which the
+// T5 retry counts reuse.
 package adapt
