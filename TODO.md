@@ -80,20 +80,10 @@ orchestrator; every agent may append or update its own entries.
   (FIND-1 LOW + 3 INFO closed in a nit round, gates re-run), committed
   this session; T3c document channel + secrentel adapter VERIFIED —
   review APPROVE WITH NITS (FIND-1 MEDIUM docs + 4 INFO closed across two
-  fix rounds, closure verified, gates re-run), committed 9da5793; T3d1
-  jsintel producer IN PROGRESS — implemented + verified line-by-line
-  against the contract on a second pass (first dispatch cancelled
-  mid-flight; 2 finishing changes + 1 new test added, gates re-run —
-  records below), review pending, never self-closed; T3d2 dns/httpprobe/
-  urlintel/techintel producers IN PROGRESS — working tree verified
-  line-by-line against the contract, known-issue reconciliation + 7 new
-  tests added, gates re-run green (records below), review pending, never
-  self-closed; T3d3 priority/detect/report producers + the report stage's
-  full-Context consumption IN PROGRESS — working tree verified
-  line-by-line against the contract, FIND-2 + truncation-chain pins and
-  the one full-pipeline integration test added, docs + TODO records
-  updated, gates re-run green (records below), review pending, never
-  self-closed)
+  fix rounds, closure verified, gates re-run), committed 9da5793; T3d
+  adapters results production/consumption VERIFIED — review APPROVE WITH
+  NITS (FIND-1..4 LOW/INFO doc fixes closed in a fix round, closure
+  re-verified, gates re-run), committed 9abe2d3; T4 determinism next)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
