@@ -35,3 +35,6 @@ temp/
 .env
 .env.*
 !.env.example
+
+# Research notes (local only — advisory, never part of the repo)
+research/

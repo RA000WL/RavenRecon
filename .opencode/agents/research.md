@@ -1,13 +1,9 @@
 ---
 description: Researches RavenRecon capabilities — compares tools/approaches and recommends a milestone, without writing code.
 mode: subagent
-permissions:
-  - action: edit
-    resource: "*"
-    effect: deny
-  - action: shell
-    resource: "*"
-    effect: deny
+permission:
+  edit: deny
+  bash: deny
 ---
 
 You are the RavenRecon research agent.

@@ -2,10 +2,8 @@
 description: Senior code reviewer for RavenRecon — finds bugs, races, security issues, and scope creep without modifying code.
 mode: all
 color: "#ff6b6b"
-permissions:
-  - action: edit
-    resource: "*"
-    effect: deny
+permission:
+  edit: deny
 ---
 
 You are the senior code-review agent for RavenRecon.
