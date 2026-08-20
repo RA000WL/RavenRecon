@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -177,6 +178,121 @@ func TestURLIntelStageHappyPath(t *testing.T) {
 	}
 	if !runner.called("gau example.com") || !runner.called("gau api.example.com") {
 		t.Fatal("the stage must query every declared domain through the selected tool")
+	}
+	// T3d results wiring: one GET endpoint per entry and the graph edges
+	// (host->url + url->endpoint). The corpus has no query strings, so no
+	// parameters and no parameter edges.
+	requireEqualStrings(t, "results endpoints", endpointStrings(res.Results.Endpoints), []string{
+		"GET https://api.example.com/x",
+		"GET https://example.com/a",
+		"GET https://example.com/b",
+		"GET https://example.com/c",
+	})
+	if got := len(res.Results.Relationships); got != 8 {
+		t.Errorf("results relationships = %d, want 8 (4 host->url + 4 url->endpoint)", got)
+	}
+	if len(res.Results.Parameters) != 0 {
+		t.Errorf("results parameters = %v, want empty (no query strings in the corpus)", res.Results.Parameters)
+	}
+}
+
+// TestURLIntelStageResultsParameters pins the parameter results wiring: a
+// URL with a canonical query yields its parameters plus the url->parameter
+// and endpoint->parameter edges — the only results channels the stage can
+// contribute beyond endpoints and relationships.
+func TestURLIntelStageResultsParameters(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	runner := newFakeRunner(gauLines("example.com", "https://example.com/search?q=hello&page=2"))
+	s := NewURLIntelStage(runner, fakeLookup)
+
+	res, err := s.Run(context.Background(), urlintelInput(target, nil, nil, nil))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	paramStrs := make([]string, 0, len(res.Results.Parameters))
+	for _, p := range res.Results.Parameters {
+		paramStrs = append(paramStrs, p.Identity().String())
+	}
+	requireEqualStrings(t, "results parameters", paramStrs,
+		[]string{"parameter:query:page", "parameter:query:q"})
+	// 1 host->url + 1 url->endpoint + 2 url->parameter + 2 endpoint->parameter.
+	if got := len(res.Results.Relationships); got != 6 {
+		t.Errorf("results relationships = %d, want 6", got)
+	}
+}
+
+// TestURLIntelStageResultsDedupedAcrossDomains pins the results-channel
+// dedup through the adapter: the same URL observed from two queried domains
+// merges into ONE report entry in the engine's shared accumulator — one
+// endpoint, one parameter, and the merged edge set — and the adapter copies
+// that merged report verbatim (never rebuilt, never re-deduplicated).
+func TestURLIntelStageResultsDedupedAcrossDomains(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	domain := mustDomain(t, "api.example.com")
+	runner := newFakeRunner(gauLines("example.com", "https://example.com/a?q=1"))
+	runner.script["gau api.example.com"] = func(discovery.Cmd) (discovery.RunResult, error) {
+		return discovery.RunResult{Stdout: []byte("https://example.com/a?q=1\n")}, nil
+	}
+
+	s := NewURLIntelStage(runner, fakeLookup)
+	res, err := s.Run(context.Background(), urlintelInput(target, []asset.Domain{domain}, nil, nil))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want %q", res.Outcome, pipeline.OutcomeCompleted)
+	}
+	if res.ItemsProcessed != 1 {
+		t.Fatalf("ItemsProcessed = %d, want 1 (one distinct canonical URL across both domains)", res.ItemsProcessed)
+	}
+	requireEqualStrings(t, "results endpoints", endpointStrings(res.Results.Endpoints),
+		[]string{"GET https://example.com/a?q=1"})
+	paramStrs := make([]string, 0, len(res.Results.Parameters))
+	for _, p := range res.Results.Parameters {
+		paramStrs = append(paramStrs, p.Identity().String())
+	}
+	requireEqualStrings(t, "results parameters", paramStrs, []string{"parameter:query:q"})
+	// host->url + url->endpoint + url->parameter + endpoint->parameter, each
+	// edge from the one merged entry.
+	if got := len(res.Results.Relationships); got != 4 {
+		t.Errorf("results relationships = %d, want 4 (host->url + url->endpoint + url->parameter + endpoint->parameter)", got)
+	}
+}
+
+// TestURLIntelStageResultsDeterminism pins the determinism contract for the
+// results channel: two identical runs over the same scripted tool (fixed
+// clock) produce DeepEqual StageResults, including every results channel
+// the stage contributes — parameters, endpoints, and relationships.
+func TestURLIntelStageResultsDeterminism(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	domain := mustDomain(t, "api.example.com")
+	runner := newFakeRunner(gauLines("example.com",
+		"https://example.com/a",
+		"https://example.com/search?q=hello&page=2",
+	))
+	runner.script["gau api.example.com"] = func(discovery.Cmd) (discovery.RunResult, error) {
+		return discovery.RunResult{Stdout: []byte("https://api.example.com/x\n")}, nil
+	}
+
+	run := func() pipeline.StageResult {
+		t.Helper()
+		s := NewURLIntelStage(runner, fakeLookup)
+		res, err := s.Run(context.Background(), urlintelInput(target, []asset.Domain{domain}, nil, nil))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return res
+	}
+	res1, res2 := run(), run()
+	if !reflect.DeepEqual(res1, res2) {
+		t.Fatalf("two identical runs differ:\nrun 1: %+v\nrun 2: %+v", res1, res2)
+	}
+	if len(res1.Results.Parameters) == 0 || len(res1.Results.Endpoints) == 0 ||
+		len(res1.Results.Relationships) == 0 {
+		t.Fatal("determinism pin exercised no results output (parameters/endpoints/relationships all empty)")
 	}
 }
 

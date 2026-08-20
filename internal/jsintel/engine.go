@@ -211,6 +211,18 @@ type Config struct {
 	// default; clamped to [64 KiB, 8 MiB]).
 	MaxJSBytes int64
 
+	// RetainContent, when true, retains the fully-retained body bytes of
+	// every completed positive observation on its entry (JSEntry.Content)
+	// and exposes them run-wide through Report.RetainedContent(). Only
+	// fully-retained content is ever retained — a truncated fetch's partial
+	// prefix is NEVER retained (FetchResult.Content stays nil for
+	// truncated fetches) — and the content is bounded per entry by
+	// MaxJSBytes, so the retained set is bounded in count and size. The
+	// pipeline's jsintel stage always sets this flag (its document-channel
+	// producer, T3d); the engine default keeps the memory profile
+	// unchanged: entries carry no content.
+	RetainContent bool
+
 	// Retries is the number of immediate retries for failed fetch attempts
 	// (0 means the default 1; clamped to at most 3).
 	Retries int
@@ -1058,6 +1070,16 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 		Cached:    cached,
 		FirstSeen: firstSeen,
 		LastSeen:  lastSeen,
+	}
+	if e.cfg.RetainContent && res.Content != nil {
+		// Retention: only fully-retained content is ever retained (a
+		// truncated fetch's Content is nil by contract), so a retained
+		// body is always complete. Set before every return path — the
+		// entry carries it through the completed-negative, non-JS
+		// completed-positive, and JS-analysis branches alike, and the
+		// cache-hit path (res restored byte-identical from the js.fetch
+		// record) retains the same bytes.
+		entry.Content = res.Content
 	}
 	switch res.Status {
 	case FetchTruncated:

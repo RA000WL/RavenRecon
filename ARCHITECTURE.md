@@ -3339,9 +3339,14 @@ Implemented:
   AGENTS §0.6 carve-out, mirroring `corpus_capped`) plus `Truncated`.
   Stages receive the merged PRIOR state via `StageInput.Results`
   (read-only, identical contract to the corpus slices) and never see
-  their own additions. Planned, not yet implemented: adapter-side
-  production by the remaining stage families and the report stage's
-  consumption of the full `Context` from this struct (T3d)
+  their own additions. Adapter-side production is complete (T3d):
+  dns → IPs; httpprobe → IPs/Ports/Services/Endpoints/
+  TLSCertificates/Relationships; urlintel → Parameters/Endpoints/
+  Relationships; techintel → Technologies/Evidence/Relationships;
+  jsintel → JavaScript/SourceMaps/Relationships plus Endpoints/Secrets/
+  Technologies/Evidence; priority → Surfaces/Groups/AttackPaths; detect
+  → Findings — and the report stage consumes the full `Context` from
+  this struct (corpus + every results channel, copied whole)
   (`internal/pipeline`)
 * pipeline document channel + secrentel adapter (see "Pipeline
   requirements" and "Secret intelligence" above; v1.3 T3c): the
@@ -3372,10 +3377,10 @@ Implemented:
   truncated` is mapped too, though unreachable through this adapter
   (bounded pipeline content, truncated documents skipped). Counters and
   outcome fold mirror the T2c adapters exactly; the engine's offline
-  verification queue is never executed or propagated (T6). No adapter
-  produces documents yet (T3d: the jsintel stage family — NEW-15
-  resolved: the document channel is pipeline-internal, separate from the
-  Results channel; secrentel consumes the channel, never the
+  verification queue is never executed or propagated (T6). The jsintel
+  stage family is the document producer (T3d — NEW-15 resolved: the
+  document channel is pipeline-internal, separate from the Results
+  channel; secrentel consumes the channel, never the
   `Results.JavaScript` field) (`internal/pipeline`)
 
 Planned, not yet implemented:

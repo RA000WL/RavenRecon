@@ -1411,3 +1411,199 @@ func TestEngineAnalyzeRebindsOnContentChange(t *testing.T) {
 		t.Errorf("run 4 endpoints = %v, want /api/beta", eps)
 	}
 }
+
+func TestEngineRetentionDisabledByDefault(t *testing.T) {
+	// The default memory profile is unchanged: without Config.RetainContent
+	// entries carry no content and RetainedContent() is empty, even though
+	// the fetch itself retained the body for analysis.
+	body := []byte("var app = {x: 1};\n")
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(body)
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: "http://js.test/app.js"}})
+
+	e := rep.Entries[0]
+	if e.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", e.Status)
+	}
+	if e.Content != nil {
+		t.Errorf("entry content = %q, want nil (retention disabled by default)", e.Content)
+	}
+	if got := rep.RetainedContent(); len(got) != 0 {
+		t.Errorf("RetainedContent() = %+v, want empty", got)
+	}
+}
+
+func TestEngineRetentionEnabled(t *testing.T) {
+	body := []byte("var app = {x: 1};\nconsole.log(\"hi\");\n")
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(body)
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	cfg.RetainContent = true
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: "http://js.test/app.js"}})
+
+	e := rep.Entries[0]
+	if e.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", e.Status)
+	}
+	if !bytes.Equal(e.Content, body) {
+		t.Errorf("entry content = %q, want the exact body %q", e.Content, body)
+	}
+	got := rep.RetainedContent()
+	if len(got) != 1 {
+		t.Fatalf("RetainedContent() = %+v, want one retained body", got)
+	}
+	if got[0].URL.String() != "http://js.test/app.js" {
+		t.Errorf("retained URL = %q, want http://js.test/app.js", got[0].URL.String())
+	}
+	if !bytes.Equal(got[0].Content, body) {
+		t.Errorf("retained content = %q, want the exact body", got[0].Content)
+	}
+}
+
+func TestEngineRetentionNonJSCompletedPositive(t *testing.T) {
+	// A completed positive that is not a JS asset (an HTML body) is still
+	// retained when the flag is on: documents legitimately include observed
+	// content, and the content is fully retained by construction.
+	html := []byte("<html><body>hello</body></html>")
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write(html)
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	cfg.RetainContent = true
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: "http://js.test/page"}})
+
+	e := rep.Entries[0]
+	if e.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", e.Status)
+	}
+	if e.JS != nil {
+		t.Fatal("a non-JS body must not produce a JS asset")
+	}
+	if !bytes.Equal(e.Content, html) {
+		t.Errorf("entry content = %q, want the HTML body", e.Content)
+	}
+	if got := rep.RetainedContent(); len(got) != 1 {
+		t.Fatalf("RetainedContent() = %+v, want one retained body", got)
+	}
+}
+
+func TestEngineRetentionTruncatedNeverRetainsPrefix(t *testing.T) {
+	// Retention never weakens the truncation honesty contract: a truncated
+	// fetch's partial prefix is NEVER retained, flag or no flag.
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", strconv.Itoa(100<<10))
+		w.Write(bytes.Repeat([]byte("x"), 100<<10))
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	cfg.MaxJSBytes = 64 << 10 // the 100 KiB body truncates
+	cfg.RetainContent = true
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: "http://js.test/big.js"}})
+
+	e := rep.Entries[0]
+	if e.Status != StatusIncomplete {
+		t.Fatalf("status = %s, want incomplete (truncated fetch)", e.Status)
+	}
+	if e.Content != nil {
+		t.Errorf("entry content = %q, want nil (a partial prefix is never retained)", e.Content)
+	}
+	if got := rep.RetainedContent(); len(got) != 0 {
+		t.Errorf("RetainedContent() = %+v, want empty (no complete body)", got)
+	}
+}
+
+func TestEngineRetentionCacheHitRestoresContent(t *testing.T) {
+	// The js.fetch cache record stores the content byte-identically, so a
+	// completed cache hit restores the SAME retained body as the fresh
+	// fetch — retention works on both paths.
+	body := []byte("var app = {x: 1};\n")
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write(body)
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	cfg.RetainContent = true
+	cfg.Cache = openTestCache(t)
+	items := []Item{{Kind: ItemLine, Line: "http://js.test/app.js"}}
+
+	rep1 := runEngine(t, cfg, items)
+	if rep1.Entries[0].Cached {
+		t.Fatal("run 1 must be a fresh fetch")
+	}
+	rep2 := runEngine(t, cfg, items)
+	if !rep2.Entries[0].Cached {
+		t.Fatal("run 2 must be served from the completed cache record")
+	}
+	if !bytes.Equal(rep1.Entries[0].Content, body) {
+		t.Errorf("run 1 content = %q, want the body", rep1.Entries[0].Content)
+	}
+	if !bytes.Equal(rep2.Entries[0].Content, body) {
+		t.Errorf("run 2 (cached) content = %q, want the byte-identical body", rep2.Entries[0].Content)
+	}
+	if got := rep2.RetainedContent(); len(got) != 1 || !bytes.Equal(got[0].Content, body) {
+		t.Errorf("run 2 RetainedContent() = %+v, want the body", got)
+	}
+}
+
+func TestMergeEntriesRetentionFirstSeenWins(t *testing.T) {
+	// The retained body merges first-seen-wins: the earliest observation's
+	// body is the entry's, and an entry without content adopts the first
+	// observed one (mirrors the JS asset's earliest-observation-wins rule).
+	cfg := DefaultConfig()
+	u := mustURL(t, "http://js.test/app.js")
+	first := JSEntry{URL: u, Status: StatusCompleted, Content: []byte("first body")}
+	second := JSEntry{URL: u, Status: StatusCompleted, Content: []byte("second body")}
+
+	dst := first
+	mergeEntries(&dst, second, cfg)
+	if !bytes.Equal(dst.Content, []byte("first body")) {
+		t.Errorf("merged content = %q, want the first-seen body", dst.Content)
+	}
+
+	dst2 := JSEntry{URL: u, Status: StatusCompleted}
+	mergeEntries(&dst2, second, cfg)
+	if !bytes.Equal(dst2.Content, []byte("second body")) {
+		t.Errorf("adopted content = %q, want the first observed body", dst2.Content)
+	}
+}
+
+func TestReportRetainedContentSortedDedupedNilSkipped(t *testing.T) {
+	// RetainedContent mirrors the report's other merged accessors: sorted
+	// by canonical URL string, deduplicated by URL identity (earliest wins),
+	// and including only entries with non-nil Content — even for a
+	// hand-built report whose entries are unsorted and carry duplicate
+	// URLs (real reports hold one sorted entry per URL, so the
+	// normalization is a no-op there).
+	ua := mustURL(t, "http://js.test/a.js")
+	ub := mustURL(t, "http://js.test/b.js")
+	uc := mustURL(t, "http://js.test/c.js")
+	rep := Report{Entries: []JSEntry{
+		// Out of canonical order, and a.js appears twice with two bodies.
+		{URL: uc, Status: StatusCompleted, Content: []byte("c body")},
+		{URL: ua, Status: StatusCompleted, Content: []byte("a body")},
+		{URL: ub, Status: StatusCompleted},                                  // nil content: skipped
+		{URL: ua, Status: StatusCompleted, Content: []byte("a body later")}, // duplicate URL: dropped
+	}}
+	got := rep.RetainedContent()
+	want := []RetainedContent{
+		{URL: ua, Content: []byte("a body")},
+		{URL: uc, Content: []byte("c body")},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("RetainedContent() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].URL.String() != want[i].URL.String() {
+			t.Errorf("retained[%d] URL = %q, want %q", i, got[i].URL.String(), want[i].URL.String())
+		}
+		if !bytes.Equal(got[i].Content, want[i].Content) {
+			t.Errorf("retained[%d] content = %q, want %q", i, got[i].Content, want[i].Content)
+		}
+	}
+}

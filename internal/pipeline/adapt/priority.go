@@ -11,6 +11,18 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
 
+// priorityGroupsTruncated is the sticky flag this adapter records when the
+// priority engine's correlation cut retained groups (Correlate's run-level
+// truncation signal — groups beyond the engine's fixed maxCorrelationGroups
+// are dropped and counted). It is the ONLY truncation signal this adapter
+// can observe: the scoring engine itself reports no retention caps
+// (adapt/doc.go T2d), so every cut that can occur here is a correlation
+// cut. The name follows the package convention (adapt/doc.go): a sticky
+// flag is <engine>_<what>_truncated. Group-level member truncation
+// (Group.Truncated) rides on the group values only — it never sets this
+// flag.
+const priorityGroupsTruncated = "priority_groups_truncated"
+
 // priorityStage adapts internal/priority (priority.Score) into a
 // pipeline.Stage.
 //
@@ -88,9 +100,8 @@ func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriorit
 // sorted keys, so the parameter-name list is deterministic by
 // construction). All other signal fields (port, service, headers,
 // technologies, secrets, bundle sizes, first-seen, ...) stay zero: the
-// pipeline corpus does not carry those observation channels yet (results
-// propagation is a separate milestone). The adapter never fabricates
-// observations.
+// pipeline corpus does not carry those observation channels yet. The
+// adapter never fabricates observations.
 //
 // Boundary (mandatory, both sides): input corpus entries are pre-filtered
 // with pipeline.InDomain/FilterHosts and filterURLs (canonical names only —
@@ -99,8 +110,8 @@ func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriorit
 // out-of-domain assets through this adapter: its report carries scored
 // surfaces only, never corpus additions, and no corpus asset can leave the
 // adapter's input side. Consequently the stage produces NO corpus
-// additions: surfaces, groups, and attack paths are results, propagated by
-// the results channel in a later milestone. Additions stay empty by
+// additions: surfaces, groups, and attack paths are results, propagated
+// through the results channel (T3d, adapt/doc.go). Additions stay empty by
 // construction.
 //
 // Empty-input short-circuit: an empty filtered corpus yields a vacuous
@@ -140,11 +151,14 @@ func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriorit
 // Cancelled asset count (every asset the engine processed); ItemsFailed is
 // Failed (every asset that could not be scored).
 //
-// Truncation: the priority engine reports NO truncation or overflow
+// Truncation: the scoring engine reports NO truncation or overflow
 // signals through this adapter's input path (its retention model has no
-// caps on the asset count it reports), so this adapter never sets
-// Truncated or a sticky flag. The absence is deliberate and documented
-// (adapt/doc.go T2d); a future engine cap must surface here.
+// caps on the asset count it reports), so the ONLY signal this adapter
+// can observe is the correlation cut — Correlate's run-level truncation
+// (groups beyond the engine's fixed maxCorrelationGroups), mapped to
+// Truncated + the priority_groups_truncated sticky flag, never swallowed
+// (AGENTS §0.6). Group-level member truncation (Group.Truncated) rides on
+// the group values only.
 func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
@@ -265,16 +279,44 @@ func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, si
 }
 
 // buildPriorityResult maps one engine report onto the pipeline's
-// StageResult shape: the honest counters and empty Additions (priority
-// produces no corpus additions — T2d). No truncation mapping exists — the
-// priority engine reports no truncation signals (documented on Run).
+// StageResult shape: the honest counters, the results-channel additions
+// (scored surfaces, correlated groups, and attack-path hypotheses), the
+// correlation-cut truncation flag (never swallowed), and empty Additions
+// (priority produces no corpus additions — T2d). It is used on every path:
+// the success path and both engine-error branches — the report's honest
+// completed assets still merge through Correlate and AttackPaths (both
+// pure, deterministic, and bounded by the engine's fixed caps).
 func (s *priorityStage) buildPriorityResult(rep priority.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
-	return pipeline.StageResult{
+	res := pipeline.StageResult{
 		Outcome:        outcome,
 		Err:            err,
 		ItemsProcessed: priorityProcessed(rep),
 		ItemsFailed:    priorityFailed(rep),
 	}
+	// Results: one surface per completed asset result (the engine's
+	// canonical scored values, copied — never rebuilt), then the
+	// deterministic correlation groups and attack paths derived from those
+	// retained surfaces. Correlate and AttackPaths run on every path —
+	// even an engine-error path merges its honest completed assets —
+	// mirroring how the secrentel adapter derives its report's results.
+	surfaces := make([]priority.SurfaceAsset, 0, rep.Completed)
+	for _, ar := range rep.Assets {
+		if ar.Status == priority.StatusCompleted && ar.Surface != nil {
+			surfaces = append(surfaces, *ar.Surface)
+		}
+	}
+	groups, truncated := priority.Correlate(surfaces)
+	res.Results.Surfaces = surfaces
+	res.Results.Groups = groups
+	res.Results.AttackPaths = priority.AttackPaths(groups)
+	if truncated {
+		// The run-level correlation cut: groups beyond the engine's fixed
+		// maxCorrelationGroups were dropped. The flag, never the outcome
+		// alone, marks the retained set incomplete (AGENTS §0.6).
+		res.Truncated = true
+		res.StickyFlags = map[string]bool{priorityGroupsTruncated: true}
+	}
+	return res
 }
 
 // foldPriorityOutcome maps the engine's aggregate outcome onto the

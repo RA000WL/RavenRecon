@@ -9,16 +9,13 @@ import (
 // stages produce beyond the corpus itself (technologies, evidence,
 // findings, parameters, secrets, endpoints, JavaScript assets, scoring
 // output...). Every channel mirrors one report.Context data channel 1:1
-// (internal/report/context.go) — the report stage will consume the full
-// Context from this struct in a later milestone.
+// (internal/report/context.go) — the report stage consumes the full
+// Context from this struct (T3d).
 //
-// Producers: the secrentel T3c adapter is the first Results producer —
-// secret candidates, evidence, and relationships (the engine report's
-// canonical assets, copied into the channel, never rebuilt). The stage
-// families named per field below are the documented producers for the
-// remaining channels; the T3d adapters will fill those fields. A stage
-// that has nothing to add leaves its fields nil or empty — that is legal
-// and means "nothing added".
+// Producers: the secrentel T3c adapter was the first Results producer;
+// the T3d adapters wired the remaining stage families (the producers are
+// documented per field below). A stage that has nothing to add leaves its
+// fields nil or empty — that is legal and means "nothing added".
 //
 // The channel is assembled by the runner: every stage receives the
 // merged state of the EARLIER stages via StageInput.Results (read-only),
@@ -26,89 +23,96 @@ import (
 // merges them (first-seen dedup, deterministic order, per-channel
 // MaxOutput caps at each merge) into RunReport.Results.
 type Results struct {
-	// IPs are the canonical resolved addresses (asset.IP). Producer:
-	// the dns/httpprobe stage family (the T3d adapters — not yet
-	// wired).
+	// IPs are the canonical resolved addresses (asset.IP). Producer: the
+	// dns and httpprobe stage families (wired in T3d — the engines'
+	// AllIPs accessors, copied, never rebuilt).
 	IPs []asset.IP
 
-	// Ports are the canonical listening ports (asset.Port). Producer:
-	// the dns/httpprobe stage family (the T3d adapters — not yet
-	// wired).
+	// Ports are the canonical listening ports (asset.Port). Producer: the
+	// httpprobe stage family (wired in T3d).
 	Ports []asset.Port
 
 	// Services are the canonical services identified on ports
-	// (asset.Service). Producer: the dns/httpprobe stage family (the
-	// T3d adapters — not yet wired).
+	// (asset.Service). Producer: the httpprobe stage family (wired in
+	// T3d).
 	Services []asset.Service
 
 	// Endpoints are the canonical endpoint candidates (asset.Endpoint).
-	// Producer: the jsintel stage family (the T3d adapters — not yet
-	// wired).
+	// Producer: the httpprobe, urlintel, and jsintel stage families
+	// (wired in T3d).
 	Endpoints []asset.Endpoint
 
 	// JavaScript are the canonical script assets (asset.JavaScript).
-	// Producer: the jsintel stage family (the T3d adapters — not yet
-	// wired).
+	// Producer: the jsintel stage family (wired in T3d).
 	JavaScript []asset.JavaScript
 
 	// Parameters are the canonical observed parameters
 	// (asset.Parameter). Producer: the urlintel and jsintel stage
-	// families (the T3d adapters — not yet wired).
+	// families (wired in T3d).
 	Parameters []asset.Parameter
 
 	// Technologies are the canonical detected technologies
-	// (asset.Technology). Producer: the techintel stage family (the
-	// T3d adapters — not yet wired).
+	// (asset.Technology). Producer: the techintel and jsintel stage
+	// families (wired in T3d).
 	Technologies []asset.Technology
 
 	// Secrets are the canonical secret candidates
-	// (asset.SecretCandidate). Producer: the secrentel stage family —
-	// its T3c adapter is wired and produces — and the jsintel stage
-	// family (the T3d adapters — not yet wired). The secrentel adapter
-	// consumes the pipeline-internal document channel as its document
-	// source, never this channel's JavaScript field.
+	// (asset.SecretCandidate). Producer: the secrentel stage family (its
+	// T3c adapter is wired) and the jsintel stage family (wired in T3d).
+	// The secrentel adapter consumes the pipeline-internal document channel
+	// as its document source, never this channel's JavaScript field.
 	Secrets []asset.SecretCandidate
 
 	// Evidence are the canonical evidence observations
-	// (asset.Evidence). Producer: the techintel stage family (the T3d
-	// adapters — not yet wired) and the secrentel T3c adapter (wired —
-	// the engine's evidence passes through the adapter, never rebuilt).
+	// (asset.Evidence). Producer: the techintel and jsintel stage
+	// families (wired in T3d) and the secrentel T3c adapter (wired — the
+	// engine's evidence passes through the adapter, never rebuilt).
 	Evidence []asset.Evidence
 
-	// Findings are the detection findings (asset.Finding). Producer:
-	// the detect stage family (the T3d adapters — not yet wired).
+	// Findings are the detection findings (asset.Finding). Producer: the
+	// detect stage family (wired in T3d — the engine report's findings,
+	// copied, never rebuilt).
 	Findings []asset.Finding
 
 	// TLSCertificates are the canonical TLS leaf certificates
 	// (asset.TLSCertificate, keyed by fingerprint). Producer: the
-	// httpprobe stage family (the T3d adapters — not yet wired).
+	// httpprobe stage family (wired in T3d).
 	TLSCertificates []asset.TLSCertificate
 
 	// SourceMaps are the canonical source-map assets (asset.SourceMap).
-	// Producer: the jsintel stage family (the T3d adapters — not yet
-	// wired).
+	// Producer: the jsintel stage family (wired in T3d).
 	SourceMaps []asset.SourceMap
 
 	// Relationships are the typed, directed asset-graph edges
-	// (asset.Relationship). Producer: the dns/httpprobe, urlintel, and
-	// jsintel stage families (the T3d adapters — not yet wired) and the
-	// secrentel T3c adapter (wired — the engine's relationships pass
-	// through the adapter, never rebuilt).
+	// (asset.Relationship). Producer: the httpprobe, urlintel, techintel,
+	// and jsintel stage families (wired in T3d) and the secrentel T3c
+	// adapter (wired — the engine's relationships pass through the
+	// adapter, never rebuilt).
 	Relationships []asset.Relationship
 
 	// Surfaces are the scored surfaces of the priority engine
-	// (priority.SurfaceAsset). Producer: the priority stage family (the
-	// T3d adapters — not yet wired).
+	// (priority.SurfaceAsset). Producer: the priority stage family (wired
+	// in T3d — one surface per completed asset result, copied).
 	Surfaces []priority.SurfaceAsset
 
 	// Groups are the correlated surface groups of the priority engine
-	// (priority.Group). Producer: the priority stage family (the T3d
-	// adapters — not yet wired).
+	// (priority.Group). Producer: the priority stage family (wired in
+	// T3d). Dedup: first-seen group per anchor wins — the merge keys on
+	// Group.Anchor (see mergeResults), so when two stages contribute
+	// groups anchored at the same identity, the first stage's group
+	// survives and the later group's members are dropped wholesale. That
+	// is the documented first-seen dedup semantics (identical to the
+	// corpus merge), NOT a truncation: it never sets a flag. Group-level
+	// member truncation (Group.Truncated) rides on the group values only;
+	// the run-level correlation cut maps to the priority_groups_truncated
+	// sticky flag on the producing stage.
 	Groups []priority.Group
 
 	// AttackPaths are the attack-path hypotheses of the priority engine
-	// (priority.AttackPath). Producer: the priority stage family (the
-	// T3d adapters — not yet wired).
+	// (priority.AttackPath). Producer: the priority stage family (wired
+	// in T3d). Dedup: first-seen path per root wins — the merge keys on
+	// AttackPath.Root (see mergeResults), with the same non-truncation
+	// semantics documented on Groups.
 	AttackPaths []priority.AttackPath
 }
 

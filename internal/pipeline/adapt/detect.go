@@ -76,12 +76,16 @@ func (s *detectStage) Name() pipeline.StageName { return pipeline.StageDetect }
 // StageParams: none. in.Config is never read — the stage has no documented
 // parameter keys, and unknown keys are ignored by construction.
 //
-// Snapshot: the detection Snapshot carries ONLY the core-graph asset
-// identities derived from the in-scope corpus (in.Domains, in.Hosts,
-// in.URLs — one identity each, canonical by construction). All other
-// snapshot channels (relationships, evidence, technologies, secrets,
-// JavaScript, endpoints) stay empty: the pipeline corpus does not carry
-// them yet (results propagation is a separate milestone). The adapter
+// Snapshot: the detection Snapshot carries the core-graph asset identities
+// derived from the in-scope corpus (in.Domains, in.Hosts, in.URLs — one
+// identity each, canonical by construction) PLUS the results channel's
+// Phase 2 values the earlier stages produced (T3d): relationships,
+// evidence, technologies, secrets, JavaScript, and endpoints are copied
+// into the snapshot channels as-is — the engine's own normalization
+// deduplicates and sorts them. Findings are NOT inputs (the engine's own
+// output, never re-consumed); the remaining results channels
+// (IPs/ports/services/URLs/parameters/TLS certificates/source maps/
+// surfaces/groups/attack paths) have no snapshot counterpart. The adapter
 // never fabricates snapshot entries.
 //
 // Boundary (mandatory, both sides): input corpus entries are pre-filtered
@@ -91,22 +95,26 @@ func (s *detectStage) Name() pipeline.StageName { return pipeline.StageDetect }
 // produce out-of-domain assets through this adapter: findings are named by
 // the rules over the snapshot's in-scope identities, and the engine emits
 // no corpus additions. Consequently the stage produces NO corpus additions:
-// findings are results, propagated by the results channel in a later
-// milestone. Additions stay empty by construction.
+// findings are results, propagated by the results channel (T3d —
+// buildDetectResult). Additions stay empty by construction.
 //
 // Empty-input short-circuit: an empty filtered corpus with an EMPTY
 // registry is observationally identical to calling the engine (zero rules,
 // nothing attempted → vacuous completed), so the stage short-circuits —
-// but only when BOTH hold: a non-empty registry may contain rules without
-// RequiredAssetTypes that genuinely EXECUTE against an empty corpus (and
-// can fail or emit findings), so an empty corpus alone never skips the
-// engine. The canonicality gate is kept for shape-consistency with the
-// sibling adapters: with a non-canonical target the scope filter is
-// unsound, so the stage falls through to the engine with an empty snapshot
-// and lets the engine produce its own honest vacuous (or rule-driven)
-// outcome. Note the declared target itself is NOT added to the snapshot:
-// the engine runs over the corpus as the earlier stages produced it — the
-// target domain is detected only when the corpus carries it.
+// but only when ALL THREE hold: no corpus assets, no snapshot-feeding
+// results channels (relationships, evidence, technologies, secrets,
+// JavaScript, endpoints — see Run), and an empty registry. A non-empty
+// registry may contain rules without RequiredAssetTypes that genuinely
+// EXECUTE against an empty corpus (and can fail or emit findings), and a
+// non-empty results channel is a non-empty corpus to such rules, so an
+// empty corpus alone never skips the engine. The canonicality gate is kept
+// for shape-consistency with the sibling adapters: with a non-canonical
+// target the scope filter is unsound, so the stage falls through to the
+// engine with an empty snapshot and lets the engine produce its own honest
+// vacuous (or rule-driven) outcome. Note the declared target itself is NOT
+// added to the snapshot: the engine runs over the corpus as the earlier
+// stages produced it — the target domain is detected only when the corpus
+// carries it.
 //
 // Outcome mapping (engine report outcome → pipeline outcome; the engine
 // folds its per-rule statuses into Report.Outcome itself):
@@ -164,12 +172,13 @@ func (s *detectStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 	}
 
 	// Empty filtered input short-circuit — only when observationally
-	// identical to calling the engine: an empty corpus AND an empty
-	// registry (see Run). A non-canonical target makes the scope filter
-	// unsound, so the stage falls through to the engine with an empty
-	// snapshot (the engine never validates the target, so this yields the
-	// engine's own honest outcome, never a fabricated error).
-	if len(domains)+len(hosts)+len(urls) == 0 && reg.Len() == 0 {
+	// identical to calling the engine: an empty corpus (including the
+	// snapshot-feeding results channels) AND an empty registry (see Run).
+	// A non-canonical target makes the scope filter unsound, so the stage
+	// falls through to the engine with an empty snapshot (the engine never
+	// validates the target, so this yields the engine's own honest outcome,
+	// never a fabricated error).
+	if len(domains)+len(hosts)+len(urls) == 0 && resultsSnapshotEmpty(in.Results) && reg.Len() == 0 {
 		if !targetCanonical(in.Target) {
 			return s.runDetect(ctx, in, reg, detect.Snapshot{})
 		}
@@ -180,11 +189,32 @@ func (s *detectStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		return pipeline.StageResult{Outcome: pipeline.OutcomeCompleted}, nil
 	}
 
-	// One core-graph identity per in-scope corpus asset (see Run).
+	// The core-graph identities plus the results channel's snapshot values
+	// (see Run). Findings are not inputs; the remaining results channels
+	// have no snapshot counterpart.
 	snap := detect.Snapshot{
-		Assets: buildSnapshotAssets(domains, hosts, urls),
+		Assets:        buildSnapshotAssets(domains, hosts, urls),
+		Relationships: in.Results.Relationships,
+		Evidence:      in.Results.Evidence,
+		Technologies:  in.Results.Technologies,
+		Secrets:       in.Results.Secrets,
+		JavaScript:    in.Results.JavaScript,
+		Endpoints:     in.Results.Endpoints,
 	}
 	return s.runDetect(ctx, in, reg, snap)
+}
+
+// resultsSnapshotEmpty reports whether every results channel that feeds the
+// detection snapshot is empty. The short-circuit must not fire when an
+// earlier stage produced snapshot values: rules without RequiredAssetTypes
+// genuinely execute against them (see Run).
+func resultsSnapshotEmpty(r pipeline.Results) bool {
+	return len(r.Relationships) == 0 &&
+		len(r.Evidence) == 0 &&
+		len(r.Technologies) == 0 &&
+		len(r.Secrets) == 0 &&
+		len(r.JavaScript) == 0 &&
+		len(r.Endpoints) == 0
 }
 
 // runDetect derives the engine config from the StageInput, calls
@@ -254,8 +284,11 @@ func (s *detectStage) runDetect(ctx context.Context, in pipeline.StageInput, reg
 }
 
 // buildDetectResult maps one engine report onto the pipeline's StageResult
-// shape: the honest counters, the truncation flag (never swallowed), and
-// empty Additions (detect produces no corpus additions — T2d).
+// shape: the honest counters, the truncation flag (never swallowed), the
+// results-channel additions (the engine's canonical findings, copied —
+// never rebuilt — per the one-normalization-point rule), and empty
+// Additions (detect produces no corpus additions — T2d). It is used on
+// every path: the success path and both engine-error branches.
 func (s *detectStage) buildDetectResult(rep detect.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
@@ -263,6 +296,10 @@ func (s *detectStage) buildDetectResult(rep detect.Report, outcome pipeline.Outc
 		ItemsProcessed: detectProcessed(rep),
 		ItemsFailed:    detectFailed(rep),
 	}
+	// Findings are results, never corpus additions. They are copied whole:
+	// the rules emitted them over the in-scope snapshot, and findings carry
+	// no scope-boundary semantics of their own (adapt/doc.go T3d).
+	res.Results.Findings = rep.Findings
 	if rep.FindingsTruncated {
 		res.Truncated = true
 		res.StickyFlags = map[string]bool{detectFindingsTruncatedFlag: true}

@@ -11,6 +11,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
+	"github.com/RA000WL/RavenRecon/internal/priority"
 	"github.com/RA000WL/RavenRecon/internal/report"
 )
 
@@ -201,6 +202,146 @@ func TestReportStageContextComposition(t *testing.T) {
 	requireEqualStrings(t, "model URLs", urlStrings(m.URLs), []string{"https://www.example.com/login"})
 	if len(m.Domains) != 1 || m.Domains[0].Name != "example.com" {
 		t.Errorf("model domains = %+v, want [example.com]", m.Domains)
+	}
+}
+
+// TestReportStageContextEveryChannel pins the T3d full-Context
+// composition: every results channel the earlier stages produced reaches
+// the report model (the engine re-normalizes, so each channel is asserted
+// by membership and count, never by order).
+func TestReportStageContextEveryChannel(t *testing.T) {
+	var m *report.Model
+	reg := newReportRegistry(t, captureReporter("capture", func(got *report.Model) { m = got }))
+
+	host := mustHost(t, "www.example.com")
+	ip, err := asset.NewIP("192.168.1.10", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewIP: %v", err)
+	}
+	port, err := asset.NewPort(443, "tcp", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewPort: %v", err)
+	}
+	svc, err := asset.NewService("https", port, asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	ep, err := asset.NewEndpoint("GET", "https://www.example.com/login", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	js, err := asset.NewJavaScript("https://www.example.com/app.js", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewJavaScript: %v", err)
+	}
+	param, err := asset.NewParameter("q", "query", "v", "url", fixedTime, asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewParameter: %v", err)
+	}
+	tech, err := asset.NewTechnology("nginx", asset.CategoryServer, asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewTechnology: %v", err)
+	}
+	sec, err := asset.NewSecretCandidate(asset.SecretTypeAWS, "AKIA0123456789ABCDEF", host.Identity(), asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewSecretCandidate: %v", err)
+	}
+	ev, err := asset.NewEvidence(asset.MethodHeader, "x-nginx-version", "1.25", host.Identity(), asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	f, err := asset.NewFinding(asset.Finding{
+		RuleID:     "test.rule",
+		RuleName:   "Test Rule",
+		Category:   "exposure",
+		Subject:    host.Identity(),
+		Confidence: 0.9,
+		Evidence:   []asset.Evidence{ev},
+		Priority:   "info",
+		Status:     "open",
+		Created:    fixedTime,
+	})
+	if err != nil {
+		t.Fatalf("NewFinding: %v", err)
+	}
+	cert, err := asset.NewTLSCertificate("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewTLSCertificate: %v", err)
+	}
+	sm, err := asset.NewSourceMap("https://www.example.com/app.js.map", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewSourceMap: %v", err)
+	}
+	rel, err := asset.NewRelationship(host.Identity(), asset.RelationshipHostToIP, ip.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship: %v", err)
+	}
+	surf := priority.SurfaceAsset{Identity: host.Identity(), Kind: asset.KindHost, Score: 0.5, Level: priority.LevelLow}
+	group := priority.Group{Anchor: host.Identity(), Members: []priority.SurfaceAsset{surf}, Score: 0.5, Level: priority.LevelLow}
+	path := priority.AttackPath{
+		Root:  host.Identity(),
+		Steps: []priority.PathStep{{Identity: host.Identity(), Kind: asset.KindHost, FactorName: "test-factor", Reason: "test reason", Evidence: []string{"test evidence"}}},
+		Score: 0.5,
+		Level: priority.LevelLow,
+	}
+
+	in := reportInput(mustDomain(t, "example.com"), nil, nil, nil, t.TempDir(), nil)
+	in.Results = pipeline.Results{
+		IPs:             []asset.IP{ip},
+		Ports:           []asset.Port{port},
+		Services:        []asset.Service{svc},
+		Endpoints:       []asset.Endpoint{ep},
+		JavaScript:      []asset.JavaScript{js},
+		Parameters:      []asset.Parameter{param},
+		Technologies:    []asset.Technology{tech},
+		Secrets:         []asset.SecretCandidate{sec},
+		Evidence:        []asset.Evidence{ev},
+		Findings:        []asset.Finding{f},
+		TLSCertificates: []asset.TLSCertificate{cert},
+		SourceMaps:      []asset.SourceMap{sm},
+		Relationships:   []asset.Relationship{rel},
+		Surfaces:        []priority.SurfaceAsset{surf},
+		Groups:          []priority.Group{group},
+		AttackPaths:     []priority.AttackPath{path},
+	}
+
+	res, err := NewReportStage(reg).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome %s, want completed", res.Outcome)
+	}
+	if m == nil {
+		t.Fatal("reporter never ran")
+	}
+	channels := []struct {
+		name  string
+		count int
+	}{
+		{"IPs", len(m.IPs)}, {"Ports", len(m.Ports)}, {"Services", len(m.Services)},
+		{"Endpoints", len(m.Endpoints)}, {"JavaScript", len(m.JavaScript)},
+		{"Parameters", len(m.Parameters)}, {"Technologies", len(m.Technologies)},
+		{"Secrets", len(m.Secrets)}, {"Evidence", len(m.Evidence)},
+		{"Findings", len(m.Findings)}, {"TLSCertificates", len(m.TLSCertificates)},
+		{"SourceMaps", len(m.SourceMaps)}, {"Relationships", len(m.Relationships)},
+		{"Surfaces", len(m.Surfaces)}, {"Groups", len(m.Groups)},
+		{"AttackPaths", len(m.AttackPaths)},
+	}
+	for _, ch := range channels {
+		if ch.count != 1 {
+			t.Errorf("model %s = %d, want 1 (the results channel value reaches the Context)", ch.name, ch.count)
+		}
+	}
+	// Spot-check the values survived the normalization.
+	if m.IPs[0].Identity().String() != ip.Identity().String() {
+		t.Errorf("model IPs = %+v, want %s", m.IPs, ip.Identity())
+	}
+	if m.Groups[0].Anchor.String() != host.Identity().String() {
+		t.Errorf("model Groups anchor = %s, want %s", m.Groups[0].Anchor, host.Identity())
+	}
+	if m.Findings[0].RuleID != "test.rule" {
+		t.Errorf("model Findings = %+v, want rule %q", m.Findings, "test.rule")
 	}
 }
 

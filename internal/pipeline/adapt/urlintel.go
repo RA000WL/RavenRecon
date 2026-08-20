@@ -276,7 +276,7 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 				// attached — the runner's isContextError traverses the wrap
 				// and keeps the cancelled classification (mirrors the dns
 				// adapter's mapping).
-				return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: urlintelAdditions(in, report)}, wrapped
+				return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: urlintelAdditions(in, report), Results: urlintelResults(report)}, wrapped
 			case ctx.Err() != nil:
 				// The stage context fired while the engine errored (for
 				// example teardown on forced pool shutdown): cancellation is
@@ -284,9 +284,9 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 				// attached, with the engine's error joined in so nothing is
 				// lost (INFO-1 convention, mirroring the dns adapter).
 				joined := fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), engineErr))
-				return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: joined, Additions: urlintelAdditions(in, report)}, nil
+				return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: joined, Additions: urlintelAdditions(in, report), Results: urlintelResults(report)}, nil
 			default:
-				return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: urlintelAdditions(in, report)}, wrapped
+				return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: urlintelAdditions(in, report), Results: urlintelResults(report)}, wrapped
 			}
 		}
 		switch status {
@@ -308,7 +308,7 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 		// attached.
 		report := acc.Report()
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
-		return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: urlintelAdditions(in, report)}, wrapped
+		return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: urlintelAdditions(in, report), Results: urlintelResults(report)}, wrapped
 	}
 
 	report := acc.Report()
@@ -317,6 +317,7 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 		ItemsProcessed: len(report.Entries),
 		ItemsFailed:    report.Malformed + failedDomains,
 		Additions:      urlintelAdditions(in, report),
+		Results:        urlintelResults(report),
 	}
 	if urlintelTruncated(report) {
 		// Any entry's Overflow (parameters dropped at the per-URL cap): the
@@ -448,6 +449,22 @@ func urlintelDomains(in pipeline.StageInput) []asset.Domain {
 func urlintelAdditions(in pipeline.StageInput, report urlintel.Report) pipeline.StageAdditions {
 	return pipeline.StageAdditions{
 		URLs: filterURLs(in.Target, report.AllURLs()),
+	}
+}
+
+// urlintelResults builds the stage's results-channel additions from the
+// merged engine report: parameters, endpoints, and relationships — the
+// engine report's canonical assets, copied (never rebuilt) per the
+// one-normalization-point rule. Parameters and endpoints are not corpus
+// values, and relationships cannot be meaningfully scope-filtered without
+// corrupting the graph (adapt/doc.go T3d), so the whole report flows
+// through. It is used on every path: the success path and both
+// engine-error branches (the runner merges a failed stage's results).
+func urlintelResults(report urlintel.Report) pipeline.Results {
+	return pipeline.Results{
+		Parameters:    report.AllParameters(),
+		Endpoints:     report.AllEndpoints(),
+		Relationships: report.AllRelationships(),
 	}
 }
 

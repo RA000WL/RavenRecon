@@ -173,10 +173,12 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		Transport: s.transport,
 	}
 
-	// v1.3 note: IP assets are not yet part of the pipeline corpus, so the
-	// ips map is nil (adapt/doc.go); the ip->port edges the engine derives
-	// from caller-provided addresses are deferred until the corpus carries
-	// IPs.
+	// The ips map stays nil: IP assets are not part of the pipeline corpus
+	// (the results channel carries them — see buildResult — but the corpus
+	// merge does not), so the ip→port edges the engine derives from
+	// caller-provided addresses remain deferred (adapt/doc.go). The engine
+	// report's own resolved addresses, ports, services, TLS certificates,
+	// endpoints, and relationships flow through the results channel.
 	report, err := httpprobe.Probe(ctx, in.Target, hosts, nil, cfg)
 
 	if err != nil && ctx.Err() != nil {
@@ -210,9 +212,11 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 }
 
 // buildResult maps one engine report onto the pipeline's StageResult shape:
-// the honest counters, the truncation flag (never swallowed), and the
+// the honest counters, the truncation flag (never swallowed), the
 // boundary-filtered Additions (the output-side mandatory filter: out-of-domain
-// hosts and URL hosts are dropped before propagation).
+// hosts and URL hosts are dropped before propagation), and the results-channel
+// additions (the engine report's canonical assets, copied — never rebuilt —
+// per the one-normalization-point rule).
 func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
@@ -227,6 +231,23 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 	res.Additions = pipeline.StageAdditions{
 		Hosts: pipeline.FilterHosts(declared, report.AllHosts()),
 		URLs:  filterURLs(declared, report.AllURLs()),
+	}
+	// Results: IPs, ports, services, TLS certificates, endpoints, and
+	// relationships are not corpus values — the results channel carries
+	// them. IPs/ports/services/TLS certificates need no scope filter: they
+	// are observations of the in-scope hosts this stage probed (an address
+	// or port is not "in-domain"; the engine derives them from the probed
+	// hosts' own targets). Endpoints and relationships are copied whole:
+	// they are derived from the in-scope URLs the engine observed, and
+	// relationship edges cannot be meaningfully scope-filtered without
+	// corrupting the graph (adapt/doc.go T3d).
+	res.Results = pipeline.Results{
+		IPs:             report.AllIPs(),
+		Ports:           report.AllPorts(),
+		Services:        report.AllServices(),
+		Endpoints:       report.AllEndpoints(),
+		TLSCertificates: report.AllTLSCertificates(),
+		Relationships:   report.AllRelationships(),
 	}
 	return res
 }

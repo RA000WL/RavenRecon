@@ -3,6 +3,7 @@ package adapt
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -133,6 +134,81 @@ func TestTechIntelStageHappyPath(t *testing.T) {
 	}
 	if got := rec.putCount(); got != 2 {
 		t.Fatalf("cache Puts = %d, want 2 (one completed record per processed URL)", got)
+	}
+	// T3d results wiring: only the /admin observation matches the synthetic
+	// fingerprint — one technology, one evidence observation, and the graph
+	// edges (host->technology, url->technology, technology->evidence).
+	// The engine's canonical assets are copied, never rebuilt.
+	if got := len(res.Results.Technologies); got != 1 {
+		t.Fatalf("results technologies = %d, want 1 (only /admin matches synthetic-cms)", got)
+	}
+	if got := res.Results.Technologies[0].Name; got != "synthetic-cms" {
+		t.Errorf("results technology = %q, want synthetic-cms", got)
+	}
+	if got := len(res.Results.Evidence); got != 1 {
+		t.Errorf("results evidence = %d, want 1 (the indicator match observation)", got)
+	}
+	if got := len(res.Results.Relationships); got != 3 {
+		t.Errorf("results relationships = %d, want 3 (host->technology + url->technology + technology->evidence)", got)
+	}
+}
+
+// TestTechIntelStageResultsDeduped pins the results-channel dedup through
+// the adapter: two observations matching the same fingerprint merge into
+// ONE canonical technology (the report identity-merges technology results),
+// while evidence stays per observation (its identity embeds the observation
+// source) and the shared host->technology edge is deduplicated by edge
+// identity. The adapter copies the merged report verbatim, never rebuilt.
+func TestTechIntelStageResultsDeduped(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	s := techStage(t)
+
+	res, err := s.Run(context.Background(), techintelInput(target, []asset.URL{
+		techURL(t, "https://example.com/admin"),
+		techURL(t, "https://example.com/admin/x"), // substring path match fires the same fingerprint
+	}, nil, nil))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want %q", res.Outcome, pipeline.OutcomeCompleted)
+	}
+	if got := len(res.Results.Technologies); got != 1 {
+		t.Fatalf("results technologies = %d, want 1 (identity-merged across the two observations)", got)
+	}
+	if got := len(res.Results.Evidence); got != 2 {
+		t.Errorf("results evidence = %d, want 2 (evidence identity embeds the observation source)", got)
+	}
+	// 1 host->technology (same host, deduped) + 2 url->technology +
+	// 2 technology->evidence.
+	if got := len(res.Results.Relationships); got != 5 {
+		t.Errorf("results relationships = %d, want 5 (1 host->technology + 2 url->technology + 2 technology->evidence)", got)
+	}
+}
+
+// TestTechIntelStageResultsDeterminism pins the determinism contract for the
+// results channel: two identical runs over the synthetic DB (fixed clock)
+// produce DeepEqual StageResults, including every results channel the stage
+// contributes — technologies, evidence, and relationships.
+func TestTechIntelStageResultsDeterminism(t *testing.T) {
+	run := func() pipeline.StageResult {
+		t.Helper()
+		res, err := techStage(t).Run(context.Background(), techintelInput(mustDomain(t, "example.com"), []asset.URL{
+			techURL(t, "https://example.com/admin"),
+			techURL(t, "https://example.com/login"),
+		}, nil, nil))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return res
+	}
+	res1, res2 := run(), run()
+	if !reflect.DeepEqual(res1, res2) {
+		t.Fatalf("two identical runs differ:\nrun 1: %+v\nrun 2: %+v", res1, res2)
+	}
+	if len(res1.Results.Technologies) == 0 || len(res1.Results.Evidence) == 0 ||
+		len(res1.Results.Relationships) == 0 {
+		t.Fatal("determinism pin exercised no results output (technologies/evidence/relationships all empty)")
 	}
 }
 

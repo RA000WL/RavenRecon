@@ -100,6 +100,14 @@ type JSEntry struct {
 	// a truncated fetch).
 	JS *asset.JavaScript
 
+	// Content is the retained body bytes of the observation's fetch; nil
+	// unless Config.RetainContent enabled retention AND the fetch's content
+	// was fully retained (a truncated fetch never retains a partial
+	// prefix). Bounded by MaxJSBytes per entry. Merged first-seen-wins:
+	// the earliest observation's body is the retained one (mirrors the JS
+	// asset's earliest-observation-wins rule).
+	Content []byte
+
 	// Imports are the javascript_to_javascript edges FROM this file to the
 	// canonical URLs of its resolved imports, deduplicated by edge identity
 	// and bounded per observation by MaxImportsPerFile. Edges are recorded
@@ -239,6 +247,13 @@ func mergeEntries(dst *JSEntry, src JSEntry, cfg Config) {
 	dst.Secrets = mergeSecrets(dst.Secrets, src.Secrets, cfg.MaxSecretsPerFile)
 	dst.Technologies = mergeTechnologies(dst.Technologies, src.Technologies, cfg.MaxTechPerFile)
 	dst.Evidence = mergeEvidence(dst.Evidence, src.Evidence, cfg.MaxEvidencePerFile)
+	if dst.Content == nil && src.Content != nil {
+		// First-seen wins: the earliest observation's retained body is the
+		// entry's (mirrors the JS asset's earliest-observation-wins rule;
+		// the placeholder-replacement path above already keeps the real
+		// observation's content wholesale).
+		dst.Content = src.Content
+	}
 	dst.Cached = dst.Cached || src.Cached
 	dst.Err = joinEntryErrors(dst.Err, src.Err)
 }
@@ -663,9 +678,18 @@ func (m *Metrics) addSecretLine() {
 // MaxSourceMapsPerFile source maps, MaxEndpointsPerFile endpoints and URL
 // observations, MaxSecretsPerFile secrets, MaxTechPerFile technologies,
 // MaxEvidencePerFile evidence, the parser's per-parse export cap, and the
-// edge caps of extraction). Consumers that must stream arbitrarily many
-// distinct URLs without retention use the Config.Emit hook instead and
-// never materialize a Report.
+// edge caps of extraction). With Config.RetainContent set, each entry
+// additionally carries its fully-retained body bytes (JSEntry.Content),
+// bounded by MaxJSBytes per entry — the opt-in retention surface
+// (Report.RetainedContent). Run-wide, retained content is bounded twice:
+// per entry by MaxJSBytes (2 MiB by default) AND in count by the run's
+// script caps (MaxScripts, 500 by default — over-cap candidates are
+// dropped, never retained), so the worst case is ~1 GiB held by reference
+// per run (the merge copies the entry struct, never the body bytes). Off
+// by default, so the default memory profile is unchanged: entries carry
+// observations only. Consumers that must stream arbitrarily many distinct
+// URLs without retention use the Config.Emit hook instead and never
+// materialize a Report.
 type Accumulator struct {
 	mu        sync.Mutex
 	cfg       Config
@@ -781,6 +805,47 @@ type Report struct {
 // with Config.Metrics; it returns the immutable Snapshot, never the live
 // counter object.
 func (r Report) Metrics() Snapshot { return r.metrics }
+
+// RetainedContent is one fully-retained body: the canonical URL it was
+// fetched from and the exact bytes, bounded by the run's MaxJSBytes.
+// Content is never a truncated prefix — retention only ever carries
+// complete bodies.
+type RetainedContent struct {
+	// URL is the canonical fetched URL.
+	URL asset.URL
+
+	// Content is the fully-retained body bytes (bounded by the run's
+	// MaxJSBytes).
+	Content []byte
+}
+
+// RetainedContent returns the run's retained bodies in canonical-URL
+// order, deduplicated by URL identity (earliest wins), including only
+// entries with non-nil Content — mirroring the report's other merged
+// accessors (AllJavaScript, AllSourceMaps, AllRelationships), which
+// deduplicate and sort internally rather than relying on the entries'
+// invariants. Real reports hold one entry per canonical URL already, so
+// the dedup is a no-op there and the order is the entries' canonical
+// order; a hand-built report is normalized the same way. The list is
+// empty unless Config.RetainContent enabled retention. Content is
+// returned by reference — the entry (and the fetch result behind it) owns
+// the bytes; consumers must not mutate it.
+func (r Report) RetainedContent() []RetainedContent {
+	seen := make(map[asset.Identity]struct{}, len(r.Entries))
+	var out []RetainedContent
+	for _, e := range r.Entries {
+		if e.Content == nil {
+			continue
+		}
+		if _, dup := seen[e.URL.Identity()]; dup {
+			continue
+		}
+		seen[e.URL.Identity()] = struct{}{}
+		out = append(out, RetainedContent{URL: e.URL, Content: e.Content})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].URL.String() < out[j].URL.String() })
+	return out
+}
 
 // StatusCounts returns the number of entries per status. Every status key
 // is always present, so consumers can rely on stable keys.

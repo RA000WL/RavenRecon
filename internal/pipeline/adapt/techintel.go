@@ -111,7 +111,7 @@ func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIn
 // through the input filter. There is consequently no output-side URL filter
 // (nothing new can leave the scope) and, per T2c (adapt/doc.go), techintel
 // produces NO corpus additions — technologies, evidence, and relationships
-// are results, propagated by the results channel in a later milestone.
+// are results, propagated by the results channel (T3d).
 // Additions stay empty by construction.
 //
 // Malformed observations (non-canonical URLs that survive the input filter —
@@ -300,14 +300,28 @@ func (s *techIntelStage) runIngest(ctx context.Context, in pipeline.StageInput, 
 }
 
 // buildTechResult maps one engine report onto the pipeline's StageResult
-// shape: the honest counters, the truncation flag (never swallowed), and
-// empty Additions (techintel produces no corpus additions — T2c).
+// shape: the honest counters, the truncation flag (never swallowed), the
+// results-channel additions (the engine report's canonical assets, copied —
+// never rebuilt — per the one-normalization-point rule), and empty Additions
+// (techintel produces no corpus additions — T2c). It is used on every path:
+// the success path and both engine-error branches.
 func (s *techIntelStage) buildTechResult(rep techintel.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
 		Err:            err,
 		ItemsProcessed: techProcessed(rep),
 		ItemsFailed:    techFailed(rep),
+	}
+	// Results: technologies, evidence, and relationships are not corpus
+	// values — the results channel carries them. They are copied whole:
+	// the engine derived them from the in-scope URLs this stage consumed
+	// (header/TLS/DNS metadata observations), and relationship edges cannot
+	// be meaningfully scope-filtered without corrupting the graph
+	// (adapt/doc.go T3d).
+	res.Results = pipeline.Results{
+		Technologies:  rep.Technologies,
+		Evidence:      rep.Evidence,
+		Relationships: rep.Relationships,
 	}
 	if techTruncated(rep) {
 		res.Truncated = true

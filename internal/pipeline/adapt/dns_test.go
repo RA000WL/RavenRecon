@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -171,6 +172,15 @@ func hostNames(hosts []asset.Host) []string {
 	return out
 }
 
+// ipStrings renders IP assets as canonical address strings.
+func ipStrings(ips []asset.IP) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
 // requireEqualStrings fails when the slices differ in length or element order.
 func requireEqualStrings(t *testing.T, what string, got, want []string) {
 	t.Helper()
@@ -226,6 +236,73 @@ func TestDNSStageResolvesInDomainHosts(t *testing.T) {
 		[]string{"alias.example.com", "api.example.com", "www.example.com"})
 	if len(res.Additions.Domains) != 0 || len(res.Additions.URLs) != 0 {
 		t.Fatalf("additions domains/urls = %v/%v, want empty", res.Additions.Domains, res.Additions.URLs)
+	}
+	// T3d results wiring: the resolved addresses flow through the results
+	// channel (the engine's merged AllIPs, sorted) — the dns stage's only
+	// results contribution. IPs need no scope filter: an address is not
+	// in- or out-of-domain.
+	requireEqualStrings(t, "results IPs", ipStrings(res.Results.IPs),
+		[]string{"93.184.216.34", "93.184.216.35"})
+}
+
+// TestDNSStageResultsIPsDeduped pins the results-channel dedup through the
+// adapter: two hosts resolving to the SAME address produce exactly ONE
+// canonical IP entry — the engine's merged AllIPs dedupes by Phase 2
+// identity (earliest provenance wins) and the adapter copies that merged
+// report verbatim, never rebuilding and never re-deduplicating.
+func TestDNSStageResultsIPsDeduped(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	www := mustHost(t, "www.example.com")
+	api := mustHost(t, "api.example.com")
+
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.34")
+
+	in := dnsInput(target, []asset.Host{www, api})
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want %q", res.Outcome, pipeline.OutcomeCompleted)
+	}
+	if res.ItemsProcessed != 2 {
+		t.Fatalf("ItemsProcessed = %d, want 2 (both hosts were still processed)", res.ItemsProcessed)
+	}
+	requireEqualStrings(t, "results IPs", ipStrings(res.Results.IPs), []string{"93.184.216.34"})
+	requireEqualStrings(t, "additions", hostNames(res.Additions.Hosts),
+		[]string{"api.example.com", "www.example.com"})
+}
+
+// TestDNSStageResultsDeterminism pins the determinism contract for the
+// results channel: two identical runs (fixed clock, scripted resolver)
+// produce DeepEqual StageResults including the IPs channel — the engine's
+// merged, sorted canonical assets are stable across runs.
+func TestDNSStageResultsDeterminism(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	www := mustHost(t, "www.example.com")
+	api := mustHost(t, "api.example.com")
+
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("www.example.com", dns.TypeCNAME, "alias.example.com")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+
+	run := func() pipeline.StageResult {
+		t.Helper()
+		res, err := NewDNSStage(fake).Run(context.Background(), dnsInput(target, []asset.Host{www, api}))
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		return res
+	}
+	res1, res2 := run(), run()
+	if !reflect.DeepEqual(res1, res2) {
+		t.Fatalf("two identical runs differ:\nrun 1: %+v\nrun 2: %+v", res1, res2)
+	}
+	if len(res1.Results.IPs) == 0 {
+		t.Fatal("determinism pin exercised no results output (IPs empty)")
 	}
 }
 

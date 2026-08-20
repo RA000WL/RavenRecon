@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -289,6 +290,125 @@ func TestHTTPProbeStageAliveHostsAdditions(t *testing.T) {
 		})
 	if got := tr.requestCount(); got != 4 {
 		t.Fatalf("requests = %d, want 4", got)
+	}
+}
+
+// TestHTTPProbeStageResultsChannel pins the T3d results wiring: the engine's
+// canonical Phase 2 assets flow through the results channel — open ports,
+// confirmed services, probe endpoints, and the graph edges — while IPs stay
+// empty (the corpus has no IPs; the adapter's ips map is nil, v1.3 note) and
+// TLS certificates stay empty (the canned transport completes no real TLS
+// handshake, so no 5C observation exists).
+func TestHTTPProbeStageResultsChannel(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	cannedHost(tr, "api.example.com", cannedResponse{status: 200, body: "ok"})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+		httpProbeMustHost(t, "api.example.com"),
+	}, nil, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+
+	// Open ports are host-agnostic assets ("80/tcp", "443/tcp"), merged
+	// across both hosts.
+	var portStrs []string
+	for _, p := range res.Results.Ports {
+		portStrs = append(portStrs, p.String())
+	}
+	requireEqualStrings(t, "results ports", portStrs, []string{"443/tcp", "80/tcp"})
+
+	// Services are host-agnostic too: the canonical Service identity is
+	// Port.String() + "/" + encoded name (asset/service.go), and the engine
+	// builds its probe ports with Protocol "tcp" (httpprobe observe.go
+	// portForScheme) — so the canonical identities carry the protocol:
+	// https on 443/tcp and http on 80/tcp. The adapter copies the engine's
+	// canonical assets and never rebuilds them, so these are exactly the
+	// forms the report produced.
+	var svcStrs []string
+	for _, s := range res.Results.Services {
+		svcStrs = append(svcStrs, s.Identity().String())
+	}
+	requireEqualStrings(t, "results services", svcStrs, []string{"service:443/tcp/https", "service:80/tcp/http"})
+
+	// One endpoint per probe target URL (GET on each of the 4 scheme-host
+	// pairs).
+	requireEqualStrings(t, "results endpoints", endpointStrings(res.Results.Endpoints), []string{
+		"GET http://api.example.com/",
+		"GET http://www.example.com/",
+		"GET https://api.example.com/",
+		"GET https://www.example.com/",
+	})
+
+	// Edges: per host host->url (2) + url->endpoint (2) + port->service (2)
+	// = 6, across 2 hosts = 12. The port->service edges repeat across the
+	// two hosts: the engine's per-host assemble() dedupes within a host
+	// only, and AllRelationships sorts without cross-host dedup — collapsing
+	// the duplicates is the RUNNER's first-seen per-edge merge
+	// (mergeResults), not the adapter's job.
+	if got := len(res.Results.Relationships); got != 12 {
+		t.Errorf("results relationships = %d, want 12 (6 per host x 2 hosts)", got)
+	}
+
+	// No IPs and no TLS certificates: the IPs channel IS wired (AllIPs from
+	// the report) but the engine derives IP assets only from caller-provided
+	// addresses, and this adapter passes no ips map (the corpus carries no
+	// IPs — v1.3 note), so the honest result is empty. TLS certificates
+	// stay empty because the canned transport completes no real TLS
+	// handshake, so no 5C observation exists.
+	if len(res.Results.IPs) != 0 {
+		t.Errorf("results IPs = %v, want empty (the corpus has no IPs)", res.Results.IPs)
+	}
+	if len(res.Results.TLSCertificates) != 0 {
+		t.Errorf("results TLS certificates = %d, want 0 (no 5C observation)", len(res.Results.TLSCertificates))
+	}
+}
+
+// endpointStrings renders endpoint assets as their canonical identity value.
+func endpointStrings(eps []asset.Endpoint) []string {
+	out := make([]string, 0, len(eps))
+	for _, e := range eps {
+		out = append(out, e.Identity().Value)
+	}
+	return out
+}
+
+// TestHTTPProbeStageResultsDeterminism pins the determinism contract for the
+// results channel: two identical runs over the same canned transport
+// (fixed clock) produce DeepEqual StageResults, including every results
+// channel the stage contributes — ports, services, endpoints, and
+// relationships (IPs and TLS certificates stay empty through this adapter,
+// as pinned above).
+func TestHTTPProbeStageResultsDeterminism(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	cannedHost(tr, "api.example.com", cannedResponse{status: 200, body: "ok"})
+
+	run := func() pipeline.StageResult {
+		t.Helper()
+		in := httpProbeStageInput(t, "example.com", []asset.Host{
+			httpProbeMustHost(t, "www.example.com"),
+			httpProbeMustHost(t, "api.example.com"),
+		}, nil, nil)
+		res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return res
+	}
+	res1, res2 := run(), run()
+	if !reflect.DeepEqual(res1, res2) {
+		t.Fatalf("two identical runs differ:\nrun 1: %+v\nrun 2: %+v", res1, res2)
+	}
+	if len(res1.Results.Ports) == 0 || len(res1.Results.Services) == 0 ||
+		len(res1.Results.Endpoints) == 0 || len(res1.Results.Relationships) == 0 {
+		t.Fatal("determinism pin exercised no results output (ports/services/endpoints/relationships all empty)")
 	}
 }
 

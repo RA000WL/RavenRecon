@@ -81,10 +81,12 @@
 // (urlintel.go) — never a bare generic like "truncated", which could collide
 // across engines in the report's StickyFlags map.
 //
-// v1.3 note: IP assets are not yet part of the pipeline corpus, so the
+// v1.3 note: IP assets are not part of the pipeline corpus, so the
 // httpprobe adapter passes a nil ips map (the ip→port relationship edges
 // that the engine derives from caller-provided addresses are deferred
-// until the corpus carries IPs).
+// until the corpus carries IPs). The engine's own report still flows the
+// resolved addresses, ports, services, TLS certificates, endpoints, and
+// relationships through the results channel (T3d — see buildResult).
 //
 // T2c conventions (urlintel / techintel / jsintel):
 //
@@ -94,15 +96,18 @@
 //     ingests the tool's line stream, and produces Additions.URLs (in-domain
 //     filtered). Parameter extraction (ParseParameters, default true) is
 //     retained in the engine report; corpus propagation carries URLs only —
-//     results propagation is a separate milestone.
+//     parameters, endpoints, and relationships flow through the results
+//     channel (T3d, urlintelResults).
 //   - techintel consumes in.URLs as observations (header/TLS/DNS metadata;
 //     the pipeline never fetches bodies — D3) and produces NO corpus
-//     additions: its technology/evidence outputs are results, propagated by
-//     the results channel (separate milestone). Truncation/overflow flags
-//     are preserved honestly (AGENTS §0.6).
+//     additions: its technology/evidence/relationship outputs flow through
+//     the results channel (T3d). Truncation/overflow flags are preserved
+//     honestly (AGENTS §0.6).
 //   - jsintel consumes in.URLs as candidates and produces NO corpus
-//     additions (scripts/endpoints/secret candidates are results). Bounded
-//     truncated fetches report truncation honestly.
+//     additions: scripts/endpoints/secret candidates flow through the
+//     results channel, and the retained bodies flow through the document
+//     channel (T3d — the stage is the pipeline's document producer).
+//     Bounded truncated fetches report truncation honestly.
 //   - secrentel is NOT in this batch: the pipeline corpus carries no
 //     document content, so a meaningful adapter requires the
 //     results/document channel (T3); a no-op stage would violate the
@@ -132,11 +137,107 @@
 //   - StageInput.Results is read-only: the runner passes its live merged
 //     slices, so an adapter that mutates them corrupts later stages and
 //     the final report (identical contract to the corpus slices).
-//   - The secrentel adapter (T3c) is the first Results producer — secret
+//   - The secrentel adapter (T3c) was the first Results producer — secret
 //     candidates, evidence, and relationships (never rebuilt; the engine
-//     report's canonical assets are copied into the channel). The
-//     remaining producers (and the report stage's consumption of the full
-//     Context) are wired in T3d.
+//     report's canonical assets are copied into the channel). The remaining
+//     producers and the report stage's consumption of the full Context are
+//     wired in T3d (per-field producers documented on pipeline.Results).
+//
+// T3d conventions (adapter results production/consumption):
+//
+//   - Every producer adapter copies its engine report's canonical Phase 2
+//     assets into the results channel through the report's own merged
+//     accessors — never rebuilt (AGENTS §0.5). The per-adapter channel
+//     sets are pinned by the adapters' tests and documented in the
+//     adapters' build functions: dns → IPs; httpprobe → IPs, Ports,
+//     Services, Endpoints, TLSCertificates, Relationships; urlintel →
+//     Parameters, Endpoints, Relationships; techintel → Technologies,
+//     Evidence, Relationships; jsintel → JavaScript, SourceMaps,
+//     Relationships plus Endpoints/Secrets/Technologies/Evidence derived
+//     from the per-entry lists (deduplicated by canonical identity and
+//     sorted — the report exposes no merged accessors for those);
+//     priority → Surfaces (one per completed asset result), Groups
+//     (Correlate), AttackPaths (AttackPaths); detect → Findings. The
+//     results-channel additions are computed on EVERY path — success and
+//     engine-error — so a failed stage's honest retained results still
+//     merge (mirroring the corpus/Additions semantics). The ONE exception
+//     is the jsintel adapter's engine-error branches (mapResult): those
+//     return a bare failed/cancelled StageResult — results AND documents
+//     are dropped there (pre-existing T2c behavior, honestly documented on
+//     buildJSResult), because the engine returned no usable report on those
+//     paths.
+//
+//   - The jsintel stage is the pipeline's document-channel producer:
+//     Config.RetainContent is always enabled, and the engine's retained
+//     bodies (Report.RetainedContent — bounded per entry by the engine's
+//     2 MiB default MaxJSBytes, equal to pipeline.MaxDocumentBytes, so the
+//     pipeline's hostile-producer guard never fires on engine output)
+//     become pipeline.Documents with the canonical JavaScript asset
+//     identity (asset.Identity{Kind: KindJavaScript, Value: the canonical
+//     URL string}) and Truncated always false — retention only ever
+//     carries complete bodies. The identity is keyed to the URL, not to
+//     the retained body's classification: a body that is not itself
+//     JS-classified (e.g. fetched HTML) still yields a document with the
+//     JavaScript-kind identity of its URL, so a document identity without
+//     a corresponding Results.JavaScript asset (the engine records JS
+//     assets only for JS-classified observations) is a documented
+//     contract, not a surprise. The consumer adapters (secrentel) and the
+//     report stage treat the document channel exactly as T3c documents.
+//     External-host URL observations (entry.URLs values on CDN/external
+//     hosts, e.g. wss://example.com/socket or http://cdn.example.net/x)
+//     are deliberately NOT propagated: there is no Results URL channel,
+//     the observations never become documents or JavaScript assets (the
+//     document and JavaScript channels carry exactly the fetched files),
+//     and only in-scope REST endpoint candidates are retained — pinned by
+//     the jsintel results/documents production test.
+//
+//   - Channel production/consumption at a glance (producer → consumer;
+//     "report" is the report stage's full-Context consumption):
+//
+//     channel           producer(s)                                   consumer(s)
+//     IPs               dns, httpprobe                                report
+//     Ports             httpprobe                                     report
+//     Services          httpprobe                                     report
+//     Endpoints         httpprobe, urlintel, jsintel                  detect, report
+//     JavaScript        jsintel                                       detect, report
+//     Parameters        urlintel                                      report
+//     Technologies      techintel, jsintel                            detect, report
+//     Secrets           jsintel, secrentel                            detect, report
+//     Evidence          techintel, jsintel, secrentel                 detect, report
+//     Findings          detect                                        report
+//     TLSCertificates   httpprobe                                     report
+//     SourceMaps        jsintel                                       report
+//     Relationships     httpprobe, urlintel, techintel, jsintel,      detect, report
+//     secrentel
+//     Surfaces          priority                                      report
+//     Groups            priority                                      report
+//     AttackPaths       priority                                      report
+//
+//     (The document channel is the pipeline-internal jsintel → secrentel
+//     flow; see T3c.)
+//
+//   - Consumer adapters apply NO additional scope filtering on the results
+//     channels: results are pipeline-composed (each producer filtered its
+//     own inputs), and relationship edges cannot be meaningfully
+//     scope-filtered without corrupting the graph. The detect adapter
+//     feeds the snapshot channels the engine consumes (relationships,
+//     evidence, technologies, secrets, JavaScript, endpoints — findings
+//     are the engine's own output, never re-consumed, and the remaining
+//     channels have no snapshot counterpart), and its empty-input
+//     short-circuit fires only when the corpus AND the snapshot-feeding
+//     results channels are all empty. The report adapter composes the full
+//     report.Context from the corpus plus the whole results channel
+//     (error/runtime/cache/execution stats stay empty — no pipeline
+//     counterparts).
+//
+//   - Priority truncation: the priority engine reports no scoring caps,
+//     but Correlate's run-level truncation (groups beyond its fixed
+//     maxCorrelationGroups) maps to Truncated + the priority_groups_
+//     truncated sticky flag on the producing stage — the flag, never the
+//     outcome alone, marks the retained set incomplete (AGENTS §0.6).
+//     Group-level member truncation (Group.Truncated) rides on the group
+//     values only. Dedup on the Groups/AttackPaths channels is first-seen
+//     per anchor/root (pipeline.Results), never a truncation (FIND-2).
 //
 // T3c conventions (the document channel and the secrentel adapter):
 //
@@ -154,8 +255,8 @@
 //   - Hostile-producer guard at the merge: over-cap content (>
 //     MaxDocumentBytes) is dropped WHOLE — Content nil + Truncated — never
 //     a partial prefix; the document still merges (identity/URL remain).
-//   - No adapter produces documents yet: production is T3d (the jsintel
-//     stage family — NEW-15 resolved: a pipeline-internal document
+//   - No adapter produced documents until T3d: the jsintel stage family is
+//     now the producer (NEW-15 resolved: a pipeline-internal document
 //     channel, separate from the Results channel; secrentel consumes the
 //     channel, never the Results.JavaScript field).
 //   - secrentel (NewSecretIntelStage) consumes the document channel as
@@ -197,25 +298,30 @@
 //     constructor seam: nil/nil = production tables; a single provided
 //     catalog is completed with an explicit EMPTY counterpart (the engine
 //     digests the pair and rejects a nil catalog). Produces NO corpus
-//     additions: surfaces/groups/attack-paths are results (T3).
+//     additions: surfaces/groups/attack-paths flow through the results
+//     channel (T3d — buildPriorityResult, with the correlation-cut flag).
 //   - detect consumes the in-scope corpus as core-graph asset identities in
-//     the engine snapshot (domains/hosts/URLs only — every other snapshot
-//     channel needs the results/document channel, T3). The registry comes
-//     from the constructor seam: nil = the EMPTY registry (D2 — no rules
-//     ship with the framework). The empty-input short-circuit fires only
-//     when BOTH the filtered corpus AND the registry are empty: rules
-//     without RequiredAssetTypes genuinely execute against an empty corpus,
-//     so an empty corpus alone never skips the engine. Produces NO corpus
-//     additions: findings are results (T3). FindingsTruncated (the engine's
-//     fixed maxFindingsPerRun cap) maps to Truncated + the
+//     the engine snapshot (domains/hosts/URLs) plus the results channel's
+//     snapshot values — relationships, evidence, technologies, secrets,
+//     JavaScript, and endpoints (T3d; findings are the engine's own output,
+//     never re-consumed). The registry comes from the constructor seam:
+//     nil = the EMPTY registry (D2 — no rules ship with the framework).
+//     The empty-input short-circuit fires only when the filtered corpus,
+//     the snapshot-feeding results channels, AND the registry are all
+//     empty: rules without RequiredAssetTypes genuinely execute against a
+//     non-empty corpus, so an empty corpus alone never skips the engine.
+//     Produces NO corpus additions: findings flow through the results
+//     channel (T3d). FindingsTruncated (the engine's fixed
+//     maxFindingsPerRun cap) maps to Truncated + the
 //     detect_findings_truncated sticky flag; the engine reports the
 //     truncated run's outcome as incomplete, so the stage reports partial
 //     with the flag set.
 //   - report consumes the in-scope corpus into the engine Context
 //     (Target/StartedAt/EndedAt/Domains/Hosts/URLs — StartedAt and EndedAt
 //     are both the stage's single honest clock "now", because the pipeline
-//     tracks no run bracket yet; every other Context channel needs the
-//     results/document channel, T3). The registry comes from the
+//     tracks no run bracket yet) plus the whole results channel (T3d —
+//     every data channel; the error/runtime/cache/execution stats channels
+//     have no pipeline counterparts). The registry comes from the
 //     constructor seam: nil = the engine's default registry (json, csv,
 //     markdown, html). The stage NEVER short-circuits: rendering the
 //     (possibly empty) report is its work, so the engine always runs.
@@ -223,11 +329,12 @@
 //     is the engine's validation error → failed. The report engine has no
 //     Rate/Burst configuration, so those bounds are unused by this stage.
 //     Produces NO corpus additions (it writes files).
-//   - Truncation absence, pinned: the priority and report engines report
-//     no truncation/overflow signals through these adapters' input paths
-//     (priority's report has no retention caps; the report renderer has
-//     none either), so those two adapters never set Truncated or a sticky
-//     flag — a future engine cap must surface there (AGENTS §0.6).
+//   - Truncation absence, pinned: the report engine reports no
+//     truncation/overflow signals through this adapter's input path (the
+//     renderer has no retention caps), so that adapter never sets
+//     Truncated or a sticky flag — a future engine cap must surface there
+//     (AGENTS §0.6). The priority adapter's only truncation signal is the
+//     correlation cut (priority_groups_truncated, T3d).
 //   - The declared target itself is never added to any engine input: the
 //     engines run over the corpus as the earlier stages produced it — the
 //     target domain is scored/detected/reported only when the corpus

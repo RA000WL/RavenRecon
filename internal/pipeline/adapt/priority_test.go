@@ -3,6 +3,7 @@ package adapt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -386,5 +387,153 @@ func TestPriorityStageCounters(t *testing.T) {
 	}
 	if res.ItemsFailed != 1 {
 		t.Errorf("ItemsFailed = %d, want 1", res.ItemsFailed)
+	}
+}
+
+// TestPriorityStageResultsChannel pins the T3d results wiring on the fresh
+// happy path: one surface per completed asset result (canonical engine
+// values, never rebuilt), the deterministic correlation groups and attack
+// paths derived from those surfaces, and NO truncation flag (the corpus
+// anchors in one group, far below the engine's fixed group cap).
+func TestPriorityStageResultsChannel(t *testing.T) {
+	interesting, risk := priorityCatalogs(t)
+	domains, hosts, urls := priorityCorpus(t)
+	c := &recordingCache{}
+	in := priorityInput(mustDomain(t, "example.com"), domains, hosts, urls, c)
+
+	res, err := NewPriorityStage(interesting, risk).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome %s, want completed", res.Outcome)
+	}
+	if res.Truncated {
+		t.Error("Truncated = true, want false (one group is below the correlation cut)")
+	}
+	if len(res.StickyFlags) != 0 {
+		t.Errorf("StickyFlags = %v, want empty", res.StickyFlags)
+	}
+
+	// One surface per completed asset — all 4 corpus assets score cleanly.
+	if got := len(res.Results.Surfaces); got != 4 {
+		t.Fatalf("Surfaces = %d, want 4 (one per completed asset)", got)
+	}
+	wantIds := map[string]bool{
+		asset.Identity{Kind: asset.KindDomain, Value: "example.com"}.String():          true,
+		asset.Identity{Kind: asset.KindHost, Value: "admin.example.com"}.String():      true,
+		asset.Identity{Kind: asset.KindHost, Value: "www.example.com"}.String():        true,
+		mustURL(t, "https://admin.example.com/login?token=1&id=2").Identity().String(): true,
+	}
+	for _, s := range res.Results.Surfaces {
+		if !wantIds[s.Identity.String()] {
+			t.Errorf("surface identity %s not in the corpus set", s.Identity)
+		}
+	}
+
+	// All four surfaces derive to the declared domain anchor — one group.
+	if got := len(res.Results.Groups); got != 1 {
+		t.Fatalf("Groups = %d, want 1 (all corpus assets anchor at example.com)", got)
+	}
+	g := res.Results.Groups[0]
+	if got := g.Anchor.String(); got != "domain:example.com" {
+		t.Errorf("group anchor = %s, want domain:example.com", got)
+	}
+	if got := len(g.Members); got != 4 {
+		t.Errorf("group members = %d, want 4", got)
+	}
+	if g.Truncated {
+		t.Error("group Truncated = true, want false (4 members are below the member cap)")
+	}
+
+	// The group carries factor-carrying members (the admin host and the URL
+	// both match the interestingness catalog on their hostname), so one
+	// attack-path hypothesis derives from it.
+	if got := len(res.Results.AttackPaths); got != 1 {
+		t.Fatalf("AttackPaths = %d, want 1 (one factor-carrying group)", got)
+	}
+	if got := res.Results.AttackPaths[0].Root.String(); got != "domain:example.com" {
+		t.Errorf("attack path root = %s, want domain:example.com", got)
+	}
+}
+
+// TestPriorityStageErrorPathMergesResults pins the every-path contract: an
+// engine-error outcome still merges the report's honest completed assets
+// through the results channel (surfaces, groups, attack paths) — a failed
+// stage's retained results are never dropped.
+func TestPriorityStageErrorPathMergesResults(t *testing.T) {
+	s := &priorityStage{}
+	rep := priority.Report{
+		Outcome: priority.OutcomeFailed,
+		Assets: []priority.AssetResult{
+			{
+				Status: priority.StatusCompleted,
+				Surface: &priority.SurfaceAsset{
+					Identity: asset.Identity{Kind: asset.KindHost, Value: "admin.example.com"},
+				},
+			},
+			{
+				Status: priority.StatusFailed, // never surfaces
+				Surface: &priority.SurfaceAsset{
+					Identity: asset.Identity{Kind: asset.KindHost, Value: "broken.example.com"},
+				},
+			},
+		},
+	}
+	res := s.buildPriorityResult(rep, pipeline.OutcomeFailed, errors.New("engine failed"))
+	if res.Outcome != pipeline.OutcomeFailed {
+		t.Fatalf("outcome %s, want failed", res.Outcome)
+	}
+	if res.Err == nil {
+		t.Fatal("Err = nil, want the engine error carried on the result")
+	}
+	if got := len(res.Results.Surfaces); got != 1 {
+		t.Fatalf("Surfaces = %d, want 1 (only the completed asset)", got)
+	}
+	if got := res.Results.Surfaces[0].Identity.String(); got != "host:admin.example.com" {
+		t.Errorf("surface identity = %s, want host:admin.example.com", got)
+	}
+	if got := len(res.Results.Groups); got != 1 {
+		t.Errorf("Groups = %d, want 1 (singleton group for the completed asset)", got)
+	}
+	if res.Truncated || len(res.StickyFlags) != 0 {
+		t.Errorf("Truncated=%v StickyFlags=%v, want no truncation (one group, no cut)", res.Truncated, res.StickyFlags)
+	}
+}
+
+// TestPriorityStageCorrelationCutFlag pins the never-swallowed correlation
+// cut: a corpus whose surfaces exceed the engine's fixed maxCorrelationGroups
+// distinct anchors yields the capped group set, Truncated, and the
+// priority_groups_truncated sticky flag (AGENTS §0.6) — the flag, never the
+// outcome alone, marks the retained set incomplete.
+func TestPriorityStageCorrelationCutFlag(t *testing.T) {
+	interesting, risk := priorityCatalogs(t)
+	// 1025 in-scope hosts, each with a distinct parent-domain anchor
+	// (x.pN.example.com anchors at pN.example.com). The priority engine's
+	// Correlate retains at most maxCorrelationGroups = 1024 groups.
+	var hosts []asset.Host
+	for i := 0; i < 1025; i++ {
+		hosts = append(hosts, mustHost(t, fmt.Sprintf("x.p%d.example.com", i)))
+	}
+	in := priorityInput(mustDomain(t, "example.com"), nil, hosts, nil, &recordingCache{})
+
+	res, err := NewPriorityStage(interesting, risk).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome %s, want completed (every asset scored; only the group set was cut)", res.Outcome)
+	}
+	if got := len(res.Results.Surfaces); got != 1025 {
+		t.Fatalf("Surfaces = %d, want 1025 (the correlation cut never drops surfaces)", got)
+	}
+	if got := len(res.Results.Groups); got != 1024 {
+		t.Fatalf("Groups = %d, want 1024 (the fixed group cap)", got)
+	}
+	if !res.Truncated {
+		t.Fatal("Truncated = false, want true (groups were cut)")
+	}
+	if !res.StickyFlags[priorityGroupsTruncated] {
+		t.Errorf("StickyFlags = %v, want %s set", res.StickyFlags, priorityGroupsTruncated)
 	}
 }

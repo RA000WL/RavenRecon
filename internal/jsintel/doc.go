@@ -101,6 +101,18 @@
 // as hits; a later run re-fetches), and a re-fetch under a lowered cap
 // simply truncates again — cap changes never invalidate entries.
 //
+// # Content retention (T3d)
+//
+// Config.RetainContent (default false) opts a run into retaining the
+// fully-retained body bytes: every entry whose fetch retained complete
+// content carries it on JSEntry.Content (bounded per entry by MaxJSBytes),
+// and Report.RetainedContent() exposes the run-wide set — deterministic
+// canonical-URL order, one entry per URL, never a truncated prefix. The
+// pipeline's jsintel stage always enables retention: its document channel
+// (pipeline.Document) is produced from RetainedContent (T3d, adapt/doc.go).
+// With the flag off the memory profile is unchanged (entries carry no
+// content).
+//
 // # The js.fetch cache operation
 //
 // record_fetch.go implements the cache-before-execute sides: the key

@@ -134,6 +134,16 @@ func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dn
 		Hosts: pipeline.FilterHosts(in.Target, rep.AllHosts()),
 	}
 
+	// Results: the engine report's canonical resolved addresses are copied
+	// into the results channel, never rebuilt (the one-normalization-point
+	// rule, AGENTS §0.5). IPs need no scope filtering: they are the answers
+	// of the in-scope hosts this stage resolved, and an address is not
+	// "in-domain" or "out-of-domain" — an out-of-domain address (CDN, ...)
+	// is a legitimate observation of an in-scope host (mirrors how the
+	// engine records them; the stage produces no IP corpus additions, so
+	// the corpus scope boundary is unaffected).
+	results := pipeline.Results{IPs: rep.AllIPs()}
+
 	// Engine error paths. Errors are wrapped with context and returned;
 	// cancellation is reported through Outcome cancelled with the context
 	// error, exactly as the pipeline contract documents.
@@ -141,15 +151,15 @@ func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dn
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), engineErr)
 		switch {
 		case isContextError(engineErr):
-			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: additions}, wrapped
+			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped, Additions: additions, Results: results}, wrapped
 		case ctx.Err() != nil:
 			// The engine failed on teardown (for example a forced pool
 			// shutdown) while the stage context was also firing: the
 			// cancellation is the dominant, more honest signal.
 			wrappedCtx := fmt.Errorf("stage %s: %w", s.Name(), ctx.Err())
-			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrappedCtx, Additions: additions}, wrappedCtx
+			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrappedCtx, Additions: additions, Results: results}, wrappedCtx
 		default:
-			return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: additions}, wrapped
+			return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped, Additions: additions, Results: results}, wrapped
 		}
 	}
 
@@ -191,6 +201,7 @@ func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dn
 			ItemsProcessed: processed,
 			ItemsFailed:    failed,
 			Additions:      additions,
+			Results:        results,
 		}
 		return applyTruncation(res, anyTruncated), wrapped
 	}
@@ -246,6 +257,7 @@ func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dn
 		ItemsProcessed: processed,
 		ItemsFailed:    failed,
 		Additions:      additions,
+		Results:        results,
 	}
 	return applyTruncation(res, anyTruncated), nil
 }

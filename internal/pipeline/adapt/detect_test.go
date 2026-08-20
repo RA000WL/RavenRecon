@@ -76,6 +76,94 @@ func captureAssetsRule(captured *[]string) detect.Detector {
 	}
 }
 
+// TestDetectStageSnapshotResultsChannels pins the T3d full-snapshot
+// consumption: every results channel with a snapshot counterpart flows
+// into the engine snapshot (relationships, evidence, technologies,
+// secrets, JavaScript, endpoints) — the rules see the earlier stages'
+// outputs, not just the corpus identities. Findings are the engine's own
+// output and never re-enter.
+func TestDetectStageSnapshotResultsChannels(t *testing.T) {
+	host := mustHost(t, "www.example.com")
+	ip, err := asset.NewIP("192.168.1.10", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewIP: %v", err)
+	}
+	rel, err := asset.NewRelationship(host.Identity(), asset.RelationshipHostToIP, ip.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship: %v", err)
+	}
+	ev, err := asset.NewEvidence(asset.MethodHeader, "x-nginx-version", "1.25", host.Identity(), asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	tech, err := asset.NewTechnology("nginx", asset.CategoryServer, asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewTechnology: %v", err)
+	}
+	sec, err := asset.NewSecretCandidate(asset.SecretTypeAWS, "AKIA0123456789ABCDEF", host.Identity(), asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewSecretCandidate: %v", err)
+	}
+	js, err := asset.NewJavaScript("https://www.example.com/app.js", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewJavaScript: %v", err)
+	}
+	ep, err := asset.NewEndpoint("GET", "https://www.example.com/api/v1/users", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+
+	var gotRelationships, gotEvidence, gotTechnologies, gotSecrets, gotJavaScript, gotEndpoints []string
+	reg := newDetectRegistry(t, newDetectRule(t, "test.snapshot", func(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) {
+		for _, r := range dctx.Relationships {
+			gotRelationships = append(gotRelationships, r.ID())
+		}
+		for _, e := range dctx.Evidence {
+			gotEvidence = append(gotEvidence, e.Identity().String())
+		}
+		for _, tech := range dctx.Technologies {
+			gotTechnologies = append(gotTechnologies, tech.Identity().String())
+		}
+		for _, s := range dctx.Secrets {
+			gotSecrets = append(gotSecrets, s.Identity().String())
+		}
+		for _, j := range dctx.JavaScript {
+			gotJavaScript = append(gotJavaScript, j.Identity().String())
+		}
+		for _, e := range dctx.Endpoints {
+			gotEndpoints = append(gotEndpoints, e.Identity().String())
+		}
+		return nil, nil
+	}))
+
+	in := detectInput(mustDomain(t, "example.com"), nil, nil, nil, nil)
+	in.Results = pipeline.Results{
+		Relationships: []asset.Relationship{rel},
+		Evidence:      []asset.Evidence{ev},
+		Technologies:  []asset.Technology{tech},
+		Secrets:       []asset.SecretCandidate{sec},
+		JavaScript:    []asset.JavaScript{js},
+		Endpoints:     []asset.Endpoint{ep},
+	}
+	res, err := NewDetectStage(reg).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome %s, want completed", res.Outcome)
+	}
+	if res.ItemsProcessed != 1 {
+		t.Errorf("ItemsProcessed = %d, want 1 (the capture rule executed)", res.ItemsProcessed)
+	}
+
+	requireEqualStrings(t, "snapshot relationships", gotRelationships, []string{rel.ID()})
+	requireEqualStrings(t, "snapshot evidence", gotEvidence, []string{ev.Identity().String()})
+	requireEqualStrings(t, "snapshot technologies", gotTechnologies, []string{tech.Identity().String()})
+	requireEqualStrings(t, "snapshot secrets", gotSecrets, []string{sec.Identity().String()})
+	requireEqualStrings(t, "snapshot javascript", gotJavaScript, []string{js.Identity().String()})
+	requireEqualStrings(t, "snapshot endpoints", gotEndpoints, []string{ep.Identity().String()})
+}
+
 // TestDetectStageName pins the stage's pipeline identity.
 func TestDetectStageName(t *testing.T) {
 	if got := NewDetectStage(nil).Name(); got != pipeline.StageDetect {

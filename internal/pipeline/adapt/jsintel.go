@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 
+	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/jsintel"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 )
@@ -95,9 +97,12 @@ const jsFetchTruncated = "js_fetch_truncated"
 // cross-domain observation an earlier stage retained — are pre-filtered with
 // the shared URL filter (filterURLs: canonical host via the asset model, IP
 // literals and zero URLs dropped — IPs are never in scope and are not yet in
-// the corpus). The output side is vacuous: this adapter produces NO corpus
-// additions — scripts, endpoints, and secret candidates are results,
-// propagated by the results channel (separate milestone, adapt/doc.go).
+// the corpus). The output side: this adapter produces NO corpus additions —
+// scripts, endpoints, and secret candidates are results, propagated through
+// the results channel (T3d, adapt/doc.go) — and it IS the pipeline's
+// document-channel producer: the engine's retained bodies
+// (Config.RetainContent is always enabled here) become pipeline.Documents
+// (jsDocuments).
 //
 // Empty filtered input short-circuits to completed with zero work (honest
 // no-op) — but only for a canonical target (targetCanonical, the dns/httpprobe
@@ -230,6 +235,13 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 		// adapter never configures the content cap; its bounded-fetch
 		// truncation is reported, not tuned).
 		Transport: s.transport,
+		// Content retention is always enabled: this stage is the pipeline's
+		// document-channel producer (T3d) — the engine's retained bodies
+		// become pipeline.Documents (jsDocuments). The retained content is
+		// bounded per entry by the engine's 2 MiB default MaxJSBytes, equal
+		// to pipeline.MaxDocumentBytes, so the pipeline's hostile-producer
+		// guard never fires on engine output.
+		RetainContent: true,
 	}
 
 	report, engineErr := jsintel.Run(ctx, cfg, jsintel.SliceSource(items))
@@ -239,7 +251,8 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 // mapResult translates the engine's report and error into the pipeline's
 // fixed outcome vocabulary, counters, and truncation flags. Additions are
 // always empty: scripts, endpoints, and secret candidates are results,
-// propagated by the results channel (separate milestone, adapt/doc.go).
+// propagated through the results channel; the retained bodies flow through
+// the document channel (T3d, adapt/doc.go).
 func (s *jsIntelStage) mapResult(ctx context.Context, report jsintel.Report, engineErr error) (pipeline.StageResult, error) {
 	// Engine error paths. Errors are wrapped with context and returned;
 	// cancellation is reported through Outcome cancelled with the context
@@ -279,9 +292,17 @@ func (s *jsIntelStage) mapResult(ctx context.Context, report jsintel.Report, eng
 }
 
 // buildJSResult maps one engine report onto the pipeline's StageResult
-// shape: the honest counters, the truncation flag (never swallowed), and the
-// outcome. Additions stay empty (results are a separate milestone). It is
-// used on every path: the success path and both engine error branches.
+// shape: the honest counters, the truncation flag (never swallowed), the
+// document-channel additions (the engine's retained bodies — the stage is
+// the pipeline's document producer, T3d), the results-channel additions
+// (the engine report's canonical assets, copied — never rebuilt — per the
+// one-normalization-point rule), and the outcome. Additions stay empty
+// (scripts/endpoints/secrets are results, never corpus values). It is
+// used on the paths where a report exists to merge: the success path and
+// the cancelled-in-flight path (the report's honest retained entries
+// still merge). The engine-error branches return early with a bare
+// failed/cancelled StageResult (T2c behavior — the engine returned no
+// usable report on those paths).
 func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
@@ -293,7 +314,99 @@ func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) p
 		res.Truncated = true
 		res.StickyFlags = map[string]bool{jsFetchTruncated: true}
 	}
+	res.Documents = jsDocuments(report)
+	res.Results = jsResults(report)
 	return res
+}
+
+// jsResults builds the stage's results-channel additions from the engine
+// report: the canonical JavaScript assets, source maps, and relationships
+// through the report's own merged, sorted accessors, plus the endpoint,
+// secret, technology, and evidence candidates derived from the per-entry
+// lists (the report exposes no merged accessors for those — the adapter
+// derives them from the sorted entries, deduplicating by canonical identity
+// and sorting, so the additions are deterministic). External (different-
+// host) URL observations are NOT propagated: the corpus URL channel belongs
+// to the urlintel stage's producer and the report exposes no merged URL
+// accessor for them (documented). Nothing is rebuilt — every value is the
+// engine's canonical Phase 2 asset, copied.
+func jsResults(report jsintel.Report) pipeline.Results {
+	res := pipeline.Results{
+		JavaScript:    report.AllJavaScript(),
+		SourceMaps:    report.AllSourceMaps(),
+		Relationships: report.AllRelationships(),
+	}
+	var eps []asset.Endpoint
+	var secretsList []asset.SecretCandidate
+	var techList []asset.Technology
+	var evList []asset.Evidence
+	for _, e := range report.Entries {
+		eps = append(eps, e.Endpoints...)
+		secretsList = append(secretsList, e.Secrets...)
+		techList = append(techList, e.Technologies...)
+		evList = append(evList, e.Evidence...)
+	}
+	res.Endpoints = dedupeByIdentity(eps, func(a asset.Endpoint) asset.Identity { return a.Identity() })
+	res.Secrets = dedupeByIdentity(secretsList, func(a asset.SecretCandidate) asset.Identity { return a.Identity() })
+	res.Technologies = dedupeByIdentity(techList, func(a asset.Technology) asset.Identity { return a.Identity() })
+	res.Evidence = dedupeByIdentity(evList, func(a asset.Evidence) asset.Identity { return a.Identity() })
+	return res
+}
+
+// jsDocuments builds the stage's document-channel additions from the engine
+// report's retained bodies: one pipeline.Document per fully retained body,
+// in canonical-URL order (Report.RetainedContent is already sorted and
+// deduplicated by URL). The document identity is the canonical JavaScript
+// asset identity of the URL — asset.Identity{Kind: KindJavaScript, Value:
+// the canonical URL string}, exactly what the engine's JS asset Identity()
+// produces — so a document and its JavaScript asset share one identity by
+// construction. The identity is keyed to the URL, not to the retained
+// body's classification: the engine keeps the bytes of every completed
+// positive observation (engine.go classify), so a fully-retained body that
+// is not itself JS-classified (e.g. fetched HTML) still yields a document
+// carrying the JavaScript-kind identity of its URL — a document identity
+// without a corresponding Results.JavaScript asset (the engine records JS
+// assets only for JS-classified observations) is therefore a documented
+// contract, not a surprise. Truncated is always false: retention only ever
+// carries complete bodies (jsintel/doc.go), and the pipeline's
+// hostile-producer guard re-binds over-cap content at the merge anyway.
+// Content is passed by reference — the report owns the bytes (pipeline
+// document-merge semantics).
+func jsDocuments(report jsintel.Report) []pipeline.Document {
+	ret := report.RetainedContent()
+	if len(ret) == 0 {
+		return nil
+	}
+	out := make([]pipeline.Document, 0, len(ret))
+	for _, rc := range ret {
+		u := rc.URL
+		out = append(out, pipeline.Document{
+			Identity: asset.Identity{Kind: asset.KindJavaScript, Value: u.String()},
+			URL:      &u,
+			Content:  rc.Content,
+		})
+	}
+	return out
+}
+
+// dedupeByIdentity deduplicates a slice by canonical asset identity,
+// keeping first-seen order, and sorts the survivors by identity string
+// (deterministic regardless of observation order — the report's per-entry
+// lists are sorted within an entry, but the same candidate may be observed
+// in several files, and the adapter's additions must be deterministic).
+func dedupeByIdentity[T any](in []T, key func(T) asset.Identity) []T {
+	seen := make(map[asset.Identity]struct{}, len(in))
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		id := key(v)
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return key(out[i]).String() < key(out[j]).String() })
+	return out
 }
 
 // foldJSEntries reduces the engine report's per-entry statuses to one stage

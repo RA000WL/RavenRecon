@@ -76,14 +76,23 @@ func (s *reportStage) Name() pipeline.StageName { return pipeline.StageReport }
 //	                            EndedAt BEFORE StartedAt)
 //	EndedAt   ← in.Clock.Now()
 //	Domains/Hosts/URLs ← the in-scope filtered corpus
+//	every other data channel ← the results channel as the earlier stages
+//	                            produced it (T3d): IPs, Ports, Services,
+//	                            Endpoints, JavaScript, Parameters,
+//	                            Technologies, Secrets, Evidence, Findings,
+//	                            TLSCertificates, SourceMaps, Relationships,
+//	                            Surfaces, Groups, AttackPaths — copied
+//	                            whole, never rebuilt (the engine's
+//	                            NewModel re-normalizes, deduplicates, and
+//	                            sorts everything)
 //
-// Every other Context channel (IPs, ports, endpoints, JavaScript,
-// parameters, technologies, secrets, evidence, findings, TLS certificates,
-// source maps, relationships, surfaces, groups, attack paths, error
-// records, runtime/cache/execution stats) stays empty: the pipeline corpus
-// and the results channel do not carry them yet (a separate milestone).
-// The adapter never fabricates context entries. The zero corpus is valid —
-// an empty report renders honestly.
+// The error/runtime/cache/execution stats channels stay empty: the report
+// stage has no pipeline counterparts for them (the runner's own bookkeeping
+// is not exposed on the report Context). Results channels get NO additional
+// scope filtering here: they are pipeline-composed (each producer filtered
+// its own inputs), and relationship edges cannot be meaningfully
+// scope-filtered without corrupting the graph (adapt/doc.go T3d). The zero
+// corpus is valid — an empty report renders honestly.
 //
 // Boundary (mandatory, both sides): input corpus entries are pre-filtered
 // with pipeline.InDomain/FilterHosts and filterURLs (canonical names only —
@@ -173,12 +182,28 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		now = in.Clock.Now()
 	}
 	rctx := report.Context{
-		Target:    in.Target.Name,
-		StartedAt: now,
-		EndedAt:   now,
-		Domains:   domains,
-		Hosts:     hosts,
-		URLs:      urls,
+		Target:          in.Target.Name,
+		StartedAt:       now,
+		EndedAt:         now,
+		Domains:         domains,
+		Hosts:           hosts,
+		URLs:            urls,
+		IPs:             in.Results.IPs,
+		Ports:           in.Results.Ports,
+		Services:        in.Results.Services,
+		Endpoints:       in.Results.Endpoints,
+		JavaScript:      in.Results.JavaScript,
+		Parameters:      in.Results.Parameters,
+		Technologies:    in.Results.Technologies,
+		Secrets:         in.Results.Secrets,
+		Evidence:        in.Results.Evidence,
+		Findings:        in.Results.Findings,
+		TLSCertificates: in.Results.TLSCertificates,
+		SourceMaps:      in.Results.SourceMaps,
+		Relationships:   in.Results.Relationships,
+		Surfaces:        in.Results.Surfaces,
+		Groups:          in.Results.Groups,
+		AttackPaths:     in.Results.AttackPaths,
 	}
 
 	return s.runReport(ctx, in, reg, rctx)

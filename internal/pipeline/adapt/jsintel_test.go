@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -937,5 +938,424 @@ func TestJSIntelStageEngineErrorCancelled(t *testing.T) {
 	}
 	if o.res.Err == nil || !strings.Contains(fmt.Sprintf("%v", o.res.Err), "jsintel") {
 		t.Fatalf("Err = %v, want the engine's shutdown detail joined in", o.res.Err)
+	}
+}
+
+// jsRetentionTestBodies are the two synthetic script bodies of the T3d
+// results/documents production tests, served hermetically by a loopback
+// httptest server. Together they exercise every results channel and the
+// document channel from ONE deterministic run:
+//
+//   - app.js: an import edge (js→js, resolved to shared.js — the engine's
+//     bounded import expansion fetches it at depth+1, so the run processes
+//     THREE files), a REST endpoint, a different-host wss:// endpoint
+//     (which is ALSO a URL observation), an AWS secret candidate, a react
+//     technology marker (with its MethodJS evidence), a sourceMappingURL
+//     reference, and a different-host absolute URL shared with lib.js
+//     (dedup pin);
+//   - lib.js: a REST endpoint, a Google API key secret candidate, a
+//     webpack marker (second technology/evidence), and two different-host
+//     absolute URLs — one shared with app.js;
+//   - shared.js (the resolved import target): no string literals — it
+//     contributes only its script asset and its retained document, never
+//     endpoint/secret candidates.
+//
+// The external-host observations (example.com:443 via wss://,
+// cdn.example.net) are entry.URLs values — CDN/external host:port
+// observations that this adapter deliberately does NOT propagate (no
+// Results URL channel; documented on jsResults): they appear in NO output
+// channel as URL assets, and they never become documents or JavaScript
+// assets (the fetched files only).
+var jsRetentionTestBodies = map[string]string{
+	"/app.js": `import "./shared.js";
+const api = "/api/v1/users";
+const ws = "wss://example.com/socket";
+const key = "AKIAIOSFODNN7EXAMPLE";
+const cdn = "http://cdn.example.net/shared";
+window.__REACT_DEVTOOLS_GLOBAL_HOOK__ = true;
+//# sourceMappingURL=/app.js.map
+`,
+	"/lib.js": `const orders = "/api/v2/orders";
+const shared = "http://cdn.example.net/shared";
+const gkey = "AIzaSyA-test-key-123456789012345678901234";
+const cdn = "https://cdn.example.net/lib.js";
+window.__webpack_require__ = {};
+`,
+	"/shared.js": `window.ready = true;
+`,
+}
+
+// jsRetentionLoopback starts the loopback server serving
+// jsRetentionTestBodies and returns it plus the rewrite transport that
+// forwards the canonical www.example.com/api.example.com URLs to it (the
+// engine never leaves the loopback; the REAL HTTP stack is exercised).
+func jsRetentionLoopback(t *testing.T) (*httptest.Server, *rewriteTransport) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := jsRetentionTestBodies[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &rewriteTransport{base: srv.URL}
+}
+
+// TestJSIntelStageResultsAndDocumentsProduction pins the T3d production
+// surface end-to-end: from one synthetic run (loopback HTTP serving
+// synthetic JS), the results channel carries the engine report's canonical
+// JavaScript/SourceMap/Relationship assets (copied, never rebuilt) plus the
+// deduplicated, sorted endpoint/secret/technology/evidence candidates, and
+// the document channel carries the retained bodies 1:1 (canonical identity,
+// Truncated=false). External URL observations (entry.URLs) are NOT
+// propagated: the document and JavaScript channels carry exactly the fetched
+// files, never the external hosts.
+func TestJSIntelStageResultsAndDocumentsProduction(t *testing.T) {
+	_, tr := jsRetentionLoopback(t)
+	in := jsStageInput(t, "example.com", []asset.URL{
+		jsMustURL(t, "http://www.example.com/app.js"),
+		jsMustURL(t, "http://api.example.com/lib.js"),
+	}, nil, nil)
+	res, err := jsRunBounded(t, NewJSIntelStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	if res.Truncated || len(res.StickyFlags) != 0 {
+		t.Fatalf("Truncated/flags = %v/%v, want false/empty", res.Truncated, res.StickyFlags)
+	}
+	if res.ItemsProcessed != 3 || res.ItemsFailed != 0 {
+		t.Fatalf("counters = %d/%d, want 3/0 (app.js + lib.js + the resolved import shared.js)", res.ItemsProcessed, res.ItemsFailed)
+	}
+	assertJSAdditionsEmpty(t, res)
+
+	// Results.JavaScript: exactly the three fetched files, canonical assets
+	// copied from the report (never rebuilt — pinned below against a direct
+	// engine run under the adapter's exact config surface).
+	if len(res.Results.JavaScript) != 3 {
+		t.Fatalf("Results.JavaScript = %+v, want the 3 fetched scripts", res.Results.JavaScript)
+	}
+	var jsURLs []string
+	for _, j := range res.Results.JavaScript {
+		if j.URL.String() == "" {
+			t.Fatalf("JavaScript asset %+v carries no canonical URL", j)
+		}
+		jsURLs = append(jsURLs, j.URL.String())
+	}
+	sort.Strings(jsURLs)
+	requireEqualStrings(t, "results JavaScript URLs", jsURLs,
+		[]string{"http://api.example.com/lib.js", "http://www.example.com/app.js", "http://www.example.com/shared.js"})
+	if got := res.Results.JavaScript[0].Prov.Source; got != string(pipeline.StageJSIntel) {
+		t.Fatalf("JavaScript provenance source = %q, want %q", got, pipeline.StageJSIntel)
+	}
+
+	// Results.SourceMaps: the sourceMappingURL reference resolved against
+	// the file's own URL, canonical asset.
+	if len(res.Results.SourceMaps) != 1 {
+		t.Fatalf("Results.SourceMaps = %+v, want the one source map", res.Results.SourceMaps)
+	}
+	if got := res.Results.SourceMaps[0].URL.String(); got != "http://www.example.com/app.js.map" {
+		t.Fatalf("source map URL = %q, want http://www.example.com/app.js.map", got)
+	}
+
+	// Results.Relationships: the engine's merged, sorted edges (at minimum
+	// the import edge and the endpoint edges).
+	if len(res.Results.Relationships) == 0 {
+		t.Fatal("Results.Relationships empty, want the engine's typed edges")
+	}
+	if !sort.SliceIsSorted(res.Results.Relationships, func(i, j int) bool {
+		return res.Results.Relationships[i].ID() < res.Results.Relationships[j].ID()
+	}) {
+		t.Fatal("Results.Relationships not sorted by edge identity")
+	}
+	kindSeen := map[asset.RelationshipKind]bool{}
+	for _, r := range res.Results.Relationships {
+		kindSeen[r.Kind] = true
+	}
+	if !kindSeen[asset.RelationshipJavaScriptToJavaScript] || !kindSeen[asset.RelationshipJavaScriptToEndpoint] {
+		t.Fatalf("relationships kinds = %v, want at least the import and endpoint edges", kindSeen)
+	}
+
+	// Results.Endpoints: the classified candidates from both files,
+	// deduplicated by identity (the shared cdn.example.net URL observed in
+	// both files is ONE endpoint) and sorted by identity.
+	endpointIDs := make([]string, 0, len(res.Results.Endpoints))
+	for _, ep := range res.Results.Endpoints {
+		endpointIDs = append(endpointIDs, ep.Identity().String())
+	}
+	requireEqualStrings(t, "results endpoints (sorted, deduped)", endpointIDs, []string{
+		"endpoint:GET http://api.example.com/api/v2/orders",
+		"endpoint:GET http://cdn.example.net/shared",
+		"endpoint:GET http://www.example.com/api/v1/users",
+		"endpoint:GET http://www.example.com/shared.js",
+		"endpoint:GET https://cdn.example.net/lib.js",
+		"endpoint:WS wss://example.com/socket",
+	})
+
+	// Results.Secrets: one candidate per observed secret, sorted.
+	secretTypes := make([]string, 0, len(res.Results.Secrets))
+	for _, s := range res.Results.Secrets {
+		secretTypes = append(secretTypes, s.Type.String())
+	}
+	sort.Strings(secretTypes)
+	requireEqualStrings(t, "results secret types", secretTypes, []string{"aws", "google"})
+
+	// Results.Technologies + Evidence: one per fired marker, sorted.
+	techNames := make([]string, 0, len(res.Results.Technologies))
+	for _, tech := range res.Results.Technologies {
+		techNames = append(techNames, tech.Name)
+	}
+	sort.Strings(techNames)
+	requireEqualStrings(t, "results technologies", techNames, []string{"react", "webpack"})
+	if len(res.Results.Evidence) != 2 {
+		t.Fatalf("Results.Evidence = %+v, want the two per-marker evidence records", res.Results.Evidence)
+	}
+	for _, ev := range res.Results.Evidence {
+		if ev.Method != asset.MethodJS {
+			t.Fatalf("evidence method = %q, want %q", ev.Method, asset.MethodJS)
+		}
+	}
+
+	// Documents: one per fully-retained fetch, canonical identity, exact
+	// body bytes, never Truncated. The external URL observations are NOT
+	// propagated: the document set is exactly the fetched files.
+	if len(res.Documents) != 3 {
+		t.Fatalf("Documents = %+v, want one document per retained fetch (3)", res.Documents)
+	}
+	// RetainedContent iterates the report's URL-sorted entries, so the
+	// documents come back in canonical-URL order: lib.js, app.js, shared.js.
+	wantDocURLs := []string{
+		"http://api.example.com/lib.js",
+		"http://www.example.com/app.js",
+		"http://www.example.com/shared.js",
+	}
+	wantDocBodies := []string{
+		jsRetentionTestBodies["/lib.js"],
+		jsRetentionTestBodies["/app.js"],
+		jsRetentionTestBodies["/shared.js"],
+	}
+	for i, d := range res.Documents {
+		if d.Identity.Kind != asset.KindJavaScript || d.Identity.Value != wantDocURLs[i] {
+			t.Fatalf("document %d identity = %v, want javascript:%s", i, d.Identity, wantDocURLs[i])
+		}
+		if d.URL == nil || d.URL.String() != wantDocURLs[i] {
+			t.Fatalf("document %d URL = %v, want %s", i, d.URL, wantDocURLs[i])
+		}
+		if d.Truncated {
+			t.Fatalf("document %d Truncated = true, want false (retention only carries complete bodies)", i)
+		}
+		if string(d.Content) != wantDocBodies[i] {
+			t.Fatalf("document %d content = %q, want the exact served body", i, d.Content)
+		}
+	}
+
+	// External URL observations absent: the document and JavaScript
+	// channels carry exactly the fetched files — the different-host
+	// observations (wss://example.com/socket, cdn.example.net) never leak
+	// into them as URL assets (there is no Results URL channel; documented
+	// on jsResults).
+	for _, d := range res.Documents {
+		if strings.Contains(d.URL.String(), "cdn.example.net") || strings.Contains(d.URL.String(), "example.com/socket") {
+			t.Fatalf("document URL %q is an external URL observation, not a fetched file", d.URL)
+		}
+	}
+	for _, j := range res.Results.JavaScript {
+		if strings.Contains(j.URL.String(), "cdn.example.net") || strings.Contains(j.URL.String(), "example.com/socket") {
+			t.Fatalf("JavaScript URL %q is an external URL observation, not a fetched file", j.URL)
+		}
+	}
+
+	// Never-rebuilt pin: the identical engine run under the adapter's exact
+	// config surface (RetainContent enabled, same source/clock/transport)
+	// produces byte-identical JavaScript assets — the adapter copies the
+	// report's canonical assets, never rebuilds them.
+	dflt := pipeline.DefaultStageConfig()
+	direct, err := jsintel.Run(context.Background(), jsintel.Config{
+		Concurrency:   dflt.MaxConcurrency,
+		QueueSize:     dflt.QueueSize,
+		Source:        string(pipeline.StageJSIntel),
+		Clock:         jsFixedClock{},
+		Transport:     tr,
+		RetainContent: true,
+	}, jsintel.SliceSource([]jsintel.Item{
+		{Kind: jsintel.ItemLine, Line: "http://www.example.com/app.js"},
+		{Kind: jsintel.ItemLine, Line: "http://api.example.com/lib.js"},
+	}))
+	if err != nil {
+		t.Fatalf("direct engine run: %v", err)
+	}
+	if !reflect.DeepEqual(direct.AllJavaScript(), res.Results.JavaScript) {
+		t.Fatalf("Results.JavaScript %+v != direct engine AllJavaScript %+v (assets must be copied, never rebuilt)",
+			res.Results.JavaScript, direct.AllJavaScript())
+	}
+}
+
+// TestJSIntelStageDocumentsByReference pins the document-construction
+// contract at the unit level: one pipeline.Document per retained body, in
+// canonical-URL order, identity = the canonical JavaScript asset identity
+// of the URL, URL pointer set, Truncated always false, and Content handed
+// BY REFERENCE — the document's bytes share the entry's backing array (the
+// runner's document merge is by reference; a copy would double the memory
+// of every retained body).
+func TestJSIntelStageDocumentsByReference(t *testing.T) {
+	u1 := jsMustURL(t, "http://www.example.com/app.js")
+	u2 := jsMustURL(t, "http://api.example.com/lib.js")
+	body := []byte("var app = {x: 1};\n")
+	rep := jsintel.Report{Entries: []jsintel.JSEntry{
+		// The second entry is a completed observation whose fetch retained
+		// no content (a completed negative): it contributes no document.
+		{URL: u2, Status: jsintel.StatusCompleted},
+		{URL: u1, Status: jsintel.StatusCompleted, Content: body},
+	}}
+	docs := jsDocuments(rep)
+	if len(docs) != 1 {
+		t.Fatalf("jsDocuments = %+v, want exactly the one retained body", docs)
+	}
+	d := docs[0]
+	if d.Identity != (asset.Identity{Kind: asset.KindJavaScript, Value: "http://www.example.com/app.js"}) {
+		t.Fatalf("document identity = %v, want the canonical JavaScript asset identity", d.Identity)
+	}
+	if d.URL == nil || d.URL.String() != "http://www.example.com/app.js" {
+		t.Fatalf("document URL = %v, want http://www.example.com/app.js", d.URL)
+	}
+	if d.Truncated {
+		t.Fatal("document Truncated = true, want false (retention only carries complete bodies)")
+	}
+	if &d.Content[0] != &body[0] {
+		t.Fatal("document content must be handed by reference (same backing array), never copied")
+	}
+
+	// An empty retained set yields nil documents, not an empty slice: the
+	// additions stay nil (stage conventions).
+	if got := jsDocuments(jsintel.Report{}); got != nil {
+		t.Fatalf("jsDocuments(empty report) = %+v, want nil", got)
+	}
+}
+
+// TestJSIntelStageDocumentsTruncatedAbsent pins the truncation honesty rule
+// at the stage level: a fetch that could not be fully retained contributes
+// NO document (never a partial prefix) — the stage still reports the
+// truncation with its flag and folds to partial, exactly as before
+// retention existed.
+func TestJSIntelStageDocumentsTruncatedAbsent(t *testing.T) {
+	const over = (2 << 20) + 1 // engine default MaxJSBytes is 2 MiB; +1 exceeds it
+	tr := &cannedTransport{}
+	// ContentLength = len(body) > 2 MiB: the declared bound truncates
+	// without reading a byte.
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: strings.Repeat("x", over)})
+
+	in := jsStageInput(t, "example.com", []asset.URL{jsMustURL(t, "http://www.example.com/app.js")}, nil, nil)
+	res, err := jsRunBounded(t, NewJSIntelStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomePartial {
+		t.Fatalf("Outcome = %q, want partial (truncated entry is engine-incomplete)", res.Outcome)
+	}
+	if !res.Truncated || !res.StickyFlags[jsFetchTruncated] {
+		t.Fatalf("Truncated/flags = %v/%v, want true/%q set", res.Truncated, res.StickyFlags, jsFetchTruncated)
+	}
+	if len(res.Documents) != 0 {
+		t.Fatalf("Documents = %+v, want none (a truncated fetch retains NOTHING, never a partial prefix)", res.Documents)
+	}
+	if len(res.Results.JavaScript) != 0 {
+		t.Fatalf("Results.JavaScript = %+v, want none (no JS asset from a truncated fetch)", res.Results.JavaScript)
+	}
+}
+
+// TestJSIntelStageDocumentsCacheHit pins retention on the cache-hit path:
+// the js.fetch record stores the body byte-identically, so a completed
+// cache hit (zero transport requests on the second run) still yields the
+// document and the results — content retention is consistent across fresh
+// and cache-served runs.
+func TestJSIntelStageDocumentsCacheHit(t *testing.T) {
+	c, err := cache.Open(t.TempDir(), cache.WithClock(jsFixedClock{}.Now))
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	body := "console.log('cached')"
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{
+		status:  200,
+		body:    body,
+		headers: map[string]string{"Content-Type": "application/javascript"},
+	})
+
+	run := func() pipeline.StageResult {
+		t.Helper()
+		in := jsStageInput(t, "example.com", []asset.URL{jsMustURL(t, "http://www.example.com/app.js")}, nil, c)
+		res, err := jsRunBounded(t, NewJSIntelStage(tr), context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return res
+	}
+
+	res1 := run()
+	if res1.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("first run Outcome = %q, want completed", res1.Outcome)
+	}
+	if got := tr.requestCount(); got != 1 {
+		t.Fatalf("first run requests = %d, want 1 (one cache-miss fetch)", got)
+	}
+	if len(res1.Documents) != 1 || string(res1.Documents[0].Content) != body {
+		t.Fatalf("first run Documents = %+v, want the retained body", res1.Documents)
+	}
+
+	res2 := run()
+	if res2.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("second run Outcome = %q, want completed (served from cache)", res2.Outcome)
+	}
+	if got := tr.requestCount(); got != 1 {
+		t.Fatalf("second run requests = %d, want 1 (unchanged: a cache hit performs zero fetches)", got)
+	}
+	if len(res2.Documents) != 1 || string(res2.Documents[0].Content) != body {
+		t.Fatalf("second run Documents = %+v, want the byte-identical retained body", res2.Documents)
+	}
+	if res2.Documents[0].Truncated || res2.Documents[0].Identity.Value != "http://www.example.com/app.js" {
+		t.Fatalf("second run document = %+v, want the canonical identity and Truncated=false", res2.Documents[0])
+	}
+	// The cache-served run reproduces the results and documents of the
+	// fresh run exactly (deterministic across fresh and cache-hit paths).
+	if !reflect.DeepEqual(res1.Results, res2.Results) {
+		t.Fatalf("cache-hit Results %+v != fresh Results %+v", res2.Results, res1.Results)
+	}
+	if !reflect.DeepEqual(res1.Documents, res2.Documents) {
+		t.Fatalf("cache-hit Documents %+v != fresh Documents %+v", res2.Documents, res1.Documents)
+	}
+}
+
+// TestJSIntelStageRunDeterminismWithResultsAndDocuments pins the run-level
+// determinism of the T3d production surface: two identical runs (same
+// corpus, same transport, same fixed clock) produce DeepEqual StageResults
+// — outcome, counters, results channel, and documents channel alike.
+func TestJSIntelStageRunDeterminismWithResultsAndDocuments(t *testing.T) {
+	_, tr := jsRetentionLoopback(t)
+	run := func() pipeline.StageResult {
+		t.Helper()
+		in := jsStageInput(t, "example.com", []asset.URL{
+			jsMustURL(t, "http://www.example.com/app.js"),
+			jsMustURL(t, "http://api.example.com/lib.js"),
+		}, nil, nil)
+		res, err := jsRunBounded(t, NewJSIntelStage(tr), context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return res
+	}
+
+	res1 := run()
+	res2 := run()
+	if !reflect.DeepEqual(res1, res2) {
+		t.Fatalf("two identical runs differ:\nrun 1: %+v\nrun 2: %+v", res1, res2)
+	}
+	if len(res1.Documents) != 3 || len(res1.Results.Endpoints) != 6 {
+		t.Fatalf("run produced %d documents / %d endpoints, want 3/6 (the determinism pin must exercise real output)",
+			len(res1.Documents), len(res1.Results.Endpoints))
 	}
 }

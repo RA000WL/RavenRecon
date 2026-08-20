@@ -80,7 +80,20 @@ orchestrator; every agent may append or update its own entries.
   (FIND-1 LOW + 3 INFO closed in a nit round, gates re-run), committed
   this session; T3c document channel + secrentel adapter VERIFIED —
   review APPROVE WITH NITS (FIND-1 MEDIUM docs + 4 INFO closed across two
-  fix rounds, closure verified, gates re-run), committed 9da5793)
+  fix rounds, closure verified, gates re-run), committed 9da5793; T3d1
+  jsintel producer IN PROGRESS — implemented + verified line-by-line
+  against the contract on a second pass (first dispatch cancelled
+  mid-flight; 2 finishing changes + 1 new test added, gates re-run —
+  records below), review pending, never self-closed; T3d2 dns/httpprobe/
+  urlintel/techintel producers IN PROGRESS — working tree verified
+  line-by-line against the contract, known-issue reconciliation + 7 new
+  tests added, gates re-run green (records below), review pending, never
+  self-closed; T3d3 priority/detect/report producers + the report stage's
+  full-Context consumption IN PROGRESS — working tree verified
+  line-by-line against the contract, FIND-2 + truncation-chain pins and
+  the one full-pipeline integration test added, docs + TODO records
+  updated, gates re-run green (records below), review pending, never
+  self-closed)
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ten library engines exist but nothing composes them; v1.3
@@ -564,7 +577,213 @@ pinned in adapt/doc.go; gates green (gofmt/test/vet/-race/build +
   go test -race -count=1 ./internal/pipeline/... (see Results below),
   full suite go test -count=1 ./... (see Results below).
 
-### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
+- T3d1 IMPLEMENTED (this session, builder; claimed IN PROGRESS at session
+  start, never self-closed): the jsintel engine content-retention surface +
+  the jsintel adapter results/documents production, exactly per the
+  orchestrator contract — no deviations. Engine (internal/jsintel):
+  Config.RetainContent (default false — flag off is byte-identical to
+  today's memory profile, all pre-existing jsintel tests pass unmodified)
+  retains each entry's fully-retained body on JSEntry.Content (bounded by
+  MaxJSBytes, set before every classify return path incl. the cache-hit
+  path, whose js.fetch record restores byte-identical content); truncated
+  fetches retain NOTHING (FetchResult.Content nil by contract — never a
+  partial prefix); new exported RetainedContent{URL asset.URL, Content
+  []byte} + Report.RetainedContent() (canonical-URL order, one per URL —
+  the report's sorted one-entry-per-URL invariant — non-nil Content only,
+  empty when the flag is off); mergeEntries first-seen-wins for Content
+  (mirrors the JS asset rule); Accumulator memory doc updated to state the
+  optional retention. Adapter (internal/pipeline/adapt/jsintel.go):
+  RetainContent always enabled; StageResult.Results populated with
+  AllJavaScript/AllSourceMaps/AllRelationships (copied, never rebuilt) +
+  Endpoints/Secrets/Technologies/Evidence derived from the sorted entries,
+  deduped by canonical identity + sorted (dedupeByIdentity); entry.URLs
+  external observations NOT propagated (no Results URL channel — documented
+  on jsResults); StageResult.Documents from RetainedContent 1:1, identity =
+  the canonical JavaScript asset identity (asset.Identity{KindJavaScript,
+  URL string} — exactly asset.JavaScript.Identity()), URL pointer, Content
+  by reference, Truncated always false; outcome fold/counters/truncation
+  unchanged (T2c semantics). Tests: engine — retention off/on, non-JS
+  completed positive retained, truncated never retains a prefix, cache-hit
+  restores byte-identical content, merge first-seen-wins; adapter — full
+  7-channel results + 3-document production from a loopback synthetic run
+  (incl. import-expansion fetch of the resolved shared.js), by-reference
+  content pin (same backing array), truncated fetch → no document + flag,
+  cache-hit run retains documents + DeepEqual results/documents, cross-run
+  determinism (DeepEqual incl. Documents), never-rebuilt pin against a
+  direct engine run under the adapter's exact config.
+- T3d1 SECOND PASS (this session, builder — the first dispatch was
+  cancelled mid-flight; the working tree was verified line-by-line against
+  the contract instead of redone): every contract item above verified in
+  the tree (engine classify/merge/cache-restore/truncate-nil paths,
+  adapter jsResults/jsDocuments identity + by-reference + Truncated=false,
+  doc.go retention section, Accumulator memory doc, TODO record). Two
+  finishing changes: (1) Report.RetainedContent() now deduplicates by URL
+  identity and sorts internally — mirroring the report's other merged
+  accessors (AllJavaScript/AllSourceMaps/AllRelationships), which do NOT
+  rely on the entries' invariants; real reports are unaffected (one sorted
+  entry per URL), a hand-built report is normalized the same way; new
+  engine test TestReportRetainedContentSortedDedupedNilSkipped pins it.
+  (2) buildJSResult doc comment corrected: it runs on the success +
+  cancelled-in-flight paths; the engine-error branches return early with a
+  bare failed/cancelled StageResult (T2c behavior, unchanged — pinned by
+  the pre-existing engine-error tests).
+- T3d1 GATE RECORD (this session, verbatim): gofmt -l $(find . -name
+  '*.go' -type f) → clean (empty). go test -count=1 ./internal/jsintel/...
+  ./internal/pipeline/... → jsintel, jsintel/adapt, pipeline ok; adapt
+  FAILS ONLY on the pre-existing TestHTTPProbeStageResultsChannel (other
+  unit's in-flight work, below) — all 43 pre-existing jsintel adapter
+  tests + 5 new T3d1 tests pass. go vet ./... → ok. go build ./... → ok.
+  go test -race -count=1 ./internal/jsintel/... ./internal/pipeline/...
+  → same single pre-existing httpprobe failure; no races elsewhere. Full
+  suite go test -count=1 ./... → same single failure. T3d1's own scope is
+  fully green; the httpprobe failure blocks the shared pipeline gates
+  until the httpprobe unit reconciles it (recorded below).
+- T3d1 GATE RECORD (second pass, this session, verbatim): gofmt -l
+  $(find . -name '*.go' -type f) → clean. go test -count=1
+  ./internal/jsintel/... ./internal/pipeline/... → jsintel ok, jsintel/
+  adapt ok, pipeline ok, adapt FAILS ONLY on the same pre-existing
+  TestHTTPProbeStageResultsChannel (httpprobe_test.go:331: services
+  identity "443/tcp/https" vs expected "443/https" — the httpprobe engine
+  at HEAD builds ports with Protocol "tcp" (observe.go:581-588, untouched
+  in this tree) and the out-of-scope T3d2 adapter test expects the
+  protocol-less form; internal to the httpprobe unit's own files, T3d1
+  never touches them). All 43 pre-existing jsintel adapter tests + the 5
+  T3d1 tests + 7 engine retention tests (6 prior + 1 added this pass:
+  TestReportRetainedContentSortedDedupedNilSkipped) pass. go vet ./... →
+  ok. go build ./... → ok. go test -race -count=1 ./internal/jsintel/...
+  ./internal/pipeline/... → same single httpprobe failure only; no races.
+  Full suite go test -count=1 ./... → same single failure. T3d1 scope
+  fully green; the httpprobe failure blocks the shared pipeline gates
+  until the httpprobe unit builder reconciles its engine-vs-test
+  inconsistency (also recorded above under T3d1 second pass).
+- T3d2 IMPLEMENTED (this session, builder; claimed IN PROGRESS at session
+  start, never self-closed): the dns/httpprobe/urlintel/techintel adapter
+  results production, exactly per the orchestrator contract — no
+  deviations. VERIFICATION of the inherited working tree (line-by-line
+  against the contract): dns.go already wired Results.IPs = rep.AllIPs()
+  on all four return paths (error branches, ctx-firing branch, success);
+  httpprobe.go buildResult already set IPs/Ports/Services/Endpoints/
+  TLSCertificates/Relationships from the report accessors on every path;
+  urlintel.go urlintelResults (Parameters/Endpoints/Relationships) on all
+  five return paths; techintel.go buildTechResult (Technologies/Evidence/
+  Relationships) on all four paths. Corpus filtering (FilterHosts/
+  filterURLs), folds, counters, cache-before-execute, and truncation flags
+  (dnsAnswersTruncated / probe_truncated / urlintel_parameters_truncated /
+  tech_indicators_truncated) unchanged in all four — existing tests pass
+  unmodified. KNOWN-ISSUE RECONCILIATION (orchestrator-verified, not open
+  for debate): httpprobe_test.go asserted the non-canonical service
+  identities `service:443/https` / `service:80/http`; the asset model's
+  canonical Service identity = Port.String()+"/"+encodedName and the
+  engine builds its probe ports with Protocol "tcp" (observe.go
+  portForScheme, unchanged at HEAD), so the canonical identities ARE
+  `service:443/tcp/https` / `service:80/tcp/http`. FIXED in the test
+  (the only protocol-less expectations in the file — repo-wide grep
+  confirmed no others); the engine and asset model untouched. SECOND
+  TEST-EXPECTATION CORRECTION found while verifying: the same test
+  asserted 10 relationships; the engine's AllRelationships sorts WITHOUT
+  cross-host dedup (per-host assemble() dedupes within a host only; the
+  cross-host collapse is the runner's first-seen per-edge mergeResults),
+  so 2 hosts × (2 host->url + 2 url->endpoint + 2 port->service) = 12 —
+  corrected to 12 with the reason documented in the test. NEW TESTS added
+  (mirroring the T3d1 harness style; all hermetic — canned transport /
+  scripted runner / synthetic fingerprint DB / fake resolver): dns —
+  TestDNSStageResultsIPsDeduped (two hosts resolving to the same address
+  → exactly one canonical IP, engine-merged AllIPs copied verbatim) +
+  TestDNSStageResultsDeterminism (two identical runs → DeepEqual
+  StageResults incl. IPs); httpprobe — TestHTTPProbeStageResultsDeterminism
+  (two identical runs → DeepEqual incl. ports/services/endpoints/
+  relationships; IPs/TLS empty pinned in the corrected channel test);
+  urlintel — TestURLIntelStageResultsDedupedAcrossDomains (same URL from
+  two queried domains → one merged entry: one endpoint, one parameter,
+  4 edges) + TestURLIntelStageResultsDeterminism; techintel —
+  TestTechIntelStageResultsDeduped (two observations matching the same
+  fingerprint → one identity-merged technology, evidence per observation,
+  host->technology edge deduped → 5 edges) + TestTechIntelStageResultsDeterminism.
+  7 new tests; production mapping was already pinned by the inherited
+  working-tree tests (dns happy-path IPs, httpprobe channel test, urlintel
+  happy-path endpoints + parameters test, techintel happy-path
+  technologies/evidence/relationships). No adapter .go file changed this
+  pass; no engine/asset/results.go/doc.go changes; jsintel/priority/
+  detect/report/secrentel untouched.
+- T3d2 GATE RECORD (this session, verbatim): gofmt -l $(find . -name
+  '*.go' -type f) → clean (empty). go test -count=1 ./internal/pipeline/
+  ... → ok (pipeline 0.160s, adapt 17.295s — first run failed ONLY on the
+  pre-fix relationship count, corrected as above; final run clean). go vet
+  ./... → ok. go build ./... → ok. go test -race -count=1
+  ./internal/pipeline/... → ok (adapt 18.547s, no races). Full suite go
+  test -count=1 ./... → ok (25 packages; discovery 75.6s; adapt 17.3s).
+  Existing pipeline tests pass unmodified (the four adapters' pre-existing
+  tests unchanged except the two corrected expectations above). No new
+  issues opened.
+- T3d3 IMPLEMENTED (this session, builder; claimed IN PROGRESS at session
+  start, never self-closed): the priority/detect/report adapter results
+  production/consumption, exactly per the orchestrator contract — no
+  deviations. VERIFICATION of the inherited working tree (line-by-line
+  against the contract): priority.go already wired Surfaces (copied from
+  completed AssetResult.Surface, never rebuilt) + Groups/AttackPaths via
+  priority.Correlate/AttackPaths in buildPriorityResult on every path,
+  with the priority_groups_truncated sticky flag on the correlation cut;
+  detect.go already built the full 7-channel engine Snapshot (corpus
+  identities + Results Relationships/Evidence/Technologies/Secrets/
+  JavaScript/Endpoints, copied whole) with the D2 empty-registry
+  short-circuit preserved (fires only when corpus AND snapshot-feeding
+  channels AND registry are all empty); report.go already composed the
+  full report.Context (corpus Domains/Hosts/URLs + all 16 Results
+  channels, copied whole; the render-cache invariant untouched). One
+  stale doc comment fixed in detect.go ("in a later milestone" → T3d —
+  the results wiring is implemented right below it; techintel.go's
+  analogous stale wording noted, out of scope). FIND-2 verified as
+  documented on pipeline.Results: the Groups/AttackPaths merge keys on
+  the anchor/root only (mergeChannel by Anchor.String()/Root.String()).
+  §0.6 TRUNCATION DECISION (evidence + file:line): the priority engine
+  caches per-surface records only and builds the Report fresh every run
+  (internal/priority/engine.go), so the adapter's Correlate call in
+  buildPriorityResult (internal/pipeline/adapt/priority.go) re-derives
+  the group set deterministically from replayed surfaces on EVERY path —
+  the cut flag can never be lost in replay, is merged stickily into the
+  StageRecord, and surfaces via RunReport.Truncated (run.go:330) →
+  completed-with-flag is the legal AGENTS §0.6 carve-out. NEW TESTS: the
+  one integration test (t3d_integration_test.go — TestT3dEndToEndRun:
+  seed stage under the discover name + the real dns/httpprobe/urlintel/
+  techintel/jsintel/secrentel/priority/detect/report stages, all hermetic
+  — fake resolver, canned transport, scripted gau, loopback HTTP serving
+  synthetic script bodies, synthetic secret DB, hermetic detect rule
+  emitting one technology-listing finding, capture reporter; asserts
+  every stage completed, every Results channel populated producer-by-
+  producer, the jsintel→secrentel document flow with the synthetic AWS
+  key, the full report Context in the captured model, and DeepEqual
+  determinism across two identical runs), plus TestResultsGroupsFirstSeen
+  PerAnchorCollapse (FIND-2 pin: distinct groups with the same anchor →
+  first-seen wins, later members never merge; same for AttackPaths per
+  root), TestPriorityTruncationFlagSurvivesRunReport (§0.6 chain through
+  the runner: 1025 distinct-anchor hosts → 1024 groups, Truncated,
+  StageRecord flag, completed), TestDetectStageSnapshotResultsChannels
+  (all six snapshot-feeding channels reach the rules), and
+  TestReportStageContextEveryChannel (all 16 Results channels reach the
+  report model). Docs: adapt/doc.go T3d section gained the
+  external-URL non-propagation note and the producer/consumer
+  per-channel table; ARCHITECTURE.md's two stale "planned / no producer
+  yet" lines now state T3d completion; README.md verified — no line
+  becomes false. No engine/asset/results.go/run.go changes; T3d1/T3d2
+  files untouched.
+- T3d3 GATE RECORD (this session, verbatim, all commands actually run):
+  gofmt -l $(find . -name '*.go' -type f) → clean (empty output; doc.go
+  table + new test file formatted). go test -count=1
+  ./internal/pipeline/... → ok (pipeline 0.161s, adapt 17.306s). go vet
+  ./... → ok. go build ./... → ok. go test -race -count=1
+  ./internal/pipeline/... → ok (pipeline 1.188s, adapt 18.531s). Full
+  suite go test -count=1 ./... → ok (24 packages). During development
+  the new integration test failed three times on revealed expectations,
+  each fixed in the test itself, not in engine code: the detect rule's
+  finding needed Name/Category/Version aligned with the rule metadata
+  plus Created via the injected clock (engine validation contract);
+  the Google secret candidate value is retained at the engine's bounded
+  candidate cap (assert by type, not exact value); the report engine
+  validates group members and path steps (shape fixed in the fixture).
+  Existing pipeline tests pass unmodified — the T3d3 delta adds one new
+  test file (t3d_integration_test.go), extends detect_test.go and
+  report_test.go, and changes one doc line in detect.go. No new issues
+  opened.
 - Status: DEFERRED
 - Reporter: reviewer
 - Owner: (none)
