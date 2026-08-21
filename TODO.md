@@ -1714,6 +1714,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Problem: 8,254-URL corpus — 10s per dead host starved the shared stage budget; run cancelled with 1,635 errors and no truncation marker.
 - Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
 - Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
+- Post-fix field run 4 (verily.com, fresh cache): urllive still hits the shared stage deadline at 8,199-URL scale (1,587 errors) BUT now carries Truncated+urllive_truncated honestly; alive 172, 3xx 2,361, 4xx 4,078. The remaining lever is a dedicated urllive stage budget (StageBounds Timeout for urllive) or higher concurrency via StageParams — operator-tunable today: --stages with per-stage bounds. Not a defect; recorded as tuning guidance.
 
 ## Operational warnings (all agents)
 ### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
@@ -1729,6 +1730,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Problem: 8,254-URL corpus — 10s per dead host starved the shared stage budget; run cancelled with 1,635 errors and no truncation marker.
 - Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
 - Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
+- Post-fix field run 4 (verily.com, fresh cache): urllive still hits the shared stage deadline at 8,199-URL scale (1,587 errors) BUT now carries Truncated+urllive_truncated honestly; alive 172, 3xx 2,361, 4xx 4,078. The remaining lever is a dedicated urllive stage budget (StageBounds Timeout for urllive) or higher concurrency via StageParams — operator-tunable today: --stages with per-stage bounds. Not a defect; recorded as tuning guidance.
 
 ## Operational warnings (all agents)
 
