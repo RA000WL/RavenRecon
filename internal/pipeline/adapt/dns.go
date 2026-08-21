@@ -38,8 +38,19 @@ const dnsBruteTruncatedFlag = "dns_brute_truncated"
 // supplied the dnsx_resolvers StageParam: the parameter is shape-validated
 // and acknowledged but NOT honored — the engine's native resolver performs
 // every query — so the run is honestly marked instead of silently discarding
-// operator input.
+// operator input. ANY supplied value raises it, including a comma-only one
+// ("," / ",,") that parses to zero resolvers and zero invalid entries
+// (NEW-45): an operator-supplied value must never silently vanish.
 const dnsBruteResolversIgnoredFlag = "dns_brute_resolvers_ignored"
+
+// dnsBruteSkippedCancelledFlag is the sticky flag set when the stage context
+// fired during the wildcard probe, aborting the opt-in brute before any
+// candidate was generated or resolved (NEW-47). The stage outcome stays the
+// base run's — exactly as for the wildcard abort — because the base
+// resolution itself is honest and complete; the flag is the marker that the
+// retained set lacks brute hosts because brute never ran, never silence
+// (AGENTS §0.6).
+const dnsBruteSkippedCancelledFlag = "dns_brute_skipped_cancelled"
 
 // dnsStage adapts internal/dns (dns.Resolve) into a pipeline.Stage.
 //
@@ -100,10 +111,13 @@ func (s *dnsStage) Name() pipeline.StageName { return pipeline.StageDNS }
 //	                       Capped at 5000 entries and 5000 hosts.
 //	dnsx_resolvers string comma-separated IPs; shape-validated (every entry
 //	                       must parse as an IP address) but NOT honored — the
-//	                       native resolver is always used. When supplied with
-//	                       brute enabled, the dns_brute_resolvers_ignored
-//	                       sticky flag marks the run so operator input is
-//	                       never silently discarded.
+//	                       native resolver is always used. When ANY value was
+//	                       supplied with brute enabled — including a
+//	                       comma-only one that yields zero entries — the
+//	                       dns_brute_resolvers_ignored sticky flag marks the
+//	                       run so operator input is never silently discarded.
+//	                       Absent, empty, or whitespace-only values raise no
+//	                       flag (nothing was supplied).
 //
 // When enabled, after the normal dns resolution the stage probes wildcard
 // (random-uuid subdomain), aborts on positive with the dns_brute_wildcard
@@ -112,7 +126,9 @@ func (s *dnsStage) Name() pipeline.StageName { return pipeline.StageDNS }
 // 20/s, per-domain brute timeout 60s, MaxBruteHostsPerDomain 5000). Brute
 // hosts are emitted as corpus Hosts additions (like discovery), no new
 // results channel. Brute candidates are not separately cached — per
-// (host,type) DNS cache already exists.
+// (host,type) DNS cache already exists. If the stage context fires during
+// the wildcard probe, brute is skipped and the dns_brute_skipped_cancelled
+// sticky flag marks the run (the base outcome is preserved).
 //
 // Run never panics on engine errors: every error return of dns.Resolve is
 // wrapped with context ("stage %s: %w") and returned; a non-nil error return
@@ -166,16 +182,18 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 
 	rep, engineErr := dns.Resolve(ctx, in.Target, hosts, cfg)
 	baseRes, baseErr := s.mapResult(ctx, in, rep, engineErr)
-	// Honest operator-input accounting (NEW-31): when brute is enabled and
-	// dnsx_resolvers was supplied, the parameter is NOT honored — the native
-	// resolver performs every query — so the run carries the
-	// dns_brute_resolvers_ignored sticky flag instead of silently discarding
-	// the input. The flag is set on baseRes before every brute path so each
-	// downstream return (wildcard abort, empty merge, full merge) preserves
-	// it. With brute disabled the param is inert like every other dnsx_*
-	// param and no flag is raised.
+	// Honest operator-input accounting (NEW-31, NEW-45): when brute is
+	// enabled and dnsx_resolvers was supplied AT ALL — any non-blank raw
+	// value, including a comma-only one that parses to zero entries — the
+	// parameter is NOT honored (the native resolver performs every query),
+	// so the run carries the dns_brute_resolvers_ignored sticky flag
+	// instead of silently discarding the input. The flag is set on baseRes
+	// before every brute path so each downstream return (wildcard abort,
+	// cancelled-probe skip, empty merge, full merge) preserves it. With
+	// brute disabled the param is inert like every other dnsx_* param and
+	// no flag is raised.
 	if bruteEnabled {
-		if resolvers, invalid := dnsBruteResolvers(in.Config); len(resolvers) > 0 || invalid > 0 {
+		if _, _, supplied := dnsBruteResolvers(in.Config); supplied {
 			if baseRes.StickyFlags == nil {
 				baseRes.StickyFlags = make(map[string]bool)
 			}
@@ -509,17 +527,22 @@ func dnsBruteWordlist(params map[string]string) ([]string, bool) {
 // dns_brute_resolvers_ignored sticky flag when anything was supplied.
 // Parsing validates shape: every non-empty entry must parse as an IP address
 // (netip.ParseAddr); entries failing validation are counted in the second
-// return value and never error the stage. An absent, empty, or
-// whitespace-only param yields (nil, 0).
-func dnsBruteResolvers(params map[string]string) (resolvers []string, invalid int) {
+// return value and never error the stage. The third return value reports
+// whether ANY value was supplied (the trimmed raw string is non-empty) —
+// true even for a comma-only value such as "," or ",," that yields zero
+// resolvers and zero invalid entries (NEW-45), so a supplied-but-unparseable
+// value raises the ignored flag instead of silently vanishing. An absent,
+// empty, or whitespace-only param yields (nil, 0, false).
+func dnsBruteResolvers(params map[string]string) (resolvers []string, invalid int, supplied bool) {
 	v, ok := params["dnsx_resolvers"]
 	if !ok {
-		return nil, 0
+		return nil, 0, false
 	}
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return nil, 0
+		return nil, 0, false
 	}
+	supplied = true
 	var out []string
 	for _, p := range strings.Split(v, ",") {
 		p = strings.TrimSpace(p)
@@ -532,7 +555,7 @@ func dnsBruteResolvers(params map[string]string) (resolvers []string, invalid in
 			invalid++
 		}
 	}
-	return out, invalid
+	return out, invalid, supplied
 }
 
 // runBrute executes the opt-in brute path: wildcard probe, candidate
@@ -547,9 +570,13 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 	wildcard, err := dns.IsWildcard(ctx, in.Target, s.resolver)
 	if err != nil {
 		// Cancellation/deadline during probe: abort brute, propagate no
-		// wildcard flag — the stage context already carries cancellation.
+		// wildcard flag. NEW-47: the skip itself is surfaced via the
+		// dns_brute_skipped_cancelled sticky flag — the caller merges it
+		// onto the base result (the base outcome is preserved), so an
+		// opt-in brute silently skipped by cancellation never reports a
+		// bare completed with no marker.
 		if isContextError(err) {
-			return pipeline.StageResult{}, false, false
+			return pipeline.StageResult{StickyFlags: map[string]bool{dnsBruteSkippedCancelledFlag: true}}, false, false
 		}
 		wildcard = false
 	}

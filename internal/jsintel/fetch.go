@@ -591,7 +591,8 @@ func newTransport() *http.Transport {
 		}
 		// The transport normally derives ServerName from the request host
 		// (addTLS); with a custom dialer the address is all we have.
-		// Unlike httpprobe's dialer, ServerName is set UNCONDITIONALLY
+		// Mirroring httpprobe's dialer (NEW-50), ServerName is set
+		// UNCONDITIONALLY
 		// when empty — including for IP literals, exactly like net/http's
 		// addTLS does: crypto/tls rejects a verifying config with an empty
 		// ServerName outright ("either ServerName or InsecureSkipVerify"),

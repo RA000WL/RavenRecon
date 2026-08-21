@@ -83,6 +83,17 @@
 // "truncated", which could collide across engines in the report's StickyFlags
 // map.
 //
+// Non-truncation diagnostic flags follow the same <engine>_<what> shape and
+// mark a retained set that honestly lacks something the operator asked for,
+// with the stage outcome preserved (completed + flag is the legal §0.6
+// carve-out): dns_brute_wildcard (the opt-in brute aborted on a wildcard DNS
+// zone, dns.go), dns_brute_resolvers_ignored (a supplied dnsx_resolvers
+// param is acknowledged but NOT honored; raised whenever ANY value was
+// supplied — including a comma-only one that parses to zero entries,
+// NEW-45), dns_brute_skipped_cancelled (the stage context fired during the
+// wildcard probe so the opt-in brute never ran; NEW-47 — the skip is marked,
+// never silently completed).
+//
 // Asset-level truncation markers (OPT-P1-4). Two asset models carry their
 // own sticky drop markers, and the adapters that return those assets OR the
 // markers into stage sticky flags:
@@ -102,8 +113,11 @@
 // success, engine error, and cache replay alike — so the AGENTS §0.6 chain
 // holds trivially: the marker is written into the stored record, replayed
 // from cache as part of the decoded asset, re-ORed into the sticky flag on
-// the warm run, merged stickily by the runner, and exposed through the
-// report. The markers are outputs only — never part of an asset identity and
+// the warm run, merged stickily by the runner, and exposed via
+// RunReport.Stages[].StickyFlags, RunReport.Truncated, and the scan
+// summary's per-stage flags= rendering (NEW-51: rendered report artifacts in
+// internal/report surface neither stage sticky flags nor RunReport.
+// Truncated). The markers are outputs only — never part of an asset identity and
 // never an input to any cache key — so no cache schema-version bump or key
 // change accompanies them, and records written before the fields existed
 // decode with the marker false. An asset-level marker fires alongside
@@ -145,6 +159,18 @@
 //     document content, so a meaningful adapter requires the
 //     results/document channel (T3); a no-op stage would violate the
 //     no-placeholder rule (AGENTS §5).
+//
+// Network-hermeticity note for run-level tests (NEW-16). A nil transport at
+// NewJSIntelStage (and NewHTTPProbeStage / NewUrlliveStage) means the
+// engine's bounded default transport — a REAL network dialer. The httpprobe
+// engine records the probe-target URL on its results regardless of probe
+// outcome, so the URL corpus handed to the jsintel stage is non-empty
+// whenever any host was probed; a run-level test that constructs the
+// production jsintel stage over probed hosts therefore reaches the network.
+// Hermetic run-level tests must substitute an http.RoundTripper fake through
+// the stages seam exactly as TestRunScanSmokeE2E does (production behavior
+// is unchanged: newScanStages keeps nil = the engine default transport,
+// correct for the real CLI).
 //
 // T3b conventions (the results channel):
 //

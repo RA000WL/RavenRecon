@@ -346,7 +346,11 @@ var _ pipeline.Stage = (*jsIntelStage)(nil)
 // transport is the constructor test-seam hook (adapt/doc.go): pass nil for
 // production (the engine uses its bounded default transport), or a hermetic
 // fake in tests. It is never read from StageParams — params are operator
-// configuration, not test plumbing.
+// configuration, not test plumbing. NOTE (NEW-16): a nil transport DIALS THE
+// NETWORK once the corpus carries candidate URLs, and the URL corpus handed
+// to this stage is non-empty whenever httpprobe probed any host (probe
+// targets are recorded regardless of probe outcome). Hermetic run-level
+// tests must substitute a fake http.RoundTripper through the stages seam.
 func NewJSIntelStage(transport http.RoundTripper) pipeline.Stage {
 	return &jsIntelStage{transport: transport}
 }

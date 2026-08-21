@@ -979,41 +979,52 @@ func TestDNSBruteTimeoutTruncated(t *testing.T) {
 
 // TestDNSBruteResolversParsing pins the parser's shape validation: entries
 // must parse as IP addresses, invalid entries are counted (never errored),
-// and absent/empty params yield nothing.
+// and absent/empty params yield nothing — while ANY non-blank raw value,
+// including a comma-only one (NEW-45), reports supplied.
 func TestDNSBruteResolversParsing(t *testing.T) {
 	tests := []struct {
 		name        string
 		params      map[string]string
 		wantCount   int
 		wantInvalid int
+		wantSupply  bool
 	}{
-		{name: "absent", params: nil, wantCount: 0, wantInvalid: 0},
-		{name: "empty value", params: map[string]string{"dnsx_resolvers": ""}, wantCount: 0, wantInvalid: 0},
-		{name: "whitespace only", params: map[string]string{"dnsx_resolvers": "   "}, wantCount: 0, wantInvalid: 0},
+		{name: "absent", params: nil, wantCount: 0, wantInvalid: 0, wantSupply: false},
+		{name: "empty value", params: map[string]string{"dnsx_resolvers": ""}, wantCount: 0, wantInvalid: 0, wantSupply: false},
+		{name: "whitespace only", params: map[string]string{"dnsx_resolvers": "   "}, wantCount: 0, wantInvalid: 0, wantSupply: false},
 		{
 			name:        "valid ipv4 and ipv6",
 			params:      map[string]string{"dnsx_resolvers": "192.0.2.1, 2001:db8::1"},
 			wantCount:   2,
 			wantInvalid: 0,
+			wantSupply:  true,
 		},
 		{
 			name:        "mixed valid and invalid",
 			params:      map[string]string{"dnsx_resolvers": "192.0.2.1,not-an-ip, ,999.1.2.3"},
 			wantCount:   1,
 			wantInvalid: 2,
+			wantSupply:  true,
 		},
 		{
 			name:        "only invalid",
 			params:      map[string]string{"dnsx_resolvers": "example.com"},
 			wantCount:   0,
 			wantInvalid: 1,
+			wantSupply:  true,
 		},
+		// NEW-45: a comma-only supplied value parses to zero resolvers and
+		// zero invalid entries but was SUPPLIED — it must report so, or the
+		// dns_brute_resolvers_ignored flag would never fire and operator
+		// input would silently vanish.
+		{name: "comma only (NEW-45)", params: map[string]string{"dnsx_resolvers": ","}, wantCount: 0, wantInvalid: 0, wantSupply: true},
+		{name: "double comma only (NEW-45)", params: map[string]string{"dnsx_resolvers": ",,"}, wantCount: 0, wantInvalid: 0, wantSupply: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, invalid := dnsBruteResolvers(tt.params)
-			if len(got) != tt.wantCount || invalid != tt.wantInvalid {
-				t.Fatalf("dnsBruteResolvers = (%v, %d), want (%d entries, %d invalid)", got, invalid, tt.wantCount, tt.wantInvalid)
+			got, invalid, supplied := dnsBruteResolvers(tt.params)
+			if len(got) != tt.wantCount || invalid != tt.wantInvalid || supplied != tt.wantSupply {
+				t.Fatalf("dnsBruteResolvers = (%v, %d, %v), want (%d entries, %d invalid, supplied=%v)", got, invalid, supplied, tt.wantCount, tt.wantInvalid, tt.wantSupply)
 			}
 		})
 	}
@@ -1066,6 +1077,27 @@ func TestDNSBruteResolversIgnoredFlag(t *testing.T) {
 		}
 	})
 
+	// NEW-45 regression: a comma-only supplied value yields zero parsed
+	// entries, but it WAS supplied — the ignored flag must fire so operator
+	// input never silently vanishes. Fails pre-fix (no flag raised).
+	t.Run("comma-only value still flags", func(t *testing.T) {
+		fake := newFakeResolver()
+		fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{
+			"dnsx_brute":     "true",
+			"dnsx_wordlist":  "www",
+			"dnsx_resolvers": ",,",
+		}
+		res, err := NewDNSStage(fake).Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run error: %v", err)
+		}
+		if !res.StickyFlags[dnsBruteResolversIgnoredFlag] {
+			t.Fatalf("StickyFlags = %v, want %q set for a comma-only value", res.StickyFlags, dnsBruteResolversIgnoredFlag)
+		}
+	})
+
 	t.Run("absent param no flag", func(t *testing.T) {
 		fake := newFakeResolver()
 		in := dnsInput(target, nil)
@@ -1094,6 +1126,44 @@ func TestDNSBruteResolversIgnoredFlag(t *testing.T) {
 			t.Fatalf("StickyFlags = %v, want no %q with brute disabled", res.StickyFlags, dnsBruteResolversIgnoredFlag)
 		}
 	})
+}
+
+// probeCancelResolver simulates the stage context firing during the
+// wildcard probe (NEW-47): its FIRST Lookup — which, with brute enabled and
+// an empty input host list, is exactly dns.IsWildcard's random-uuid probe —
+// cancels the stage context and returns the typed cancellation surface.
+type probeCancelResolver struct {
+	cancel context.CancelFunc
+}
+
+func (r *probeCancelResolver) Lookup(ctx context.Context, host string, rt dns.RecordType) ([]string, error) {
+	r.cancel()
+	return nil, context.Canceled
+}
+
+// TestDNSBruteSkippedCancelledFlag is the NEW-47 regression: when the stage
+// context fires during the wildcard probe, the opt-in brute is silently
+// skipped — pre-fix the stage fell through to a bare base result that could
+// record completed with NO marker. Post-fix the run carries the
+// dns_brute_skipped_cancelled sticky flag while the base resolution's honest
+// outcome is preserved.
+func TestDNSBruteSkippedCancelledFlag(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+	res, err := NewDNSStage(&probeCancelResolver{cancel: cancel}).Run(ctx, in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if !res.StickyFlags[dnsBruteSkippedCancelledFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set when the probe was cancelled", res.StickyFlags, dnsBruteSkippedCancelledFlag)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed (the flag marks the skipped brute; the base outcome is preserved)", res.Outcome)
+	}
 }
 
 // --- NEW-32: explicit cap-hit instead of length inference ---

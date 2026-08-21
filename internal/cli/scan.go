@@ -47,6 +47,12 @@ Options (after the target):
   --cache <dir>           Open the persistent cache at dir for this run.
   --no-cache              Disable the cache for this run even if --cache was
                           given (or caching is enabled in configuration).
+  --dry-run               Parse and validate everything, print the effective
+                          configuration (canonical target, selected stages,
+                          per-stage concurrency/deadline bounds, parameter
+                          overrides, cache state, output directory), and
+                          exit 0 WITHOUT invoking any stage or touching any
+                          target.
   --output <dir>          Report output directory. The report stage creates
                           it as needed and commits each report file
                           atomically; re-running into the same directory
@@ -63,6 +69,15 @@ Options (after the target):
                           frame. Mutually exclusive with --verbose.
   --tui-compact           Condense the --tui frame (no per-worker or
                           resource sections). Requires --tui.
+
+Timeouts: each external discovery tool runs under a per-tool execution
+deadline — the configuration key Discovery.Timeout (internal/config; zero
+defers to the global configuration Timeout, then to the discovery stage
+default). --timeout <d> is a DIFFERENT knob: it maps onto the pipeline's
+per-stage deadline override applied to EVERY selected stage (--timeout 0
+means no per-stage deadline); it does not change the per-tool discovery
+timeout. There is deliberately no amass opt-in flag: amass runs by default
+and is excluded via --sources.
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
@@ -141,6 +156,10 @@ type scanOptions struct {
 	outputDir string
 	verbose   bool
 
+	// dryRun (--dry-run): validate everything and print the effective
+	// configuration without invoking any stage (NEW-48).
+	dryRun bool
+
 	// tui enables the live observability frame on stderr (--tui); it is
 	// mutually exclusive with verbose. tuiCompact condenses the frame
 	// (--tui-compact) and requires tui.
@@ -174,6 +193,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	cacheDir := fs.String("cache", "", "cache directory")
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	outputDir := fs.String("output", "", "report output directory")
+	dryRun := fs.Bool("dry-run", false, "print the effective configuration and exit without running")
 	verbose := fs.Bool("verbose", false, "print stage events to stderr")
 	tuiFlag := fs.Bool("tui", false, "render a live observability frame on stderr")
 	tuiCompact := fs.Bool("tui-compact", false, "condense the --tui frame (requires --tui)")
@@ -195,6 +215,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		tuiCompact: *tuiCompact,
 		cacheDir:   *cacheDir,
 		outputDir:  *outputDir,
+		dryRun:     *dryRun,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -358,28 +379,46 @@ func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig
 // enabled in configuration (at the configured dir or the platform default),
 // and --no-cache forces it off on every path.
 func scanCache(cfg config.Config, opts scanOptions) (cache.Cache, error) {
-	if opts.noCache {
-		return nil, nil
+	dir, open, err := resolveScanCacheDir(cfg, opts)
+	if err != nil {
+		return nil, err
 	}
-	dir := opts.cacheDir
-	if dir == "" {
-		if !cfg.Cache.Enabled {
-			return nil, nil
-		}
-		dir = cfg.Cache.Dir
-		if dir == "" {
-			d, err := cache.DefaultDir()
-			if err != nil {
-				return nil, fmt.Errorf("scan: resolve default cache directory: %w", err)
-			}
-			dir = d
-		}
+	if !open {
+		return nil, nil
 	}
 	c, err := cache.Open(dir, cache.WithTTL(cfg.Cache.TTL))
 	if err != nil {
 		return nil, fmt.Errorf("scan: open cache at %s: %w", dir, err)
 	}
 	return c, nil
+}
+
+// resolveScanCacheDir resolves WHERE (and whether) a run's persistent cache
+// would be opened, with NO side effects: no directory is created and no
+// cache file is touched. It is the single source of truth for both
+// scanCache (which then opens the resolved directory) and --dry-run (which
+// only prints the effective cache state, NEW-48). open=false means the run
+// would have caching disabled.
+func resolveScanCacheDir(cfg config.Config, opts scanOptions) (dir string, open bool, err error) {
+	if opts.noCache {
+		return "", false, nil
+	}
+	dir = opts.cacheDir
+	if dir != "" {
+		return dir, true, nil
+	}
+	if !cfg.Cache.Enabled {
+		return "", false, nil
+	}
+	dir = cfg.Cache.Dir
+	if dir == "" {
+		d, err := cache.DefaultDir()
+		if err != nil {
+			return "", false, fmt.Errorf("scan: resolve default cache directory: %w", err)
+		}
+		dir = d
+	}
+	return dir, true, nil
 }
 
 // newScanStages returns the production twelve-stage pipeline: every adapter
@@ -513,6 +552,19 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 	if err != nil {
 		return err
 	}
+	// NEW-48 (--dry-run): everything above is parse+validate (flag values,
+	// target normalization through asset.NewDomain, config construction).
+	// Dry-run prints the effective configuration — resolved WITHOUT side
+	// effects (the cache directory is resolved but never opened) — and
+	// exits 0 without invoking any stage; the stages seam is never
+	// consulted on this path.
+	if opts.dryRun {
+		cacheDir, cacheOpen, err := resolveScanCacheDir(config.Default(), opts)
+		if err != nil {
+			return err
+		}
+		return printDryRun(w, cfg, cacheDir, cacheOpen)
+	}
 	c, err := scanCache(config.Default(), opts)
 	if err != nil {
 		return err
@@ -601,6 +653,77 @@ func printScanUsage(w io.Writer) error {
 	return err
 }
 
+// printDryRun renders the effective scan configuration for --dry-run
+// (NEW-48): the canonical target, the selected stages in run order with
+// their EFFECTIVE per-stage concurrency/deadline bounds (explicit overrides
+// resolved through StageConfig.WithDefaults, so what is printed is exactly
+// what the runner would enforce), the parameter overrides (sources,
+// request-timeout; sorted for a stable output), the cache state, and the
+// output directory. It prints only — no stage runs, no network, no cache
+// open, no directory creation. Durations are rendered from the parsed
+// values; no timestamps appear, so the output is stable for identical
+// input.
+func printDryRun(w io.Writer, cfg pipeline.ScanConfig, cacheDir string, cacheOpen bool) error {
+	if _, err := fmt.Fprintf(w, "RavenRecon scan (dry run): %s\n\n", cfg.Target.Name); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Target: %s (canonical)\n", cfg.Target.Name); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Output: %s\n", cfg.OutputDir); err != nil {
+		return err
+	}
+	if cacheOpen {
+		if _, err := fmt.Fprintf(w, "Cache: %s\n", cacheDir); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprint(w, "Cache: disabled\n"); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprint(w, "\nStages:\n"); err != nil {
+		return err
+	}
+	for _, name := range cfg.Stages {
+		b := pipeline.DefaultStageConfig()
+		if bc, ok := cfg.StageBounds[name]; ok {
+			b = bc.WithDefaults()
+		}
+		timeout := "none"
+		if b.Timeout > 0 {
+			timeout = b.Timeout.String()
+		}
+		if _, err := fmt.Fprintf(w, "  %-10s concurrency=%d timeout=%s\n", name, b.MaxConcurrency, timeout); err != nil {
+			return err
+		}
+	}
+	if len(cfg.StageParams) > 0 {
+		names := make([]string, 0, len(cfg.StageParams))
+		for name := range cfg.StageParams {
+			names = append(names, string(name))
+		}
+		sort.Strings(names)
+		if _, err := fmt.Fprint(w, "\nParams:\n"); err != nil {
+			return err
+		}
+		for _, n := range names {
+			keys := make([]string, 0, len(cfg.StageParams[pipeline.StageName(n)]))
+			for k := range cfg.StageParams[pipeline.StageName(n)] {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if _, err := fmt.Fprintf(w, "  %s.%s=%s\n", n, k, cfg.StageParams[pipeline.StageName(n)][k]); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	_, err := fmt.Fprint(w, "\nNothing was run: dry run validates configuration only.\n")
+	return err
+}
+
 // printScanSummary renders one scan run's summary: the target, the cache
 // state, the pipeline outcome, one line per stage (name, outcome, honest
 // counters, truncation/flags, error detail), and the report output — the
@@ -681,9 +804,19 @@ func printScanSummary(w io.Writer, rep pipeline.RunReport, outputDir string, cac
 	return nil
 }
 
+// reportTmpPrefix matches internal/report's unexported tmpPrefix
+// (internal/report/writer.go): the report writer prefixes every temporary
+// output file with it so aborted renders "can be identified and never look
+// like reports". The summary must honor that contract: an interrupted-render
+// temp file left in the output directory is never listed as a report. The
+// constant is unexported in internal/report and is referenced here as a
+// literal with this comment (writer.go itself is not modified).
+const reportTmpPrefix = ".ravenrecon-report-"
+
 // reportFiles lists the direct, non-directory entries of dir, sorted by
-// name. An unreadable or missing directory is an error the caller renders
-// as an honest note.
+// name, excluding interrupted-render temp files (reportTmpPrefix, NEW-17).
+// An unreadable or missing directory is an error the caller renders as an
+// honest note.
 func reportFiles(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -691,7 +824,7 @@ func reportFiles(dir string) ([]string, error) {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), reportTmpPrefix) {
 			names = append(names, e.Name())
 		}
 	}

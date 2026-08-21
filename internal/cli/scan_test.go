@@ -494,6 +494,12 @@ func TestPrintScanSummary(t *testing.T) {
 			t.Fatalf("write %s: %v", f, err)
 		}
 	}
+	// NEW-17 regression: an interrupted-render temp file in the output
+	// directory must not appear in the summary — fails pre-fix.
+	tmp := filepath.Join(dir, ".ravenrecon-report-example.com.md.part1")
+	if err := os.WriteFile(tmp, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
 	rep := pipeline.RunReport{
 		Target:         target,
 		Outcome:        pipeline.OutcomePartial,
@@ -535,6 +541,9 @@ func TestPrintScanSummary(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary output missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, ".ravenrecon-report-") {
+		t.Fatalf("summary must never list interrupted-render temp files:\n%s", out)
 	}
 }
 
@@ -596,6 +605,12 @@ func TestReportFiles(t *testing.T) {
 			t.Fatalf("write %s: %v", f, err)
 		}
 	}
+	// NEW-17 regression: an interrupted-render temp file (the report
+	// writer's tmpPrefix) must never be listed — fails pre-fix.
+	tmp := filepath.Join(dir, ".ravenrecon-report-example.com.json.tmp123456")
+	if err := os.WriteFile(tmp, nil, 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
 	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -604,7 +619,7 @@ func TestReportFiles(t *testing.T) {
 		t.Fatalf("reportFiles: %v", err)
 	}
 	if !reflect.DeepEqual(files, []string{"a.json", "b.txt"}) {
-		t.Fatalf("reportFiles = %v, want sorted non-directory entries", files)
+		t.Fatalf("reportFiles = %v, want sorted non-directory entries without temp files", files)
 	}
 	if _, err := reportFiles(filepath.Join(dir, "missing")); err == nil {
 		t.Fatal("reportFiles on a missing directory must error")
@@ -1218,6 +1233,122 @@ func TestRunScanHelp(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "Usage:") {
 		t.Fatalf("usage output missing the usage section:\n%s", buf.String())
+	}
+	// NEW-48 additions: the usage text documents the per-tool execution
+	// timeout (config Discovery.Timeout), how --timeout maps onto the
+	// per-stage deadline, the --dry-run flag, and that amass exclusion is
+	// via --sources (no opt-in flag).
+	for _, want := range []string{
+		"Discovery.Timeout",
+		"--timeout",
+		"per-stage deadline",
+		"--dry-run",
+		"--sources",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("usage output missing %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+// TestRunScanDryRun is the NEW-48 regression: --dry-run parses and
+// validates everything, prints the effective configuration, exits 0, and
+// NEVER invokes any stage (the seam-capture counter proves it).
+func TestRunScanDryRun(t *testing.T) {
+	base := t.TempDir()
+	outDir := filepath.Join(base, "out")
+	cacheDir := filepath.Join(base, "cache")
+
+	var calls int
+	stages := func(cfg pipeline.ScanConfig) []pipeline.Stage {
+		calls++
+		return nil
+	}
+
+	t.Run("prints effective config, runs nothing", func(t *testing.T) {
+		var buf bytes.Buffer
+		args := []string{
+			"Example.COM.", // normalization must be reflected in the printout
+			"--dry-run",
+			"--stages", "discover,dns",
+			"--sources", "subfinder",
+			"--request-timeout", "2s",
+			"--concurrency", "3",
+			"--timeout", "5s",
+			"--cache", cacheDir,
+			"--output", outDir,
+		}
+		if err := runScan(context.Background(), &buf, args, stages, nil); err != nil {
+			t.Fatalf("dry run must exit cleanly, got %v", err)
+		}
+		if calls != 0 {
+			t.Fatalf("stages seam invoked %d time(s) during dry run, want 0", calls)
+		}
+		got := buf.String()
+		for _, want := range []string{
+			"RavenRecon scan (dry run): example.com",
+			"Target: example.com (canonical)",
+			"Output: " + outDir,
+			"Cache: " + cacheDir,
+			"discover",
+			"dns",
+			"concurrency=3",
+			"timeout=5s",
+			"discover.sources=subfinder",
+			"httpprobe.request_timeout=2s",
+			"Nothing was run",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("dry-run output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("defaults: cache disabled, no deadline", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := runScan(context.Background(), &buf, []string{"example.com", "--dry-run"}, stages, nil); err != nil {
+			t.Fatalf("dry run must exit cleanly, got %v", err)
+		}
+		if calls != 0 {
+			t.Fatalf("stages seam invoked %d time(s) during dry run, want 0", calls)
+		}
+		got := buf.String()
+		for _, want := range []string{
+			"Target: example.com (canonical)",
+			"Cache: disabled",
+			"timeout=none",
+			"Output: " + defaultOutputDir,
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("dry-run output missing %q:\n%s", want, got)
+			}
+		}
+	})
+}
+
+// TestRunScanDryRunInvalidInputsFail pins that --dry-run validates before
+// printing: invalid flags/targets still fail validation and never invoke a
+// stage.
+func TestRunScanDryRunInvalidInputsFail(t *testing.T) {
+	var calls int
+	stages := func(cfg pipeline.ScanConfig) []pipeline.Stage {
+		calls++
+		return nil
+	}
+	cases := [][]string{
+		{"example.com", "--dry-run", "--stages", "not-a-stage"},
+		{"bad_target!", "--dry-run"},
+		{"example.com", "--dry-run", "--concurrency", "0"},
+	}
+	for _, args := range cases {
+		var buf bytes.Buffer
+		err := runScan(context.Background(), &buf, args, stages, nil)
+		if err == nil {
+			t.Fatalf("args %v: dry run must fail validation, got nil error (output:\n%s)", args, buf.String())
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("stages seam invoked %d time(s), want 0", calls)
 	}
 }
 
