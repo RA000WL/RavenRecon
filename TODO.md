@@ -1699,6 +1699,16 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   - Known issues for follow-up: (1) urllive cancelled at stage deadline with 1644 errors — needs per-URL timeout tuning or higher concurrency for 2k-URL corpora; (2) amass failed after contributing 0 (known slow-source); (3) urlintel completed 0 (gau/wayback empty for this target — tools ran 0.2s); (4) summary duration_ms still 0 (pipeline bracket wiring deferred from P0-5 — model ready, adapt/report.go single-now pending).
 - Verification: run outcome cancelled (urllive deadline), but all v1.5 deliverables demonstrated on an authorized real target.
 
+### NEW-38 (INFO) — Field trial 3: verily.com post-chaos-fix validation (cmd/ravenrecon)
+- Status: VERIFIED (orchestrator, 2026-08-21) — chaos fix proven; coverage delta recorded
+- Evidence (/tmp/opencode/fieldtrial-verily2.log, report-verily2, fresh cache):
+  - chaos now contributes 1,044 hosts (was 1); discover 2,183 processed → corpus 1,067 hosts (+23 net-new vs trial 2, all real: dev-v1.login, granular-uw-* GKE clusters, identity-playground…).
+  - urlintel UNLOCKED: gau returned 6,120 URLs in 2m00s partial (per-tool timeout fired as designed — P0-4 working); trial 1 had 0.
+  - urllive triaged 8,254 URLs: 182×2xx alive (13× net-new incl. dev-files.verily.com, page.verily.com), 2,370×3xx, 4,066×4xx — still cancelled at stage deadline (1,635 errors): per-URL concurrency tuning remains the open item.
+  - Full-funnel proof: crawl 1,067 → techintel 8,254 → jsintel 500/267 truncated → secrentel 205 → priority 9,321 surfaces / 97 groups / 32 paths.
+  - Remaining known items: urllive deadline tuning; duration_ms wiring (P0-5 deferred); amass opt-in.
+
+## Operational warnings (all agents)
 ### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
 - Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
 - Reporter: master (field trial 2, NEW-36)
