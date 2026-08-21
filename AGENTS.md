@@ -4,57 +4,64 @@ RavenRecon is a reliability-first reconnaissance framework for **authorized**
 bug bounty and security testing — never an exploitation or credential-attack
 framework.
 
+This file is loaded into every session automatically — never spend turns
+re-reading it or other top-level docs wholesale. Treat it as guardrails, not
+procedure: it marks the cliffs (§0), the load-bearing patterns (§7–§11), and
+the honesty rules (§13, §17). How you explore, plan, and build is yours.
+Where judgment and this document conflict, judgment wins everywhere except
+§0 — there, the constraint wins and you escalate instead.
+
 ## 0. Non-negotiable constraints
 
-These override every other instruction in this document, regardless of task
-size or how the request is phrased. If a change would require violating one
-of these, stop, document the conflict, and propose an alternative instead of
-proceeding.
+These override everything else, regardless of task size or phrasing. If a
+change would violate one: stop, document the conflict, propose an
+alternative — never improvise around §0.
 
 1. **Recon only.** Never implement credential stuffing, password spraying,
    authentication brute force, persistence, automated exploitation,
    unauthorized access, or automatic vulnerability submission.
 2. **Stdlib only.** `go.mod` declares no dependencies. Adding one is an
-   architectural decision that needs explicit sign-off — never a
-   convenience default.
-3. **No shell interpolation of target-derived data.** Never build a command
+   architectural decision needing explicit sign-off — never a convenience
+   default.
+3. **No shell interpolation of target-derived data.** Never build commands
    with `sh -c "<untrusted input>"` or string-concatenated arguments. See §8.
 4. **`internal/runtime` never imports `internal/cache`.** Consumer stages
-   compose "cache-before-execute" around pool jobs — the dependency does not
-   go the other way.
-5. **One normalization point.** Every normalization goes through the Phase 2
-   asset builders in `internal/asset` (`NewDomain`, `NewHost`, `ParseURL`,
-   ...). Never write a second normalizer for the same concept.
+   compose cache-before-execute around pool jobs; the dependency does not
+   point back.
+5. **One normalization point.** Every normalization goes through the asset
+   builders in `internal/asset` (`NewDomain`, `NewHost`, `ParseURL`, ...).
+   Never write a second normalizer for the same concept.
 6. **Outcome vocabulary is fixed:** `completed / partial / failed /
    cancelled / incomplete`. Truncated results are never silently
-   `completed`: pipelines must either store truncated results as
-   `partial`/`incomplete` (never served from cache), or — where the
-   pipeline's records preserve a mandatory truncation flag end-to-end
-   (written to the record, replayed from cache on hits, merged stickily, and
-   exposed in the report — techintel's `Truncated`/`Overflow`, urlintel's
-   `Overflow`) — the entry may be recorded `completed` with the flag set,
-   and consumers must treat a flagged entry as an incomplete retained set.
-   A pipeline whose flag is dropped at any link in that chain must store
-   truncated results as `partial`/`incomplete` instead.
+   `completed`: either store them `partial`/`incomplete` (never served from
+   cache), or — where the pipeline preserves a mandatory truncation flag
+   end-to-end (written to the record, replayed from cache, merged stickily,
+   exposed in the report; techintel `Truncated`/`Overflow`, urlintel
+   `Overflow`) — record `completed` with the flag set, and consumers treat
+   flagged entries as an incomplete retained set. If the flag drops at any
+   link in that chain, store `partial`/`incomplete`.
 7. **All concurrency is bounded** — explicit max concurrency, cancellation,
    and shutdown behavior, on every worker system. See §10.
 8. **Never commit real secrets** — API keys, passwords, tokens, cookies,
-   private keys, credentials, or private target data. Synthetic test values
+   private keys, credentials, private target data. Synthetic test values
    only.
-9. **Never claim a test was run, or work was completed, that wasn't.** §13
-   makes this a gate, not just a norm.
-## 1. Task tiers
+9. **Never claim a test was run, or work was completed, that wasn't.**
+   §13 makes this a gate, not a norm.
 
-Classify the task before starting. The tier determines how much of the rest
-of this document is mandatory.
+## 1. Rigor scales with blast radius, not ceremony
 
-| Tier | Examples | Reading required (§4) | Gate before finishing |
-|---|---|---|---|
-| **A — Trivial** | typo, comment, log message, one-line bug fix with obvious cause | Skim the file(s) you're touching | `gofmt`, `go build ./...` |
-| **B — Scoped change** | new function, bug fix touching one package, test additions | AGENTS.md §0, §6; the package's own docs if present | Full §13 checklist |
-| **C — Architectural** | new package, new CLI command, cross-package interface change, anything touching `internal/runtime`, `internal/cache`, `internal/asset`, or the event bus | AGENTS.md (full), README.md, ARCHITECTURE.md, ROADMAP.md | Full §13 checklist + §16 PR write-up |
+Calibrate once, then work — no reading requirements are attached to any
+size (this file is already in your context; read code, not process):
 
-When in doubt, round up a tier. Never round down to skip §0.
+- **Trivial** (typo, comment, log line): format + build what you touched.
+- **Scoped** (behavior change within one package): full §13 gate.
+- **Architectural** (new package, CLI command, cross-package interface, or
+  anything touching `internal/runtime`, `internal/cache`,
+  `internal/asset`, or the event bus): §13 gate, docs move with code (§6),
+  written design rationale when asked.
+
+When unsure, round up. Never round down out of §0.
+
 ## 2. Repository layout
 - `cmd/ravenrecon/` — CLI entry; `internal/cli` — command wiring; `internal/config` — global config (`CacheConfig` disabled by default, `TUIConfig`)
 - `internal/asset` — typed asset model; the only normalization point
@@ -73,6 +80,7 @@ When in doubt, round up a tier. Never round down to skip §0.
 - `internal/tui` — terminal observability (library only; wired into the CLI by `ravenrecon scan --tui`)
 - `internal/pipeline`, `internal/pipeline/adapt` — end-to-end pipeline orchestration (runner, stages, params, events) and the adapters that wrap each engine as a stage (library only; wired into the CLI by `ravenrecon scan`)
 Most pipelines (dns, httpprobe, urlintel, techintel, jsintel) have **no standalone CLI command yet** — do not add CLI wiring outside the milestone that calls for it. (The pipeline as a whole IS reachable via `ravenrecon scan`, and the TUI IS wired into scan via `--tui`; those engines still have no standalone commands.)
+
 ## 3. Common commands
 
 ```bash
@@ -83,37 +91,44 @@ go test ./...                            # all tests
 go test ./internal/asset/...             # focused package tests
 gofmt -w $(find . -name '*.go' -type f)  # format
 ```
+
 ## 4. Before modifying code
-Read what your task tier (§1) requires, then inspect the existing implementation of anything you're about to touch or extend.
-**Never assume a planned feature already exists** — roadmap docs describe intent, not current state; verify against the code.
-**Never read ARCHITECTURE.md in full** — use its "Reader's map" at the top and read only the sections relevant to your task.
-## 5. Milestone discipline — phase ownership
-Milestones own **features**, not files. Implement only the requested milestone — never silently implement future roadmap milestones, even if they look easy to include.
-Classify any change touching a subsystem outside the milestone's own scope:
-- **Primary** — the milestone's purpose (ROADMAP).
-- **Infrastructure** — strictly required to complete the current milestone (e.g. a stage interface the pipeline needs, a report metadata field, a cache operation type). Allowed; interfaces belong where they are first needed.
-- **Refactor** — improves existing code without adding future functionality. Allowed.
-- **Future Feature** — user-facing functionality scheduled for a later milestone (a CLI command, a new engine), or placeholder/disabled code and partial implementations of future roadmap items. Not allowed.
-Rule: **you may modify any subsystem if the change is strictly required to complete the current milestone; you may not implement the future milestone's user-facing functionality.**
-A required architectural issue outside scope that is not strictly required: (1) document it, (2) propose the change, (3) stop — never improvise a fix.
+Inspect the existing implementation of anything you touch or extend.
+Roadmap docs describe intent, not current state — verify against the code;
+never assume a planned feature already exists. For architecture context,
+use ARCHITECTURE.md's Reader's map and read only the section your task
+needs — never the whole file.
+
+## 5. Milestone discipline
+Milestones own **features**, not files. Implement the requested milestone —
+never silently implement future roadmap milestones, however easy they look.
+
+Touching another subsystem is fine when strictly required to complete the
+current milestone (a stage interface the pipeline needs, a cache operation
+type, a report metadata field); interfaces belong where first needed.
+Refactors that add no future functionality are fine. Placeholder or partial
+implementations of future features are not.
+
+An architectural issue you notice but that isn't required here: document
+it, propose the change, move on — never fold it into the current work.
+
 ## 6. Architecture boundaries
 - **Layers:** CLI → config → runtime pool → pipeline stages → asset model.
 - **Event bus is observer-only, one-directional:** engines emit, consumers observe; no consumer calls back into an engine through the bus.
 - **External tools are adapters behind interfaces** (`discovery.Source`, `urlintel.LineSource`); core pipelines never branch on tool names.
-- **Docs move with code:** update README.md and ARCHITECTURE.md with milestone changes (Tier C).
+- **Docs move with code:** milestone-level changes update README.md and ARCHITECTURE.md.
+
 ## 7. Core engineering rules
 1. Prefer small, cohesive packages.
 2. Avoid global mutable state.
 3. Pass dependencies explicitly.
-4. Library code must return errors.
-5. No `log.Fatal`, `os.Exit`, or panic for ordinary library failures.
-6. Use `context.Context` for cancellable operations.
-7. Bound all concurrency (§10).
-8. Avoid unbounded queues.
-9. Avoid unbounded memory growth.
-10. Prefer deterministic tests.
-11. Keep exported APIs small.
-12. Prefer the standard library when practical.
+4. Library code returns errors — no `log.Fatal`, `os.Exit`, or panic for ordinary failures.
+5. Use `context.Context` for cancellable operations.
+6. Bound all concurrency (§10); avoid unbounded queues and memory growth.
+7. Prefer deterministic tests.
+8. Keep exported APIs small.
+9. Prefer the standard library when practical.
+
 ## 8. External commands — canonical pattern
 **Do this:**
 ```go
@@ -122,27 +137,29 @@ cmd.Stdout = limitedBuffer   // enforce output limits
 // timeout via ctx; structured error on failure
 ```
 **Never this:** `exec.CommandContext(ctx, "sh", "-c", "subfinder -d "+domain)` — never construct shell commands via string concatenation, especially for target-derived data (§0.3).
-All command execution: use `exec.CommandContext`; pass arguments as separate values; honor context cancellation; enforce timeouts; enforce output limits where appropriate; return structured errors.
+All command execution: `exec.CommandContext`; arguments as separate values; context cancellation honored; timeouts enforced; output limits where appropriate; structured errors returned.
+
 ## 9. Tool detection
 Tool detection must be tool-specific — never assume `-version`, `-v`, or `--version` support. Executable existence and capability detection are separate concerns; a broken version command must not report a correctly installed tool as missing.
+
 ## 10. Concurrency — canonical pattern
-**Never** create an unbounded goroutine per target, host, URL, endpoint, or result. **Do this** — every worker system needs all four:
+**Never** create an unbounded goroutine per target, host, URL, endpoint, or result. Every worker system needs all four properties:
 ```go
 pool := runtime.NewPool(ctx, runtime.Config{MaxWorkers: n}) // explicit maximum concurrency
 // ctx cancellation propagates to all workers; pool.Shutdown() drains cleanly
 ```
-Plus tests for leaks and races (§13). Rate limiting centralized where practical.
+Plus leak/race coverage (§13). Rate limiting centralized where practical.
+
 ## 11. Caching
 Cache keys must contain every input that materially changes the operation's result — never return stale results merely because a target string matches. Keys account for: schema version, configuration, tool version (where relevant), operation, normalized target.
+
 ## 12. Security and scope
-§0 holds the hard constraints (recon-only, stdlib-only, no real secrets). Never commit API keys, passwords, tokens, cookies, private keys, real credentials, or private target data — use synthetic test values. Never leak secrets through errors or logs (§15).
-## 13. Testing — gate before declaring work done
+§0.1, §0.2, and §0.8 carry the hard lines. Beyond them: synthetic test data only, and never leak secrets through errors or logs (§15).
 
-New behavior requires tests. Bug fixes should include regression tests
-whenever practical.
+## 13. Testing — know, don't assume
+New behavior requires tests; bug fixes include regression tests whenever practical. Tests are hermetic: loopback servers, fake resolvers, synthetic input — no public internet.
 
-**You may not describe a change as complete until you have actually run the
-commands below in this session** (not "would pass" — run them):
+Before calling work done, run these in this session:
 
 ```bash
 gofmt
@@ -151,45 +168,26 @@ go vet ./...
 go build ./...
 ```
 
-For concurrency-sensitive changes, add:
-```bash
-go test -race ./...
-```
+Add `go test -race ./...` for concurrency-sensitive changes. If a check fails — or cannot run (missing toolchain, broken environment) — say so plainly. An honest "not verified" beats a silent assumption.
 
-All tests are hermetic: no public internet, fake resolvers, loopback
-servers, synthetic input only.
+Keep the board honest: record new open issues in TODO.md (severity + file:line evidence + concrete fix), mark claimed entries IN PROGRESS, and never self-close — the orchestrator moves entries to VERIFIED. Work not on the board is work the next session loses.
 
-If a check fails or wasn't run, say so explicitly rather than omitting it.
-
-**Before declaring a change complete, update TODO.md** (the agent-coordination
-board): record new open issues (severity + file:line evidence + concrete fix),
-mark claimed entries IN PROGRESS, and never self-close entries — the
-orchestrator moves entries to VERIFIED. Work that is not on the board is work
-the next session will lose; a change is not done until the board says what it
-was for and what state it is in.
 ## 14. Performance
-No guess-based optimization: establish a baseline, measure, identify the bottleneck, optimize, benchmark again. Never trade correctness for speed without explicit justification.
+No guess-based optimization: baseline, measure, fix the bottleneck, measure again. Never trade correctness for speed without explicit justification.
+
 ## 15. Error handling
-Wrap with context when it materially improves diagnosis: `fmt.Errorf("parse tool output: %w", err)` — not bare `return err`. Never leak secrets through errors or logs.
-## 16. Pull request requirements (Tier C, or on request)
-Every PR explains: problem, solution, design decisions, files changed, tests added, tests executed, performance impact, concurrency impact, security considerations, known limitations.
-## 17. Final self-review — gate before finishing
+Wrap errors with context when it materially improves diagnosis: `fmt.Errorf("parse tool output: %w", err)` — not bare `return err`. Never leak secrets through errors or logs.
 
-Do not output a final summary of your work until you have gone through this
-list explicitly, item by item, against your actual diff:
+## 16. Change write-ups
+On request, or for architectural changes, cover: problem, approach, design decisions, files changed, tests executed (with results), known limitations. Skip ceremony beyond that.
 
-1. Review the complete diff.
-2. Check for accidental scope expansion (§5).
-3. Check for command injection (§8).
-4. Check for race conditions (§10).
-5. Check for goroutine leaks (§10).
-6. Check for unbounded memory/queues (§7).
-7. Check for incorrect cancellation (§10).
-8. Check for leaked secrets (§12, §15).
-9. Confirm §13's commands were actually run, not assumed.
-10. Confirm TODO.md reflects this work — new issues recorded with evidence,
-    claimed entries marked IN PROGRESS, nothing self-closed (the orchestrator
-    closes entries).
-11. Report exactly what changed — no more, no less than what was asked.
+## 17. Before you call it done
+A habit, not a ritual — against your actual diff:
+
+- Diff reviewed end to end; scope is exactly what was asked (§5).
+- §0 clean: no injection paths (§8), unbounded concurrency (§10), or secret leaks (§12, §15).
+- §13 gates actually ran; results reported as they happened.
+- TODO.md reflects the work; nothing self-closed.
+- Your summary states exactly what changed — no more, no less.
 
 Do not claim work that was not performed.
