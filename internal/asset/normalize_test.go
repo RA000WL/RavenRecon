@@ -32,6 +32,16 @@ func TestNewDomain(t *testing.T) {
 		{name: "leading hyphen", in: "-example.com", wantErr: true},
 		{name: "trailing hyphen", in: "example-.com", wantErr: true},
 		{name: "underscore", in: "exa_mple.com", wantErr: true},
+		{name: "leading underscore dmarc", in: "_dmarc.example.com", want: "_dmarc.example.com"},
+		{name: "leading underscore domainkey", in: "s1._domainkey.example.com", want: "s1._domainkey.example.com"},
+		{name: "leading underscore acme", in: "_acme-challenge.example.com", want: "_acme-challenge.example.com"},
+		{name: "bare underscore", in: "_", wantErr: true},
+		{name: "bare underscore dotted", in: "_.example.com", wantErr: true},
+		{name: "double underscore", in: "__dmarc.example.com", wantErr: true},
+		{name: "double underscore alt", in: "__test.example.com", wantErr: true},
+		{name: "underscore hyphen start", in: "_-dmarc.example.com", wantErr: true},
+		{name: "underscore hyphen end", in: "_dmarc-.example.com", wantErr: true},
+		{name: "mid underscore still rejected 2", in: "a_b.example.com", wantErr: true},
 		{name: "space inside", in: "exa mple.com", wantErr: true},
 		{name: "non-ascii", in: "éxample.com", wantErr: true},
 		{name: "bare ipv4", in: "1.2.3.4", wantErr: true},
@@ -78,8 +88,46 @@ func TestNewHost(t *testing.T) {
 		}
 	}
 
+	// RFC 8552 leading-underscore labels are valid service names.
+	underscoreValid := []struct {
+		in   string
+		want string
+	}{
+		{in: "_dmarc.example.com", want: "_dmarc.example.com"},
+		{in: "s1._domainkey.example.com", want: "s1._domainkey.example.com"},
+		{in: "_acme-challenge.example.com", want: "_acme-challenge.example.com"},
+		{in: "_DMARC.EXAMPLE.COM", want: "_dmarc.example.com"},
+		{in: "_dmarc.example.com.", want: "_dmarc.example.com"},
+		{in: " _acme-challenge.example.com ", want: "_acme-challenge.example.com"},
+	}
+	for _, tc := range underscoreValid {
+		h, err := NewHost(tc.in, p)
+		if err != nil {
+			t.Fatalf("NewHost(%q) unexpected error: %v", tc.in, err)
+		}
+		if h.Name != tc.want {
+			t.Errorf("NewHost(%q).Name = %q, want %q", tc.in, h.Name, tc.want)
+		}
+	}
+
 	invalid := []string{"", "1.2.3.4", "::1", "-x.com", "x_.com", "é.example"}
 	for _, in := range invalid {
+		if _, err := NewHost(in, p); err == nil {
+			t.Errorf("NewHost(%q) expected error, got nil", in)
+		}
+	}
+	// Mid-label underscores and bare/double underscores remain invalid.
+	underscoreInvalid := []string{
+		"exa_mple.com",
+		"_",
+		"_.example.com",
+		"__dmarc.example.com",
+		"__test.example.com",
+		"_-dmarc.example.com",
+		"_dmarc-.example.com",
+		"a_b.example.com",
+	}
+	for _, in := range underscoreInvalid {
 		if _, err := NewHost(in, p); err == nil {
 			t.Errorf("NewHost(%q) expected error, got nil", in)
 		}
