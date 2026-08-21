@@ -235,6 +235,12 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			Clock:     clock,
 			Cache:     cache,
 			OutputDir: cfg.OutputDir,
+			// The run bracket's start (RunReport.StartAt, stamped above
+			// the loop): stages that present the run's wall-clock bracket
+			// (the report stage) compose it from here. RunEndedAt stays
+			// zero — EndAt does not exist until the loop below completes;
+			// the report stage falls back to its own render-time read.
+			RunStartedAt: report.StartAt,
 		}
 		stageCtx := ctx
 		cancel := func() {}

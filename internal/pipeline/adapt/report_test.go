@@ -163,10 +163,12 @@ func TestReportStageEmptyCorpus(t *testing.T) {
 }
 
 // TestReportStageContextComposition pins the Context the stage composes:
-// the declared target, the single honest "now" from the injected clock for
-// both bracket ends (equal — the pipeline tracks no run bracket yet), and
+// the declared target, and — on the LEGACY path (no StageInput.RunStartedAt,
+// i.e. direct engine use outside the runner) — the single honest "now" from
+// the injected clock for both bracket ends (equal values are valid), plus
 // only the in-scope filtered corpus — out-of-domain entries never reach the
-// model.
+// model. The runner-driven honest bracket is pinned by
+// TestReportStageRunBracket below.
 func TestReportStageContextComposition(t *testing.T) {
 	var m *report.Model
 	reg := newReportRegistry(t, captureReporter("capture", func(got *report.Model) { m = got }))

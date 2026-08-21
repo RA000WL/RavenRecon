@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
@@ -102,6 +103,22 @@ type StageInput struct {
 
 	// OutputDir is the configured output directory (report stage).
 	OutputDir string
+
+	// RunStartedAt is the run's start instant (RunReport.StartAt, stamped
+	// by the injected clock before the first stage runs). The runner sets
+	// it on every StageInput; zero means unknown — a stage invoked
+	// outside the runner (direct engine use) — and consumers must fall
+	// back to their own clock read. The report stage composes its honest
+	// run bracket from it (adapt/report.go).
+	RunStartedAt time.Time
+
+	// RunEndedAt is the run's end instant when a caller knows it ahead of
+	// a stage's turn. The sequential runner can never know it while
+	// stages still run (RunReport.EndAt is stamped only after the last
+	// stage), so it stays zero on the pipeline path and the report stage
+	// falls back to its own render-time clock read; a caller composing
+	// inputs after a completed run may set it explicitly. Zero = unknown.
+	RunEndedAt time.Time
 }
 
 // StageResult is what one stage run reports.

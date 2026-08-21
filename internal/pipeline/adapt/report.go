@@ -69,12 +69,16 @@ func (s *reportStage) Name() pipeline.StageName { return pipeline.StageReport }
 //
 //	Target    ← in.Target.Name (display metadata; the engine derives and
 //	                            sanitizes the report base name from it)
-//	StartedAt ← in.Clock.Now()  (EndedAt equals it: the pipeline tracks no
-//	                            run bracket yet, so both timestamps are the
-//	                            stage's single honest "now"; equal values
-//	                            are valid — the engine rejects only an
-//	                            EndedAt BEFORE StartedAt)
-//	EndedAt   ← in.Clock.Now()
+//	StartedAt ← in.RunStartedAt (the runner's StartAt, stamped by the
+//	                            injected clock before the first stage);
+//	                            legacy/direct use without it: the clock's
+//	                            single "now" below
+//	EndedAt   ← in.RunEndedAt when non-zero (a caller composing inputs
+//	                            after a completed run), else in.Clock.Now()
+//	                            read at render-composition time — on the
+//	                            sequential runner the render IS the run's
+//	                            effective end (EndAt is stamped right
+//	                            after); legacy: the same single now
 //	Domains/Hosts/URLs ← the in-scope filtered corpus
 //	every other data channel ← the results channel as the earlier stages
 //	                            produced it (T3d): IPs, Ports, Services,
@@ -172,22 +176,37 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 	hosts := pipeline.FilterHosts(in.Target, in.Hosts)
 	urls := filterURLs(in.Target, in.URLs)
 
-	// The run bracket: the pipeline tracks no per-run timestamps yet, so
-	// the stage's single honest "now" fills both ends (equal values are
-	// valid). On the pipeline path the injected clock always wins and the
-	// bracket is always deterministic — pipeline.Run rejects a nil clock
-	// (run.go:160-161), so the wall-clock fallback below is
-	// DIRECT-CALLER-ONLY: a nil clock can reach this stage only when the
-	// stage is invoked outside the runner. The report content itself never
-	// carries these timestamps.
+	// The run bracket (OPT-P0-5): when the runner passed the run's start
+	// instant (in.RunStartedAt — RunReport.StartAt, stamped by the
+	// injected clock before the first stage), the stage composes the
+	// honest bracket StartedAt=RunStartedAt → EndedAt=clock.Now() read at
+	// render-composition time (the render IS the run's effective end on
+	// the sequential runner: EndAt is stamped immediately after this
+	// stage returns). An explicit in.RunEndedAt wins when non-zero; zero
+	// means unknown and falls back to the render-time read. Without
+	// RunStartedAt (legacy/direct engine use) both ends stay the stage's
+	// single honest "now" (equal values are valid — the engine rejects
+	// only an EndedAt BEFORE StartedAt). On the pipeline path the
+	// injected clock always wins and every read is deterministic —
+	// pipeline.Run rejects a nil clock (run.go:160-161), so the
+	// wall-clock fallback below is DIRECT-CALLER-ONLY: a nil clock can
+	// reach this stage only when the stage is invoked outside the runner.
 	now := time.Now()
 	if in.Clock != nil {
 		now = in.Clock.Now()
 	}
+	startedAt, endedAt := now, now
+	if !in.RunStartedAt.IsZero() {
+		startedAt = in.RunStartedAt
+		endedAt = now
+		if !in.RunEndedAt.IsZero() {
+			endedAt = in.RunEndedAt
+		}
+	}
 	rctx := report.Context{
 		Target:          in.Target.Name,
-		StartedAt:       now,
-		EndedAt:         now,
+		StartedAt:       startedAt,
+		EndedAt:         endedAt,
 		Domains:         domains,
 		Hosts:           hosts,
 		URLs:            urls,
