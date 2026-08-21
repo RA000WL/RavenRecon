@@ -38,3 +38,6 @@ temp/
 
 # Research notes (local only — advisory, never part of the repo)
 research/
+
+# orchestrator session artifacts
+.pi/

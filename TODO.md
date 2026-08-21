@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-53).
+  next free `NEW-n` (currently NEW-54).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1092,6 +1092,13 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   deterministic or pin the trigger.
 - Verification: 20+ consecutive `go test -race -count=1 -run
   'TestProbeCompletedHTTPS' ./internal/httpprobe/` runs pass.
+- SIBLING SIGHTING (orchestrator, 2026-08-21): TestProbeTLSMetadataCapture
+  failed once during a 9-package concurrent -race run
+  (`Err:readLoopPeekFailLocked: %!w(<nil>)`, want completed 400 got
+  failed/other); 5/5 passes in isolation under -race immediately after; the
+  working-tree diff at the time did not touch httpprobe; full non-race suite
+  green same session. Same load-order/TLS-timing family — fold into this
+  entry's eventual determinism investigation.
 
 ### NEW-16 (INFO) — a nil jsintel transport dials the network once httpprobe recorded probe targets; hermetic run-level tests must substitute the transport (internal/pipeline/adapt/httpprobe.go, jsintel.go, internal/cli/scan_test.go)
 - Status: OPEN
@@ -1902,37 +1909,6 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   Gates: gofmt clean, build/vet OK, asset+adapt suites ok incl. -race;
   orchestrator full-suite + race green post-change.
 
-### NEW-51 (LOW) — adapt/doc.go overstates marker exposure as "the report" (internal/pipeline/adapt/doc.go)
-- Status: OPEN
-- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
-- Owner: docs
-- Problem: the "Asset-level truncation markers" section says flags are
-  "exposed through the report"; rendered report artifacts (internal/report
-  html/markdown) surface neither stage sticky flags nor RunReport.Truncated —
-  actual exposure is RunReport.Stages[].StickyFlags + the CLI stage summary
-  line. Phrasing copies pre-existing house comments, so not a regression.
-- Fix: one-line reword in the next docs pass: "exposed via
-  RunReport.Stages[].StickyFlags, RunReport.Truncated, and the scan summary's
-  per-stage flags= rendering".
-- Verification: wording matches run.go/scan.go behavior; no code change.
-
-### NEW-52 (LOW) — engine-level warm-run pin for marked assets missing (internal/detect, internal/httpprobe)
-- Status: OPEN
-- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
-- Owner: (unassigned)
-- Problem: OPT-P1-4 round-trip coverage is asset-level (marshal→unmarshal +
-  buildResult), not the full engine chain (storeProbe→decodeStoredProbe→
-  replay; encodeStoredFindings→decodeStoredFindings→validateFinding). Every
-  link verified safe by inspection, but the load-bearing link — NewFinding's
-  in-place normalization preserving Truncated through validateFinding's
-  canonical round-trip — is unpinned: a future refactor of NewFinding to
-  rebuild-style normalization would silently reject cached records containing
-  marked findings.
-- Fix: add an engine-level warm-run test injecting a crafted cache record
-  containing a marked Finding (and ideally a marked TLSCertificate) and
-  asserting the record is served and the sticky flag fires on the warm run.
-- Verification: test fails if NewFinding stops preserving the field; gates
-  green.
 - Batch 2 (OPT-P1-3 fuzz harnesses + property tests) IMPLEMENTED (builders
   ses_fdb856014ffeclxaS731gQjYZT [2a: asset/discovery/urlintel] +
   ses_fdb856013ffeAd6ArIEaGT7kec [2b: jsintel/secrentel/cache/report]; one
@@ -1976,6 +1952,37 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   pre-existing/documented). Gates: gofmt clean, build/vet OK, focused suites
   ok incl. -race; orchestrator full-suite + race green post-change.
 
+### NEW-51 (LOW) — adapt/doc.go overstates marker exposure as "the report" (internal/pipeline/adapt/doc.go)
+- Status: OPEN
+- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
+- Owner: docs
+- Problem: the "Asset-level truncation markers" section says flags are
+  "exposed through the report"; rendered report artifacts (internal/report
+  html/markdown) surface neither stage sticky flags nor RunReport.Truncated —
+  actual exposure is RunReport.Stages[].StickyFlags + the CLI stage summary
+  line. Phrasing copies pre-existing house comments, so not a regression.
+- Fix: one-line reword in the next docs pass: "exposed via
+  RunReport.Stages[].StickyFlags, RunReport.Truncated, and the scan summary's
+  per-stage flags= rendering".
+- Verification: wording matches run.go/scan.go behavior; no code change.
+
+### NEW-52 (LOW) — engine-level warm-run pin for marked assets missing (internal/detect, internal/httpprobe)
+- Status: OPEN
+- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
+- Owner: (unassigned)
+- Problem: OPT-P1-4 round-trip coverage is asset-level (marshal→unmarshal +
+  buildResult), not the full engine chain (storeProbe→decodeStoredProbe→
+  replay; encodeStoredFindings→decodeStoredFindings→validateFinding). Every
+  link verified safe by inspection, but the load-bearing link — NewFinding's
+  in-place normalization preserving Truncated through validateFinding's
+  canonical round-trip — is unpinned: a future refactor of NewFinding to
+  rebuild-style normalization would silently reject cached records containing
+  marked findings.
+- Fix: add an engine-level warm-run test injecting a crafted cache record
+  containing a marked Finding (and ideally a marked TLSCertificate) and
+  asserting the record is served and the sticky flag fires on the warm run.
+- Verification: test fails if NewFinding stops preserving the field; gates
+  green.
 ### NEW-50 (MED) — httpprobe DialTLSContext leaves ServerName empty for IP-literal targets: local config rejection recorded as a TLS negative without any handshake (internal/httpprobe/run.go)
 - Status: OPEN
 - Reporter: builder (OPT-P1-5 batch, NEW-49) + reviewer verification against
@@ -1997,6 +2004,26 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   proving an IP-literal probe completes a REAL handshake.
 - Verification: new test fails pre-fix (fabricated tls negative) and passes
   post-fix; existing httpprobe TLS tests unchanged; gates + race green.
+
+### NEW-53 (LOW) — remaining dedup migrations after OPT-P2-6 single homes landed (httpprobe/crawl/pipeline/urlintel-adapt/jsintel-adapt)
+- Status: OPEN
+- Reporter: builder + reviewer (NEW-49 batch 3a)
+- Owner: (unassigned)
+- Problem: OPT-P2-6 created the single homes asset.InDomain
+  (internal/asset/scope.go) and discovery.VersionPattern/ExtractVersion
+  (internal/discovery/version.go) but only migrated the dns + discovery/detect
+  copies (file allowlist). Still duplicated: inDomain at httpprobe/scope.go:52,
+  crawl/katana.go:450, pipeline/scope.go:22 (the latter two typed
+  (asset.Domain, asset.Host) WITH empty-input guard — drop-in safe since F1
+  added the guard to asset.InDomain); versionPattern/extractVersion at
+  urlintel/adapt/tool.go:273 + jsintel/adapt/tool.go:393 (both already import
+  internal/discovery). Separately: validateScope/validateInputHost triplicates
+  (dns/httpprobe/discovery) differ by pinned error-message prefixes — needs a
+  cross-package error-context decision before any unification.
+- Fix: migrate the five mechanical copies; decide the validateScope question
+  separately (likely document-don't-unify).
+- Verification: existing tests pass unmodified; grep shows a single non-test
+  definition per concept; gates + race green.
 
 ## Operational warnings (all agents)
 
