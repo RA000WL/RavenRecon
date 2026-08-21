@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
@@ -67,6 +68,26 @@ const defaultTool = "gau"
 //	                      retained in the engine report only — corpus
 //	                      propagation carries URLs only (adapt/doc.go). Any
 //	                      other value is a structured error (Outcome failed).
+//	"tool_timeout_default"      — a Go duration string (time.ParseDuration,
+//	                              surrounding whitespace trimmed). Names the
+//	                              default per-tool execution timeout that
+//	                              encloses the runner only (ingest has its
+//	                              own pool deadline, Timeout, and is never
+//	                              bounded by this value). Absent, empty, or
+//	                              "0" selects the built-in default 2m
+//	                              (urladapt.DefaultToolTimeout, mandatory
+//	                              and always on — the per-tool timeout cannot
+//	                              be disabled; 0 means “use the default”,
+//	                              not “no deadline”). Negative values are a
+//	                              structured error (Outcome failed). The
+//	                              built-in 2m is intentional: it bounds
+//	                              external tool execution even when the
+//	                              operator supplies no duration.
+//	"tool_timeout_gau"          — optional per-tool override for gau
+//	                              (same ParseDuration semantics; empty or
+//	                              absent means “use the default”).
+//	"tool_timeout_waybackurls"  — optional per-tool override for waybackurls.
+//	"tool_timeout_waymore"      — optional per-tool override for waymore.
 //
 // Config derivation (engine Config from StageInput only — no pre-resolved
 // pipeline defaults):
@@ -223,6 +244,11 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
 			fmt.Errorf("stage %s: %w", s.Name(), err)
 	}
+	toolTimeoutDefault, perToolTimeout, err := toolTimeoutParams(in.Config)
+	if err != nil {
+		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
+			fmt.Errorf("stage %s: %w", s.Name(), err)
+	}
 	if err := ctx.Err(); err != nil {
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
 		return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped}, wrapped
@@ -261,7 +287,7 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 	failedDomains := 0
 
 	for _, d := range urlintelDomains(in) {
-		status, engineErr := s.runDomain(ctx, tool, cfg, d, acc)
+		status, engineErr := s.runDomain(ctx, tool, cfg, d, acc, toolTimeoutDefault, perToolTimeout)
 		if engineErr != nil {
 			// Engine error paths (the unified outcome mapping table): the
 			// engine report's honest retained observations still propagate as
@@ -347,7 +373,7 @@ const (
 // statuses — never returned errors: the fold and ItemsFailed carry them
 // honestly, and returning a Go error would force the runner's failed
 // classification over the fold.
-func (s *urlintelStage) runDomain(ctx context.Context, tool urladapt.Tool, cfg urlintel.Config, d asset.Domain, acc *urlintel.Accumulator) (domainStatus, error) {
+func (s *urlintelStage) runDomain(ctx context.Context, tool urladapt.Tool, cfg urlintel.Config, d asset.Domain, acc *urlintel.Accumulator, toolTimeoutDefault time.Duration, perToolTimeout map[string]time.Duration) (domainStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return domainCancelled, nil
 	}
@@ -379,25 +405,57 @@ func (s *urlintelStage) runDomain(ctx context.Context, tool urladapt.Tool, cfg u
 	if runner == nil {
 		runner = discovery.ExecRunner{}
 	}
-	rres, err := runner.Run(ctx, discovery.Cmd{Path: path, Args: tool.Args(host)}, discovery.Limits{MaxOutput: discovery.DefaultMaxOutput})
+	// Per-tool execution timeout encloses the runner only — ingest has its
+	// own pool deadline (cfg.Timeout) and is never bounded by this value.
+	// The timeout is mandatory and always on (cannot be disabled): the
+	// built-in 2m default is intentional, bounding external tool execution
+	// even when the operator supplies no duration (AGENTS §0.6: truncated
+	// results are never silently completed — the tool's timeout is the
+	// outermost per-tool bound). A per-tool timeout that fires is reported
+	// as partial (the captured prefix is ingested, the retained set is
+	// incomplete), miroring urlintel/adapt's ResultPartial classification.
+	effective := effectiveToolTimeout(tool.Name, toolTimeoutDefault, perToolTimeout)
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if effective > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, effective)
+		defer cancel()
+	}
+	rres, err := runner.Run(runCtx, discovery.Cmd{Path: path, Args: tool.Args(host)}, discovery.Limits{MaxOutput: discovery.DefaultMaxOutput})
+	isPerToolTimeout := false
 	if err != nil {
-		if ctx.Err() != nil {
-			// Run teardown (cancellation or the pipeline's per-stage
-			// deadline): the stage reports cancelled; the tool's error detail
-			// is not needed because the context error is the dominant signal.
-			return domainCancelled, nil
+		if runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			isPerToolTimeout = true
+		} else {
+			if ctx.Err() != nil {
+				// Run teardown (cancellation or the pipeline's per-stage
+				// deadline): the stage reports cancelled; the tool's error detail
+				// is not needed because the context error is the dominant signal.
+				return domainCancelled, nil
+			}
+			return domainFailed, nil
 		}
-		return domainFailed, nil
 	}
 
 	// The bounded capture is a valid line stream regardless of the exit code
 	// (mirroring urlintel/adapt's runOne): stream it through the engine, then
-	// classify the domain.
+	// classify the domain. On a per-tool timeout the captured prefix is still
+	// valid — ingest it and report partial.
 	src := newToolLineSource(rres.Stdout)
 	if ierr := urlintel.IngestInto(ctx, cfg, src, acc); ierr != nil {
 		// An engine error: the run-level mapping decides failed vs cancelled.
 		// The shared accumulator keeps every observation consumed so far.
+		if isPerToolTimeout {
+			return domainPartial, ierr
+		}
 		return domainFailed, ierr
+	}
+
+	if ctx.Err() != nil {
+		return domainCancelled, nil
+	}
+	if isPerToolTimeout {
+		return domainPartial, nil
 	}
 
 	switch {
@@ -535,6 +593,96 @@ func parseParametersParam(params map[string]string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid parse_parameters value %q (want \"true\" or \"false\")", v)
 	}
+}
+
+// toolTimeoutParams parses the per-tool timeout StageParams keys
+// defensively (TrimSpace, time.ParseDuration):
+//
+//   - "tool_timeout_default" — the default per-tool execution timeout
+//     (the StageParams surface for urladapt.Config.ToolTimeoutDefault).
+//     Absent, empty, all-whitespace, or "0" selects the built-in default
+//     2m (urladapt.DefaultToolTimeout, mandatory and always on — the
+//     per-tool timeout cannot be disabled; 0 means “use the default”, not
+//     “no deadline”), mirroring parseParametersParam and toolParam. Negative
+//     values are a structured error (the caller maps it to Outcome failed).
+//   - "tool_timeout_gau", "tool_timeout_waybackurls",
+//     "tool_timeout_waymore" — optional per-tool overrides (the
+//     per-tool map surface for urladapt.Config.PerToolTimeout). Each absent,
+//     empty, all-whitespace, or "0" entry means “use the default” and is
+//     not stored; negative values are a structured error.
+//
+// If params is nil, the defaults apply (zero default, nil map — the caller
+// then resolves through effectiveToolTimeout which falls back to the
+// built-in 2m). The returned map is nil when no per-tool override was
+// supplied, mirroring adapt.Config's nil-means-default semantics.
+func toolTimeoutParams(params map[string]string) (time.Duration, map[string]time.Duration, error) {
+	if params == nil {
+		return 0, nil, nil
+	}
+	var def time.Duration
+	if v, ok := params["tool_timeout_default"]; ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return 0, nil, fmt.Errorf("invalid tool_timeout_default %q: %w", v, err)
+			}
+			if d < 0 {
+				return 0, nil, fmt.Errorf("tool_timeout_default must not be negative, got %s", d)
+			}
+			if d == 0 {
+				def = 0
+			} else {
+				def = d
+			}
+		}
+	}
+	perTool := make(map[string]time.Duration)
+	for _, name := range []string{"gau", "waybackurls", "waymore"} {
+		key := "tool_timeout_" + name
+		v, ok := params[key]
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, nil, fmt.Errorf("invalid %s %q: %w", key, v, err)
+		}
+		if d < 0 {
+			return 0, nil, fmt.Errorf("%s must not be negative, got %s", key, d)
+		}
+		if d == 0 {
+			continue
+		}
+		perTool[name] = d
+	}
+	if len(perTool) == 0 {
+		return def, nil, nil
+	}
+	return def, perTool, nil
+}
+
+// effectiveToolTimeout returns the effective per-tool execution timeout for
+// the named tool: perTool[tool] when positive, otherwise def when positive,
+// otherwise the built-in default 2m (urladapt.DefaultToolTimeout). It mirrors
+// adapt.Config.ToolTimeout's resolution, including the mandatory 2m fallback
+// (the per-tool timeout is always on — it cannot be disabled, even by
+// supplying 0, which means “use the default”). Negative values are never
+// returned — they are rejected by toolTimeoutParams validation.
+func effectiveToolTimeout(tool string, def time.Duration, perTool map[string]time.Duration) time.Duration {
+	if perTool != nil {
+		if d, ok := perTool[tool]; ok && d > 0 {
+			return d
+		}
+	}
+	if def > 0 {
+		return def
+	}
+	return urladapt.DefaultToolTimeout
 }
 
 // toolLineSource is the adapter's urlintel.LineSource over one tool's bounded

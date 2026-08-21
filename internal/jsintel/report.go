@@ -691,10 +691,11 @@ func (m *Metrics) addSecretLine() {
 // URLs without retention use the Config.Emit hook instead and never
 // materialize a Report.
 type Accumulator struct {
-	mu        sync.Mutex
-	cfg       Config
-	byURL     map[asset.Identity]*JSEntry
-	malformed int
+	mu            sync.Mutex
+	cfg           Config
+	byURL         map[asset.Identity]*JSEntry
+	malformed     int
+	healthAborted bool
 }
 
 // NewAccumulator returns an empty accumulator. cfg supplies the per-entry
@@ -712,6 +713,21 @@ func (a *Accumulator) adopt(cfg Config) {
 	a.mu.Unlock()
 }
 
+// SetHealthAborted records that the health gate aborted remaining fetches.
+// It is set once, sticky, and preserved end-to-end (accumulator → Report).
+func (a *Accumulator) setHealthAborted(v bool) {
+	a.mu.Lock()
+	a.healthAborted = v
+	a.mu.Unlock()
+}
+
+// isHealthAborted reports whether the health gate triggered.
+func (a *Accumulator) isHealthAborted() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.healthAborted
+}
+
 // merge folds one observation into the accumulator under the lock.
 func (a *Accumulator) merge(src JSEntry) {
 	a.mu.Lock()
@@ -723,6 +739,15 @@ func (a *Accumulator) merge(src JSEntry) {
 		return
 	}
 	mergeEntries(dst, src, a.cfg)
+}
+
+// remove deletes the entry for id, if present. Used by the health gate to
+// abort queued jobs: their pre-registered cancelled placeholder is removed so
+// the aborted URL never appears in the report (it is counted Skipped).
+func (a *Accumulator) remove(id asset.Identity) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.byURL, id)
 }
 
 // addMalformed counts rejected raw lines or HTML references.
@@ -780,7 +805,7 @@ func (a *Accumulator) Report() Report {
 	if a.cfg.Metrics != nil {
 		snap = a.cfg.Metrics.Snapshot()
 	}
-	return Report{Entries: entries, Malformed: a.malformed, metrics: snap}
+	return Report{Entries: entries, Malformed: a.malformed, HealthAborted: a.healthAborted, metrics: snap}
 }
 
 // Report is the aggregated outcome of one or more runs: the merged,
@@ -796,6 +821,13 @@ type Report struct {
 	// ingest boundary. Malformed inputs are never cached and never appear
 	// as entries.
 	Malformed int
+
+	// HealthAborted reports whether the health gate aborted remaining fetches:
+	// the first 50 fetches had >90% failure, so the run stopped early,
+	// emitted the jsintel_health_abort flag, and returned completed. The
+	// flag is sticky (accumulator → Report) and is the engine's honest
+	// early-stop signal.
+	HealthAborted bool
 
 	// metrics is the run's counter snapshot at materialization time.
 	metrics Snapshot

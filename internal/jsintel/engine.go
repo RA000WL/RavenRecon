@@ -576,6 +576,12 @@ func RunInto(ctx context.Context, cfg Config, src Source, acc *Accumulator) erro
 
 	var sourceErr error
 	for {
+		if rs.isHealthAborted() {
+			// Health gate aborted: stop reading further items. Already-
+			// submitted jobs will short-circuit at processJob entry; queued
+			// jobs are aborted there and their placeholders removed.
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			// The run is being cancelled: stop reading. Candidates already
 			// submitted keep their pre-registered entries (cancelled until
@@ -773,6 +779,11 @@ type runState struct {
 	// drained, so no lock is needed.
 	lineCurrent asset.URL
 	lineSecrets map[asset.Identity]*lineSecretBucket
+
+	healthMu      sync.Mutex
+	healthFetches int
+	healthFails   int
+	healthAborted bool
 }
 
 // lineSecretBucket is the pending line-secret accumulation for ONE URL
@@ -780,6 +791,42 @@ type runState struct {
 type lineSecretBucket struct {
 	u    asset.URL
 	secs []lineSecret
+}
+
+// isHealthAborted reports whether the health gate triggered.
+func (rs *runState) isHealthAborted() bool {
+	rs.healthMu.Lock()
+	defer rs.healthMu.Unlock()
+	return rs.healthAborted
+}
+
+// recordHealth tracks fetch health: fetches (actual network fetches, not
+// cache hits) are counted, and if the sliding window after 50 has >90%
+// failure the gate triggers, sets the accumulator flag, and aborts remaining
+// fetches. The check is sticky — once triggered, later fetches do not
+// re-evaluate — but it is a sliding >90% after 50, not exactly once at 50
+// (every fetch at and after 50 evaluates, so a run that was 90% at 50 and
+// then further degrades still triggers).
+func (rs *runState) recordHealth(entry JSEntry) {
+	if entry.Cached {
+		return
+	}
+	if isPlaceholder(entry) {
+		return
+	}
+	rs.healthMu.Lock()
+	defer rs.healthMu.Unlock()
+	if rs.healthAborted {
+		return
+	}
+	rs.healthFetches++
+	if entry.Status == StatusFailed {
+		rs.healthFails++
+	}
+	if rs.healthFetches >= 50 && float64(rs.healthFails)/float64(rs.healthFetches) > 0.9 {
+		rs.healthAborted = true
+		rs.acc.setHealthAborted(true)
+	}
 }
 
 // addLineSecret accumulates one recognized line-secret against the current
@@ -916,8 +963,14 @@ func (rs *runState) reserve(u asset.URL) (claimed, dup bool) {
 }
 
 // offer is the reader-side admission: claim the candidate and submit a
-// depth-0 job, or account the drop.
+// depth-0 job, or account the drop. The health gate short-circuits new
+// offers: when the first 50 fetches were >90% failed, remaining candidates
+// are counted Skipped and never submitted.
 func (rs *runState) offer(ctx context.Context, u asset.URL) {
+	if rs.isHealthAborted() {
+		rs.env.metricsSkipped(1)
+		return
+	}
 	claimed, dup := rs.reserve(u)
 	switch {
 	case claimed:
@@ -962,9 +1015,31 @@ func (rs *runState) submitJob(ctx context.Context, u asset.URL, depth int) {
 // processJob runs one candidate through the pipeline: fetch (cache-first)
 // → classify → parse → extract → merge → emit → bounded expansion. The job
 // never panics (the pool contains panics anyway) and never recurses:
-// expansion submits NEW jobs, it does not chain calls.
+// expansion submits NEW jobs, it does not chain calls. The health gate
+// short-circuits jobs that start after the gate triggered: they are counted
+// Skipped, their placeholder is removed, and no fetch is performed. The gate
+// itself is evaluated after each fetch (recordHealth).
 func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
+	if rs.isHealthAborted() {
+		rs.env.metricsSkipped(1)
+		rs.acc.remove(u.Identity())
+		return
+	}
 	entry, resolved := rs.env.process(ctx, u)
+	rs.recordHealth(entry)
+	if rs.isHealthAborted() && entry.Status == StatusFailed {
+		// The gate triggered on this very fetch: keep the entry (it is part
+		// of the 50 that decided the gate) but abort its expansion and any
+		// further work. Already-queued jobs will short-circuit at their entry.
+		rs.acc.merge(entry)
+		if rs.cfg.Emit != nil {
+			if eerr := callEmit(ctx, entry, rs.cfg.Emit); eerr != nil {
+				rs.env.recordErr(fmt.Errorf("jsintel: emit %s: %w", u.String(), eerr))
+			}
+		}
+		rs.env.metricsSkipped(len(resolved))
+		return
+	}
 	rs.acc.merge(entry)
 	if rs.cfg.Emit != nil {
 		// The emit hook runs AFTER the entry was merged, so a panicking or
@@ -979,11 +1054,19 @@ func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
 	// recorded during extraction) and counts Skipped. Depth-capped imports
 	// are NOT admitted to the visited set: a shallower path to the same
 	// URL must still be able to fetch it.
+	if rs.isHealthAborted() {
+		rs.env.metricsSkipped(len(resolved))
+		return
+	}
 	if depth >= rs.cfg.MaxImportDepth {
 		rs.env.metricsSkipped(len(resolved))
 		return
 	}
 	for _, child := range resolved {
+		if rs.isHealthAborted() {
+			rs.env.metricsSkipped(1)
+			continue
+		}
 		claimed, dup := rs.reserve(child)
 		switch {
 		case claimed:

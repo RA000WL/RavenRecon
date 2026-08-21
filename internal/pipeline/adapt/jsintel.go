@@ -49,6 +49,29 @@ const jsFetchTruncated = "js_fetch_truncated"
 // not the outcome, marks the retained set incomplete).
 const jsURLOverflowFlag = "jsintel_url_overflow"
 
+// jsHealthAbortedFlag is the sticky-flag name this adapter records when the
+// jsintel engine's health gate aborted remaining fetches: the first 50
+// fetches (actual network fetches, not cache hits) had >90% failure (sliding
+// window >90% after 50, sticky — once triggered, remaining candidates are
+// skipped and queued jobs short-circuit). The flag is the engine's honest
+// early-stop signal (jsintel.Report.HealthAborted — accumulator → Report,
+// sticky) and is presented as a completed-with-flag carve-out (AGENTS §0.6):
+// the stage outcome is forced to completed, the flag (not the outcome) marks
+// the retained set incomplete, never swallowed, preserved end-to-end
+// (result → RunReport → report). Health abort is not a truncation (no
+// content cut) and does not by itself set Truncated; the flag alone is the
+// advisory signal, though consumers must treat a flagged run as an incomplete
+// retained set just as they do for truncation flags. The engine's many
+// StatusFailed entries that triggered the gate remain honest, but the gate's
+// early stop is the more honest signal — completed with flag, not failed
+// or partial — so the adapter forces OutcomeCompleted when HealthAborted is
+// true (unless the run was cancelled, which dominates). The flag is never
+// cached as a hit without re-evaluating: the engine's Report is not cached
+// separately; the stage result's flag is the durable surface (the report's
+// own HealthAborted is restored from the accumulator on hits, and the
+// stage re-applies the flag).
+const jsHealthAbortedFlag = "jsintel_health_abort"
+
 // jsURLCapDefault is the default per-run cap for analyzer-derived URL
 // additions (endpoint URLs that become corpus URLs). Zero in StageParams
 // means this default (mirroring other adapters' zero-means-default).
@@ -222,6 +245,20 @@ func jsCollectURLs(report jsintel.Report, target asset.Domain, incoming []asset.
 //	(the default per-run cap). The cap is enforced after in-domain
 //	filtering, dedup, and sorting; excess beyond the cap is truncated and
 //	reported with Truncated=true and the jsintel_url_overflow sticky flag.
+//
+// Health gate (engine → adapter sticky flag, not a StageParam): the jsintel
+// engine aborts remaining fetches when the first 50 fetches had >90% failure
+// (sliding window >90% after 50, sticky — jsintel.Report.HealthAborted,
+// accumulator → Report). The adapter surfaces it as the sticky flag
+// "jsintel_health_abort" with outcome completed (the AGENTS §0.6
+// completed-with-flag carve-out: the flag, not the outcome, marks the
+// retained set incomplete), preserved end-to-end (result → RunReport →
+// report), never swallowed. A health-aborted run is completed, not failed
+// or partial — the many StatusFailed entries that triggered the gate remain
+// honest, but the gate's early stop is the more honest signal. Cancellation
+// dominates the gate: a cancelled run stays cancelled. Truncated is not set
+// by the gate itself (health abort is not a content cut); the advisory flag
+// alone is the signal.
 //
 // Input (in.URLs → Source of candidate Items): every corpus URL maps to ONE
 // Item of kind ItemLine with Line = the URL's canonical string. ItemHTML is
@@ -414,6 +451,32 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 			res.StickyFlags[jsURLOverflowFlag] = true
 		}
 	}
+	// Health gate: the engine's honest early-stop signal (first 50 fetches
+	// had >90% failure, sliding >90% after 50, sticky). When the report
+	// carries HealthAborted, the adapter surfaces it as the completed-
+	// with-flag carve-out (AGENTS §0.6): outcome completed, flag
+	// jsintel_health_abort set, preserved end-to-end (result → RunReport →
+	// report), never swallowed. A health-aborted run is completed, not
+	// failed or partial — the many StatusFailed entries that triggered the
+	// gate remain honest, but the gate's early stop is the more honest
+	// signal — so the outcome is forced to completed (cancellation
+	// dominates the gate, so a cancelled run stays cancelled). The flag
+	// alone is the advisory signal (not Truncated — health abort is not a
+	// content cut), though consumers must still treat a flagged run as an
+	// incomplete retained set. The engine's Report flag is sticky
+	// (accumulator → Report) and the stage result's flag is the durable
+	// pipeline surface; the cache is not re-evaluated separately (the
+	// stage result flag is sufficient, the report's own sticky is
+	// restored on hits and the stage re-applies the flag).
+	if report.HealthAborted {
+		if res.StickyFlags == nil {
+			res.StickyFlags = map[string]bool{}
+		}
+		res.StickyFlags[jsHealthAbortedFlag] = true
+		if res.Outcome != pipeline.OutcomeCancelled && engineErr == nil {
+			res.Outcome = pipeline.OutcomeCompleted
+		}
+	}
 	return res, err
 }
 
@@ -471,11 +534,17 @@ func (s *jsIntelStage) mapResult(ctx context.Context, report jsintel.Report, eng
 // one-normalization-point rule), and the outcome. Corpus URL additions
 // (the JS → URL feedback loop) are layered in Run after this function —
 // buildJSResult handles only the fetch-truncation flag (js_fetch_truncated);
-// the url-overflow flag is added in Run. It is used on the paths where a
-// report exists to merge: the success path and the cancelled-in-flight path
-// (the report's honest retained entries still merge). The engine-error
-// branches return early with a bare failed/cancelled StageResult (T2c
-// behavior — the engine returned no usable report on those paths).
+// the url-overflow flag is added in Run. The health-abort flag
+// (jsintel_health_abort) is also surfaced here when
+// report.HealthAborted is true: it is set on the result with outcome
+// forced to completed (the AGENTS §0.6 carve-out), preserved end-to-end
+// (result → RunReport → report), never swallowed. Cancellation dominates
+// the gate, so a cancelled outcome is not forced. It is used on the
+// paths where a report exists to merge: the success path and the
+// cancelled-in-flight path (the report's honest retained entries still
+// merge). The engine-error branches return early with a bare
+// failed/cancelled StageResult (T2c behavior — the engine returned no
+// usable report on those paths).
 func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
@@ -486,6 +555,15 @@ func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) p
 	if jsTruncated(report) {
 		res.Truncated = true
 		res.StickyFlags = map[string]bool{jsFetchTruncated: true}
+	}
+	if report.HealthAborted {
+		if res.StickyFlags == nil {
+			res.StickyFlags = map[string]bool{}
+		}
+		res.StickyFlags[jsHealthAbortedFlag] = true
+		if res.Outcome != pipeline.OutcomeCancelled {
+			res.Outcome = pipeline.OutcomeCompleted
+		}
 	}
 	res.Documents = jsDocuments(report)
 	res.Results = jsResults(report)

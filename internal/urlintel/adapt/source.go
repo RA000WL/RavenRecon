@@ -111,6 +111,52 @@ type Config struct {
 	// LookPath resolves tool executables. Nil means exec.LookPath; tests
 	// inject fakes.
 	LookPath discovery.LookupFunc
+
+	// PerToolTimeout overrides the per-tool execution timeout for the named
+	// tool. Zero means ToolTimeoutDefault or the built-in default (2m) —
+	// the timeout is mandatory and cannot be disabled, 0 means “use the
+	// default”. Negative values are rejected by validation. The timeout
+	// encloses the runner only — ingest has its own pool deadline (Timeout)
+	// and is never bounded by the per-tool timeout.
+	PerToolTimeout map[string]time.Duration
+
+	// ToolTimeoutDefault is the default per-tool execution timeout (0 means
+	// the built-in default 2m — the timeout is mandatory and cannot be
+	// disabled, 0 means “use the default”). It is the StageParams
+	// "tool_timeout_default" surface. Negative values are rejected. Zero
+	// per-tool entries fall back to this default, and when both are zero
+	// the built-in default applies.
+	ToolTimeoutDefault time.Duration
+}
+
+// DefaultToolTimeout is the built-in default per-tool execution timeout
+// (StageParams "tool_timeout_default" when absent). It encloses the runner
+// only — ingest has its own pool deadline.
+//
+// The per-tool timeout is mandatory and always on (cannot be disabled):
+// the built-in 2m is intentional, bounding external tool execution even
+// when the operator supplies no duration (AGENTS §0.6: truncated results
+// are never silently completed — the timeout is the outermost per-tool
+// bound). Supplying 0 (or omitting the key) means “use the default”, not
+// “no deadline”; a per-tool timeout that fires is reported as partial with
+// the captured prefix ingested.
+const DefaultToolTimeout = 2 * time.Minute
+
+// ToolTimeout returns the effective per-tool execution timeout for the named
+// tool: PerToolTimeout[tool] when positive, otherwise ToolTimeoutDefault
+// when positive, otherwise DefaultToolTimeout (2m). Zero per-tool entries
+// fall back to the default. Negative values are never returned — they are
+// rejected by validation.
+func (c Config) ToolTimeout(tool string) time.Duration {
+	if c.PerToolTimeout != nil {
+		if d, ok := c.PerToolTimeout[tool]; ok && d > 0 {
+			return d
+		}
+	}
+	if c.ToolTimeoutDefault > 0 {
+		return c.ToolTimeoutDefault
+	}
+	return DefaultToolTimeout
 }
 
 // DefaultConfig returns a Config with documented defaults: the three
@@ -120,15 +166,16 @@ type Config struct {
 // extraction enabled, and the 4 MiB per-stream capture cap.
 func DefaultConfig() Config {
 	return Config{
-		Concurrency:     2,
-		QueueSize:       8,
-		Timeout:         30 * time.Second,
-		Rate:            2,
-		Burst:           1,
-		IngestWorkers:   4,
-		ParseParameters: true,
-		MaxOutputSize:   discovery.DefaultMaxOutput,
-		DetectTimeout:   DefaultDetectTimeout,
+		Concurrency:        2,
+		QueueSize:          8,
+		Timeout:            30 * time.Second,
+		Rate:               2,
+		Burst:              1,
+		IngestWorkers:      4,
+		ParseParameters:    true,
+		MaxOutputSize:      discovery.DefaultMaxOutput,
+		DetectTimeout:      DefaultDetectTimeout,
+		ToolTimeoutDefault: DefaultToolTimeout,
 	}
 }
 
@@ -179,6 +226,14 @@ func validateAndDefault(cfg Config) (Config, error) {
 	}
 	if cfg.Timeout < 0 {
 		return Config{}, fmt.Errorf("adapt: timeout must not be negative, got %s", cfg.Timeout)
+	}
+	if cfg.ToolTimeoutDefault < 0 {
+		return Config{}, fmt.Errorf("adapt: tool timeout default must not be negative, got %s", cfg.ToolTimeoutDefault)
+	}
+	for tool, d := range cfg.PerToolTimeout {
+		if d < 0 {
+			return Config{}, fmt.Errorf("adapt: per-tool timeout for %q must not be negative, got %s", tool, d)
+		}
 	}
 	return cfg, nil
 }
@@ -497,27 +552,40 @@ func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, a
 		return res, nil
 	}
 
-	rres, err := e.runner.Run(ctx, discovery.Cmd{Path: path, Args: t.Args(target)}, e.limits)
+	timeout := cfg.ToolTimeout(t.Name)
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	rres, err := e.runner.Run(runCtx, discovery.Cmd{Path: path, Args: t.Args(target)}, e.limits)
+	isPerToolTimeout := false
 	if err != nil {
-		// The process never ran to completion. Context classification
-		// takes priority: cancellation and deadline-elapse are never tool
-		// failures.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return classifyContextSlot(res, ctxErr)
-		}
-		if errors.Is(err, discovery.ErrExecutableNotFound) {
+		if runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			isPerToolTimeout = true
+		} else {
+			// The process never ran to completion. Context classification
+			// takes priority: cancellation and deadline-elapse are never tool
+			// failures.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return classifyContextSlot(res, ctxErr)
+			}
+			if errors.Is(err, discovery.ErrExecutableNotFound) {
+				res.Status = ResultFailed
+				res.Err = fmt.Errorf("adapt: %s %s: %w (%s)", t.Name, target.Name, discovery.ErrExecutableNotFound, bin)
+				return res, nil
+			}
 			res.Status = ResultFailed
-			res.Err = fmt.Errorf("adapt: %s %s: %w (%s)", t.Name, target.Name, discovery.ErrExecutableNotFound, bin)
+			res.Err = fmt.Errorf("adapt: %s %s could not be executed: %w", t.Name, target.Name, err)
 			return res, nil
 		}
-		res.Status = ResultFailed
-		res.Err = fmt.Errorf("adapt: %s %s could not be executed: %w", t.Name, target.Name, err)
-		return res, nil
 	}
 
 	// The process executed and exited; its bounded stdout capture is valid
-	// regardless of the exit code. Stream it through the engine (raw lines
-	// exist only at the ingest boundary), then classify.
+	// regardless of the exit code. On a per-tool timeout the captured prefix
+	// is still valid — ingest it and report partial. Stream it through the
+	// engine (raw lines exist only at the ingest boundary), then classify.
 	src := newToolSource(rres.Stdout)
 	ierr := urlintel.IngestInto(ctx, urlintel.Config{
 		Concurrency:     cfg.IngestWorkers,
@@ -535,6 +603,17 @@ func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, a
 		// Run teardown mid-ingest (outer deadline or run cancellation): the
 		// consumed lines are already represented in the report.
 		return classifyContextSlot(res, ctxErr)
+	}
+
+	if isPerToolTimeout {
+		res.Status = ResultPartial
+		res.Err = fmt.Errorf("adapt: %s %s: per-tool timeout %s exceeded", t.Name, target.Name, timeout)
+		if ierr != nil {
+			dw := fmt.Errorf("adapt: %s %s: ingest: %w", t.Name, target.Name, ierr)
+			res.Err = errors.Join(res.Err, dw)
+			return res, dw
+		}
+		return res, nil
 	}
 
 	switch {
