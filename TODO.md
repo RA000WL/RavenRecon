@@ -1687,6 +1687,18 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   6. asset/merge.go:119 `out.Method = a.Method` is dead code (out already copies a).
 - Verification: n/a (notes; claim individually if promoted).
 
+### NEW-36 (INFO) — Field trial 2: verily.com real-target validation (cmd/ravenrecon)
+- Status: VERIFIED (orchestrator, 2026-08-21) — evidence recorded below
+- Reporter: master
+- Evidence (run: /tmp/opencode/fieldtrial-verily.log, report: /tmp/opencode/ravenrecon-report-verily, cache: ravenrecon-cache-verily):
+  - Quality gate LIVE: subfinder 1036 hosts flagged divergence vs others [103,1] — discovery_quality_flagged fired BEFORE corpus ingestion (NEW-22 contract proven on real data; no junk cascade).
+  - NEW-21 fix PROVEN live: TUI log shows phase crawl/jsintel/urllive etc. across 901 frames with stages N/unknown; final frame carried full 12-stage table with per-stage counters.
+  - 12-stage pipeline incl. crawl (1044 hosts crawled, 36.7s) and urllive (2088 URLs triaged: 14×2xx, 254×3xx observed-not-followed, 174×4xx, 2×5xx, 1644 errors) — OPT-P0-3 working end-to-end.
+  - jsintel health-relevant: 500 processed/262 failed truncated (js_fetch_truncated) — P0-4 caps visible.
+  - Report honest: live_record_count=2088 in statistics; digest stable a6437a7c…; markdown/html Live URLs section rendered.
+  - Known issues for follow-up: (1) urllive cancelled at stage deadline with 1644 errors — needs per-URL timeout tuning or higher concurrency for 2k-URL corpora; (2) amass failed after contributing 0 (known slow-source); (3) urlintel completed 0 (gau/wayback empty for this target — tools ran 0.2s); (4) summary duration_ms still 0 (pipeline bracket wiring deferred from P0-5 — model ready, adapt/report.go single-now pending).
+- Verification: run outcome cancelled (urllive deadline), but all v1.5 deliverables demonstrated on an authorized real target.
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this
