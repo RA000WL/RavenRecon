@@ -2047,3 +2047,21 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   5. runtime execute derives a WithCancel child immediately replaced by WithTimeout (pool.go:447-451) — construct the timeout context directly.
   6. asset/merge.go:119 `out.Method = a.Method` is dead code (out already copies a).
 - Verification: n/a (notes; claim individually if promoted).
+
+### NEW-58 (LOW) — C-4 drift detectors missing for detect/report caps (internal/detect, internal/report)
+- Status: VERIFIED — implemented (builder session ses_fda40ee7cffeIG9invXq9imvcA)
+  and orchestrator-verified 2026-08-22: both in-package detectors follow the
+  established exemplar pattern; constants verified code↔doc before pinning
+  (detect.maxFindingsPerRun=4096 at engine.go:30 ↔ C-4 "detect 4096 findings";
+  report.maxModelPerKind=100_000 at model.go:31 ↔ C-4 "report 100k/
+  modelPerKind"); perturbation evidence shows each detector fails naming
+  constant, actual value, expected value, and doc source; gofmt/vet/build/
+  full test suite green.
+- Reporter: builder (v1.7 batch D, NEW-56)
+- Owner: builder
+- Problem: every other C-4-documented cap gained an in-package bounds_c4_test.go
+  drift detector in batch D; detect and report did not because those packages
+  were scope-restricted mid-task. Their constants are unexported, so detectors
+  must be in-package.
+- Fix: add bounds_c4_test.go to both packages pinning the documented values.
+- Verification: tests pass; constants drift would fail them.

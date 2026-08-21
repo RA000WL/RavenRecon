@@ -1,0 +1,76 @@
+goos: linux
+goarch: amd64
+pkg: github.com/RA000WL/RavenRecon/internal/event
+cpu: AMD Ryzen 5 8645HS w/ Radeon 760M Graphics
+BenchmarkValidate-12                           	183688053	         6.397 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	183719653	         6.366 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	188753103	         6.385 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	190321834	         6.290 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	188740309	         6.447 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	188979976	         6.356 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	189494948	         6.350 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	182816602	         6.338 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	189863200	         6.328 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidate-12                           	189952752	         6.364 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8071992	       147.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8137513	       148.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8120079	       147.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8062111	       147.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8001696	       148.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8210145	       148.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8076178	       148.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8111029	       148.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 8093894	       148.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanout-12                   	 7959118	       147.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13533739	        87.79 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13527674	        87.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13773722	        88.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13127961	        89.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13555086	        87.95 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13628355	        88.04 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	11689629	        88.68 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13404703	        88.39 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13370142	        89.13 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishDrop-12                     	13406158	        87.83 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2750746	       440.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2706362	       441.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2760770	       443.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2762775	       434.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2776761	       434.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2791189	       430.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2611654	       433.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2759898	       434.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2807718	       425.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishFanoutFourSubscribers-12    	 2733249	       437.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10143921 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10147593 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10145750 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10142745 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10139317 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10142157 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10138485 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10148722 ns/op	       2 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10142862 ns/op	       2 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/100_per_sec-12        	     100	  10137716 ns/op	       3 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1123	   1063758 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1129	   1065782 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1124	   1065278 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1126	   1064326 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1128	   1064452 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1126	   1065534 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1124	   1064828 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1126	   1064335 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1125	   1064114 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/1000_per_sec-12       	    1128	   1064439 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1137	   1062994 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1120	   1067587 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1140	   1063469 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1140	   1062203 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1138	   1063618 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1126	   1063332 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1140	   1063236 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1136	   1063539 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1137	   1062680 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBusPublishPaced/10000_per_sec-12      	    1137	   1063676 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/RA000WL/RavenRecon/internal/event	97.473s

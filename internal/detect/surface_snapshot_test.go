@@ -48,7 +48,6 @@ package detect
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -61,11 +60,14 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/RA000WL/RavenRecon/internal/golden"
 )
 
-// updateGolden regenerates testdata/api_v1.golden instead of comparing. It
-// is the ONLY regeneration path: a normal run never writes.
-var updateGolden = flag.Bool("update", false, "regenerate testdata/api_v1.golden instead of comparing")
+// updateGolden is the shared -update opt-in (internal/golden): regeneration
+// happens ONLY through the explicit flag; a normal run never writes.
+// golden.Update() replaces the former package-local flag.Bool("update", ...)
+// with identical flag-name behavior.
 
 // goldenFile is the snapshot file, relative to this package's directory.
 const goldenFile = "testdata/api_v1.golden"
@@ -583,12 +585,12 @@ func TestSDKAPISurfaceSnapshot(t *testing.T) {
 	}
 	got := surfaceSerialize(syms)
 
-	golden := filepath.Join(pkgDir, goldenFile)
-	if *updateGolden {
-		if err := surfaceWriteGolden(golden, got); err != nil {
+	goldenPath := filepath.Join(pkgDir, goldenFile)
+	if golden.Update() {
+		if err := golden.Write(goldenPath, got); err != nil {
 			t.Fatalf("regenerate golden: %v", err)
 		}
-		re, err := os.ReadFile(golden)
+		re, err := os.ReadFile(goldenPath)
 		if err != nil {
 			t.Fatalf("re-read regenerated golden: %v", err)
 		}
@@ -599,7 +601,7 @@ func TestSDKAPISurfaceSnapshot(t *testing.T) {
 		return
 	}
 
-	want, err := os.ReadFile(golden)
+	want, err := os.ReadFile(goldenPath)
 	if err != nil {
 		t.Fatalf("read golden %s: %v (generate it with: go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update)", goldenFile, err)
 	}
@@ -618,38 +620,8 @@ func TestSDKAPISurfaceSnapshot(t *testing.T) {
 		}
 		msg.WriteString("(a deliberate Level-1 change must go through the maintainer-approved API path (api.go) and -update regeneration; a new experimental helper must be added to excludedSurface with a reason)\n")
 	}
-	msg.WriteString(diffLines(string(want), string(got)))
+	msg.WriteString(golden.Diff(string(want), string(got)))
 	t.Fatalf("detect SDK surface drifted from %s:\n%s", goldenFile, msg.String())
-}
-
-// surfaceWriteGolden writes the golden atomically (temp file + fsync +
-// rename) — the only regeneration path.
-func surfaceWriteGolden(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".api_v1.golden.tmp*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once renamed
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 // surfaceNames extracts the symbol names from a serialized golden document:
@@ -716,117 +688,4 @@ func surfaceSetDiff(want, got []string) (added, removed []string) {
 	sort.Strings(added)
 	sort.Strings(removed)
 	return added, removed
-}
-
-// surfaceSplitLines splits a document into lines, dropping the single
-// trailing empty element a final newline produces.
-func surfaceSplitLines(s string) []string {
-	lines := strings.Split(s, "\n")
-	if n := len(lines); n > 0 && lines[n-1] == "" {
-		lines = lines[:n-1]
-	}
-	return lines
-}
-
-// diffLines returns a compact unified-style line diff (LCS-based, at most
-// three context lines around every change, unchanged runs collapsed with a
-// marker, output byte-capped). The golden documents are small; the cell cap
-// bounds memory on pathological inputs.
-func diffLines(oldText, newText string) string {
-	oldLines := surfaceSplitLines(oldText)
-	newLines := surfaceSplitLines(newText)
-
-	const maxCells = 4_000_000
-	if len(oldLines)*len(newLines) > maxCells {
-		return "old:\n" + oldText + "new:\n" + newText
-	}
-
-	lcs := make([][]int, len(oldLines)+1)
-	for i := range lcs {
-		lcs[i] = make([]int, len(newLines)+1)
-	}
-	for i := len(oldLines) - 1; i >= 0; i-- {
-		for j := len(newLines) - 1; j >= 0; j-- {
-			switch {
-			case oldLines[i] == newLines[j]:
-				lcs[i][j] = lcs[i+1][j+1] + 1
-			case lcs[i+1][j] >= lcs[i][j+1]:
-				lcs[i][j] = lcs[i+1][j]
-			default:
-				lcs[i][j] = lcs[i][j+1]
-			}
-		}
-	}
-
-	type op struct {
-		kind byte // '=', '-', '+'
-		line string
-	}
-	var ops []op
-	i, j := 0, 0
-	for i < len(oldLines) && j < len(newLines) {
-		if oldLines[i] == newLines[j] {
-			ops = append(ops, op{'=', oldLines[i]})
-			i++
-			j++
-			continue
-		}
-		if lcs[i+1][j] >= lcs[i][j+1] {
-			ops = append(ops, op{'-', oldLines[i]})
-			i++
-		} else {
-			ops = append(ops, op{'+', newLines[j]})
-			j++
-		}
-	}
-	for ; i < len(oldLines); i++ {
-		ops = append(ops, op{'-', oldLines[i]})
-	}
-	for ; j < len(newLines); j++ {
-		ops = append(ops, op{'+', newLines[j]})
-	}
-
-	// Collapse unchanged runs: keep at most 2*context+1 context lines around
-	// the changes; longer runs become a marker with ctx lines either side.
-	const ctx = 3
-	var b strings.Builder
-	var run []string
-	flush := func() {
-		if len(run) == 0 {
-			return
-		}
-		if len(run) > 2*ctx+1 {
-			for _, l := range run[:ctx] {
-				b.WriteString("  " + l + "\n")
-			}
-			fmt.Fprintf(&b, "… (%d unchanged lines)\n", len(run)-2*ctx)
-			for _, l := range run[len(run)-ctx:] {
-				b.WriteString("  " + l + "\n")
-			}
-		} else {
-			for _, l := range run {
-				b.WriteString("  " + l + "\n")
-			}
-		}
-		run = run[:0]
-	}
-	const maxOut = 8 << 10
-	for _, o := range ops {
-		if o.kind == '=' {
-			run = append(run, o.line)
-			continue
-		}
-		flush()
-		if o.kind == '-' {
-			b.WriteString("- " + o.line + "\n")
-		} else {
-			b.WriteString("+ " + o.line + "\n")
-		}
-		if b.Len() >= maxOut {
-			b.WriteString("… (diff truncated)\n")
-			return b.String()
-		}
-	}
-	flush()
-	return b.String()
 }

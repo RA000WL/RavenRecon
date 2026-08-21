@@ -129,8 +129,67 @@ orchestrator; every agent may append or update its own entries.
   D6 interaction regression gaps to cover via profiles: pipeline-level
      corrupt-cache recovery, compound failure+truncation combos w/ sticky
      merges cold->warm, mid-run cancellation across all 12 stages
-  D7 docs drift (OPTIMIZATION.md appendix statuses, ten-vs-twelve stage,
-     benchstat wording) reconciled in the closing docs wave
+   D7 docs drift (OPTIMIZATION.md appendix statuses, ten-vs-twelve stage,
+      benchstat wording) reconciled in the closing docs wave
+
+- Batch D (memory/bench baselines + comparator) IMPLEMENTED + REVIEWED
+  (builder sessions ses_fdab1e38cffeajqRzxUgNvEeI8 +
+  ses_fda343727fferNXxxfMWx2vQyj; reviewer APPROVE after one fix round,
+  2026-08-22): structural tier — bounds_c4_test.go drift detectors pinning
+  every C-4 constant where it lives (discovery/jsintel/pipeline/httpprobe/
+  urlintel/techintel/secrentel/detect/report — all 9 packages); byte tier —
+  post-GC HeapInuse retained-heap guards for discovery (Δ≈0 B vs 32 MiB
+  ceiling) and jsintel (Δ≈11.2 MiB vs 32 MiB) with exact race-skip via
+  build-tag pair; NO unbounded growth found. Baselines:
+  testdata/bench/{event,techintel,priority,urlintel,jsintel,httpprobe}.txt
+  (-count=10 -benchmem; asset substituted by urlintel — zero benchmarks).
+  Comparator: cmd/benchgate (stdlib-only), median B/op + allocs/op >25%
+  threshold fails exit 1, ns/op advisory-only; 16 unit tests; a new side
+  recorded without -benchmem now FAILS LOUDLY instead of passing vacuously
+  (review HIGH-1 fixed; NaN/±Inf thresholds rejected exit 2).
+  Shared golden support landed: internal/golden (atomic write, LCS diff,
+  -update; TEST-SUPPORT ONLY doc constraint) with detect migrated as second
+  consumer.
+  DEFERRED TO ACCEPTANCE BATCH (review HIGH-2 resolution): fixtures/ +
+  internal/pipeline/adapt/fixture_manifest.go land TOGETHER with their
+  consumer (acceptance tests materializing through T4 harness seams) plus
+  parser tests — never commit the manifest format standalone.
+  Queued into D7 docs wave (review INFO-1): C-4 table soft corners —
+  pipeline MaxDocumentBytes self-justification and techintel HTML-cap
+  wording deserve explicit doc lines.
+
+### NEW-57 (MED) — BenchmarkIngestMillion fails its own assertion: ~1.8% store shortfall at 1M lines (internal/urlintel)
+- Status: OPEN
+- Reporter: builder (v1.7 batch D, NEW-56)
+- Owner: (unassigned)
+- Problem: internal/urlintel/bench_test.go:225 BenchmarkIngestMillion
+  observes {Lines:1000000 Canonicalized:1000000 Extracted:1000000
+  Stored:981506 Reads:1000000 Malformed:0} and fails wanting a full cold
+  pass — 18,494 stores short (~1.8%) with zero malformed lines. Pre-existing
+  (reproduced during baseline recording; no production/test code changed).
+  Candidates: retained-entry cap interaction, cache-store failures at scale,
+  or a flaky assumption in the assertion. Excluded from urlintel.txt baseline
+  until fixed; re-include afterwards (~1 min/iteration).
+- Fix: root-cause the store shortfall (instrument which records fail to
+  store and why); fix or correct the benchmark's expectation if it encodes a
+  wrong invariant; add regression coverage.
+- Verification: benchmark passes deterministically (3+ consecutive runs);
+  included in testdata/bench/urlintel.txt.
+
+### NEW-58 (LOW) — C-4 drift detectors missing for detect/report caps (internal/detect, internal/report)
+- Status: VERIFIED — implemented (builder session ses_fda40ee7cffeIG9invXq9imvcA)
+  and orchestrator-verified 2026-08-22: constants verified code↔doc before
+  pinning (detect.maxFindingsPerRun=4096, report.maxModelPerKind=100_000);
+  perturbation evidence shows each detector fails naming constant, actual,
+  expected, and doc source; gates green. Archived to TODO.closed.md.
+- Reporter: builder (v1.7 batch D, NEW-56)
+- Owner: builder
+- Problem: every other C-4-documented cap gained an in-package bounds_c4_test.go
+  drift detector in batch D; detect (maxFindingsPerRun=4096) and report
+  (maxModelPerKind=100000) did not because those packages were scope-restricted
+  mid-task. Their constants are unexported, so detectors must be in-package.
+- Fix: add bounds_c4_test.go to both packages pinning the documented values.
+- Verification: tests pass; constants drift would fail them.
 
 ## Operational warnings (all agents)
 

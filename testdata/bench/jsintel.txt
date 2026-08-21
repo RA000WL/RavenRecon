@@ -1,0 +1,76 @@
+goos: linux
+goarch: amd64
+pkg: github.com/RA000WL/RavenRecon/internal/jsintel
+cpu: AMD Ryzen 5 8645HS w/ Radeon 760M Graphics
+BenchmarkParseSmall-12          	   68336	     17485 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   69043	     17854 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   69661	     18014 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   67321	     17700 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   65244	     17697 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   69007	     18026 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   66536	     17321 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   73426	     17232 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   66386	     18290 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseSmall-12          	   66274	     18384 ns/op	   31088 B/op	      33 allocs/op
+BenchmarkParseLargeBundle-12    	     133	   9028060 ns/op	23071945 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     132	   9025998 ns/op	23071943 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     133	   9083568 ns/op	23071947 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     133	   9076026 ns/op	23071945 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     130	   8749110 ns/op	23071943 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     132	   9030094 ns/op	23071960 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     132	   8912478 ns/op	23071951 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     132	   8881501 ns/op	23071935 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     134	   9069244 ns/op	23071953 B/op	    3742 allocs/op
+BenchmarkParseLargeBundle-12    	     133	   8961931 ns/op	23071948 B/op	    3742 allocs/op
+BenchmarkFetchMiss-12           	      98	  10753445 ns/op	 111.44 MB/s	 8401237 B/op	     298 allocs/op
+BenchmarkFetchMiss-12           	     100	  10486425 ns/op	 114.28 MB/s	 8370483 B/op	     294 allocs/op
+BenchmarkFetchMiss-12           	     110	  10807693 ns/op	 110.88 MB/s	 8598362 B/op	     295 allocs/op
+BenchmarkFetchMiss-12           	     100	  11094428 ns/op	 108.02 MB/s	 8161883 B/op	     292 allocs/op
+BenchmarkFetchMiss-12           	     100	  10622735 ns/op	 112.81 MB/s	 8370820 B/op	     294 allocs/op
+BenchmarkFetchMiss-12           	     100	  10706584 ns/op	 111.93 MB/s	 8451179 B/op	     294 allocs/op
+BenchmarkFetchMiss-12           	     100	  10715003 ns/op	 111.84 MB/s	 8660860 B/op	     296 allocs/op
+BenchmarkFetchMiss-12           	     100	  10700546 ns/op	 111.99 MB/s	 8435440 B/op	     295 allocs/op
+BenchmarkFetchMiss-12           	      94	  10644031 ns/op	 112.59 MB/s	 8609964 B/op	     295 allocs/op
+BenchmarkFetchMiss-12           	     100	  10760036 ns/op	 111.37 MB/s	 8563599 B/op	     296 allocs/op
+BenchmarkFetchHit-12            	      80	  14099410 ns/op	 6175541 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      79	  15082583 ns/op	 6175585 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      75	  14479569 ns/op	 6175602 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      75	  14455471 ns/op	 6175581 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      79	  14703013 ns/op	 6175580 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      73	  13963938 ns/op	 6175596 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      80	  14089542 ns/op	 6175573 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      73	  15456792 ns/op	 6175609 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      76	  14384028 ns/op	 6175576 B/op	     133 allocs/op
+BenchmarkFetchHit-12            	      79	  15236118 ns/op	 6175622 B/op	     133 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2575	    502515 ns/op	  329398 B/op	    4266 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2536	    506333 ns/op	  329497 B/op	    4267 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2199	    513368 ns/op	  329640 B/op	    4268 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2329	    531273 ns/op	  329820 B/op	    4270 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2464	    489025 ns/op	  329440 B/op	    4266 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2546	    504863 ns/op	  329733 B/op	    4269 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2371	    504786 ns/op	  329612 B/op	    4268 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2313	    519245 ns/op	  329790 B/op	    4269 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2433	    538454 ns/op	  329825 B/op	    4268 allocs/op
+BenchmarkAnalyzeCacheHit-12     	    2295	    507634 ns/op	  329549 B/op	    4267 allocs/op
+BenchmarkExtractEndpoints-12    	     592	   2039492 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     612	   1995974 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     590	   2022014 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     579	   2057441 ns/op	 1554901 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     559	   2067641 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     579	   2031644 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     612	   2014023 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     578	   2041093 ns/op	 1554901 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     580	   2018605 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractEndpoints-12    	     592	   2075364 ns/op	 1554902 B/op	   28619 allocs/op
+BenchmarkExtractSecrets-12      	     708	   1637579 ns/op	  152939 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     740	   1638545 ns/op	  153261 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     705	   1627964 ns/op	  152732 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     700	   1638614 ns/op	  152896 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     733	   1678111 ns/op	  152915 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     729	   1605644 ns/op	  153174 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     771	   1613469 ns/op	  152880 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     727	   1576513 ns/op	  153022 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     745	   1604380 ns/op	  153005 B/op	    2175 allocs/op
+BenchmarkExtractSecrets-12      	     734	   1626682 ns/op	  153523 B/op	    2175 allocs/op
+PASS
+ok  	github.com/RA000WL/RavenRecon/internal/jsintel	99.714s
