@@ -664,3 +664,175 @@ func TestDNSStageEngineErrorWrappedNoPanic(t *testing.T) {
 		t.Fatalf("err = %v, want the engine's concurrency cause preserved", err)
 	}
 }
+
+// --- Dnsx brute (opt-in) tests ---
+
+func TestDNSBruteDisabledNoExtraCost(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	// No brute param: the stage must not issue any wildcard probe or brute
+	// candidate queries. Only the explicitly listed host is resolved.
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+
+	in := dnsInput(target, []asset.Host{mustHost(t, "www.example.com")})
+	// No Config: brute disabled (default).
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	// The resolver should have been queried only for the input host's types
+	// (A/AAAA/CNAME) and the CNAME target's A/AAAA if any — exactly 3 plus
+	// 2 for the CNAME target if it existed. With no brute, the wildcard
+	// probe host must never be queried.
+	if seen := fake.seenHosts(); seen["ravenrecon-wildcard-check.example.com"] {
+		t.Fatalf("wildcard probe host was queried despite brute being disabled (zero cost violation)")
+	}
+	requireEqualStrings(t, "additions", hostNames(res.Additions.Hosts), []string{"www.example.com"})
+	if len(res.Additions.Hosts) != 1 {
+		t.Fatalf("brute hosts leaked with brute disabled: %v", hostNames(res.Additions.Hosts))
+	}
+}
+
+func TestDNSBruteEnabledResolves(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	// Wildcard probe must NOT resolve (no wildcard) — leave unsripted (NODATA)
+	// so IsWildcard returns false.
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+	// The brute wordlist hosts are "www" and "api" via StageParams.
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www,api"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	requireEqualStrings(t, "brute additions", hostNames(res.Additions.Hosts), []string{"api.example.com", "www.example.com"})
+	requireEqualStrings(t, "brute IPs", ipStrings(res.Results.IPs), []string{"93.184.216.34", "93.184.216.35"})
+	if seen := fake.seenHosts(); !seen["ravenrecon-wildcard-check.example.com"] {
+		t.Fatalf("wildcard probe host was not queried with brute enabled")
+	}
+	if res.Truncated || len(res.StickyFlags) != 0 {
+		t.Fatalf("unexpected truncation flags: truncated=%v flags=%v", res.Truncated, res.StickyFlags)
+	}
+}
+
+func TestDNSBruteEnabledDefaultWordlist(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true"} // no wordlist -> default 10
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	// Default wordlist includes www and api, so at least those two should be
+	// present; others are NODATA and filtered out (no IPs), so not in
+	// additions.
+	requireEqualStrings(t, "default wordlist brute", hostNames(res.Additions.Hosts), []string{"api.example.com", "www.example.com"})
+}
+
+func TestDNSBruteWildcardAborts(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	// Wildcard probe resolves -> brute must abort.
+	fake.set("ravenrecon-wildcard-check.example.com", dns.TypeA, "5.6.7.8")
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www,api"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if len(res.Additions.Hosts) != 0 {
+		t.Fatalf("wildcard abort failed: brute hosts leaked: %v", hostNames(res.Additions.Hosts))
+	}
+	if !res.StickyFlags["dns_brute_wildcard"] {
+		t.Fatalf("StickyFlags = %v, want dns_brute_wildcard set on wildcard abort", res.StickyFlags)
+	}
+	// Brute candidate hosts must NOT have been queried after the abort.
+	if seen := fake.seenHosts(); seen["www.example.com"] || seen["api.example.com"] {
+		t.Fatalf("brute candidates were queried despite wildcard abort: seen=%v", seen)
+	}
+}
+
+func TestDNSBruteDedup(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	www := mustHost(t, "www.example.com")
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+	// Input already contains www; brute wordlist also contains www and api.
+	// www must not be duplicated, api should be added.
+	in := dnsInput(target, []asset.Host{www})
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www,api"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	requireEqualStrings(t, "dedup", hostNames(res.Additions.Hosts), []string{"api.example.com", "www.example.com"})
+	requireEqualStrings(t, "dedup IPs", ipStrings(res.Results.IPs), []string{"93.184.216.34", "93.184.216.35"})
+}
+
+func TestDNSBruteUnknownParamIgnored(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	in := dnsInput(target, []asset.Host{mustHost(t, "www.example.com")})
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www", "bogus_key": "x", "another": "y"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	requireEqualStrings(t, "unknown param ignored", hostNames(res.Additions.Hosts), []string{"www.example.com"})
+}
+
+func TestDNSBrutePipelineE2E(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+
+	stage := NewDNSStage(fake)
+	cfg := pipeline.ScanConfig{
+		Target: target,
+		Stages: []pipeline.StageName{pipeline.StageDNS},
+		StageParams: map[pipeline.StageName]map[string]string{
+			pipeline.StageDNS: {"dnsx_brute": "true", "dnsx_wordlist": "www,api"},
+		},
+	}
+	report, err := pipeline.Run(context.Background(), cfg, nil, fixedClock{now: fixedTime}, []pipeline.Stage{stage})
+	if err != nil {
+		t.Fatalf("pipeline.Run error: %v", err)
+	}
+	if report.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("report.Outcome = %q, want completed", report.Outcome)
+	}
+	requireEqualStrings(t, "pipeline brute hosts", hostNames(report.Hosts), []string{"api.example.com", "www.example.com"})
+	if len(report.Results.IPs) != 2 {
+		t.Fatalf("report.Results.IPs = %v, want 2", ipStrings(report.Results.IPs))
+	}
+}
+
+func TestDNSBruteEmptyCorpusWithBrute(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	requireEqualStrings(t, "empty corpus brute", hostNames(res.Additions.Hosts), []string{"www.example.com"})
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/dns"
@@ -18,6 +19,18 @@ import (
 // whenever any retained type is truncated and is preserved end-to-end
 // (result → RunReport → report), never swallowed (AGENTS §0.6).
 const dnsAnswersTruncated = "dns_answers_truncated"
+
+// dnsBruteWildcardFlag is the sticky flag this adapter sets when the
+// wildcard probe detected a wildcard DNS zone and brute was aborted to
+// prevent *.example.com inflation. The flag is the opt-in brute's
+// diagnostic surface — the stage remains completed but no brute hosts are
+// emitted.
+const dnsBruteWildcardFlag = "dns_brute_wildcard"
+
+// dnsBruteTruncatedFlag is the sticky flag set when the brute wordlist
+// exceeded MaxBruteWordlistEntries or the candidate set exceeded
+// MaxBruteHostsPerDomain and was capped. The retained set is incomplete.
+const dnsBruteTruncatedFlag = "dns_brute_truncated"
 
 // dnsStage adapts internal/dns (dns.Resolve) into a pipeline.Stage.
 //
@@ -68,8 +81,25 @@ func (s *dnsStage) Name() pipeline.StageName { return pipeline.StageDNS }
 // Concurrency and QueueSize; a direct caller passing 0 for either gets the
 // engine's own pool-creation error (mapped to Outcome failed below).
 //
-// StageParams: none. in.Config is never read — the stage has no documented
-// parameter keys, and unknown keys are ignored by construction.
+// StageParams: the dns stage is opt-in brute via dnsx-compatible keys
+// (all other keys are ignored — the adapter reads defensively):
+//
+//	dnsx_brute     bool   "true"/"1"/"yes"/"on" (case-insensitive) enables
+//	                       brute. Absent/false = zero cost, exactly as before.
+//	dnsx_wordlist  string comma-separated prefixes ("www,api,dev"); empty or
+//	                       absent uses the embedded 10-item default wordlist.
+//	                       Capped at 5000 entries and 5000 hosts.
+//	dnsx_resolvers string comma-separated IPs; parsed but unused (reserved;
+//	                       native resolver is used — hermetic without binary).
+//
+// When enabled, after the normal dns resolution the stage probes wildcard
+// (random-uuid subdomain), aborts on positive with the dns_brute_wildcard
+// sticky flag, otherwise generates wordlist×domain candidates, deduplicates,
+// caps, and resolves them via the same bounded engine (central limiter
+// 20/s, per-domain brute timeout 60s, MaxBruteHostsPerDomain 5000). Brute
+// hosts are emitted as corpus Hosts additions (like discovery), no new
+// results channel. Brute candidates are not separately cached — per
+// (host,type) DNS cache already exists.
 //
 // Run never panics on engine errors: every error return of dns.Resolve is
 // wrapped with context ("stage %s: %w") and returned; a non-nil error return
@@ -85,6 +115,8 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 	// in internal/asset.
 	hosts := pipeline.FilterHosts(in.Target, in.Hosts)
 
+	bruteEnabled := dnsBruteEnabled(in.Config)
+
 	// Empty filtered input short-circuit. dns.Resolve treats an empty host
 	// list as VALID input (it returns an empty report without starting a
 	// pool), so short-circuiting here is observationally identical to
@@ -95,7 +127,12 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 	// engine's honest error with a completed outcome. The canonicality
 	// re-check goes through asset.NewDomain — the single normalization
 	// point, exactly as the engine's own scope validation does.
-	if len(hosts) == 0 && targetCanonical(in.Target) {
+	//
+	// When brute is enabled, the empty-host short-circuit is intentionally
+	// disabled: brute operates on the domain itself (wordlist×domain) even
+	// with no corpus hosts, so the stage must still run the engine (and
+	// the brute path) rather than returning a vacuous completed result.
+	if len(hosts) == 0 && targetCanonical(in.Target) && !bruteEnabled {
 		if err := ctx.Err(); err != nil {
 			wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
 			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: wrapped}, wrapped
@@ -115,7 +152,60 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 	}
 
 	rep, engineErr := dns.Resolve(ctx, in.Target, hosts, cfg)
-	return s.mapResult(ctx, in, rep, engineErr)
+	baseRes, baseErr := s.mapResult(ctx, in, rep, engineErr)
+	// Opt-in brute: zero cost when disabled. When enabled, attempt brute
+	// after the normal resolution, merging brute hosts into the corpus.
+	if !bruteEnabled {
+		return baseRes, baseErr
+	}
+	// Brute is not attempted when the base run failed or was cancelled, or
+	// the stage context is already done — the base outcome already carries
+	// the honesty signal.
+	if engineErr != nil || ctx.Err() != nil {
+		return baseRes, baseErr
+	}
+	// Non-canonical target: the engine would have already rejected it;
+	// brute must not hide that error behind a wildcard probe.
+	if !targetCanonical(in.Target) {
+		return baseRes, baseErr
+	}
+	bruteRes, bruteTruncated, bruteWildcard := s.runBrute(ctx, in, cfg, baseRes)
+	if bruteWildcard {
+		// Wildcard detected: abort brute, surface diagnostic via sticky flag.
+		// The stage outcome stays that of the base run; the flag marks the
+		// retained set as honestly without brute hosts.
+		if baseRes.StickyFlags == nil {
+			baseRes.StickyFlags = make(map[string]bool)
+		}
+		baseRes.StickyFlags[dnsBruteWildcardFlag] = true
+		return baseRes, baseErr
+	}
+	if len(bruteRes.Additions.Hosts) == 0 && len(bruteRes.Results.IPs) == 0 {
+		// No brute hosts resolved (or truncated without hosts): preserve the
+		// truncation flag if the wordlist/candidate cap was hit.
+		if bruteTruncated {
+			if baseRes.StickyFlags == nil {
+				baseRes.StickyFlags = make(map[string]bool)
+			}
+			baseRes.StickyFlags[dnsBruteTruncatedFlag] = true
+			baseRes.Truncated = true
+		}
+		return baseRes, baseErr
+	}
+	// Merge brute hosts into the base result's corpus additions and results.
+	merged := mergeBruteAdditions(baseRes, bruteRes, in.Target)
+	if bruteTruncated {
+		if merged.StickyFlags == nil {
+			merged.StickyFlags = make(map[string]bool)
+		}
+		merged.StickyFlags[dnsBruteTruncatedFlag] = true
+		merged.Truncated = true
+	}
+	// Preserve base outcome/counters: add brute processed count.
+	merged.ItemsProcessed = baseRes.ItemsProcessed + bruteRes.ItemsProcessed
+	// ItemsFailed counts hosts with no usable observation — brute failures
+	// are not counted here because only resolving brute hosts are emitted.
+	return merged, baseErr
 }
 
 // mapResult translates the engine's report and error into the pipeline's
@@ -274,6 +364,310 @@ func applyTruncation(res pipeline.StageResult, anyTruncated bool) pipeline.Stage
 		res.StickyFlags = map[string]bool{dnsAnswersTruncated: true}
 	}
 	return res
+}
+
+// dnsBruteEnabled reports whether brute is enabled via StageParams.
+func dnsBruteEnabled(params map[string]string) bool {
+	if params == nil {
+		return false
+	}
+	v, ok := params["dnsx_brute"]
+	if !ok {
+		return false
+	}
+	v = strings.TrimSpace(strings.ToLower(v))
+	return v == "true" || v == "1" || v == "yes" || v == "on"
+}
+
+// dnsBruteWordlist parses the dnsx_wordlist StageParam. Absent, empty, or
+// whitespace-only values select the embedded default wordlist; otherwise the
+// comma-separated prefixes are trimmed and empty elements dropped. The result
+// is capped at dns.MaxBruteWordlistEntries; an over-long wordlist sets the
+// caller-observed truncation flag. Unknown params are ignored.
+func dnsBruteWordlist(params map[string]string) ([]string, bool) {
+	v, ok := params["dnsx_wordlist"]
+	if !ok {
+		return dns.DefaultBruteWordlist, false
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return dns.DefaultBruteWordlist, false
+	}
+	parts := strings.Split(v, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return dns.DefaultBruteWordlist, false
+	}
+	truncated := false
+	if len(out) > dns.MaxBruteWordlistEntries {
+		out = out[:dns.MaxBruteWordlistEntries]
+		truncated = true
+	}
+	return out, truncated
+}
+
+// dnsBruteResolvers parses the optional dnsx_resolvers StageParam
+// (comma-separated IPs). It is accepted but unused — the native resolver is
+// used (hermetic without binary). Parsing validates shape but never errors;
+// unknown values are ignored.
+func dnsBruteResolvers(params map[string]string) []string {
+	v, ok := params["dnsx_resolvers"]
+	if !ok {
+		return nil
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// runBrute executes the opt-in brute path: wildcard probe, candidate
+// generation, bounded resolution, and filtering to resolving hosts. It
+// returns the brute StageResult (additions + results), whether the wordlist
+// or candidate set was truncated, and whether a wildcard was detected. The
+// candidate resolution is bounded by BruteTimeout and the stage's own
+// context, with the same bounded pool and limiter as the normal path.
+func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns.Config, base pipeline.StageResult) (pipeline.StageResult, bool, bool) {
+	// Wildcard probe before any brute work.
+	// Use the stage's resolver seam (nil = production). IsWildcard handles nil.
+	wildcard, err := dns.IsWildcard(ctx, in.Target, s.resolver)
+	if err != nil {
+		// Cancellation/deadline during probe: abort brute, propagate no
+		// wildcard flag — the stage context already carries cancellation.
+		if isContextError(err) {
+			return pipeline.StageResult{}, false, false
+		}
+		wildcard = false
+	}
+	if wildcard {
+		return pipeline.StageResult{}, false, true
+	}
+
+	wordlist, wordlistTruncated := dnsBruteWordlist(in.Config)
+	// Reserving parsing of resolvers (unused, but defensive).
+	_ = dnsBruteResolvers(in.Config)
+
+	candidates := dns.GenerateBruteCandidates(in.Target, wordlist)
+	if len(candidates) == 0 {
+		return pipeline.StageResult{}, wordlistTruncated, false
+	}
+	// Dedup candidates against hosts already in the base report (input
+	// hosts plus CNAME targets) to avoid redundant queries.
+	seen := make(map[string]bool, len(base.Additions.Hosts)+len(candidates))
+	for _, h := range base.Additions.Hosts {
+		seen[h.Name] = true
+	}
+	// Also dedup against the input hosts that were filtered before the
+	// base resolve (in case base had no report due to empty input).
+	for _, h := range in.Hosts {
+		seen[h.Name] = true
+	}
+	var filtered []asset.Host
+	for _, h := range candidates {
+		if seen[h.Name] {
+			continue
+		}
+		seen[h.Name] = true
+		filtered = append(filtered, h)
+	}
+	if len(filtered) == 0 {
+		return pipeline.StageResult{}, wordlistTruncated, false
+	}
+	candidateTruncated := len(candidates) >= dns.MaxBruteHostsPerDomain || wordlistTruncated
+	// Brute candidates are already capped by GenerateBruteCandidates, but
+	// filtering may have reduced them; the truncation flag reflects the
+	// generation cap, not the filtered size.
+
+	// Bounded per-domain brute timeout. The stage context already bounds the
+	// run; this additional deadline ensures a single domain cannot wedge the
+	// stage indefinitely. If the context already has a tighter deadline, it
+	// wins (WithTimeout respects the parent's deadline).
+	bruteCtx, cancel := context.WithTimeout(ctx, dns.BruteTimeout)
+	defer cancel()
+
+	rep, err := dns.Resolve(bruteCtx, in.Target, filtered, cfg)
+	if err != nil {
+		if isContextError(err) {
+			return pipeline.StageResult{}, candidateTruncated, false
+		}
+		// Engine error on brute: treat as failed brute with no additions.
+		return pipeline.StageResult{}, candidateTruncated, false
+	}
+	// Filter brute hosts to only those that actually resolved (have at least
+	// one address or CNAME observation). NXDOMAIN / NODATA hosts are not
+	// useful brute discoveries and must not pollute the corpus.
+	var resolving []asset.Host
+	var resolvingIPs []asset.IP
+	for _, hr := range rep.Results {
+		if len(hr.IPs) > 0 || len(hr.Targets) > 0 {
+			// Host resolved to at least one IP or CNAME target.
+			resolving = append(resolving, hr.Host)
+			// Also include the CNAME targets themselves if they are in-domain
+			// (the adapter's output filter will enforce in-domain again).
+			resolving = append(resolving, hr.Targets...)
+		}
+	}
+	if len(resolving) == 0 {
+		return pipeline.StageResult{}, candidateTruncated, false
+	}
+	// Deduplicate resolving hosts by identity and filter to in-domain.
+	resolving = dedupeHosts(resolving)
+	resolving = pipeline.FilterHosts(in.Target, resolving)
+	if len(resolving) == 0 {
+		return pipeline.StageResult{}, candidateTruncated, false
+	}
+	// Collect IPs for the results channel (only for resolving hosts) —
+	// use the report's merged IPs filtered to resolving hosts' contributions.
+	// Simplest: use rep.AllIPs which already contains only resolving hosts'
+	// IPs (non-resolving hosts have none).
+	resolvingIPs = pipelineFilterIPs(resolving, rep.AllIPs())
+
+	bruteResult := pipeline.StageResult{
+		Outcome:        pipeline.OutcomeCompleted,
+		ItemsProcessed: len(filtered),
+		ItemsFailed:    0,
+		Additions:      pipeline.StageAdditions{Hosts: resolving},
+		Results:        pipeline.Results{IPs: resolvingIPs},
+	}
+	// Propagate any per-type truncation from the brute resolve as well
+	// (answer cap). If any brute type was truncated, the stage's truncation
+	// marker must not be swallowed.
+	for _, hr := range rep.Results {
+		for _, tr := range hr.Types {
+			if tr.Truncated {
+				bruteResult.Truncated = true
+				if bruteResult.StickyFlags == nil {
+					bruteResult.StickyFlags = make(map[string]bool)
+				}
+				bruteResult.StickyFlags[dnsAnswersTruncated] = true
+				break
+			}
+		}
+		if bruteResult.Truncated {
+			break
+		}
+	}
+	return bruteResult, candidateTruncated, false
+}
+
+// dedupeHosts deduplicates hosts by Phase 2 identity, keeping first-seen,
+// then sorting by canonical name — deterministic.
+func dedupeHosts(hosts []asset.Host) []asset.Host {
+	seen := make(map[string]bool, len(hosts))
+	var out []asset.Host
+	for _, h := range hosts {
+		if seen[h.Name] {
+			continue
+		}
+		seen[h.Name] = true
+		out = append(out, h)
+	}
+	// Sorting is already done by GenerateBruteCandidates and by the
+	// report's AllHosts, but deduping may have mixed order; sort for
+	// determinism.
+	sortHosts(out)
+	return out
+}
+
+// sortHosts sorts hosts by canonical name.
+func sortHosts(hosts []asset.Host) {
+	// Use a simple sort to keep hermetic and avoid extra imports beyond
+	// what the file already has; time is already imported for BruteTimeout.
+	for i := 1; i < len(hosts); i++ {
+		for j := i; j > 0 && hosts[j].Name < hosts[j-1].Name; j-- {
+			hosts[j], hosts[j-1] = hosts[j-1], hosts[j]
+		}
+	}
+}
+
+// pipelineFilterIPs keeps only IPs that belong to resolving hosts.
+// Since rep.AllIPs is already filtered to resolving hosts' IPs (non-resolving
+// hosts contribute none), this is effectively a pass-through, but we keep the
+// helper for explicitness and future scope filtering.
+func pipelineFilterIPs(resolvingHosts []asset.Host, ips []asset.IP) []asset.IP {
+	// No host-to-IP filtering is required: IPs are observations of
+	// in-scope hosts, and an address is not in- or out-of-domain.
+	// Return the IPs sorted and deduplicated (AllIPs already is).
+	return ips
+}
+
+// mergeBruteAdditions merges brute hosts and results into the base stage
+// result, deduplicating by identity and sorting deterministically.
+func mergeBruteAdditions(base, brute pipeline.StageResult, target asset.Domain) pipeline.StageResult {
+	merged := base
+	// Merge Hosts additions.
+	hostSet := make(map[string]bool, len(base.Additions.Hosts)+len(brute.Additions.Hosts))
+	for _, h := range base.Additions.Hosts {
+		hostSet[h.Name] = true
+	}
+	var mergedHosts []asset.Host
+	mergedHosts = append(mergedHosts, base.Additions.Hosts...)
+	for _, h := range brute.Additions.Hosts {
+		if hostSet[h.Name] {
+			continue
+		}
+		hostSet[h.Name] = true
+		mergedHosts = append(mergedHosts, h)
+	}
+	sortHosts(mergedHosts)
+	merged.Additions.Hosts = pipeline.FilterHosts(target, mergedHosts)
+
+	// Merge IPs results.
+	ipSet := make(map[string]bool, len(base.Results.IPs)+len(brute.Results.IPs))
+	for _, ip := range base.Results.IPs {
+		ipSet[ip.String()] = true
+	}
+	var mergedIPs []asset.IP
+	mergedIPs = append(mergedIPs, base.Results.IPs...)
+	for _, ip := range brute.Results.IPs {
+		if ipSet[ip.String()] {
+			continue
+		}
+		ipSet[ip.String()] = true
+		mergedIPs = append(mergedIPs, ip)
+	}
+	// IPs are already sorted by AllIPs; sort deterministically if merged.
+	sortIPs(mergedIPs)
+	merged.Results.IPs = mergedIPs
+
+	// Merge sticky flags.
+	if len(brute.StickyFlags) > 0 {
+		if merged.StickyFlags == nil {
+			merged.StickyFlags = make(map[string]bool)
+		}
+		for k, v := range brute.StickyFlags {
+			merged.StickyFlags[k] = v
+		}
+	}
+	if brute.Truncated {
+		merged.Truncated = true
+	}
+	return merged
+}
+
+// sortIPs sorts IPs by canonical string.
+func sortIPs(ips []asset.IP) {
+	for i := 1; i < len(ips); i++ {
+		for j := i; j > 0 && ips[j].String() < ips[j-1].String(); j-- {
+			ips[j], ips[j-1] = ips[j-1], ips[j]
+		}
+	}
 }
 
 // targetCanonical reports whether d is the canonical form asset.NewDomain
