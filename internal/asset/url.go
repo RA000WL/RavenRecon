@@ -277,9 +277,22 @@ func sortQuery(raw string) string {
 			continue
 		}
 		k, v, found := strings.Cut(pair, "=")
-		dk, err := url.QueryUnescape(k)
+		// Sort by the decode of the EMITTED key form, not of the raw key:
+		// emission (escapeRawQuery) rewrites ' ', '#', '&', '=' to their
+		// %XX forms, and every later parse sees the emitted form, so
+		// decoding exactly that form keeps each pair's sort key identical
+		// across re-canonicalization and makes the canonical query a fixed
+		// point. Sorting by the raw key's decode instead let a key with an
+		// invalid percent escape (e.g. " %0") decode differently after
+		// emission, flipping its order against other keys and changing the
+		// URL identity on re-parse (found by FuzzParseURL). For keys without
+		// invalid escapes this is value-identical to decoding the raw key:
+		// escapeRawQuery only rewrites the four bytes that QueryUnescape
+		// decodes back to themselves ("%20"/"%23"/"%26"/"%3D").
+		emittedKey := escapeRawQuery(k)
+		dk, err := url.QueryUnescape(emittedKey)
 		if err != nil {
-			dk = k
+			dk = emittedKey
 		}
 		params = append(params, param{rawKey: k, key: dk, value: v, hasValue: found})
 	}
