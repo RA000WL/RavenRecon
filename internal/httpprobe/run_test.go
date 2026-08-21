@@ -1,16 +1,20 @@
 package httpprobe
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1402,5 +1406,126 @@ func TestProbeDeadlineDuringTokenWaitRetainsChain(t *testing.T) {
 	httpsPr := probeResultFor(hr, "https")
 	if httpsPr.Status != ProbeCancelled {
 		t.Fatalf("https probe = %+v (want cancelled)", httpsPr)
+	}
+}
+
+// TestIsHeaderCapAbortPinnedToCurrentStdlib pins isHeaderCapAbort's
+// dependency on the CURRENT stdlib's header-cap abort shape (NEW-35.3):
+// classification requires the EXACT stdlib-constructed message
+//
+//	net/http: server response headers exceeded <MaxResponseHeaderBytes> bytes; aborted
+//
+// to appear on SOME error in the %w chain (the transport wraps the abort
+// with "net/http: HTTP/1.x transport connection broken: ..."). This test
+// drives a REAL over-cap response through the PRODUCTION transport and
+// asserts that shape end-to-end, so a Go upgrade that changes the abort
+// message or stops wrapping it fails LOUDLY here instead of silently
+// disabling truncation detection (the degradation direction — failed/other —
+// stays safe, but it would re-probe every genuine cap hit instead of serving
+// the truncated observation; this pin makes that visible, not silent).
+func TestIsHeaderCapAbortPinnedToCurrentStdlib(t *testing.T) {
+	cs := newCountingServer(t, 200, "ok")
+	cs.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		// A single header value larger than MaxHeaderBytes forces the
+		// transport's MaxResponseHeaderBytes abort.
+		w.Header().Set("Big", strings.Repeat("a", MaxHeaderBytes+1024))
+		w.WriteHeader(200)
+	})
+
+	tr := newTransport() // production transport: MaxResponseHeaderBytes = MaxHeaderBytes
+	tr.DisableKeepAlives = true
+	addr := cs.srv.Listener.Addr().String()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 5 * time.Second}
+		return d.DialContext(ctx, network, addr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://www.example.com/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	_, err = tr.RoundTrip(req)
+	if err == nil {
+		t.Fatal("over-cap header block completed without error; truncation detection has nothing to pin")
+	}
+	want := fmt.Sprintf("net/http: server response headers exceeded %d bytes; aborted", MaxHeaderBytes)
+	found := false
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if e.Error() == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("current stdlib did not produce the pinned exact abort message %q anywhere in the %%w chain of %q; "+
+			"isHeaderCapAbort can no longer recognize genuine truncation and detection has silently degraded",
+			want, err)
+	}
+	if !isHeaderCapAbort(err) {
+		t.Fatalf("isHeaderCapAbort(%q) = false through the production transport despite the exact pinned message", err)
+	}
+}
+
+// drainTrackingBody records how much of one response body was drained and
+// whether it was closed.
+type drainTrackingBody struct {
+	content []byte
+	pos     int
+
+	mu     sync.Mutex
+	read   int
+	closed bool
+}
+
+func (b *drainTrackingBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pos >= len(b.content) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.content[b.pos:])
+	b.pos += n
+	b.read += n
+	return n, nil
+}
+
+func (b *drainTrackingBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
+
+// TestDrainFollowedBodyBoundedAndCloses pins the followed-redirect body
+// handling (NEW-35.2): the body is always closed, drained at most
+// maxRedirectDrainBytes (keep-alive reuse enabled, hostile endless streams
+// never hold the probe open), and drain failures are ignored.
+func TestDrainFollowedBodyBoundedAndCloses(t *testing.T) {
+	// Oversized body: draining must stop at the cap, close must happen.
+	huge := &drainTrackingBody{content: bytes.Repeat([]byte("x"), maxRedirectDrainBytes+4096)}
+	drainFollowedBody(huge)
+	if !huge.closed {
+		t.Fatal("oversized body was not closed")
+	}
+	huge.mu.Lock()
+	got := huge.read
+	huge.mu.Unlock()
+	if got != maxRedirectDrainBytes {
+		t.Fatalf("drained %d bytes of an oversized body, want exactly the %d cap", got, maxRedirectDrainBytes)
+	}
+
+	// Small body: fully drained, closed.
+	small := &drainTrackingBody{content: []byte("ok")}
+	drainFollowedBody(small)
+	if !small.closed {
+		t.Fatal("small body was not closed")
+	}
+	small.mu.Lock()
+	got = small.read
+	small.mu.Unlock()
+	if got != 2 {
+		t.Fatalf("small body drained %d bytes, want 2", got)
 	}
 }

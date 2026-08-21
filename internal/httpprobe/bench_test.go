@@ -283,7 +283,7 @@ func BenchmarkTLSConfigClonePerDial(b *testing.B) {
 		if cfg == nil {
 			cfg = &tls.Config{}
 		}
-		if cfg.ServerName == "" && net.ParseIP(host) == nil {
+		if cfg.ServerName == "" {
 			cfg.ServerName = host
 		}
 		sink = cfg

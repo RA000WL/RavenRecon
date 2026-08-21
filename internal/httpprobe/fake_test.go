@@ -1,6 +1,7 @@
 package httpprobe
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -396,6 +398,49 @@ func (r schemeRouter) RoundTrip(req *http.Request) (*http.Response, error) {
 	return r.httpRT.RoundTrip(req)
 }
 
+// maxRequestHeadBytes bounds how much of one client request head the eager
+// responders below consume before answering.
+const maxRequestHeadBytes = 16 << 10 // 16 KiB
+
+// awaitClientRequest consumes just enough of one accepted connection to
+// prove the client committed its outbound request, so the canned response
+// can never arrive at the client's transport UNSOLICITED: net/http's
+// readLoop peeks the connection BEFORE persistConn.roundTrip registers
+// numExpectedResponses, and canned bytes already buffered at that instant
+// poison the connection with the stdlib artifact
+//
+//	readLoopPeekFailLocked: %!w(<nil>)
+//
+// instead of the intended classification input — the intermittent
+// full-package -race flake (NEW-54: a different probe test failed on
+// different runs, always with this error in a probe result). Waiting for
+// the client's request head is what makes the eager responders deterministic:
+// when the client later parses the response, its request has provably been
+// sent (the counter increment happens-before the bytes hit the wire).
+//
+// A TLS record (a ClientHello starts 0x16 0x03) returns immediately: those
+// connections are answered mid-handshake on purpose, so the plaintext canned
+// payload fails the TLS handshake deterministically exactly as before. Read
+// errors, EOF, or exceeding maxRequestHeadBytes return too; the caller then
+// writes its canned payload as-is. A read deadline bounds a wedged peer so
+// the fixture can never hang a test.
+func awaitClientRequest(c net.Conn) {
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+	br := bufio.NewReader(io.LimitReader(c, maxRequestHeadBytes))
+	if b, err := br.Peek(3); err != nil || (b[0] == 0x16 && b[1] == 0x03) {
+		// No request head readable (EOF/error), or a TLS ClientHello:
+		// answer now.
+		return
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			return // request head complete, or the peer gave up
+		}
+	}
+}
+
 // plainResponder is a deterministic "non-TLS server": it answers EVERY
 // connection with a plain-text HTTP 400 and closes. A TLS ClientHello sent
 // to it therefore fails the handshake with "tls: first record does not look
@@ -422,6 +467,11 @@ func newPlainResponder(t testing.TB) *plainResponder {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
+				// Answer only after the client committed its request (or
+				// sent a ClientHello): see awaitClientRequest — an eager
+				// unsolicited response intermittently poisons net/http's
+				// readLoop under -race load (NEW-54).
+				awaitClientRequest(c)
 				// A fixed, plain-text HTTP response: readable by an HTTP
 				// client, and unreadable as a TLS first record by an https
 				// client (deterministic TLS handshake failure).
@@ -459,6 +509,11 @@ func newRawResponder(t testing.TB, response string) *rawResponder {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
+				// Answer only after the client committed its request (or
+				// sent a ClientHello): see awaitClientRequest — an eager
+				// unsolicited response intermittently poisons net/http's
+				// readLoop under -race load (NEW-54).
+				awaitClientRequest(c)
 				c.Write([]byte(response))
 			}(conn)
 		}

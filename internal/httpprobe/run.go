@@ -379,7 +379,15 @@ func newTransport() *http.Transport {
 		}
 		// The transport normally derives ServerName from the request host
 		// (addTLS); with a custom dialer the address is all we have.
-		// tls.DialWithDialer infers it the same way.
+		// tls.DialWithDialer infers it the same way. ServerName is set
+		// UNCONDITIONALLY when empty — including for IP literals, exactly
+		// like net/http's addTLS does: crypto/tls rejects a verifying
+		// config with an empty ServerName outright ("either ServerName or
+		// InsecureSkipVerify"), so skipping IPs here would turn every
+		// https://IP-literal/ probe into an instant LOCAL handshake failure
+		// — a fabricated, cacheable completed/tls negative with zero server
+		// interaction — instead of a real verification against the
+		// certificate's IP SANs (NEW-50; mirrors jsintel's newTransport).
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			host = addr
@@ -388,7 +396,7 @@ func newTransport() *http.Transport {
 		if cfg == nil {
 			cfg = &tls.Config{}
 		}
-		if cfg.ServerName == "" && net.ParseIP(host) == nil {
+		if cfg.ServerName == "" {
 			cfg.ServerName = host
 		}
 		// The transport applies TLSHandshakeTimeout only on its own TLS
@@ -703,7 +711,7 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 			}
 			hops[len(hops)-1].Followed = true
 			cur = hop.URL
-			resp.Body.Close()
+			drainFollowedBody(resp.Body)
 			continue
 		}
 
@@ -784,6 +792,28 @@ func countBody(body io.ReadCloser) (size int64, exceeded bool, err error) {
 		return MaxBodyBytes, true, err
 	}
 	return n, false, err
+}
+
+// maxRedirectDrainBytes bounds how much of a FOLLOWED redirect hop's
+// response body is drained before close. A followed hop's body is never
+// retained (only its Location), but closing it undrained defeats the
+// transport's keep-alive connection reuse: an undrained body forces the
+// connection to be discarded and a fresh one dialed per hop. The bound
+// exists because a hostile or broken server can stream a body forever, and
+// no reuse benefit justifies letting it hold the probe open: past the cap
+// the connection is simply closed — only reuse is lost, nothing observed.
+// 4 KiB covers every realistic redirect document many times over while
+// keeping the drain latency negligible.
+const maxRedirectDrainBytes = 4 << 10 // 4 KiB
+
+// drainFollowedBody drains up to maxRedirectDrainBytes of one followed
+// redirect hop's response body and closes it (bounded keep-alive reuse).
+// Drain errors are deliberately ignored — like countBody's, they cannot
+// retroactively fail a received response, and the hop contributes only its
+// Location; the body was never retained in the first place.
+func drainFollowedBody(body io.ReadCloser) {
+	defer body.Close()
+	_, _ = io.CopyN(io.Discard, body, maxRedirectDrainBytes)
 }
 
 // classifyContextError maps a limiter-wait error to a probe outcome: a
