@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-50).
+  next free `NEW-n` (currently NEW-51).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1848,6 +1848,53 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: each batch reviewer-gated; full gates + -race per landing;
   fuzz targets run as seed-corpus tests in CI-normal `go test` (actual
   fuzzing opt-in, evidence recorded).
+- Batch 1 / Task A (OPT-P1-5) IMPLEMENTED (builder session
+  ses_fdbccfbd8ffeJ414r7MFpHI19n; two transport-failed dispatches before the
+  successful resume): internal/jsintel/fetch.go +95/−6 — unexported
+  tlsHandshakeError sentinel (Error+Unwrap) mirroring httpprobe/run.go:360-429;
+  newTransport() gains DialTLSContext (dials via the transport's own
+  DialContext so refused/DNS/timeout stay untagged, TLSHandshakeTimeout
+  bounded, any handshake error wrapped); isTLSError: errors.As sentinel →
+  existing typed checks → NEW typed tls.RecordHeaderError check → text
+  fallback REMOVED. Empirical ground truth (builder, verified by reviewer
+  against go1.26 toolchain source): net/http surfaces raw value-form
+  RecordHeaderError and pre-existing TLS tests passed SOLELY via the removed
+  text fallback — the typed check is load-bearing parity. Deliberate
+  documented deviation from httpprobe: ServerName assigned unconditionally
+  when empty (httpprobe's ParseIP guard makes crypto/tls reject verifying
+  configs outright → every https://IP-literal fetch becomes a fabricated
+  completed/tls negative; see NEW-50). Hostile-string direction-of-change
+  pinned: server-controlled "tls:" text previously misclassified
+  completed/tls (cacheable fabricated negative), now failed/other.
+  Tests: fetch_tls_test.go (~230 lines) — parity table with real stdlib
+  values incl. *tls.CertificateVerificationError wraps, hostile rows unit+
+  e2e, production-transport sentinel regression, and the reviewer-nit
+  discriminating IP-SAN success test (proven failing under reverted guard,
+  passing restored). Reviewer: APPROVE WITH NITS → nit closed this session;
+  no CRITICAL/HIGH; -race clean. Gates: gofmt clean, build OK, vet OK,
+  focused suites ok; orchestrator full-suite gates green post-change.
+
+### NEW-50 (MED) — httpprobe DialTLSContext leaves ServerName empty for IP-literal targets: local config rejection recorded as a TLS negative without any handshake (internal/httpprobe/run.go)
+- Status: OPEN
+- Reporter: builder (OPT-P1-5 batch, NEW-49) + reviewer verification against
+  go1.26 toolchain source
+- Owner: (unassigned)
+- Problem: httpprobe's custom DialTLSContext mirrors the old pattern of
+  setting ServerName only when `net.ParseIP(host) == nil`. crypto/tls rejects
+  a verifying config with empty ServerName outright (handshake_client.go),
+  so an https://<IP-literal> probe fails LOCALLY before any packet is sent
+  and classifies as a TLS-relevant negative — a fabricated, cacheable
+  completed/tls-style record with no server interaction (same §0.6 honesty
+  shape as the hostile-string misclassification fixed in jsintel this
+  batch). net/http's own addTLS sets ServerName unconditionally when empty;
+  jsintel's new DialTLSContext deliberately deviates from httpprobe and
+  documents why (internal/jsintel/fetch.go ~592-600).
+- Fix: assign ServerName unconditionally when empty in httpprobe's dialer
+  (mirroring net/http addTLS + the jsintel implementation), plus a
+  discriminating positive-path test (loopback cert with 127.0.0.1 IP SAN)
+  proving an IP-literal probe completes a REAL handshake.
+- Verification: new test fails pre-fix (fabricated tls negative) and passes
+  post-fix; existing httpprobe TLS tests unchanged; gates + race green.
 
 ## Operational warnings (all agents)
 

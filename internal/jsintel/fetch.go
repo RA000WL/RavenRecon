@@ -565,13 +565,88 @@ func sanitizeHeader(v string, max int) string {
 // are never consulted). Transparent gzip decompression stays ENABLED: the
 // transport hands over the decompressed body, which is what Fetch retains
 // and stores.
+//
+// TLS handshake failures are tagged at the dial boundary: DialTLSContext
+// performs the handshake and wraps ANY handshake error in the typed
+// tlsHandshakeError sentinel, so classification never depends on matching
+// error text (server-controlled bytes can reach error strings via
+// textproto.ProtocolError and net/http's badStringError, so text matching
+// is spoofable). Dial-level failures — connection refused, DNS failures,
+// dial timeouts — happen in DialContext BEFORE the handshake and pass
+// through untagged, keeping their own classification. Mirrors the
+// httpprobe production transport.
 func newTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxResponseHeaderBytes = MaxHeaderBytes
 	t.ResponseHeaderTimeout = 30 * time.Second
 	t.Proxy = nil // direct only: a stray environment proxy must never silently reroute fetching
+	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Dial through the transport's own DialContext so dial-level
+		// failures (refused, DNS, timeout) keep the classification the
+		// default TLS path gives them; only the handshake itself is
+		// tagged.
+		plain, err := t.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// The transport normally derives ServerName from the request host
+		// (addTLS); with a custom dialer the address is all we have.
+		// Unlike httpprobe's dialer, ServerName is set UNCONDITIONALLY
+		// when empty — including for IP literals, exactly like net/http's
+		// addTLS does: crypto/tls rejects a verifying config with an empty
+		// ServerName outright ("either ServerName or InsecureSkipVerify"),
+		// so skipping IPs here would turn every https://IP/ fetch into an
+		// instant handshake failure instead of a real verification against
+		// the certificate's IP SANs.
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		cfg := t.TLSClientConfig.Clone()
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		if cfg.ServerName == "" {
+			cfg.ServerName = host
+		}
+		// The transport applies TLSHandshakeTimeout only on its own TLS
+		// path (addTLS); the custom dialer must bound the handshake
+		// itself. A timeout surfaces as context.DeadlineExceeded wrapped
+		// in the sentinel and classifies failed/timeout, exactly like the
+		// default path's handshake-timeout error (the context checks run
+		// before the TLS checks in classifyFetchError).
+		hsCtx := ctx
+		var cancel context.CancelFunc
+		if d := t.TLSHandshakeTimeout; d > 0 {
+			hsCtx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+		tlsConn := tls.Client(plain, cfg)
+		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+			plain.Close()
+			return nil, &tlsHandshakeError{err: err}
+		}
+		return tlsConn, nil
+	}
 	return t
 }
+
+// tlsHandshakeError tags an error as a TLS handshake failure observed at the
+// dial boundary (the production transport's DialTLSContext). Classification
+// matches this type structurally — never error text — so a hostile server
+// that embeds "tls:"-looking text in a malformed response cannot fabricate
+// a TLS observation (a cached completed negative). Unwrap keeps the
+// underlying stdlib error reachable for the typed checks (tls.AlertError,
+// tls.RecordHeaderError, tls.CertificateVerificationError, the x509 set)
+// and for context-error classification (cancellation and deadline checks
+// run before the TLS checks, so a cancelled or timed-out handshake keeps
+// its own outcome). Mirrors the httpprobe sentinel.
+type tlsHandshakeError struct{ err error }
+
+func (e *tlsHandshakeError) Error() string {
+	return "jsintel: tls handshake failed: " + e.err.Error()
+}
+func (e *tlsHandshakeError) Unwrap() error { return e.err }
 
 // isRedirectCode reports whether status is a followable redirect status.
 func isRedirectCode(status int) bool {
@@ -645,14 +720,28 @@ func classifyFetchError(ctx context.Context, err error) (FetchStatus, FetchReaso
 }
 
 // isTLSError reports whether err stems from a TLS handshake failure:
-// protocol alerts, certificate verification failures, or the crypto/tls
-// text errors ("tls: first record does not look like a TLS handshake").
-// The text check is a last resort because crypto/tls surfaces some
-// handshake failures as plain errors; the texts are stdlib-fixed and never
-// server-controlled.
+// the dial-boundary sentinel (the production transport's DialTLSContext
+// tags every handshake error), protocol alerts, record-header failures
+// ("first record does not look like a TLS handshake"), certificate
+// verification failures, or the x509 error set. Classification is strictly
+// structural — there is deliberately NO error-text fallback: the stdlib
+// embeds raw server bytes in some error strings (textproto.ProtocolError,
+// net/http's badStringError), so matching "tls:" text would let a hostile
+// server fabricate a TLS observation (and with it a completed cache
+// record). The typed checks also cover errors from caller-injected
+// transports, whose handshake failures never cross our dial boundary.
+// Mirrors the httpprobe classifier.
 func isTLSError(err error) bool {
+	var hsErr *tlsHandshakeError
+	if errors.As(err, &hsErr) {
+		return true
+	}
 	var alert tls.AlertError
 	if errors.As(err, &alert) {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
 		return true
 	}
 	var verifyErr *tls.CertificateVerificationError
@@ -675,5 +764,5 @@ func isTLSError(err error) bool {
 	if errors.As(err, &rootsErr) {
 		return true
 	}
-	return strings.Contains(err.Error(), "tls:")
+	return false
 }
