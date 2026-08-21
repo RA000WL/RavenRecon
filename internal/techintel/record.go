@@ -1,6 +1,9 @@
 package techintel
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -58,6 +61,89 @@ type storedTech struct {
 	Overflow        Overflow            `json:"overflow,omitempty"`
 	FirstSeen       time.Time           `json:"first_seen"`
 	LastSeen        time.Time           `json:"last_seen"`
+	ContentHash     string              `json:"content_hash,omitempty"`
+}
+
+// observationContentHash computes a deterministic SHA-256 digest of the
+// observation payload that materially affects detections: headers, body,
+// cookies, TLS metadata, and DNS metadata. The hash is stored in the cache
+// record and cross-validated at lookup: a page whose content changed between
+// runs (same URL identity, same sources mask, different body/headers) must
+// never be served stale detections. The digest covers every result-relevant
+// field of the normalized observation (after prepareObservation's truncation)
+// and uses length-prefixed binary encoding so the hash is unambiguous
+// regardless of embedded delimiters. The URL identity and status code are
+// deliberately excluded: the identity is already the cache key's target and
+// the status code is never analyzed, so it cannot change a result.
+func observationContentHash(o Observation) string {
+	h := sha256.New()
+	writeString := func(s string) {
+		var lb [8]byte
+		binary.BigEndian.PutUint64(lb[:], uint64(len(s)))
+		h.Write(lb[:])
+		h.Write([]byte(s))
+	}
+	writeStrings := func(tag byte, strs []string) {
+		h.Write([]byte{tag})
+		var lb [8]byte
+		binary.BigEndian.PutUint64(lb[:], uint64(len(strs)))
+		h.Write(lb[:])
+		for _, s := range strs {
+			writeString(s)
+		}
+	}
+	// Body
+	h.Write([]byte{'B'})
+	writeString(o.Body)
+	// Headers (ordered)
+	h.Write([]byte{'H'})
+	var lb [8]byte
+	binary.BigEndian.PutUint64(lb[:], uint64(len(o.Headers)))
+	h.Write(lb[:])
+	for _, e := range o.Headers {
+		writeString(e.Name)
+		writeString(e.Value)
+	}
+	// Cookies (ordered)
+	h.Write([]byte{'C'})
+	binary.BigEndian.PutUint64(lb[:], uint64(len(o.Cookies)))
+	h.Write(lb[:])
+	for _, c := range o.Cookies {
+		writeString(c.Name)
+		writeString(c.Value)
+	}
+	// TLS
+	h.Write([]byte{'T'})
+	if o.TLS == nil {
+		h.Write([]byte{0})
+	} else {
+		h.Write([]byte{1})
+		writeString(o.TLS.Issuer)
+		writeString(o.TLS.Subject)
+		writeStrings('A', o.TLS.ALPN)
+		writeStrings('N', o.TLS.DNSNames)
+	}
+	// DNS
+	h.Write([]byte{'D'})
+	if o.DNS == nil {
+		h.Write([]byte{0})
+	} else {
+		h.Write([]byte{1})
+		writeStrings('S', o.DNS.CNAMEChain)
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum)
+}
+
+// lowerHex reports whether s is exactly lowercase hex.
+func lowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // encodeStoredTech serializes one completed observation's entry into a
@@ -94,6 +180,7 @@ func encodeStoredTech(o Observation, entry ReportEntry, mask string, now time.Ti
 		Overflow:        entry.Overflow,
 		FirstSeen:       entry.FirstSeen,
 		LastSeen:        entry.LastSeen,
+		ContentHash:     observationContentHash(o),
 	}
 	data, err := json.Marshal(st)
 	if err != nil {
@@ -143,6 +230,12 @@ func decodeStoredTech(rec cache.Record, o Observation, wantMask string, capTech,
 	}
 	if s.Sources != wantMask {
 		return nil, fmt.Errorf("record sources %q != %q", s.Sources, wantMask)
+	}
+	if s.ContentHash == "" {
+		return nil, fmt.Errorf("record has no content hash")
+	}
+	if len(s.ContentHash) != 64 || !lowerHex(s.ContentHash) {
+		return nil, fmt.Errorf("record content hash %q is not 64 lowercase hex digits", s.ContentHash)
 	}
 	if len(s.Technologies) != len(s.Levels) {
 		return nil, fmt.Errorf("record has %d technologies but %d levels", len(s.Technologies), len(s.Levels))

@@ -569,6 +569,23 @@ func lookupTech(ctx context.Context, key cache.Key, o Observation, e *env) *Repo
 			e.recordCacheDiagnostic("delete", e.cache.Delete(ctx, key))
 			return nil
 		}
+		// Content binding: stale content must never be served. The record's
+		// analysis is only valid for the content it was derived from; a hash
+		// mismatch means the page changed since the record was stored (fresh
+		// body/headers/cookies, old analysis) — delete it so the fresh
+		// analysis overwrites the same key in this run (self-healing) and fall
+		// through as a routine miss. The record itself is well-formed (decode
+		// passed) and legitimate — it was written by an earlier run for
+		// earlier content — so this is a normal lifecycle event, not an
+		// anomaly, and carries no diagnostic (mirroring jsintel's
+		// AnalyzedHash cross-validation).
+		curHash := observationContentHash(o)
+		if s.ContentHash != curHash {
+			if err := e.cache.Delete(ctx, key); err != nil {
+				e.recordCacheDiagnostic("delete", err)
+			}
+			return nil
+		}
 		entry := entryFromStored(o, s)
 		return &entry
 	case cache.StateExpired:
