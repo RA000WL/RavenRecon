@@ -1933,6 +1933,48 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   asserting the record is served and the sticky flag fires on the warm run.
 - Verification: test fails if NewFinding stops preserving the field; gates
   green.
+- Batch 2 (OPT-P1-3 fuzz harnesses + property tests) IMPLEMENTED (builders
+  ses_fdb856014ffeclxaS731gQjYZT [2a: asset/discovery/urlintel] +
+  ses_fdb856013ffeAd6ArIEaGT7kec [2b: jsintel/secrentel/cache/report]; one
+  transport-failed dispatch each, recovered via session-resume):
+  EIGHT native go fuzzing targets, all asserting real invariants inside the
+  body (not no-panic-only), all passing as ordinary seed tests under plain
+  `go test`: FuzzParseURL (22 seeds; re-parse→identical Identity + String()
+  fixed point), FuzzParseHostLines (identity re-validation through
+  asset.NewHost — no second normalizer; strictly-ascending output;
+  determinism), FuzzParseRawURL (urlintel engine.go:554ff verified PURE;
+  credential-redaction postcondition Original==canonical, no @ in hostport),
+  FuzzParseSource (jsintel lexer/parser; maxParseInputBytes both directions;
+  Truncated-honesty contrapositive; scan-budget termination),
+  FuzzScanDocument (production patterns.Load; candidate cap; (type,value)
+  dedup), FuzzStoredRecordDecode (cache readEntry/evaluate/self-heal:
+  garbage never served valid, corrupt entries physically removed),
+  FuzzRenderCSV (rectangular strict-reader output incl. formula-injection
+  hostile strings; byte-determinism), FuzzErrorContext (fixed category
+  vocabulary; normalize bounds). Property tests (asset/property_test.go):
+  testing/quick parse→Identity→parse round-trip (2000 cases + 11-row
+  fixed-point table), merge idempotence ×6 kinds (+commutativity where
+  documented), dedup invariants with exact-value pins. Reviewer verified
+  non-vacuous. FUZZ CRASHER → PRODUCTION FIX (see commit d10d719-successor):
+  sortQuery sorted by decode of the RAW key, falling back to raw on invalid
+  percent escapes while emission rewrote keys (' '→%20) → canonicalization
+  NOT idempotent ("A://0? %0& 0" oscillated between two identities across
+  parses) → MergeURLs refused merges of identical logical URLs. Fix: sort by
+  decode of the EMITTED key form. Reviewer mechanically verified: brute-force
+  over 4,146 adversarial keys — new sort key byte-identical to old whenever
+  old decode succeeded; fixed-point convergence after ONE canonicalization
+  for the buggy class (replica-proven); sibling-bug hunt clean (values never
+  ordered; Identity() consumes canonical form; §0.5 intact); cache split is
+  miss→recompute→self-heal only, false hits impossible. Crash input kept as
+  regression corpus internal/asset/testdata/fuzz/FuzzParseURL/11c448db5136086d.
+  Fuzz evidence: 20s/target campaigns post-fix all PASS (~94k-157k execs/s;
+  FuzzErrorContext ~2.78M execs). dns/resolver.go descope note: its only
+  boundary is network I/O behind net.Resolver — no pure parse function to
+  fuzz; recorded here as the honest OPT-P1-3 disposition for that cited site.
+  Reviewer APPROVE WITH NITS (zero findings above INFO: one non-discriminating
+  fixed-point table row = coverage redundancy; equal-decode tie ordering
+  pre-existing/documented). Gates: gofmt clean, build/vet OK, focused suites
+  ok incl. -race; orchestrator full-suite + race green post-change.
 
 ### NEW-50 (MED) — httpprobe DialTLSContext leaves ServerName empty for IP-literal targets: local config rejection recorded as a TLS negative without any handshake (internal/httpprobe/run.go)
 - Status: OPEN
