@@ -319,6 +319,14 @@ func TestUrlliveStageCancellation(t *testing.T) {
 	if res.Outcome != pipeline.OutcomeCancelled {
 		t.Fatalf("Outcome = %q, want cancelled", res.Outcome)
 	}
+	// A cut-short triage must be marked truncated (AGENTS §0.6): the
+	// retained records are an incomplete set.
+	if !res.Truncated {
+		t.Fatal("Truncated = false, want true for a cancelled triage")
+	}
+	if !res.StickyFlags[UrlliveStickyFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set", res.StickyFlags, UrlliveStickyFlag)
+	}
 }
 
 type blockingTransport struct{ block chan struct{} }

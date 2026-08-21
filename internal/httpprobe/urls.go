@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
@@ -18,6 +19,17 @@ import (
 )
 
 // LiveOperation is the cache operation for URL liveness triage.
+
+const (
+	// liveRequestTimeoutDefault is the per-URL deadline for ProbeURLs when
+	// the caller leaves RequestTimeout unset: triage semantics favor
+	// coverage over patience (a dead host costs 5 s, not the 10 s host-probe
+	// default). Explicit Config values always win.
+	liveRequestTimeoutDefault = 5 * time.Second
+	// liveConcurrencyDefault widens the probe pool for large URL corpora
+	// when the caller leaves Concurrency unset.
+	liveConcurrencyDefault = 20
+)
 const LiveOperation = "urllive.probe"
 
 // LiveRecord is the liveness observation for one URL. It is the Results
@@ -135,6 +147,21 @@ func ProbeURLs(ctx context.Context, domain asset.Domain, urls []asset.URL, cfg C
 	}
 	if len(norm) == 0 {
 		return LiveReport{Target: domain}, nil
+	}
+	// Triage defaults: ProbeURLs is a liveness triage pass over potentially
+	// thousands of URLs, not a deep host probe. When the caller leaves the
+	// knobs unset, use a shorter per-URL deadline and a wider pool than the
+	// host-probe defaults so a large corpus fits inside a shared stage
+	// budget (field trial 3: 8,254 URLs — 10 s per dead host starved the
+	// stage deadline). Explicit caller values always win.
+	if cfg.RequestTimeout == 0 {
+		cfg.RequestTimeout = liveRequestTimeoutDefault
+	}
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = liveConcurrencyDefault
+	}
+	if cfg.QueueSize == 0 {
+		cfg.QueueSize = cfg.Concurrency
 	}
 	e, err := buildEnv(cfg, map[string]asset.IP{})
 	if err != nil {

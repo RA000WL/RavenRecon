@@ -138,7 +138,12 @@ func (s *urlliveStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 
 	if err != nil && ctx.Err() != nil {
 		joined := fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), err))
-		return buildUrlliveResult(report, pipeline.OutcomeCancelled, joined), nil
+		res := buildUrlliveResult(report, pipeline.OutcomeCancelled, joined)
+		// The stage budget fired mid-triage: the retained records are an
+		// incomplete set. Mark truncation honestly (flag + Truncated) so
+		// consumers never treat a cancelled triage as complete (AGENTS §0.6).
+		markUrlliveCutShort(&res)
+		return res, nil
 	}
 	if err != nil {
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
@@ -146,10 +151,23 @@ func (s *urlliveStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 	}
 	if ctx.Err() != nil {
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), ctx.Err())
-		return buildUrlliveResult(report, pipeline.OutcomeCancelled, wrapped), nil
+		res := buildUrlliveResult(report, pipeline.OutcomeCancelled, wrapped)
+		markUrlliveCutShort(&res)
+		return res, nil
 	}
 
 	return buildUrlliveResult(report, foldUrlliveOutcomes(report), nil), nil
+}
+
+// markUrlliveCutShort flags a triage that ended before every URL was probed
+// (stage deadline / cancellation): Truncated + urllive_truncated, preserving
+// any flags buildUrlliveResult already set.
+func markUrlliveCutShort(res *pipeline.StageResult) {
+	res.Truncated = true
+	if res.StickyFlags == nil {
+		res.StickyFlags = map[string]bool{}
+	}
+	res.StickyFlags[UrlliveStickyFlag] = true
 }
 
 // buildUrlliveResult maps one engine live report onto the pipeline's

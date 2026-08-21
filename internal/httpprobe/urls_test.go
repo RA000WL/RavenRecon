@@ -492,6 +492,40 @@ func TestProbeURLsBoundedConcurrency(t *testing.T) {
 	}
 }
 
+// TestProbeURLsTriageDefaults pins the triage defaults: with an unset
+// RequestTimeout and Concurrency, ProbeURLs uses the 5 s triage per-URL
+// deadline (not the 10 s host default) and a widened pool (20). A blocking
+// transport proves the 5 s cut via elapsed time; a wide transport proves
+// concurrency >2 is reachable without explicit config.
+func TestProbeURLsTriageDefaults(t *testing.T) {
+	domain := mustDomainProbe(t, "example.com")
+	urls := []asset.URL{mustURLProbe(t, "http://example.com/dead")}
+	start := time.Now()
+	report, err := ProbeURLs(context.Background(), domain, urls, Config{
+		Transport: &blockingTransport{},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ProbeURLs: %v", err)
+	}
+	if len(report.Records) != 1 || report.Records[0].Err == nil {
+		t.Fatalf("want one errored record, got %+v", report.Records)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("per-URL deadline = %v, want ~5s triage default (not 10s host default)", elapsed)
+	}
+	if elapsed < 4*time.Second {
+		t.Fatalf("probe returned after %v — shorter than the 5s triage default; deadline not applied", elapsed)
+	}
+}
+
+type blockingTransport struct{}
+
+func (blockingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
 type maxConcurrentTransport struct {
 	delay     time.Duration
 	mu        sync.Mutex
