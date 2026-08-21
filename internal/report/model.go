@@ -964,12 +964,37 @@ type digestPayload struct {
 // The converse does not hold — the digest covers the full merged error
 // records while the exports only summarize them — so identical exports
 // can still differ in digest.
+//
+// Wall-clock timing (StartedAt, EndedAt, Duration, WorkerTime) is
+// deliberately excluded from the digest input: the digest is the
+// render-cache key (report:digest) and must remain stable when an
+// honest run duration is carried into the Model's RunSummary. Two
+// reports with identical content but different wall-clock brackets
+// therefore share the same digest and the same cache entry; the JSON
+// export still carries the honest wall-clock times.
 func computeDigest(m *Model) (string, error) {
+	// Timing is wall-clock metadata, not content: exclude it from the
+	// digest so the same logical report remains cache-hit stable across
+	// different run brackets (OPT-P0-5). Every other field is digested
+	// exactly as the JSON export renders it.
+	statsForDigest := m.Stats
+	statsForDigest.Duration = 0
+	// Runtime.WorkerTime is also wall-clock derived (pool event
+	// timestamps) — exclude it as well so worker-time jitter does not
+	// perturb the cache key; the JSON still reports it honestly.
+	statsForDigest.Runtime.WorkerTime = 0
+	summaryForDigest := m.Summary
+	summaryForDigest.StartedAt = time.Time{}
+	summaryForDigest.EndedAt = time.Time{}
+	summaryForDigest.Duration = 0
+	summaryForDigest.WorkerTime = 0
+	runtimeForDigest := m.Runtime
+	runtimeForDigest.WorkerTime = 0
 	p := digestPayload{
-		Schema:          m.SchemaVersion,
-		Target:          m.Target,
-		StartedAt:       m.StartedAt,
-		EndedAt:         m.EndedAt,
+		Schema: m.SchemaVersion,
+		Target: m.Target,
+		// StartedAt and EndedAt are wall-clock brackets — excluded
+		// from the digest for the same stability reason (see above).
 		Domains:         m.Domains,
 		Hosts:           m.Hosts,
 		IPs:             m.IPs,
@@ -990,10 +1015,10 @@ func computeDigest(m *Model) (string, error) {
 		Groups:          m.Groups,
 		AttackPaths:     m.AttackPaths,
 		Recommendations: m.Recommendations,
-		Statistics:      m.Stats,
-		Summary:         m.Summary,
+		Statistics:      statsForDigest,
+		Summary:         summaryForDigest,
 		ErrorRecords:    m.errorRecords,
-		Runtime:         m.Runtime,
+		Runtime:         runtimeForDigest,
 		Cache:           m.Cache,
 		Execution:       m.Execution,
 	}

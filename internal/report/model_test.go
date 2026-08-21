@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"math"
@@ -390,5 +391,118 @@ func TestKnownErrorCategoriesSorted(t *testing.T) {
 		if !c.Valid() {
 			t.Fatalf("known category %q reports invalid", c)
 		}
+	}
+}
+
+// TestReportHonestDuration pins OPT-P0-5: the report's run duration is
+// honest wall-clock (pipeline's StartAt/EndAt via the injected clock),
+// not the summary-write time. A model bracketed 5s apart must carry
+// Duration 5s (5000 ms) in both Statistics and RunSummary, the JSON
+// export must render duration_ms 5000, and the digest must remain stable
+// when only wall-clock timing changes (identical content, different
+// brackets, same digest — the render-cache key is content-addressed).
+func TestReportHonestDuration(t *testing.T) {
+	start := fixedTime
+	end := fixedTime.Add(5 * time.Second)
+
+	// Honest 5s bracket.
+	c1 := testContext(t)
+	c1.StartedAt = start
+	c1.EndedAt = end
+	m1, err := NewModel(c1)
+	if err != nil {
+		t.Fatalf("model honest: %v", err)
+	}
+	if m1.StartedAt != start || m1.EndedAt != end {
+		t.Fatalf("model bracket = %v..%v, want %v..%v", m1.StartedAt, m1.EndedAt, start, end)
+	}
+	if m1.Stats.Duration != 5000 {
+		t.Fatalf("statistics duration = %d ms, want 5000", m1.Stats.Duration)
+	}
+	if m1.Summary.Duration != 5000 {
+		t.Fatalf("summary duration = %d ms, want 5000", m1.Summary.Duration)
+	}
+	if !m1.Summary.StartedAt.Equal(start) || !m1.Summary.EndedAt.Equal(end) {
+		t.Fatalf("summary bracket = %v..%v, want %v..%v", m1.Summary.StartedAt, m1.Summary.EndedAt, start, end)
+	}
+	if !m1.Summary.EndedAt.After(m1.Summary.StartedAt) {
+		t.Fatalf("summary EndAt %v not after StartAt %v", m1.Summary.EndedAt, m1.Summary.StartedAt)
+	}
+
+	// JSON export carries the honest wall-clock: started_at < ended_at
+	// and duration_ms 5000 (the machine-readable report the pipeline
+	// exposes). The digest input excludes wall-clock, so the JSON is
+	// the only place the honest duration surfaces.
+	jsonRep := builtin(t, "json")
+	parts := renderToMem(t, jsonRep, m1)
+	raw, ok := parts[""]
+	if !ok || len(raw) == 0 {
+		t.Fatalf("json render produced no bytes")
+	}
+	var doc struct {
+		StartedAt time.Time  `json:"started_at"`
+		EndedAt   time.Time  `json:"ended_at"`
+		Stats     Statistics `json:"statistics"`
+		Summary   RunSummary `json:"summary"`
+		Digest    string     `json:"digest"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode json export: %v", err)
+	}
+	if doc.Stats.Duration != 5000 {
+		t.Fatalf("json statistics duration_ms = %d, want 5000", doc.Stats.Duration)
+	}
+	if doc.Summary.Duration != 5000 {
+		t.Fatalf("json summary duration_ms = %d, want 5000", doc.Summary.Duration)
+	}
+	if !doc.Summary.StartedAt.Equal(start) || !doc.Summary.EndedAt.Equal(end) {
+		t.Fatalf("json summary bracket = %v..%v, want %v..%v", doc.Summary.StartedAt, doc.Summary.EndedAt, start, end)
+	}
+	if doc.Summary.Duration == 0 {
+		t.Fatalf("json summary duration_ms 0, want >0 (honest wall-clock)")
+	}
+
+	// Digest stability: identical content with a different wall-clock
+	// bracket must produce the same digest. The wall-clock is
+	// presentation-only — it never perturbs the cache key.
+	c2 := testContext(t)
+	c2.StartedAt = start.Add(1 * time.Hour)
+	c2.EndedAt = c2.StartedAt.Add(5 * time.Second)
+	m2, err := NewModel(c2)
+	if err != nil {
+		t.Fatalf("model second bracket: %v", err)
+	}
+	if m2.Stats.Duration != 5000 || m2.Summary.Duration != 5000 {
+		t.Fatalf("second bracket duration = %d / %d, want 5000", m2.Stats.Duration, m2.Summary.Duration)
+	}
+	if m1.Digest != m2.Digest {
+		t.Fatalf("digest changed when only wall-clock timing changed: %s vs %s (timing must be excluded from digest)", m1.Digest, m2.Digest)
+	}
+	// WorkerTime jitter must also not perturb the digest: same logical
+	// report with different worker-time still digests equal.
+	c3 := testContext(t)
+	c3.StartedAt = start
+	c3.EndedAt = end
+	c3.Runtime.WorkerTime = Ms(1234 * time.Millisecond)
+	m3, err := NewModel(c3)
+	if err != nil {
+		t.Fatalf("model worker-time variant: %v", err)
+	}
+	if m3.Digest != m1.Digest {
+		t.Fatalf("digest changed when only worker-time changed: %s vs %s (worker-time must be excluded)", m1.Digest, m3.Digest)
+	}
+	// Zero bracket stays honest: duration 0, digest still stable.
+	c0 := testContext(t)
+	c0.StartedAt = start
+	c0.EndedAt = start
+	m0, err := NewModel(c0)
+	if err != nil {
+		t.Fatalf("model zero bracket: %v", err)
+	}
+	if m0.Stats.Duration != 0 || m0.Summary.Duration != 0 {
+		t.Fatalf("zero bracket duration = %d / %d, want 0", m0.Stats.Duration, m0.Summary.Duration)
+	}
+	if m0.Digest != m1.Digest {
+		t.Fatalf("digest changed between zero and honest bracket: %s vs %s (wall-clock must be excluded)", m0.Digest, m1.Digest)
 	}
 }
