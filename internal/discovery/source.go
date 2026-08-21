@@ -45,7 +45,7 @@ type DiscoverResult struct {
 
 // builtInNames returns the built-in sources in stable order. Cache keys, the
 // CLI, and the doctor all order on this.
-func builtInNames() []string { return []string{"subfinder", "assetfinder", "amass"} }
+func builtInNames() []string { return []string{"subfinder", "assetfinder", "amass", "chaos"} }
 
 // registry maps source names to their adapters, constructed with the tool
 // environment for one run.
@@ -53,6 +53,7 @@ var registry = map[string]func(e toolEnv) Source{
 	"subfinder":   func(e toolEnv) Source { return subfinder{env: e} },
 	"assetfinder": func(e toolEnv) Source { return assetfinder{env: e} },
 	"amass":       func(e toolEnv) Source { return amass{env: e} },
+	"chaos":       func(e toolEnv) Source { return chaos{env: e} },
 }
 
 // runAndParse executes one tool invocation and normalizes its stdout. It is

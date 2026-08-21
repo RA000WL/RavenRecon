@@ -1251,14 +1251,17 @@ type smokeScriptEntry struct {
 // smokeScript keys are "path " + strings.Join(args, " "), following the
 // scripted shape from internal/pipeline/adapt/t4_determinism_test.go:
 // every detection probe is answered, the in-scope host is emitted, and
-// gau completes cleanly with nothing to add.
+// gau completes cleanly with nothing to add. Chaos is answered as well
+// (PDCP_API_KEY is set by the test harness; chaos returns the same host).
 var smokeScript = map[string]smokeScriptEntry{
 	"subfinder -version":                 {stdout: "Current Version: v2.6.3\n"},
 	"assetfinder -h":                     {stderr: "Usage: assetfinder [domain]\n", exitCode: 2},
 	"amass -version":                     {stdout: "v3.23.0\n"},
+	"chaos -version":                     {stdout: "chaos v0.5.3\n"},
 	"subfinder -d example.com -silent":   {stdout: "www.example.com\n"},
 	"assetfinder example.com":            {stdout: "www.example.com\n"},
 	"amass enum -passive -d example.com": {stdout: "www.example.com\n"},
+	"chaos -d example.com -silent -json": {stdout: "{\"domain\":\"www.example.com\"}\n"},
 	"gau -version":                       {stdout: "v1.11.0\n"},
 	"gau example.com":                    {},
 }
@@ -1385,6 +1388,7 @@ func smokeScanStages(runner *smokeRunner, tr *smokeTransport, cfgSink *pipeline.
 // report.NewDefaultRegistry's four builtin reporters — all genuinely
 // loaded. Cache is off (the single-shot default).
 func TestRunScanSmokeE2E(t *testing.T) {
+	t.Setenv("PDCP_API_KEY", "testkey")
 	tr := &smokeTransport{}
 	runner := newSmokeRunner()
 	stages := smokeScanStages(runner, tr, nil)

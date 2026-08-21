@@ -110,8 +110,8 @@ func TestRunConcurrentCacheAccess(t *testing.T) {
 		}
 	}
 	for i := range reps {
-		if len(reps[i].Results) != 3 {
-			t.Fatalf("run %d results = %d, want 3", i, len(reps[i].Results))
+		if len(reps[i].Results) != 4 {
+			t.Fatalf("run %d results = %d, want 4", i, len(reps[i].Results))
 		}
 	}
 
@@ -122,6 +122,7 @@ func TestRunConcurrentCacheAccess(t *testing.T) {
 	}{
 		{"subfinder", "v2.6.3"},
 		{"amass", "v3.23.0"},
+		{"chaos", "v0.5.3"},
 	} {
 		k := keyFor(t, target, tc.src, tc.ver)
 		out := c.Get(context.Background(), k)

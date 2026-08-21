@@ -49,8 +49,8 @@ func TestRunCacheMissThenHit(t *testing.T) {
 	target := mustDomain(t, "example.com")
 
 	rep1 := mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != 3 {
-		t.Fatalf("first run executes = %d, want 3", got)
+	if got := r.discoverCallCount(); got != 4 {
+		t.Fatalf("first run executes = %d, want 4", got)
 	}
 
 	// Every versioned source stored a completed record.
@@ -77,7 +77,7 @@ func TestRunCacheMissThenHit(t *testing.T) {
 		t.Fatalf("unknown-version assetfinder must never be cached, got state %s", o.State)
 	}
 
-	// Second run: subfinder and amass are served from cache; assetfinder
+	// Second run: subfinder, amass, chaos are served from cache; assetfinder
 	// (unknown version) re-executes.
 	execsBefore := r.discoverCallCount()
 	rep2 := mustRun(t, target, cfg)
@@ -86,7 +86,7 @@ func TestRunCacheMissThenHit(t *testing.T) {
 	}
 	for i := range rep2.Results {
 		switch rep2.Results[i].Source {
-		case "subfinder", "amass":
+		case "subfinder", "amass", "chaos":
 			if !rep2.Results[i].Cached {
 				t.Fatalf("%s result not served from cache", rep2.Results[i].Source)
 			}
@@ -123,8 +123,8 @@ func TestRunCacheDisabledExecutesEveryTime(t *testing.T) {
 	target := mustDomain(t, "example.com")
 	mustRun(t, target, cfg)
 	mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != 6 {
-		t.Fatalf("executes = %d, want 6 (two uncached runs)", got)
+	if got := r.discoverCallCount(); got != 8 {
+		t.Fatalf("executes = %d, want 8 (two uncached runs × 4 sources)", got)
 	}
 }
 
@@ -162,7 +162,7 @@ func TestRunCachePartialStoredIncomplete(t *testing.T) {
 		t.Fatalf("partial data must retain the discovered host: %s", out.Record.Data)
 	}
 	// A later run must re-execute the partial source (and assetfinder, which
-	// is never cached); amass is served from cache.
+	// is never cached); amass and chaos are served from cache.
 	execs := r.discoverCallCount()
 	mustRun(t, target, cfg)
 	if got := r.discoverCallCount(); got != execs+2 {
@@ -234,7 +234,7 @@ func TestRunCacheFailedStored(t *testing.T) {
 	execs := r.discoverCallCount()
 	mustRun(t, target, cfg)
 	if got := r.discoverCallCount(); got != execs+2 {
-		t.Fatalf("later run must re-execute the failed source (and the never-cached assetfinder): %d -> %d", execs, got)
+		t.Fatalf("later run must re-execute the failed source (and the never-cached assetfinder): %d -> %d (amass and chaos cached)", execs, got)
 	}
 }
 
@@ -288,7 +288,7 @@ func TestRunCacheTTLExpiry(t *testing.T) {
 
 	clk.advance(2 * time.Hour)
 	mustRun(t, target, cfg)
-	if got := r.discoverCallCount(); got != execs+3 {
+	if got := r.discoverCallCount(); got != execs+4 {
 		t.Fatalf("expired records must re-execute: %d -> %d", execs, got)
 	}
 }
@@ -624,9 +624,9 @@ func TestRunCacheTamperedRecordSelfHeals(t *testing.T) {
 			if res2.Status != OutCompleted || len(res2.Hosts) != 2 {
 				t.Fatalf("run 2 = %s with %d hosts, want completed with the canonical hosts", res2.Status, len(res2.Hosts))
 			}
-			if execCalls != 1 || r.discoverCallCount() != execsBefore+4 {
+			if execCalls != 1 || r.discoverCallCount() != execsBefore+5 {
 				t.Fatalf("run 2 must not execute: subfinder executions = %d, discovery calls %d -> %d (want %d: each source once in run 1, plus the never-cached assetfinder in run 2)",
-					execCalls, execsBefore, r.discoverCallCount(), execsBefore+4)
+					execCalls, execsBefore, r.discoverCallCount(), execsBefore+5)
 			}
 
 			// Run 3: still a hit; the healed record is stable.
@@ -664,8 +664,8 @@ func TestRunCachePutFailureSurfacesError(t *testing.T) {
 	// Every versioned source attempted (and failed) its write; the never-
 	// cached assetfinder (unknown version) must not attempt one. The loss of
 	// the error would have made the warning invisible.
-	if got := fc.putCount(); got != 2 {
-		t.Fatalf("cache puts attempted = %d, want 2 (subfinder + amass)", got)
+	if got := fc.putCount(); got != 3 {
+		t.Fatalf("cache puts attempted = %d, want 3 (subfinder + amass + chaos)", got)
 	}
 }
 
@@ -709,10 +709,13 @@ func TestRunCacheVersionChangeReexecutes(t *testing.T) {
 	if execCalls != 2 {
 		t.Fatalf("subfinder executions = %d, want 2", execCalls)
 	}
-	// amass's version did not change, so it keeps serving from cache; the
+	// amass and chaos versions did not change, so they keep serving from cache; the
 	// never-cached assetfinder re-executes by policy.
 	if !rep2.Results[2].Cached {
 		t.Fatal("amass must stay cached when its version is unchanged")
+	}
+	if !rep2.Results[3].Cached {
+		t.Fatal("chaos must stay cached when its version is unchanged")
 	}
 	if rep2.Results[1].Cached {
 		t.Fatal("the unknown-version assetfinder must never be served from cache")

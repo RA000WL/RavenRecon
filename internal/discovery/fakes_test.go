@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,16 @@ import (
 
 // fixedTime is the deterministic timestamp used by most fake environments.
 var fixedTime = time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+
+func init() {
+	// Chaos requires PDCP_API_KEY; the default fake environment assumes it is
+	// present so the four-tool default (subfinder, assetfinder, amass, chaos)
+	// exercises as completed. Tests that exercise the missing-key path set it
+	// to empty explicitly via t.Setenv.
+	if os.Getenv("PDCP_API_KEY") == "" {
+		_ = os.Setenv("PDCP_API_KEY", "testkey")
+	}
+}
 
 // fakeClock is a mutex-guarded mutable clock for deterministic provenance and
 // cache TTL tests. It is safe for concurrent use (jobs run on pool workers).
@@ -275,9 +286,11 @@ func mustDomain(t *testing.T, name string) asset.Domain {
 	return d
 }
 
-// standardScript returns canned responses for all three tools against
+// standardScript returns canned responses for all four tools against
 // example.com, with an assetfinder -h invocation that exits 2 (Go's flag
-// package behavior) while printing usage to stderr.
+// package behavior) while printing usage to stderr. Chaos requires
+// PDCP_API_KEY; the fake assumes it is present (tests that exercise the
+// missing-key path set it to empty explicitly).
 func standardScript() map[string]func(Cmd) (RunResult, error) {
 	return map[string]func(Cmd) (RunResult, error){
 		"subfinder -version": func(Cmd) (RunResult, error) {
@@ -288,6 +301,9 @@ func standardScript() map[string]func(Cmd) (RunResult, error) {
 		},
 		"amass -version": func(Cmd) (RunResult, error) {
 			return RunResult{Stdout: []byte("v3.23.0\n")}, nil
+		},
+		"chaos -version": func(Cmd) (RunResult, error) {
+			return RunResult{Stdout: []byte("chaos v0.5.3\n")}, nil
 		},
 	}
 }

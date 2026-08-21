@@ -39,6 +39,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -55,17 +56,25 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
 
-// t4DiscoveryScript scripts the three built-in discovery tools to emit
+func init() {
+	if os.Getenv("PDCP_API_KEY") == "" {
+		_ = os.Setenv("PDCP_API_KEY", "testkey")
+	}
+}
+
+// t4DiscoveryScript scripts the four built-in discovery tools to emit
 // exactly the corpus the T3d3 harness seeds (www/api/admin.example.com),
 // so the downstream stages exercise the same pinned shapes. The duplicate
 // www line (subfinder + assetfinder) pins the cross-source provenance
 // merge: earliest-wins with ties resolving to the first source in
-// selection order (subfinder). admin is emitted by assetfinder AND amass,
-// so its provenance source is assetfinder (first-encountered).
+// selection order (subfinder). admin is emitted by assetfinder AND amass
+// AND chaos, so its provenance source is assetfinder (first-encountered).
 //
 // The "-version"/"-h" entries are the detection probes (the engine's
 // tool-specific detection argv, internal/discovery/{subfinder,assetfinder,
-// amass}.go); the remaining entries are the discovery executions.
+// amass,chaos}.go); the remaining entries are the discovery executions.
+// Chaos returns a duplicate admin host so the merged corpus stays 3 hosts
+// and the downstream pins (3 IPs, 15 surfaces, etc.) remain stable.
 func t4DiscoveryScript() map[string]func(discovery.Cmd) (discovery.RunResult, error) {
 	return map[string]func(discovery.Cmd) (discovery.RunResult, error){
 		"subfinder -version": func(discovery.Cmd) (discovery.RunResult, error) {
@@ -77,6 +86,9 @@ func t4DiscoveryScript() map[string]func(discovery.Cmd) (discovery.RunResult, er
 		"amass -version": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("v3.23.0\n")}, nil
 		},
+		"chaos -version": func(discovery.Cmd) (discovery.RunResult, error) {
+			return discovery.RunResult{Stdout: []byte("chaos v0.5.3\n")}, nil
+		},
 		"subfinder -d example.com -silent": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("api.example.com\nwww.example.com\n")}, nil
 		},
@@ -85,6 +97,9 @@ func t4DiscoveryScript() map[string]func(discovery.Cmd) (discovery.RunResult, er
 		},
 		"amass enum -passive -d example.com": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("admin.example.com\n")}, nil
+		},
+		"chaos -d example.com -silent -json": func(discovery.Cmd) (discovery.RunResult, error) {
+			return discovery.RunResult{Stdout: []byte("{\"domain\":\"admin.example.com\"}\n")}, nil
 		},
 	}
 }
@@ -284,7 +299,7 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 		// Re-arm the barrier per run: an already-open gate would let the
 		// later runs' jobs pass through unblocked (serialized), so every
 		// run must re-prove the overlap.
-		h.discoveryRunner.armBarrier(3)
+		h.discoveryRunner.armBarrier(4)
 		cfg.OutputDir = t.TempDir()
 		rep, err := pipeline.Run(context.Background(), cfg, nil, clk, h.stages())
 		if err != nil {
@@ -462,8 +477,8 @@ func TestT4FullRunCacheHitParity(t *testing.T) {
 	if r1.Outcome != pipeline.OutcomeCompleted {
 		t.Fatalf("cold run Outcome = %q, want completed", r1.Outcome)
 	}
-	if got := t4DiscoveryExecutions(h.discoveryRunner); got != 3 {
-		t.Fatalf("cold run discovery executions = %d, want 3 (subfinder + assetfinder + amass)", got)
+	if got := t4DiscoveryExecutions(h.discoveryRunner); got != 4 {
+		t.Fatalf("cold run discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", got)
 	}
 	dnsAfterCold := h.resolver.callCount()
 	httpAfterCold := h.transport.requestCount()
@@ -480,12 +495,12 @@ func TestT4FullRunCacheHitParity(t *testing.T) {
 	if !reflect.DeepEqual(r1, r2) {
 		t.Fatalf("cache-hit run differs from the cold run:\ncold: %+v\nwarm: %+v", r1, r2)
 	}
-	// Known-version tools (subfinder, amass) served from cache: exactly
+	// Known-version tools (subfinder, amass, chaos) served from cache: exactly
 	// ONE discovery execution on the warm run — assetfinder, the
 	// NON-CACHEABLE unknown-version source (its -h detection probe still
 	// runs, but that is detection, not discovery).
-	if got := t4DiscoveryExecutions(h.discoveryRunner); got != 4 {
-		t.Fatalf("warm run discovery executions = %d, want 4 (3 cold + 1 warm assetfinder execution)", got)
+	if got := t4DiscoveryExecutions(h.discoveryRunner); got != 5 {
+		t.Fatalf("warm run discovery executions = %d, want 5 (4 cold + 1 warm assetfinder execution)", got)
 	}
 	// Bonus zero-request pins: every downstream stage's cache-before-
 	// execute served the warm run.

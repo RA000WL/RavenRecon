@@ -33,7 +33,7 @@ import (
 // list — under genuinely overlapping jobs. The rate limiter is disabled
 // (Rate 0; the inherited default of 2/s with Burst 1 would pace the instant
 // fakes 500 ms apart and serialize them) and a barrier in the fake runner
-// (armBarrier, fakes_test.go) holds all three discovery executions inside
+// (armBarrier, fakes_test.go) holds all four discovery executions inside
 // Run before any returns, so the jobs actually race on the pool;
 // maxConcurrent > 1 is the overlap proof. The cross-run DeepEqual then
 // pins the selection-order contract (the slot array mechanism: pipeline.go
@@ -44,17 +44,17 @@ func TestRunDeterministicAcrossRunsConcurrency(t *testing.T) {
 	run := func() (*fakeRunner, Report) {
 		r := newFakeRunner(t, fullScript())
 		cfg := testConfig(r, newFakeLookup())
-		cfg.Concurrency = 4 // three jobs race on the pool
+		cfg.Concurrency = 4 // four jobs race on the pool
 		cfg.Rate = 0        // no job-start pacing: workers take jobs as fast as they can
-		r.armBarrier(3)     // all three discovery executions overlap inside Run
+		r.armBarrier(4)     // all four discovery executions overlap inside Run
 		return r, mustRun(t, target, cfg)
 	}
 	r1, rep1 := run()
 	r2, rep2 := run()
 	// Overlap proof: the barrier gate sits inside the fake runner AFTER the
 	// active/maxConcurrent counters are bumped and before the script runs,
-	// so when the gate opens all three executions are inside Run and
-	// counted — maxConcurrent must exceed 1 (it reaches 3) on every run,
+	// so when the gate opens all four executions are inside Run and
+	// counted — maxConcurrent must exceed 1 (it reaches 4) on every run,
 	// on any scheduler.
 	for i, rr := range []*fakeRunner{r1, r2} {
 		if rr.maxConcurrent <= 1 {
@@ -65,8 +65,8 @@ func TestRunDeterministicAcrossRunsConcurrency(t *testing.T) {
 		t.Fatalf("two identical runs at Concurrency 4 differ:\nrun 1: %+v\nrun 2: %+v", rep1, rep2)
 	}
 	// Per-source report order is the selection order (subfinder,
-	// assetfinder, amass — builtInNames), never pool-completion order.
-	wantOrder := []string{"subfinder", "assetfinder", "amass"}
+	// assetfinder, amass, chaos — builtInNames), never pool-completion order.
+	wantOrder := []string{"subfinder", "assetfinder", "amass", "chaos"}
 	for i, res := range rep1.Results {
 		if res.Source != wantOrder[i] {
 			t.Fatalf("results[%d].Source = %q, want %q (selection order, not completion order)",
@@ -78,6 +78,7 @@ func TestRunDeterministicAcrossRunsConcurrency(t *testing.T) {
 		"subfinder":   {"api.example.com", "www.example.com"},
 		"assetfinder": {"blog.example.com", "www.example.com"},
 		"amass":       {"api.example.com", "mail.example.com"},
+		"chaos":       {"chaos.example.com"},
 	}
 	for _, res := range rep1.Results {
 		got := names(res.Hosts)
@@ -87,7 +88,7 @@ func TestRunDeterministicAcrossRunsConcurrency(t *testing.T) {
 	}
 	// The merged list Report.All() is sorted by canonical name (the order
 	// the pipeline adapter propagates into the shared corpus).
-	wantAll := []string{"api.example.com", "blog.example.com", "mail.example.com", "www.example.com"}
+	wantAll := []string{"api.example.com", "blog.example.com", "chaos.example.com", "mail.example.com", "www.example.com"}
 	if got := names(rep1.All()); !reflect.DeepEqual(got, wantAll) {
 		t.Errorf("All() = %v, want %v (sorted by canonical name)", got, wantAll)
 	}
@@ -108,7 +109,7 @@ func TestRunDeterministicProvenanceAcrossRuns(t *testing.T) {
 		cfg := testConfig(r, newFakeLookup())
 		cfg.Concurrency = 4
 		cfg.Rate = 0    // no job-start pacing (see the sibling test)
-		r.armBarrier(3) // all three discovery executions overlap inside Run
+		r.armBarrier(4) // all four discovery executions overlap inside Run
 		return r, mustRun(t, target, cfg)
 	}
 	r1, rep1 := run()

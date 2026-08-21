@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -21,6 +22,12 @@ import (
 // adapter's clock bridge (Now = in.Clock.Now) must surface exactly this as
 // every discovered host's provenance timestamp.
 var discoveryFixedTime = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+func init() {
+	if os.Getenv("PDCP_API_KEY") == "" {
+		_ = os.Setenv("PDCP_API_KEY", "testkey")
+	}
+}
 
 // fakeClock is a deterministic runtime.Clock. Now returns the fixed
 // instant; After returns a channel that never fires — the discovery adapter
@@ -202,10 +209,10 @@ func (f *fakeCache) putCount() int {
 	return f.puts
 }
 
-// standardScript returns canned responses for the three built-in tools'
+// standardScript returns canned responses for the four built-in tools'
 // detection and discovery invocations against example.com, exactly matching
 // the documented passive argv (subfinder -d <domain> -silent, assetfinder
-// <domain>, amass enum -passive -d <domain>).
+// <domain>, amass enum -passive -d <domain>, chaos -d <domain> -silent -json).
 func standardScript() map[string]func(discovery.Cmd) (discovery.RunResult, error) {
 	return map[string]func(discovery.Cmd) (discovery.RunResult, error){
 		"subfinder -version": func(discovery.Cmd) (discovery.RunResult, error) {
@@ -217,6 +224,9 @@ func standardScript() map[string]func(discovery.Cmd) (discovery.RunResult, error
 		"amass -version": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("v3.23.0\n")}, nil
 		},
+		"chaos -version": func(discovery.Cmd) (discovery.RunResult, error) {
+			return discovery.RunResult{Stdout: []byte("chaos v0.5.3\n")}, nil
+		},
 		"subfinder -d example.com -silent": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("api.example.com\nwww.example.com\n")}, nil
 		},
@@ -225,6 +235,9 @@ func standardScript() map[string]func(discovery.Cmd) (discovery.RunResult, error
 		},
 		"amass enum -passive -d example.com": func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte("mail.example.com\n")}, nil
+		},
+		"chaos -d example.com -silent -json": func(discovery.Cmd) (discovery.RunResult, error) {
+			return discovery.RunResult{Stdout: []byte("{\"domain\":\"chaos.example.com\"}\n")}, nil
 		},
 	}
 }
@@ -288,16 +301,16 @@ func TestDiscoveryStageHappyPath(t *testing.T) {
 	if len(res.StickyFlags) != 0 {
 		t.Errorf("StickyFlags = %v, want empty", res.StickyFlags)
 	}
-	// 2 (subfinder) + 2 (assetfinder) + 1 (amass) hosts; no malformed lines.
-	if res.ItemsProcessed != 5 {
-		t.Errorf("ItemsProcessed = %d, want 5", res.ItemsProcessed)
+	// 2 (subfinder) + 2 (assetfinder) + 1 (amass) + 1 (chaos) hosts; no malformed lines.
+	if res.ItemsProcessed != 6 {
+		t.Errorf("ItemsProcessed = %d, want 6", res.ItemsProcessed)
 	}
 	if res.ItemsFailed != 0 {
 		t.Errorf("ItemsFailed = %d, want 0", res.ItemsFailed)
 	}
 	// report.All() merges by identity (www.example.com seen twice) and sorts
 	// by canonical name; the bare target host is in-domain and retained.
-	want := []string{"api.example.com", "example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "example.com", "mail.example.com", "www.example.com"}
 	if got := discoveryHostNames(res.Additions.Hosts); !reflect.DeepEqual(got, want) {
 		t.Errorf("Additions.Hosts = %v, want %v", got, want)
 	}
@@ -337,7 +350,7 @@ func TestDiscoveryStageOutOfDomainFiltered(t *testing.T) {
 			t.Errorf("out-of-domain host leaked into Additions: %q", h.Name)
 		}
 	}
-	want := []string{"api.example.com", "example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "example.com", "mail.example.com", "www.example.com"}
 	if got := discoveryHostNames(res.Additions.Hosts); !reflect.DeepEqual(got, want) {
 		t.Errorf("Additions.Hosts = %v, want %v", got, want)
 	}
@@ -348,9 +361,9 @@ func TestDiscoveryStageOutOfDomainFiltered(t *testing.T) {
 		t.Errorf("ItemsFailed = %d, want 0", res.ItemsFailed)
 	}
 	// ItemsProcessed stays the engine report's honest count (before the
-	// boundary filter): 2 + 2 + 3.
-	if res.ItemsProcessed != 7 {
-		t.Errorf("ItemsProcessed = %d, want 7 (the engine report's honest count)", res.ItemsProcessed)
+	// boundary filter): 2 + 2 + 3 + 1 (chaos).
+	if res.ItemsProcessed != 8 {
+		t.Errorf("ItemsProcessed = %d, want 8 (the engine report's honest count)", res.ItemsProcessed)
 	}
 }
 
@@ -366,17 +379,17 @@ func TestDiscoveryStageSourcesParam(t *testing.T) {
 		{
 			name:   "absent param defaults to all built-in sources",
 			params: nil,
-			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com"},
+			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com", "chaos -d example.com -silent -json"},
 		},
 		{
 			name:   "empty value defaults to all built-in sources",
 			params: map[string]string{"sources": ""},
-			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com"},
+			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com", "chaos -d example.com -silent -json"},
 		},
 		{
 			name:   "comma-only value defaults to all built-in sources",
 			params: map[string]string{"sources": ","},
-			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com"},
+			want:   []string{"subfinder -d example.com -silent", "assetfinder example.com", "amass enum -passive -d example.com", "chaos -d example.com -silent -json"},
 		},
 		{
 			name:   "selection restricts the run",
@@ -453,7 +466,7 @@ func TestDiscoveryStageTruncationFlag(t *testing.T) {
 		t.Errorf("StickyFlags = %v, want the literal %q set", res.StickyFlags, "discovery_truncated")
 	}
 	// The truncated source's hosts are still honest retained output.
-	want := []string{"api.example.com", "example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "example.com", "mail.example.com", "www.example.com"}
 	if got := discoveryHostNames(res.Additions.Hosts); !reflect.DeepEqual(got, want) {
 		t.Errorf("Additions.Hosts = %v, want %v", got, want)
 	}
@@ -703,10 +716,10 @@ func TestDiscoveryStageAdditionsPreservedOnEngineError(t *testing.T) {
 	if o.res.Outcome != pipeline.OutcomeFailed {
 		t.Errorf("Outcome = %q, want failed (engine error, stage context live)", o.res.Outcome)
 	}
-	// The sources that did run (assetfinder, amass) and the subfinder result
+	// The sources that did run (assetfinder, amass, chaos) and the subfinder result
 	// that completed right at the forced shutdown are all honest retained
 	// output; the report is merged into Additions even on the failed outcome.
-	want := []string{"api.example.com", "example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "example.com", "mail.example.com", "www.example.com"}
 	if got := discoveryHostNames(o.res.Additions.Hosts); !reflect.DeepEqual(got, want) {
 		t.Errorf("Additions.Hosts = %v, want %v (the engine report's honest retained output)", got, want)
 	}
@@ -728,10 +741,10 @@ func TestDiscoveryStageCachePassThrough(t *testing.T) {
 			t.Errorf("Outcome = %q, want completed", res.Outcome)
 		}
 		// The engine's cache-before-execute jobs observe the pipeline's cache
-		// instance: versioned tools (subfinder, amass) store records on a
+		// instance: versioned tools (subfinder, amass, chaos) store records on a
 		// miss. assetfinder has no detectable version and is never cached.
-		if n := c.putCount(); n != 2 {
-			t.Errorf("cache Put count = %d, want 2 (subfinder + amass; assetfinder is never cached)", n)
+		if n := c.putCount(); n != 3 {
+			t.Errorf("cache Put count = %d, want 3 (subfinder + amass + chaos; assetfinder is never cached)", n)
 		}
 	})
 
@@ -773,14 +786,14 @@ func TestDiscoveryStageThroughPipelineRun(t *testing.T) {
 	if len(report.Stages) != 1 || report.Stages[0].Outcome != pipeline.OutcomeCompleted {
 		t.Errorf("stage records = %+v, want one completed stage", report.Stages)
 	}
-	if report.ItemsProcessed != 5 || report.ItemsFailed != 0 {
-		t.Errorf("report counts = %d/%d, want 5/0", report.ItemsProcessed, report.ItemsFailed)
+	if report.ItemsProcessed != 6 || report.ItemsFailed != 0 {
+		t.Errorf("report counts = %d/%d, want 6/0", report.ItemsProcessed, report.ItemsFailed)
 	}
 	if report.Truncated || len(report.StickyFlags) != 0 {
 		t.Errorf("report Truncated/StickyFlags = %v/%v, want false/empty",
 			report.Truncated, report.StickyFlags)
 	}
-	want := []string{"api.example.com", "example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "example.com", "mail.example.com", "www.example.com"}
 	if got := discoveryHostNames(report.Hosts); !reflect.DeepEqual(got, want) {
 		t.Errorf("report.Hosts = %v, want %v", got, want)
 	}

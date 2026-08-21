@@ -198,9 +198,9 @@ func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage
 
 // t5DiscoveryExecutions counts the discovery stage's executions through the
 // shared runner — exactly T4's helper semantics: detection probes
-// ("-version"/"-h") never count. 3 after a cold run; the warm run over the
+// ("-version"/"-h") never count. 4 after a cold run; the warm run over the
 // same cache adds exactly 1 (the NON-CACHEABLE unknown-version assetfinder
-// source re-executes; subfinder/amass are served from cache —
+// source re-executes; subfinder/amass/chaos are served from cache —
 // internal/discovery/pipeline.go:418-426).
 func (h *t5Harness) discoveryExecutions() int {
 	return t4DiscoveryExecutions(h.discoveryRunner)
@@ -390,9 +390,9 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		}
 	}
 
-	// --- The REAL discovery stage ran and completed: three tool
-	// executions, 5 processed per-source hosts (subfinder 2 + assetfinder
-	// 2 + amass 1), zero failures, hosts-only additions (no domains). ---
+	// --- The REAL discovery stage ran and completed: four tool
+	// executions, 6 processed per-source hosts (subfinder 2 + assetfinder
+	// 2 + amass 1 + chaos 1), zero failures, hosts-only additions (no domains). ---
 	discRec := r1.Stages[0]
 	if discRec.Name != pipeline.StageDiscover {
 		t.Fatalf("Stages[0].Name = %q, want discover", discRec.Name)
@@ -400,14 +400,14 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	if discRec.Outcome != pipeline.OutcomeCompleted {
 		t.Errorf("discovery stage outcome = %q, want completed (the failure injection belongs to the dns stage)", discRec.Outcome)
 	}
-	if discRec.ItemsProcessed != 5 {
-		t.Errorf("discovery ItemsProcessed = %d, want 5 (subfinder 2 + assetfinder 2 + amass 1 per-source hosts)", discRec.ItemsProcessed)
+	if discRec.ItemsProcessed != 6 {
+		t.Errorf("discovery ItemsProcessed = %d, want 6 (subfinder 2 + assetfinder 2 + amass 1 + chaos 1 per-source hosts)", discRec.ItemsProcessed)
 	}
 	if discRec.ItemsFailed != 0 {
 		t.Errorf("discovery ItemsFailed = %d, want 0 (no malformed lines in the scripted output)", discRec.ItemsFailed)
 	}
-	if h.discoveryExecutions() != 3 {
-		t.Errorf("discovery executions = %d, want 3 (subfinder + assetfinder + amass)", h.discoveryExecutions())
+	if h.discoveryExecutions() != 4 {
+		t.Errorf("discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", h.discoveryExecutions())
 	}
 
 	// --- The failing stage's record is honest. ---
@@ -707,10 +707,10 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	if !reflect.DeepEqual(r1, r2) {
 		t.Fatalf("two identical partial runs differ:\nrun 1: %+v\nrun 2: %+v", r1, r2)
 	}
-	// Both runs are cold (nil cache): each re-executes all three discovery
+	// Both runs are cold (nil cache): each re-executes all four discovery
 	// tools — no cache interplay in the reproducible-run proof.
-	if h.discoveryExecutions() != 6 {
-		t.Errorf("discovery executions after run 2 = %d, want 6 (3 per cold run)", h.discoveryExecutions())
+	if h.discoveryExecutions() != 8 {
+		t.Errorf("discovery executions after run 2 = %d, want 8 (4 per cold run)", h.discoveryExecutions())
 	}
 	events = obs.snapshot()
 	if len(events) != 40 {
@@ -809,8 +809,8 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 6 {
 		t.Fatalf("cold wire queries for the surviving hosts = %d, want 6 (2 hosts x 3 types)", got)
 	}
-	if got := h.discoveryExecutions(); got != 3 {
-		t.Fatalf("cold discovery executions = %d, want 3 (subfinder + assetfinder + amass)", got)
+	if got := h.discoveryExecutions(); got != 4 {
+		t.Fatalf("cold discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", got)
 	}
 	httpAfterCold := h.transport.requestCount()
 	jsAfterCold := h.jsRequests()
@@ -855,11 +855,11 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 6 {
 		t.Fatalf("warm wire queries for the surviving hosts = %d, want 6 (unchanged — zero re-execution)", got)
 	}
-	// (a') Discovery re-executes only its NON-CACHEABLE source: 4 total
-	// executions (3 cold + 1 warm assetfinder; subfinder/amass served
+	// (a') Discovery re-executes only its NON-CACHEABLE source: 5 total
+	// executions (4 cold + 1 warm assetfinder; subfinder/amass/chaos served
 	// from cache — internal/discovery/pipeline.go:418-426).
-	if got := h.discoveryExecutions(); got != 4 {
-		t.Errorf("warm discovery executions = %d, want 4 (3 cold + 1 warm assetfinder execution, the NON-CACHEABLE unknown-version source)", got)
+	if got := h.discoveryExecutions(); got != 5 {
+		t.Errorf("warm discovery executions = %d, want 5 (4 cold + 1 warm assetfinder execution, the NON-CACHEABLE unknown-version source)", got)
 	}
 	// (b) Zero re-execution of the succeeded downstream work.
 	if got := h.transport.requestCount(); got != httpAfterCold {
@@ -893,10 +893,10 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 	if !reflect.DeepEqual(r2, r3) {
 		t.Fatalf("healed warm run differs from a fresh cold healed run:\nwarm: %+v\ncold: %+v", r2, r3)
 	}
-	// The healed cold run re-executes all three discovery tools against
-	// the fresh cache: 7 total executions (4 + 3).
-	if got := h.discoveryExecutions(); got != 7 {
-		t.Errorf("healed cold discovery executions = %d, want 7 (4 through run 2 + 3 fresh)", got)
+	// The healed cold run re-executes all four discovery tools against
+	// the fresh cache: 9 total executions (5 + 4).
+	if got := h.discoveryExecutions(); got != 9 {
+		t.Errorf("healed cold discovery executions = %d, want 9 (5 through run 2 + 4 fresh)", got)
 	}
 }
 
@@ -952,8 +952,8 @@ func TestT5FullRunRetryPersistent(t *testing.T) {
 	if got := resolver.seenCount("admin.example.com"); got != 3 {
 		t.Fatalf("cold admin queries = %d, want 3 (its A/AAAA/CNAME all attempted and failed)", got)
 	}
-	if got := h.discoveryExecutions(); got != 3 {
-		t.Fatalf("cold discovery executions = %d, want 3 (subfinder + assetfinder + amass)", got)
+	if got := h.discoveryExecutions(); got != 4 {
+		t.Fatalf("cold discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", got)
 	}
 	httpAfterCold := h.transport.requestCount()
 	jsAfterCold := h.jsRequests()
@@ -977,10 +977,10 @@ func TestT5FullRunRetryPersistent(t *testing.T) {
 		t.Fatalf("warm surviving-host queries = %d, want 6 (unchanged — served from cache)", got)
 	}
 	// Discovery re-executes only its NON-CACHEABLE source on the warm run
-	// (subfinder/amass served from cache; assetfinder executes fresh —
+	// (subfinder/amass/chaos served from cache; assetfinder executes fresh —
 	// internal/discovery/pipeline.go:418-426).
-	if got := h.discoveryExecutions(); got != 4 {
-		t.Errorf("warm discovery executions = %d, want 4 (3 cold + 1 warm assetfinder execution)", got)
+	if got := h.discoveryExecutions(); got != 5 {
+		t.Errorf("warm discovery executions = %d, want 5 (4 cold + 1 warm assetfinder execution)", got)
 	}
 	// The succeeded parts were served from cache: zero new probes/fetches.
 	if got := h.transport.requestCount(); got != httpAfterCold {

@@ -21,6 +21,9 @@ func fullScript() map[string]func(Cmd) (RunResult, error) {
 	s["amass enum -passive -d example.com"] = func(Cmd) (RunResult, error) {
 		return RunResult{Stdout: []byte("mail.example.com\napi.example.com\n")}, nil
 	}
+	s["chaos -d example.com -silent -json"] = func(Cmd) (RunResult, error) {
+		return RunResult{Stdout: []byte("{\"domain\":\"chaos.example.com\"}\n")}, nil
+	}
 	return s
 }
 
@@ -36,14 +39,15 @@ func mustRun(t *testing.T, target asset.Domain, cfg Config) Report {
 // TestRunAllSources exercises the full pipeline: detection, pool jobs per
 // source, cross-source deduplication by identity, and merge semantics.
 func TestRunAllSources(t *testing.T) {
+	t.Setenv("PDCP_API_KEY", "testkey")
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, newFakeLookup())
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
 
-	if len(rep.Results) != 3 {
-		t.Fatalf("results = %d, want 3", len(rep.Results))
+	if len(rep.Results) != 4 {
+		t.Fatalf("results = %d, want 4", len(rep.Results))
 	}
-	order := []string{"subfinder", "assetfinder", "amass"}
+	order := []string{"subfinder", "assetfinder", "amass", "chaos"}
 	for i, want := range order {
 		if rep.Results[i].Source != want {
 			t.Fatalf("results[%d].Source = %q, want %q", i, rep.Results[i].Source, want)
@@ -55,7 +59,7 @@ func TestRunAllSources(t *testing.T) {
 			t.Fatalf("%s status = %s, want completed", want, rep.Results[i].Status)
 		}
 	}
-	// Per-source host counts: subfinder 2, assetfinder 2, amass 2.
+	// Per-source host counts: subfinder 2, assetfinder 2, amass 2, chaos 1.
 	if got := len(rep.Results[0].Hosts); got != 2 {
 		t.Fatalf("subfinder hosts = %d, want 2", got)
 	}
@@ -65,8 +69,11 @@ func TestRunAllSources(t *testing.T) {
 	if got := len(rep.Results[2].Hosts); got != 2 {
 		t.Fatalf("amass hosts = %d, want 2", got)
 	}
-	if r.discoverCallCount() != 3 {
-		t.Fatalf("discover calls = %d, want 3", r.discoverCallCount())
+	if got := len(rep.Results[3].Hosts); got != 1 {
+		t.Fatalf("chaos hosts = %d, want 1", got)
+	}
+	if r.discoverCallCount() != 4 {
+		t.Fatalf("discover calls = %d, want 4", r.discoverCallCount())
 	}
 }
 
@@ -78,7 +85,7 @@ func TestRunMergesByPhase2Identity(t *testing.T) {
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
 
 	all := rep.All()
-	want := []string{"api.example.com", "blog.example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "blog.example.com", "chaos.example.com", "mail.example.com", "www.example.com"}
 	if len(all) != len(want) {
 		t.Fatalf("merged hosts = %v, want %v", names(all), want)
 	}
@@ -121,9 +128,10 @@ func TestRunProvenanceMergeEarliestWins(t *testing.T) {
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
 
 	// The fixture's full merged set: subfinder (api, www) at fixedTime, amass
-	// (mail, api) one minute later, assetfinder (www) one minute later.
+	// (mail, api) one minute later, assetfinder (www) one minute later,
+	// chaos (chaos.example.com) at fixedTime.
 	all := rep.All()
-	want := []string{"api.example.com", "mail.example.com", "www.example.com"}
+	want := []string{"api.example.com", "chaos.example.com", "mail.example.com", "www.example.com"}
 	if len(all) != len(want) {
 		t.Fatalf("merged = %v, want %v", names(all), want)
 	}
@@ -163,8 +171,8 @@ func TestRunMissingSourceSkipped(t *testing.T) {
 	cfg := testConfig(r, l)
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
 
-	if len(rep.Results) != 3 {
-		t.Fatalf("results = %d, want 3", len(rep.Results))
+	if len(rep.Results) != 4 {
+		t.Fatalf("results = %d, want 4", len(rep.Results))
 	}
 	if rep.Results[2].Source != "amass" || rep.Results[2].Status != OutSkipped {
 		t.Fatalf("amass result = %+v, want skipped", rep.Results[2])
@@ -175,13 +183,16 @@ func TestRunMissingSourceSkipped(t *testing.T) {
 	if rep.Results[2].Detection.Reason == "" {
 		t.Fatal("expected a skip reason")
 	}
-	if r.discoverCallCount() != 2 {
-		t.Fatalf("discover calls = %d, want 2 (amass must not run)", r.discoverCallCount())
+	if r.discoverCallCount() != 3 {
+		t.Fatalf("discover calls = %d, want 3 (amass must not run)", r.discoverCallCount())
 	}
 	for i := 0; i < 2; i++ {
 		if rep.Results[i].Status != OutCompleted {
 			t.Fatalf("results[%d] status = %s, want completed", i, rep.Results[i].Status)
 		}
+	}
+	if rep.Results[3].Source != "chaos" || rep.Results[3].Status != OutCompleted {
+		t.Fatalf("chaos result = %+v, want completed", rep.Results[3])
 	}
 }
 
@@ -193,8 +204,8 @@ func TestRunAllSourcesMissing(t *testing.T) {
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, l)
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
-	if len(rep.Results) != 3 {
-		t.Fatalf("results = %d, want 3", len(rep.Results))
+	if len(rep.Results) != 4 {
+		t.Fatalf("results = %d, want 4", len(rep.Results))
 	}
 	for _, res := range rep.Results {
 		if res.Status != OutSkipped {
@@ -267,8 +278,8 @@ func TestRunPanickingAdapterIsolation(t *testing.T) {
 	if rep.Results[0].Err == nil || !strings.Contains(rep.Results[0].Err.Error(), "panic") {
 		t.Fatalf("subfinder error = %v, want panic message", rep.Results[0].Err)
 	}
-	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted {
-		t.Fatalf("other sources must complete, got %s / %s", rep.Results[1].Status, rep.Results[2].Status)
+	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted || rep.Results[3].Status != OutCompleted {
+		t.Fatalf("other sources must complete, got %s / %s / %s", rep.Results[1].Status, rep.Results[2].Status, rep.Results[3].Status)
 	}
 }
 
@@ -314,11 +325,11 @@ func TestRunPanickingDetectionIsWarnContained(t *testing.T) {
 	if rep.Results[0].Status != OutCompleted {
 		t.Fatalf("a WARN-detected source must still execute; status = %s", rep.Results[0].Status)
 	}
-	if got := r.discoverCallCount(); got != 3 {
-		t.Fatalf("discover calls = %d, want 3 (all sources including the panicking one)", got)
+	if got := r.discoverCallCount(); got != 4 {
+		t.Fatalf("discover calls = %d, want 4 (all sources including the panicking one)", got)
 	}
-	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted {
-		t.Fatalf("other sources must complete, got %s / %s", rep.Results[1].Status, rep.Results[2].Status)
+	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted || rep.Results[3].Status != OutCompleted {
+		t.Fatalf("other sources must complete, got %s / %s / %s", rep.Results[1].Status, rep.Results[2].Status, rep.Results[3].Status)
 	}
 }
 
@@ -344,8 +355,8 @@ func TestRunWarnDetectedSourceStillExecutes(t *testing.T) {
 	if len(rep.Results[0].Hosts) != 2 {
 		t.Fatalf("subfinder hosts = %v, want the executed payload", names(rep.Results[0].Hosts))
 	}
-	if got := r.discoverCallCount(); got != 3 {
-		t.Fatalf("discover calls = %d, want 3", got)
+	if got := r.discoverCallCount(); got != 4 {
+		t.Fatalf("discover calls = %d, want 4", got)
 	}
 }
 
@@ -387,12 +398,12 @@ func TestRunRejectsUnnormalizedTargetLiteral(t *testing.T) {
 }
 
 // TestRunConcurrencyBounded verifies the pool's concurrency is respected:
-// with Concurrency 1 the three jobs run strictly sequentially.
+// with Concurrency 1 the four jobs run strictly sequentially.
 func TestRunConcurrencyBounded(t *testing.T) {
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, newFakeLookup())
 	cfg.Concurrency = 1
-	cfg.QueueSize = 3
+	cfg.QueueSize = 4
 	mustRun(t, mustDomain(t, "example.com"), cfg)
 	if r.maxConcurrent != 1 {
 		t.Fatalf("max concurrent executions = %d, want 1", r.maxConcurrent)
@@ -446,8 +457,8 @@ func TestRunPartialResultReports(t *testing.T) {
 		t.Fatalf("partial hosts = %v, want 1 retained", names(rep.Results[0].Hosts))
 	}
 	// The other sources are unaffected.
-	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted {
-		t.Fatalf("other sources: %s / %s, want completed", rep.Results[1].Status, rep.Results[2].Status)
+	if rep.Results[1].Status != OutCompleted || rep.Results[2].Status != OutCompleted || rep.Results[3].Status != OutCompleted {
+		t.Fatalf("other sources: %s / %s / %s, want completed", rep.Results[1].Status, rep.Results[2].Status, rep.Results[3].Status)
 	}
 }
 
