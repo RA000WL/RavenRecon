@@ -1708,6 +1708,13 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   - Full-funnel proof: crawl 1,067 → techintel 8,254 → jsintel 500/267 truncated → secrentel 205 → priority 9,321 surfaces / 97 groups / 32 paths.
   - Remaining known items: urllive deadline tuning; duration_ms wiring (P0-5 deferred); amass opt-in.
 
+### NEW-39 (MED) — urllive stage deadline starvation on large corpora (internal/httpprobe/urls.go, internal/pipeline/adapt/urllive.go)
+- Status: VERIFIED — fixed in 990c810 (triage defaults 5s/20-concurrency; cut-short triage marks Truncated+urllive_truncated)
+- Reporter: master (field trial 3, NEW-38)
+- Problem: 8,254-URL corpus — 10s per dead host starved the shared stage budget; run cancelled with 1,635 errors and no truncation marker.
+- Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
+- Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
+
 ## Operational warnings (all agents)
 ### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
 - Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
@@ -1715,6 +1722,13 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Problem: chaos v0.5.2 -json emits ONE object {"domain":"<apex>","subdomains":[...],"count":N}; the adapter read only "domain" → apex-only. Real cost: verily.com corpus was built from subfinder's 1,036 hosts alone; every unique chaos find (e.g. wildcard.verily.com, grudge-pandemic.verily.com) was missing from dns/probe/urllive.
 - Fix: parse subdomains array; expand labels against domain; FQDN elements as-is; legacy + text fallbacks kept.
 - Verification: TestChaosParseSubdomainsArray/FQDNNotDoubled/LegacyApexOnly hermetic; live chaos-only discover run = 1,044 hosts.
+
+### NEW-39 (MED) — urllive stage deadline starvation on large corpora (internal/httpprobe/urls.go, internal/pipeline/adapt/urllive.go)
+- Status: VERIFIED — fixed in 990c810 (triage defaults 5s/20-concurrency; cut-short triage marks Truncated+urllive_truncated)
+- Reporter: master (field trial 3, NEW-38)
+- Problem: 8,254-URL corpus — 10s per dead host starved the shared stage budget; run cancelled with 1,635 errors and no truncation marker.
+- Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
+- Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
 
 ## Operational warnings (all agents)
 
