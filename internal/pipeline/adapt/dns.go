@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -28,9 +29,17 @@ const dnsAnswersTruncated = "dns_answers_truncated"
 const dnsBruteWildcardFlag = "dns_brute_wildcard"
 
 // dnsBruteTruncatedFlag is the sticky flag set when the brute wordlist
-// exceeded MaxBruteWordlistEntries or the candidate set exceeded
-// MaxBruteHostsPerDomain and was capped. The retained set is incomplete.
+// exceeded MaxBruteWordlistEntries or distinct valid candidates were dropped
+// at MaxBruteHostsPerDomain (the generator's explicit cap-hit report, never
+// an inference from the retained length). The retained set is incomplete.
 const dnsBruteTruncatedFlag = "dns_brute_truncated"
+
+// dnsBruteResolversIgnoredFlag is the sticky flag set when the operator
+// supplied the dnsx_resolvers StageParam: the parameter is shape-validated
+// and acknowledged but NOT honored — the engine's native resolver performs
+// every query — so the run is honestly marked instead of silently discarding
+// operator input.
+const dnsBruteResolversIgnoredFlag = "dns_brute_resolvers_ignored"
 
 // dnsStage adapts internal/dns (dns.Resolve) into a pipeline.Stage.
 //
@@ -89,8 +98,12 @@ func (s *dnsStage) Name() pipeline.StageName { return pipeline.StageDNS }
 //	dnsx_wordlist  string comma-separated prefixes ("www,api,dev"); empty or
 //	                       absent uses the embedded 10-item default wordlist.
 //	                       Capped at 5000 entries and 5000 hosts.
-//	dnsx_resolvers string comma-separated IPs; parsed but unused (reserved;
-//	                       native resolver is used — hermetic without binary).
+//	dnsx_resolvers string comma-separated IPs; shape-validated (every entry
+//	                       must parse as an IP address) but NOT honored — the
+//	                       native resolver is always used. When supplied with
+//	                       brute enabled, the dns_brute_resolvers_ignored
+//	                       sticky flag marks the run so operator input is
+//	                       never silently discarded.
 //
 // When enabled, after the normal dns resolution the stage probes wildcard
 // (random-uuid subdomain), aborts on positive with the dns_brute_wildcard
@@ -153,6 +166,22 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 
 	rep, engineErr := dns.Resolve(ctx, in.Target, hosts, cfg)
 	baseRes, baseErr := s.mapResult(ctx, in, rep, engineErr)
+	// Honest operator-input accounting (NEW-31): when brute is enabled and
+	// dnsx_resolvers was supplied, the parameter is NOT honored — the native
+	// resolver performs every query — so the run carries the
+	// dns_brute_resolvers_ignored sticky flag instead of silently discarding
+	// the input. The flag is set on baseRes before every brute path so each
+	// downstream return (wildcard abort, empty merge, full merge) preserves
+	// it. With brute disabled the param is inert like every other dnsx_*
+	// param and no flag is raised.
+	if bruteEnabled {
+		if resolvers, invalid := dnsBruteResolvers(in.Config); len(resolvers) > 0 || invalid > 0 {
+			if baseRes.StickyFlags == nil {
+				baseRes.StickyFlags = make(map[string]bool)
+			}
+			baseRes.StickyFlags[dnsBruteResolversIgnoredFlag] = true
+		}
+	}
 	// Opt-in brute: zero cost when disabled. When enabled, attempt brute
 	// after the normal resolution, merging brute hosts into the corpus.
 	if !bruteEnabled {
@@ -474,17 +503,22 @@ func dnsBruteWordlist(params map[string]string) ([]string, bool) {
 }
 
 // dnsBruteResolvers parses the optional dnsx_resolvers StageParam
-// (comma-separated IPs). It is accepted but unused — the native resolver is
-// used (hermetic without binary). Parsing validates shape but never errors;
-// unknown values are ignored.
-func dnsBruteResolvers(params map[string]string) []string {
+// (comma-separated IPs). The resolvers are NOT honored — the engine always
+// uses its native resolver (dns.Config.Resolver, default NewNetResolver) —
+// so the parsed values are diagnostic only and the caller surfaces the
+// dns_brute_resolvers_ignored sticky flag when anything was supplied.
+// Parsing validates shape: every non-empty entry must parse as an IP address
+// (netip.ParseAddr); entries failing validation are counted in the second
+// return value and never error the stage. An absent, empty, or
+// whitespace-only param yields (nil, 0).
+func dnsBruteResolvers(params map[string]string) (resolvers []string, invalid int) {
 	v, ok := params["dnsx_resolvers"]
 	if !ok {
-		return nil
+		return nil, 0
 	}
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return nil
+		return nil, 0
 	}
 	var out []string
 	for _, p := range strings.Split(v, ",") {
@@ -492,9 +526,13 @@ func dnsBruteResolvers(params map[string]string) []string {
 		if p == "" {
 			continue
 		}
-		out = append(out, p)
+		if addr, err := netip.ParseAddr(p); err == nil && addr.IsValid() {
+			out = append(out, p)
+		} else {
+			invalid++
+		}
 	}
-	return out
+	return out, invalid
 }
 
 // runBrute executes the opt-in brute path: wildcard probe, candidate
@@ -520,12 +558,10 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 	}
 
 	wordlist, wordlistTruncated := dnsBruteWordlist(in.Config)
-	// Reserving parsing of resolvers (unused, but defensive).
-	_ = dnsBruteResolvers(in.Config)
 
-	candidates := dns.GenerateBruteCandidates(in.Target, wordlist)
+	candidates, candidatesCapped := dns.GenerateBruteCandidates(in.Target, wordlist)
 	if len(candidates) == 0 {
-		return pipeline.StageResult{}, wordlistTruncated, false
+		return pipeline.StageResult{}, wordlistTruncated || candidatesCapped, false
 	}
 	// Dedup candidates against hosts already in the base report (input
 	// hosts plus CNAME targets) to avoid redundant queries.
@@ -547,12 +583,14 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 		filtered = append(filtered, h)
 	}
 	if len(filtered) == 0 {
-		return pipeline.StageResult{}, wordlistTruncated, false
+		return pipeline.StageResult{}, wordlistTruncated || candidatesCapped, false
 	}
-	candidateTruncated := len(candidates) >= dns.MaxBruteHostsPerDomain || wordlistTruncated
-	// Brute candidates are already capped by GenerateBruteCandidates, but
-	// filtering may have reduced them; the truncation flag reflects the
-	// generation cap, not the filtered size.
+	// candidateTruncated reflects only REAL cuts: the generator's explicit
+	// cap-hit report (a distinct valid candidate actually dropped at
+	// MaxBruteHostsPerDomain) or the wordlist ingestion cap. A candidate set
+	// that fills the cap exactly without dropping anything is NOT truncation
+	// (NEW-32): the flag is never inferred from the retained length.
+	candidateTruncated := candidatesCapped || wordlistTruncated
 
 	// Bounded per-domain brute timeout. The stage context already bounds the
 	// run; this additional deadline ensures a single domain cannot wedge the

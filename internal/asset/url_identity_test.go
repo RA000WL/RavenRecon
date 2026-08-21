@@ -110,6 +110,7 @@ func TestURLDistinctness(t *testing.T) {
 		{"path trailing slash", "https://example.com/a", "https://example.com/a/"},
 		{"query key", "https://example.com/p?a=1", "https://example.com/p?b=1"},
 		{"query value", "https://example.com/p?a=1", "https://example.com/p?a=2"},
+		{"empty value vs no value (NEW-29)", "https://example.com/p?a=1&x=", "https://example.com/p?a=1&x"},
 		{"enc slash vs slash", "https://example.com/a%2Fb", "https://example.com/a/b"},
 		{"different host", "https://example.com/", "https://example.org/"},
 		{"enc ampersand key vs raw amp key", "https://example.com/p?a%26b=1&c=2", "https://example.com/p?a&b=1&c=2"},
@@ -157,6 +158,12 @@ func TestURLQueryRawKeyPreservation(t *testing.T) {
 		{"raw space value", "https://example.com/p?q=a b", "url:https://example.com/p?q=a%20b"},
 		{"raw space key", "https://example.com/p?a b=1", "url:https://example.com/p?a%20b=1"},
 		{"raw equals in value", "https://example.com/p?x=y=1", "url:https://example.com/p?x=y%3D1"},
+		// NEW-29 regression: a present-but-empty value keeps its '=' and a
+		// bare key stays bare — the two raw forms never collapse.
+		{"empty value keeps equals", "https://example.com/p?x=", "url:https://example.com/p?x="},
+		{"bare key stays bare", "https://example.com/p?x", "url:https://example.com/p?x"},
+		{"empty and bare keys distinct in one query", "https://example.com/p?a=1&x=", "url:https://example.com/p?a=1&x="},
+		{"bare key after valued key", "https://example.com/p?a=1&x", "url:https://example.com/p?a=1&x"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

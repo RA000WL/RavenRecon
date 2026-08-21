@@ -27,11 +27,12 @@ import (
 //   - userinfo is excluded from the identity but preserved in Original
 //
 // Query values are value-preserving by design: "?x=a%20b" and "?x=a+b" remain
-// distinct identities even though many servers treat them identically. The
-// one exception is a literal raw space, which cannot appear in a canonical
-// query string and is escaped to "%20", so "?x=a b" and "?x=a%20b" share an
-// identity. This errs toward splitting observations rather than merging
-// distinct raw forms.
+// distinct identities even though many servers treat them identically, and a
+// present-but-empty value keeps its '=' ("?x=" stays "?x=", never merged with
+// the bare key "?x"). The one exception is a literal raw space, which cannot
+// appear in a canonical query string and is escaped to "%20", so "?x=a b" and
+// "?x=a%20b" share an identity. This errs toward splitting observations
+// rather than merging distinct raw forms.
 //
 // Original preserves the URL exactly as first observed and may contain
 // userinfo credentials (e.g. "https://user:pass@example.com/"). Consuming
@@ -256,26 +257,31 @@ func removeDotSegments(path string) string {
 // '#', ' ', '&', '=') that would alter how the query is parsed: escapeRawQuery
 // percent-encodes exactly those four raw bytes at emission time. Because a
 // raw space is escaped to "%20", "?x=a b" and "?x=a%20b" share an identity.
+//
+// The '=' separator is part of the raw form: a pair that contained '=' keeps
+// it even when its value is empty ("?x=" canonicalizes to "x="), so a
+// present-but-empty value never collapses into the bare key ("?x" -> "x").
 func sortQuery(raw string) string {
 	if raw == "" {
 		return ""
 	}
 	type param struct {
-		rawKey string // original raw key, emitted with corrupting raw bytes escaped
-		key    string // decoded key, used for ordering
-		value  string
+		rawKey   string // original raw key, emitted with corrupting raw bytes escaped
+		key      string // decoded key, used for ordering
+		value    string
+		hasValue bool // the raw pair contained '=' (a present-but-empty value)
 	}
 	params := make([]param, 0, 8)
 	for _, pair := range strings.Split(raw, "&") {
 		if pair == "" {
 			continue
 		}
-		k, v, _ := strings.Cut(pair, "=")
+		k, v, found := strings.Cut(pair, "=")
 		dk, err := url.QueryUnescape(k)
 		if err != nil {
 			dk = k
 		}
-		params = append(params, param{rawKey: k, key: dk, value: v})
+		params = append(params, param{rawKey: k, key: dk, value: v, hasValue: found})
 	}
 	sort.SliceStable(params, func(i, j int) bool { return params[i].key < params[j].key })
 	var b strings.Builder
@@ -284,7 +290,7 @@ func sortQuery(raw string) string {
 			b.WriteByte('&')
 		}
 		b.WriteString(escapeRawQuery(prm.rawKey))
-		if prm.value != "" {
+		if prm.hasValue {
 			b.WriteByte('=')
 			b.WriteString(escapeRawQuery(prm.value))
 		}

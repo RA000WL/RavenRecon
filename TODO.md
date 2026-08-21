@@ -1551,36 +1551,95 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: two-pattern same-type dedup case where winner requires entropy and loser does not (and vice versa); factor list matches winner.
 
 ### NEW-29 (LOW) — sortQuery collapses ?x= and ?x into one URL identity (internal/asset)
-- Status: OPEN
+- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: url.go:286-290 writes `=` only when the value is non-empty, so distinct raw forms `?x=` and `?x` serialize identically — contradicting the type doc's "distinct raw forms never collapse" principle (url.go:30-34).
 - Fix: track whether each raw pair contained `=` and emit `key=` for present-but-empty values.
 - Verification: pin `?a=1&x=` vs `?a=1&x` as distinct identities.
+- Implementation (2026-08-21): sortQuery now records strings.Cut's found bool as
+  param.hasValue (url.go:272, :284) and emits the '=' whenever the raw pair
+  contained one, even for an empty value (`if prm.hasValue`, url.go:293), so
+  "?x=" -> "x=" and "?x" -> "x" stay distinct. Type doc and sortQuery doc
+  updated to state the rule. Regression pins: TestURLDistinctness case
+  "empty value vs no value (NEW-29)" (?a=1&x= vs ?a=1&x) and four canonical-
+  form rows in TestURLQueryRawKeyPreservation (url_identity_test.go:113,
+  :161-166). Pre-fix proof: reverting only the emission condition on a scratch
+  copy fails TestURLQueryRawKeyPreservation ("?x=" collapsed to "x"). Gates:
+  gofmt -l clean; go vet ./... ok; go build ./... ok; go test -count=1 ./...
+  ok (25 pkgs); go test -race -count=1 ./internal/asset ok.
 
 ### NEW-30 (LOW) — dns wildcard probe bypasses the central query limiter (internal/dns)
-- Status: OPEN
+- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: `IsWildcard` (brute.go:130-165) issues `resolver.Lookup` directly (brute.go:143), outside Resolve's env; dns/doc.go:40 promises every outbound query waits on the shared token-bucket limiter regardless of concurrency. Called per-run from adapt/dns.go:449.
 - Fix: route the probe through the run limiter (accept a Limiter param) or document the exception in doc.go + brute.go.
 - Verification: limiter-counting fake resolver asserts the probe consumes a token (or the doc drift is closed).
+- Implementation (2026-08-21): took the documented-exception alternative. The
+  limiter-param route would need a new exported config surface plus adapter
+  wiring, and a separately constructed limiter shares no bucket state with
+  Resolve's env (burst >= 1 -> zero wait), so it would pace nothing; for one
+  opt-in query per domain, honest docs are the proportionate fix. doc.go
+  "Concurrency and rate limiting" now scopes the promise to Resolve's own
+  pool-job queries and states the IsWildcard exception with its rationale
+  (doc.go:47-55); IsWildcard carries a matching rate-limiting note
+  (brute.go:155-159). Behavior unchanged — no new test surface; existing
+  TestIsWildcard* all pass. Gates this session: gofmt -l clean; go vet ./...
+  ok; go build ./... ok; go test -count=1 ./... ok; go test -race -count=1
+  ./internal/dns ok.
 
 ### NEW-31 (LOW) — dnsx_resolvers StageParam parsed then discarded; "validates shape" claim inaccurate (internal/pipeline/adapt/dns.go)
-- Status: OPEN
+- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: `dnsBruteResolvers` (adapt/dns.go:416-438) result discarded at :464 (`_ =`); operator-supplied resolvers are silently ignored. The comment claims parsing validates shape but no IP validation occurs (comma split only).
 - Fix: implement (thread resolvers into cfg), or warn-and-ignore with honest wording, or reject the param like other unknown params; fix the comment either way.
 - Verification: param supplied → resolvers used or warning surfaced; comment matches behavior.
+- Implementation (2026-08-21): warn-and-ignore. dnsBruteResolvers now really
+  validates shape — every non-empty entry must parse via netip.ParseAddr,
+  invalid entries counted in a second return value, never an error
+  (adapt/dns.go:514-537) — and Run sets the new sticky flag
+  dns_brute_resolvers_ignored when brute is enabled and anything was supplied
+  (adapt/dns.go:169-183); the flag is set on baseRes before every brute path,
+  so wildcard-abort/empty/full merges all preserve it. With brute disabled the
+  param is inert like every other dnsx_* param and no flag is raised (pinned).
+  The `_ =` discard in runBrute is gone; Run doc block and function comments
+  state "NOT honored — native resolver always used". Tests:
+  TestDNSBruteResolversParsing (shape table) and
+  TestDNSBruteResolversIgnoredFlag (flag set for valid+invalid input, outcome
+  not downgraded, native seam still used; no flag when absent or brute
+  disabled), adapt/dns_test.go:980-1113. Gates this session: gofmt -l clean;
+  go vet ./... ok; go build ./... ok; go test -count=1 ./... ok;
+  go test -race -count=1 ./internal/pipeline/adapt ok.
 
 ### NEW-32 (LOW) — dns brute truncation flag false-positives at exactly-at-cap (internal/pipeline/adapt/dns.go)
-- Status: OPEN
+- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: `candidateTruncated := len(candidates) >= dns.MaxBruteHostsPerDomain || wordlistTruncated` (:492) fires when generation produced exactly MaxBruteHostsPerDomain candidates without dropping anything (the generator truncates only above cap) → spurious `dns_brute_truncated` sticky flag.
 - Fix: return an explicit cap-hit bool from GenerateBruteCandidates instead of inferring from length.
 - Verification: wordlist of exactly the cap size → no flag; above cap → flag.
+- Implementation (2026-08-21): GenerateBruteCandidates now returns
+  ([]asset.Host, bool) — the bool is true iff a distinct valid candidate was
+  actually DROPPED at the cap (brute.go:74-91; core extracted into
+  buildBruteCandidates brute.go:95-131 so tests can exercise drop detection
+  with small caps — with the current equal 5000/5000 constants the public
+  path can never observe a drop). The adapter uses the explicit bool:
+  `candidatesCapped` (:562) feeds `candidateTruncated := candidatesCapped ||
+  wordlistTruncated` (:593); no length inference anywhere. Tests:
+  TestBuildBruteCandidatesCapHit (above cap -> true; exactly at cap,
+  duplicates beyond cap, invalid labels beyond cap -> false),
+  TestGenerateBruteCandidatesCap now also pins capHit=false at exactly-cap;
+  adapter level: TestDNSBruteExactlyAtCapNoTruncationFlag (5000 distinct
+  labels -> completed, no flag, brute provably ran) and
+  TestDNSBruteAboveCapTruncationFlag (5001 labels -> wordlistTruncated ->
+  flag+Truncated), adapt/dns_test.go:1116-1167. Pre-fix proof: restoring the
+  old inference line on a scratch copy fails
+  TestDNSBruteExactlyAtCapNoTruncationFlag ("Truncated = true ... at exactly
+  the cap"). Gates this session: gofmt -l clean; go vet ./... ok; go build
+  ./... ok; go test -count=1 ./... ok; go test -race -count=1
+  ./internal/dns ./internal/pipeline/adapt ./internal/asset ok.
 
 ### NEW-33 (LOW) — atomic writes never fsync the parent directory after rename (internal/cache, internal/report)
 - Status: OPEN

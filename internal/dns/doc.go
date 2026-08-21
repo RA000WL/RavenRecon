@@ -44,6 +44,15 @@
 // retries per /etc/resolv.conf, and RavenRecon neither controls nor claims to
 // control that.
 //
+// Scope of the limiter promise: it covers the queries Resolve itself
+// dispatches through its pool jobs. The standalone wildcard probe
+// (IsWildcard, brute.go) is a single pre-brute query issued by the caller
+// OUTSIDE Resolve's pool/env — it does not wait on the shared limiter. Its
+// cost is bounded by shape (one query per domain, only when opt-in brute is
+// enabled) and by the caller's context, not by pacing; routing it through a
+// separately constructed limiter would share no bucket state with Resolve's
+// env and would pace nothing.
+//
 // # Cancellation
 //
 // Cancellation is classified per type: a query cancelled before dispatch and

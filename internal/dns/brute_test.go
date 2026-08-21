@@ -15,7 +15,7 @@ import (
 func TestGenerateBruteCandidatesBasic(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := []string{"www", "api"}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	names := hostNames(candidates)
 	want := []string{"api.example.com", "www.example.com"}
 	if !reflect.DeepEqual(names, want) {
@@ -28,7 +28,7 @@ func TestGenerateBruteCandidatesBasic(t *testing.T) {
 func TestGenerateBruteCandidatesDedup(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := []string{"www", "WWW", "www", "api", "api"}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	names := hostNames(candidates)
 	want := []string{"api.example.com", "www.example.com"}
 	if !reflect.DeepEqual(names, want) {
@@ -41,7 +41,7 @@ func TestGenerateBruteCandidatesDedup(t *testing.T) {
 func TestGenerateBruteCandidatesInvalidLabels(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := []string{"", "  ", "bad_host!", "www", "-invalid", "api"}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	names := hostNames(candidates)
 	// bad_host! and "-invalid" fail asset.NewHost validation and are dropped.
 	want := []string{"api.example.com", "www.example.com"}
@@ -51,16 +51,26 @@ func TestGenerateBruteCandidatesInvalidLabels(t *testing.T) {
 }
 
 // TestGenerateBruteCandidatesCap verifies the MaxBruteHostsPerDomain cap
-// truncates deterministically and the result is sorted.
+// truncates deterministically and the result is sorted. It also pins the
+// NEW-32 regression at the generator level: a wordlist truncated to exactly
+// MaxBruteWordlistEntries (= MaxBruteHostsPerDomain) distinct entries fills
+// the output to the cap WITHOUT dropping anything, so the explicit cap-hit
+// flag must be false — truncation must never be inferred from the length.
 func TestGenerateBruteCandidatesCap(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := make([]string, MaxBruteHostsPerDomain+10)
 	for i := range wordlist {
 		wordlist[i] = "host" + itoa(i)
 	}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, capHit := GenerateBruteCandidates(domain, wordlist)
 	if len(candidates) != MaxBruteHostsPerDomain {
 		t.Fatalf("len = %d, want %d", len(candidates), MaxBruteHostsPerDomain)
+	}
+	// The wordlist was pre-truncated to MaxBruteWordlistEntries
+	// (= MaxBruteHostsPerDomain) distinct valid labels, so every retained
+	// candidate filled the cap exactly and nothing was dropped.
+	if capHit {
+		t.Fatal("capHit = true, want false: output at the cap without any dropped candidate is not truncation")
 	}
 	// Sorted check
 	for i := 1; i < len(candidates); i++ {
@@ -77,7 +87,7 @@ func TestGenerateBruteCandidatesWordlistCap(t *testing.T) {
 	for i := range wordlist {
 		wordlist[i] = "w" + itoa(i)
 	}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	if len(candidates) != MaxBruteWordlistEntries {
 		t.Fatalf("len = %d, want %d (wordlist cap)", len(candidates), MaxBruteWordlistEntries)
 	}
@@ -86,7 +96,7 @@ func TestGenerateBruteCandidatesWordlistCap(t *testing.T) {
 // TestGenerateBruteCandidatesEmptyDomain verifies empty domain returns nil.
 func TestGenerateBruteCandidatesEmptyDomain(t *testing.T) {
 	var domain asset.Domain
-	candidates := GenerateBruteCandidates(domain, []string{"www"})
+	candidates, _ := GenerateBruteCandidates(domain, []string{"www"})
 	if len(candidates) != 0 {
 		t.Fatalf("empty domain produced %v", hostNames(candidates))
 	}
@@ -95,10 +105,63 @@ func TestGenerateBruteCandidatesEmptyDomain(t *testing.T) {
 // TestGenerateBruteCandidatesEmptyWordlist verifies empty wordlist returns nil.
 func TestGenerateBruteCandidatesEmptyWordlist(t *testing.T) {
 	domain := mustDomain(t, "example.com")
-	candidates := GenerateBruteCandidates(domain, nil)
+	candidates, _ := GenerateBruteCandidates(domain, nil)
 	if len(candidates) != 0 {
 		t.Fatalf("empty wordlist produced %v", hostNames(candidates))
 	}
+}
+
+// TestBuildBruteCandidatesCapHit exercises the drop-detection logic with a
+// small cap (the production constants make the public path unable to observe
+// a drop): above the cap the flag is true; exactly at the cap without drops
+// it stays false; duplicates and invalid labels beyond the cap are not
+// drops.
+func TestBuildBruteCandidatesCapHit(t *testing.T) {
+	domain := mustDomain(t, "example.com")
+
+	t.Run("above cap reports drop", func(t *testing.T) {
+		out, capHit := buildBruteCandidates(domain, []string{"a", "b", "c", "d"}, 3)
+		if len(out) != 3 {
+			t.Fatalf("len = %d, want 3", len(out))
+		}
+		if !capHit {
+			t.Fatal("capHit = false, want true: one distinct candidate was dropped")
+		}
+	})
+
+	t.Run("exactly at cap without drop", func(t *testing.T) {
+		out, capHit := buildBruteCandidates(domain, []string{"a", "b", "c"}, 3)
+		if len(out) != 3 {
+			t.Fatalf("len = %d, want 3", len(out))
+		}
+		if capHit {
+			t.Fatal("capHit = true, want false: nothing was dropped at exactly the cap")
+		}
+	})
+
+	t.Run("duplicates beyond cap are not drops", func(t *testing.T) {
+		// "a" repeats after the cap is full: a duplicate of an already
+		// retained candidate is dedup, never a dropped NEW candidate.
+		out, capHit := buildBruteCandidates(domain, []string{"a", "b", "c", "a", "A"}, 3)
+		if len(out) != 3 {
+			t.Fatalf("len = %d, want 3", len(out))
+		}
+		if capHit {
+			t.Fatal("capHit = true, want false: only duplicates followed the cap")
+		}
+	})
+
+	t.Run("invalid labels beyond cap are not drops", func(t *testing.T) {
+		// "bad_host!" fails asset.NewHost validation: dropped as invalid,
+		// never counted as a cap drop.
+		out, capHit := buildBruteCandidates(domain, []string{"a", "b", "c", "bad_host!"}, 3)
+		if len(out) != 3 {
+			t.Fatalf("len = %d, want 3", len(out))
+		}
+		if capHit {
+			t.Fatal("capHit = true, want false: only an invalid label followed the cap")
+		}
+	})
 }
 
 // TestIsWildcardNotWildcard verifies a non-wildcard domain (probe returns
@@ -189,7 +252,7 @@ func TestIsWildcardOtherFailure(t *testing.T) {
 func TestBruteWildcardAbortIntegration(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := []string{"www", "api"}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	if len(candidates) != 2 {
 		t.Fatalf("candidates = %v, want 2", hostNames(candidates))
 	}
@@ -222,7 +285,7 @@ func TestBruteWildcardAbortIntegration(t *testing.T) {
 func TestBruteResolveFiltering(t *testing.T) {
 	domain := mustDomain(t, "example.com")
 	wordlist := []string{"www", "api", "nope"}
-	candidates := GenerateBruteCandidates(domain, wordlist)
+	candidates, _ := GenerateBruteCandidates(domain, wordlist)
 	fake := newFakeResolver()
 	fake.set("www.example.com", TypeA, "1.1.1.1")
 	fake.set("api.example.com", TypeA, "1.1.1.2")

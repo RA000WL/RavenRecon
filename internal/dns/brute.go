@@ -61,21 +61,41 @@ const WildcardProbeLabel = wildcardProbeLabel
 //   - wordlist length is capped at MaxBruteWordlistEntries
 //   - output length is capped at MaxBruteHostsPerDomain
 //
+// The second return value is the explicit cap-hit flag: true if and only if
+// at least one distinct valid candidate was DROPPED because the output cap
+// was already full. It is false when generation produced exactly the cap
+// without dropping anything — callers must use this flag instead of
+// inferring truncation from the output length (a length at the cap does not
+// mean anything was cut).
+//
 // The provenance of every returned host is Source "dns-brute" — the
 // caller may re-stamp DiscoveredAt through its own clock if desired; the
 // identity and Name are what matter for dedup and resolution.
-func GenerateBruteCandidates(domain asset.Domain, wordlist []string) []asset.Host {
+func GenerateBruteCandidates(domain asset.Domain, wordlist []string) ([]asset.Host, bool) {
 	if domain.Name == "" {
-		return nil
+		return nil, false
 	}
 	if len(wordlist) == 0 {
-		return nil
+		return nil, false
 	}
 	if len(wordlist) > MaxBruteWordlistEntries {
 		wordlist = wordlist[:MaxBruteWordlistEntries]
 	}
+	return buildBruteCandidates(domain, wordlist, MaxBruteHostsPerDomain)
+}
+
+// buildBruteCandidates is the generation core shared by
+// GenerateBruteCandidates: it applies the dedup/normalize/cap rules over the
+// already-truncated wordlist against the given maxHosts bound and reports
+// whether any distinct valid candidate was dropped at that bound. maxHosts
+// <= 0 disables the bound. The extra parameter exists so tests can exercise
+// the drop-detection logic with a small cap (the production constants make
+// the wordlist and host caps equal, so the public path can never observe a
+// drop today).
+func buildBruteCandidates(domain asset.Domain, wordlist []string, maxHosts int) ([]asset.Host, bool) {
 	seen := make(map[asset.Identity]bool, len(wordlist))
 	out := make([]asset.Host, 0, len(wordlist))
+	capHit := false
 	prov := asset.Provenance{Source: "dns-brute"}
 	for _, w := range wordlist {
 		w = strings.TrimSpace(w)
@@ -91,17 +111,21 @@ func GenerateBruteCandidates(domain asset.Domain, wordlist []string) []asset.Hos
 		if seen[id] {
 			continue
 		}
+		if maxHosts > 0 && len(out) >= maxHosts {
+			// A distinct valid candidate beyond the cap: dropped, and the
+			// caller must know. Continue scanning so duplicates of already
+			// retained candidates stay indistinguishable from drops.
+			capHit = true
+			continue
+		}
 		seen[id] = true
 		out = append(out, h)
-		if len(out) >= MaxBruteHostsPerDomain {
-			break
-		}
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, capHit
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return out, capHit
 }
 
 // wildcardProbeHost returns the host used to test whether domain is
@@ -127,6 +151,12 @@ func WildcardProbeHost(domain asset.Domain) asset.Host {
 // treated as non-wildcard to avoid false aborts (a failing resolver must
 // not suppress brute). Cancellation and deadline errors are returned so the
 // caller can propagate them.
+//
+// Rate-limiting note: the probe is issued directly, outside Resolve's env,
+// and therefore does NOT wait on the shared central query limiter — the
+// limiter promise in doc.go ("Concurrency and rate limiting") covers
+// Resolve's own queries only. The probe's cost is bounded by shape (one
+// query per domain, only when opt-in brute is enabled) and by ctx alone.
 func IsWildcard(ctx context.Context, domain asset.Domain, resolver Resolver) (bool, error) {
 	if ctx == nil {
 		return false, errors.New("dns: context must not be nil")

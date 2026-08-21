@@ -974,3 +974,194 @@ func TestDNSBruteTimeoutTruncated(t *testing.T) {
 		}
 	})
 }
+
+// --- NEW-31: dnsx_resolvers warn-and-ignore ---
+
+// TestDNSBruteResolversParsing pins the parser's shape validation: entries
+// must parse as IP addresses, invalid entries are counted (never errored),
+// and absent/empty params yield nothing.
+func TestDNSBruteResolversParsing(t *testing.T) {
+	tests := []struct {
+		name        string
+		params      map[string]string
+		wantCount   int
+		wantInvalid int
+	}{
+		{name: "absent", params: nil, wantCount: 0, wantInvalid: 0},
+		{name: "empty value", params: map[string]string{"dnsx_resolvers": ""}, wantCount: 0, wantInvalid: 0},
+		{name: "whitespace only", params: map[string]string{"dnsx_resolvers": "   "}, wantCount: 0, wantInvalid: 0},
+		{
+			name:        "valid ipv4 and ipv6",
+			params:      map[string]string{"dnsx_resolvers": "192.0.2.1, 2001:db8::1"},
+			wantCount:   2,
+			wantInvalid: 0,
+		},
+		{
+			name:        "mixed valid and invalid",
+			params:      map[string]string{"dnsx_resolvers": "192.0.2.1,not-an-ip, ,999.1.2.3"},
+			wantCount:   1,
+			wantInvalid: 2,
+		},
+		{
+			name:        "only invalid",
+			params:      map[string]string{"dnsx_resolvers": "example.com"},
+			wantCount:   0,
+			wantInvalid: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, invalid := dnsBruteResolvers(tt.params)
+			if len(got) != tt.wantCount || invalid != tt.wantInvalid {
+				t.Fatalf("dnsBruteResolvers = (%v, %d), want (%d entries, %d invalid)", got, invalid, tt.wantCount, tt.wantInvalid)
+			}
+		})
+	}
+}
+
+// TestDNSBruteResolversIgnoredFlag is the NEW-31 regression: a supplied
+// dnsx_resolvers param is never silently discarded — the run carries the
+// dns_brute_resolvers_ignored sticky flag while resolution proceeds through
+// the native resolver seam exactly as before.
+func TestDNSBruteResolversIgnoredFlag(t *testing.T) {
+	target := mustDomain(t, "example.com")
+
+	t.Run("supplied with brute enabled sets flag", func(t *testing.T) {
+		fake := newFakeResolver()
+		fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{
+			"dnsx_brute":     "true",
+			"dnsx_wordlist":  "www",
+			"dnsx_resolvers": "192.0.2.1,192.0.2.2",
+		}
+		res, err := NewDNSStage(fake).Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run error: %v", err)
+		}
+		if !res.StickyFlags[dnsBruteResolversIgnoredFlag] {
+			t.Fatalf("StickyFlags = %v, want %q set", res.StickyFlags, dnsBruteResolversIgnoredFlag)
+		}
+		if res.Outcome != pipeline.OutcomeCompleted {
+			t.Fatalf("Outcome = %q, want completed (warning must not downgrade the outcome)", res.Outcome)
+		}
+		// The native resolver seam still performed every query.
+		requireEqualStrings(t, "additions", hostNames(res.Additions.Hosts), []string{"www.example.com"})
+	})
+
+	t.Run("invalid shapes still flag", func(t *testing.T) {
+		fake := newFakeResolver()
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{
+			"dnsx_brute":     "true",
+			"dnsx_wordlist":  "www",
+			"dnsx_resolvers": "not-an-ip",
+		}
+		res, err := NewDNSStage(fake).Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run error: %v", err)
+		}
+		if !res.StickyFlags[dnsBruteResolversIgnoredFlag] {
+			t.Fatalf("StickyFlags = %v, want %q set even for shape-invalid input", res.StickyFlags, dnsBruteResolversIgnoredFlag)
+		}
+	})
+
+	t.Run("absent param no flag", func(t *testing.T) {
+		fake := newFakeResolver()
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+		res, err := NewDNSStage(fake).Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run error: %v", err)
+		}
+		if res.StickyFlags[dnsBruteResolversIgnoredFlag] {
+			t.Fatalf("StickyFlags = %v, want no %q without the param", res.StickyFlags, dnsBruteResolversIgnoredFlag)
+		}
+	})
+
+	t.Run("brute disabled no flag", func(t *testing.T) {
+		fake := newFakeResolver()
+		fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+		in := dnsInput(target, []asset.Host{mustHost(t, "www.example.com")})
+		// Param supplied but brute disabled: dnsx_* params are inert, the
+		// documented scope of the warning is the brute path.
+		in.Config = map[string]string{"dnsx_resolvers": "192.0.2.1"}
+		res, err := NewDNSStage(fake).Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run error: %v", err)
+		}
+		if res.StickyFlags[dnsBruteResolversIgnoredFlag] {
+			t.Fatalf("StickyFlags = %v, want no %q with brute disabled", res.StickyFlags, dnsBruteResolversIgnoredFlag)
+		}
+	})
+}
+
+// --- NEW-32: explicit cap-hit instead of length inference ---
+
+// bruteWordlistParam renders n distinct valid labels as a dnsx_wordlist
+// StageParam value.
+func bruteWordlistParam(n int) string {
+	labels := make([]string, n)
+	for i := range labels {
+		labels[i] = fmt.Sprintf("h%05d", i)
+	}
+	return strings.Join(labels, ",")
+}
+
+// TestDNSBruteExactlyAtCapNoTruncationFlag is the NEW-32 regression: a
+// wordlist whose distinct candidates fill MaxBruteHostsPerDomain exactly —
+// without dropping anything — must NOT raise dns_brute_truncated. The old
+// code inferred truncation from len(candidates) >= MaxBruteHostsPerDomain
+// and flagged this exact scenario spuriously.
+func TestDNSBruteExactlyAtCapNoTruncationFlag(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{
+		"dnsx_brute":    "true",
+		"dnsx_wordlist": bruteWordlistParam(dns.MaxBruteHostsPerDomain),
+	}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.Truncated {
+		t.Fatal("Truncated = true, want false at exactly the cap without drops")
+	}
+	if res.StickyFlags[dnsBruteTruncatedFlag] {
+		t.Fatalf("StickyFlags = %v, want no %q at exactly the cap without drops", res.StickyFlags, dnsBruteTruncatedFlag)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	// Prove brute actually ran at full size (the assertion above is not
+	// vacuous): the resolver saw the wildcard probe plus candidate queries.
+	if fake.callCount() <= 1 {
+		t.Fatalf("callCount = %d, want many (brute must have queried candidates)", fake.callCount())
+	}
+}
+
+// TestDNSBruteAboveCapTruncationFlag pins the honest half of NEW-32: a
+// wordlist above MaxBruteWordlistEntries IS truncated at ingestion and must
+// raise dns_brute_truncated with Truncated=true.
+func TestDNSBruteAboveCapTruncationFlag(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{
+		"dnsx_brute":    "true",
+		"dnsx_wordlist": bruteWordlistParam(dns.MaxBruteWordlistEntries + 1),
+	}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if !res.Truncated {
+		t.Fatal("Truncated = false, want true above the wordlist cap")
+	}
+	if !res.StickyFlags[dnsBruteTruncatedFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set above the wordlist cap", res.StickyFlags, dnsBruteTruncatedFlag)
+	}
+}
