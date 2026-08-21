@@ -1485,7 +1485,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: table tests — `_dmarc`/`s1._domainkey` accepted, `exa_mple` still rejected; discovery fixture with such hosts survives end-to-end.
 
 ### NEW-26 (LOW) — jsintel import window scans superlinear on adversarial input; Parse uncancellable (internal/jsintel)
-- Status: OPEN
+- Status: VERIFIED — fixed in 74851fc (maxTotalScanSteps 100k + statement-boundary early exit; adversarial <100ms, truncated honest)
 - Reporter: reviewer
 - Owner: (unassigned)
 - Problem: `findFromSpecifier` (parse.go:184-223) scans up to `maxLookaheadTokens` (1024) from every `import` keyword; input like `import x import x …` repeats gives O(tokens × 1024) (~5e8 steps at the 1M-token cap). `Parse` takes no context, so pool deadlines cannot interrupt it.
