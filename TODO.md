@@ -1477,7 +1477,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: cross-engine conformance test "content change ⇒ no stale hit"; fails pre-fix for techintel.
 
 ### NEW-25 (MED) — validateHostname rejects leading-underscore labels: _dmarc/_domainkey/_acme-challenge hosts cannot become assets (internal/asset)
-- Status: OPEN
+- Status: VERIFIED — fixed in 4c919d5 (leading underscore per label, rest [a-z0-9-] hyphen rules, mid-label _ still rejected, 23 tests)
 - Reporter: reviewer
 - Owner: (unassigned)
 - Problem: normalize.go:48-53 permits only `[a-z0-9-]`; underscore is rejected everywhere. RFC 8552-style service labels (`_dmarc.example.com`, `s1._domainkey.example.com`, `_acme-challenge.example.com`) are legitimate passive-discovery output and are dropped/error at the sole normalization point (rejection pinned by normalize_test.go:34).
