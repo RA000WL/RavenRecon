@@ -2018,20 +2018,6 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: existing tests pass unmodified; grep shows a single non-test
   definition per concept; gates + race green.
 
-## Operational warnings (all agents)
-
-- **`go test ./...` is safe to run** — verified green with `-count=1` on this
-  workspace (all 22 packages pass). internal/discovery is slow (~75 s:
-  bounded `waitForTrue` polling of 2-3 s per cache/subprocess test) but does
-  NOT hang; the earlier "deterministic hang" warning referred to a parallel
-  in-flight workspace and is resolved here.
-- Tests must stay hermetic (loopback servers, fake transports, temp dirs —
-  no public internet).
-- Stdlib only; go.mod must not gain dependencies. No real secrets in tests
-  (synthetic values only).
-- External tools are adapters behind interfaces; core pipelines never branch
-  on tool names.
-
 ### NEW-55 (LOW) — BenchmarkMatchIndicatorAllKinds exercises no TLS/DNS branches (internal/techintel)
 - Status: VERIFIED — fixed in 36d22ca (fixture TLS/DNS seams fire real DB indicators; runtime sanity gate enforces ≥1 match per family; workload change disclosed: 78→84 allocs/op is more measured work, not regression)
 - Reporter: reviewer (OPT-P2-4 review, NEW-49 batch 3b)
