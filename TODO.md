@@ -1716,6 +1716,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
 - Post-fix field run 4 (verily.com, fresh cache): urllive still hits the shared stage deadline at 8,199-URL scale (1,587 errors) BUT now carries Truncated+urllive_truncated honestly; alive 172, 3xx 2,361, 4xx 4,078. The remaining lever is a dedicated urllive stage budget (StageBounds Timeout for urllive) or higher concurrency via StageParams — operator-tunable today: --stages with per-stage bounds. Not a defect; recorded as tuning guidance.
 
+### NEW-40 (INFO) — OPT-P0-5 completion: honest duration verified on a real run
+- Status: VERIFIED — pipeline bracket wired in 08861f0; field run 5 (verily.com, fresh cache) reports started_at 14:23:21 → ended_at 14:30:53, duration_ms 452249 (7m32s). Digest stable (timing excluded). The last P0-5 piece is closed.
+
 ## Operational warnings (all agents)
 ### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
 - Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
@@ -1731,6 +1734,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
 - Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
 - Post-fix field run 4 (verily.com, fresh cache): urllive still hits the shared stage deadline at 8,199-URL scale (1,587 errors) BUT now carries Truncated+urllive_truncated honestly; alive 172, 3xx 2,361, 4xx 4,078. The remaining lever is a dedicated urllive stage budget (StageBounds Timeout for urllive) or higher concurrency via StageParams — operator-tunable today: --stages with per-stage bounds. Not a defect; recorded as tuning guidance.
+
+### NEW-40 (INFO) — OPT-P0-5 completion: honest duration verified on a real run
+- Status: VERIFIED — pipeline bracket wired in 08861f0; field run 5 (verily.com, fresh cache) reports started_at 14:23:21 → ended_at 14:30:53, duration_ms 452249 (7m32s). Digest stable (timing excluded). The last P0-5 piece is closed.
 
 ## Operational warnings (all agents)
 
