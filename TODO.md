@@ -1460,6 +1460,130 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   sane host count for a 1-subdomain domain; gates green.
 - Builder round 1 (2026-08-20): quality.go kept (verified: defaults, Normalize, over_cap, divergence, median, error); fixed pipeline.go compile (storedResult QualityIssues, runSource 3-ret, no double-store, sticky replay) and cache.go; wired adapter (discovery_quality_flagged, qualityConfigFromParams, abort) and cli doctor line; ROADMAP ticked; tests: quality_test.go (cap, divergence, median, old-schema, sticky, abort, determinism) + discovery_quality_test.go (poisoned flag, divergence, abort, pipeline E2E); gates: gofmt clean, go test ./... ok (discovery 78s adapt 17s), vet ok, build ok, race ok, doctor grep quality ok.
 
+### NEW-23 (HIGH) — DNS brute timeout indistinguishable from a complete run (internal/pipeline/adapt/dns.go)
+- Status: VERIFIED — fixed in b5aa88e (attempted-only counters, dns_brute_truncated flag, outcome downgrade to partial/cancelled, 3 hermetic subtests)
+- Reporter: reviewer
+- Owner: builder
+- Problem: AGENTS §0.6 violation. In `runBrute` (adapt/dns.go:504-573), when `dns.BruteTimeout` fires mid-resolution, `dns.Resolve` returns nil error; cancelled candidates carry no IPs/Targets and the resolving filter silently drops them; `ItemsProcessed` counts `len(filtered)` (including never-attempted hosts); only per-type answer-cap `Truncated` flags propagate — no cancellation/timeout flag exists. A timeout-truncated brute is recorded `completed` with no sticky flag.
+- Fix: inspect `rep.Results` host statuses for cancelled/timed-out; set `Truncated` + `StickyFlags["dns_brute_truncated"]`, count only attempted hosts, downgrade the outcome per the fold table.
+- Verification: fake resolver stalling past BruteTimeout → flag fires, outcome != completed, attempted-only counters; regression fails pre-fix.
+
+### NEW-24 (MED) — techintel cache key lacks observation-content digest: changed page serves stale detections (internal/techintel)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: `techKey` (record.go:26-36) binds identity + schema + db_digest + sources mask only; `storedTech` carries no content hash. Siblings solve this: secrentel digests document content into its key (document.go:261), jsintel cross-validates `AnalyzedHash` at lookup and self-heals (record_analyze.go:155-166). Until TTL expiry, a materially changed page replays old detections as zero-analysis cache hits.
+- Fix: adopt the jsintel pattern — store an observation payload hash (headers/body/cookies digest) in the record; reject+delete+recompute on mismatch.
+- Verification: cross-engine conformance test "content change ⇒ no stale hit"; fails pre-fix for techintel.
+
+### NEW-25 (MED) — validateHostname rejects leading-underscore labels: _dmarc/_domainkey/_acme-challenge hosts cannot become assets (internal/asset)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: normalize.go:48-53 permits only `[a-z0-9-]`; underscore is rejected everywhere. RFC 8552-style service labels (`_dmarc.example.com`, `s1._domainkey.example.com`, `_acme-challenge.example.com`) are legitimate passive-discovery output and are dropped/error at the sole normalization point (rejection pinned by normalize_test.go:34).
+- Fix: permit leading-underscore labels; keep mid-label underscores invalid; document the policy in doc.go.
+- Verification: table tests — `_dmarc`/`s1._domainkey` accepted, `exa_mple` still rejected; discovery fixture with such hosts survives end-to-end.
+
+### NEW-26 (LOW) — jsintel import window scans superlinear on adversarial input; Parse uncancellable (internal/jsintel)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: `findFromSpecifier` (parse.go:184-223) scans up to `maxLookaheadTokens` (1024) from every `import` keyword; input like `import x import x …` repeats gives O(tokens × 1024) (~5e8 steps at the 1M-token cap). `Parse` takes no context, so pool deadlines cannot interrupt it.
+- Fix: cap total window-scan steps per parse (fold into `w.truncated`) or stop a scan at the next import/export keyword; thread ctx or accept an explicit step budget.
+- Verification: adversarial corpus benchmark with the number pinned in parse.go's comment (§14); parse completes under pool deadline.
+
+### NEW-27 (LOW) — secrentel anchor gate ASCII-lowercases but gated regexes match via Unicode simple fold: silent false negatives (internal/secrentel)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: scan.go:82-86 builds the anchor haystack with `toLowerASCII`; anchors gate `(?i)` regexes (scan.go:101-112), which match through Unicode simple folding (ſ↔s, U+212A K↔k). A document containing e.g. `aws_ſecret_access_key=` passes the regex yet lacks the ASCII anchor → pattern skipped, violating the "anchor is a necessary substring" contract (patterns/types.go:124-131).
+- Fix: fold-compare anchors (walk with `unicode.SimpleFold`) or restrict anchored families to ASCII-only matching explicitly.
+- Verification: homoglyph regression row demonstrates match-without-anchor today, correctly anchored after fix.
+
+### NEW-28 (LOW) — secrentel dedup merge upgrades strength/family but not entropyOK (internal/secrentel)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: scan.go:176-184 merges duplicate candidates by upgrading strength/family from the winning pattern; `entropyOK` stays the creating pattern's. Phase 3 scores with the creating pattern's entropy flag while hints use the winning pattern — the factor list can contradict the winning pattern's entropy requirement (both directions possible).
+- Fix: recompute `entropyOK` from the winning pattern at merge time (or evaluate Phase 3 entropy from the winner).
+- Verification: two-pattern same-type dedup case where winner requires entropy and loser does not (and vice versa); factor list matches winner.
+
+### NEW-29 (LOW) — sortQuery collapses ?x= and ?x into one URL identity (internal/asset)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: url.go:286-290 writes `=` only when the value is non-empty, so distinct raw forms `?x=` and `?x` serialize identically — contradicting the type doc's "distinct raw forms never collapse" principle (url.go:30-34).
+- Fix: track whether each raw pair contained `=` and emit `key=` for present-but-empty values.
+- Verification: pin `?a=1&x=` vs `?a=1&x` as distinct identities.
+
+### NEW-30 (LOW) — dns wildcard probe bypasses the central query limiter (internal/dns)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: `IsWildcard` (brute.go:130-165) issues `resolver.Lookup` directly (brute.go:143), outside Resolve's env; dns/doc.go:40 promises every outbound query waits on the shared token-bucket limiter regardless of concurrency. Called per-run from adapt/dns.go:449.
+- Fix: route the probe through the run limiter (accept a Limiter param) or document the exception in doc.go + brute.go.
+- Verification: limiter-counting fake resolver asserts the probe consumes a token (or the doc drift is closed).
+
+### NEW-31 (LOW) — dnsx_resolvers StageParam parsed then discarded; "validates shape" claim inaccurate (internal/pipeline/adapt/dns.go)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: `dnsBruteResolvers` (adapt/dns.go:416-438) result discarded at :464 (`_ =`); operator-supplied resolvers are silently ignored. The comment claims parsing validates shape but no IP validation occurs (comma split only).
+- Fix: implement (thread resolvers into cfg), or warn-and-ignore with honest wording, or reject the param like other unknown params; fix the comment either way.
+- Verification: param supplied → resolvers used or warning surfaced; comment matches behavior.
+
+### NEW-32 (LOW) — dns brute truncation flag false-positives at exactly-at-cap (internal/pipeline/adapt/dns.go)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: `candidateTruncated := len(candidates) >= dns.MaxBruteHostsPerDomain || wordlistTruncated` (:492) fires when generation produced exactly MaxBruteHostsPerDomain candidates without dropping anything (the generator truncates only above cap) → spurious `dns_brute_truncated` sticky flag.
+- Fix: return an explicit cap-hit bool from GenerateBruteCandidates instead of inferring from length.
+- Verification: wordlist of exactly the cap size → no flag; above cap → flag.
+
+### NEW-33 (LOW) — atomic writes never fsync the parent directory after rename (internal/cache, internal/report)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: cache Put syncs the temp file then renames (cache/cache.go:282-291) with no directory fsync; report writer same (writer.go:148 Sync, :334 Rename). After power loss the rename itself may be lost — degrades to a cache miss / missing report, never corruption, but weakens the documented crash-safe guarantee.
+- Fix: best-effort open(dir)+Sync()+Close after rename in both writers, or scope the durability wording in docs.
+- Verification: injectable sync hook asserts dir sync invoked; docs updated.
+
+### NEW-34 (LOW) — event.Validate allocates a map literal per published event (internal/event)
+- Status: OPEN
+- Reporter: reviewer
+- Owner: (unassigned)
+- Problem: event.go:105-111 builds a 4-entry map per call; Validate runs on every publish — the hottest observability path.
+- Fix: four explicit length checks.
+- Verification: existing validation table passes unchanged; benchmark shows the allocation removed.
+
+### NF-4 (INFO) — config comment cites a discover --timeout flag that does not exist (internal/config)
+- Status: VERIFIED — fixed in 7f2f05a (config.go:168 comment corrected to Discovery.Timeout / scan --timeout)
+- Reporter: reviewer
+- Owner: docs
+
+### NF-5 (INFO) — OPTIMIZATION.md status column stale: OPT-P0-1/P0-2 implemented+verified but marked OPEN
+- Status: VERIFIED — fixed in 7f2f05a (OPTIMIZATION.md P0-1/P0-2 OPEN → VERIFIED)
+- Reporter: reviewer
+- Owner: docs
+
+### NF-6 (INFO) — SECURITY.md gives no actual reporting contact
+- Status: VERIFIED — fixed in 7f2f05a (SECURITY.md:9-11 Contact added)
+- Reporter: reviewer
+- Owner: docs
+
+### NEW-35 (note) — reviewer observations, non-mandated batch (mixed packages)
+- Status: OPEN (note)
+- Reporter: reviewer
+- Owner: (unassigned)
+- Notes (independently actionable; no severity claimed):
+  1. chaos unset PDCP_API_KEY reports MISSING though the binary exists (chaos.go:50-54; deliberate per in-code comment) — consider WARN semantics distinguishing not-installed vs not-configured.
+  2. httpprobe followed-redirect bodies closed undrained (run.go:706) — defeats keep-alive reuse; bounded io.Copy(io.Discard, ...) before close.
+  3. isHeaderCapAbort matches an exact stdlib message (run.go:894-902) — pin with a test asserting current stdlib produces it, so a Go upgrade cannot silently disable truncation detection.
+  4. asset.Parameter.Sources grows unbounded while ObservedValues caps at 1024 (parameter.go:146-148, merge.go:327-331) — inconsistent bounding on one record.
+  5. runtime execute derives a WithCancel child immediately replaced by WithTimeout (pool.go:447-451) — construct the timeout context directly.
+  6. asset/merge.go:119 `out.Method = a.Method` is dead code (out already copies a).
+- Verification: n/a (notes; claim individually if promoted).
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this
