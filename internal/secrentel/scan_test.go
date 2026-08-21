@@ -532,3 +532,218 @@ func TestScanDeterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestScanAnchorHomoglyphRegression(t *testing.T) {
+	// NEW-27: the anchor gate must use unicode folding (ſ↔s, K↔k) matching
+	// RE2's (?i). A document with aws_ſecret_access_key (ſ U+017F) must not be
+	// skipped when the pattern's anchor is the ASCII "aws_secret_access_key".
+	// Use a compiled custom pattern to isolate the gate.
+	db, err := patterns.CompileForTest([]patterns.Pattern{{
+		ID:       "test-aws-secret",
+		Type:     asset.SecretTypeAWS,
+		Provider: "aws",
+		Family:   patterns.FamilyContextual,
+		Regex:    `(?i)aws_?secret_?access_?key\s*["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?`,
+		Anchors:  []string{"aws_secret_access_key"},
+		Group:    1,
+		Strength: 0.75,
+		Entropy:  patterns.EntropyRule{MinShannon: 3.0, MinNormalized: 0.5, Class: patterns.ClassBase64},
+	}})
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	val := detRand(40, alnumMixed+"/+=", 17, 4)
+	// Content uses long s ſ (U+017F) which RE2 (?i) folds to s, but pure ASCII
+	// lower misses. The folded haystack fallback must rescue it.
+	content := []byte("aws_\u017Fecret_access_key=\"" + val + "\"")
+	sd, err := prepareDocument(Document{Kind: KindEnv, Content: content}, fixedTime(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := scanDocument(sd, db, defaultScanLimits())
+	if len(out.candidates) != 1 {
+		t.Fatalf("homoglyph anchor must be folded to match; got %d candidates: %+v counts: %+v", len(out.candidates), out.candidates, out.counts)
+	}
+	if out.candidates[0].value != val {
+		t.Errorf("candidate value = %q, want %q", out.candidates[0].value, val)
+	}
+	// Also verify the production DB's own anchor ("secret") is rescued via
+	// the same folding: the production regex also matches ſecret.
+	_, out2 := scanOf(t, Document{Kind: KindEnv, Content: []byte("aws_\u017Fecret_access_key=\"" + val + "\"")})
+	found := false
+	for _, c := range out2.candidates {
+		if c.value == val {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("production aws-secret-access-key pattern must also be found via folded anchor 'secret'")
+	}
+}
+
+func TestScanDedupEntropyWinner(t *testing.T) {
+	// NEW-28: dedup merges duplicate (type,value) candidates; the winning
+	// pattern (max strength, ID tie-break) must drive entropyOK, not the
+	// creating pattern. Test both directions.
+	highEntropyVal := detRand(32, alnumMixed, 7, 42) // high entropy, passes any rule
+
+	// Case 1: winner requires entropy, loser does not. The factor must appear
+	// (winner's entropy rule is the contract).
+	t.Run("winner requires entropy", func(t *testing.T) {
+		pLoser := patterns.Pattern{
+			ID:       "aaa-loser-no-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.5,
+		}
+		pWinner := patterns.Pattern{
+			ID:       "zzz-winner-with-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.9,
+			Entropy:  patterns.EntropyRule{MinShannon: 2.5, MinNormalized: 0.4, Class: patterns.ClassAlnum},
+		}
+		// patterns.CompileForTest sorts patterns by ID before the engine sees
+		// them, so the loser ("aaa-", lower strength) is processed FIRST and
+		// creates the candidate; the winner ("zzz-") merges second through the
+		// dedup upgrade (scan.go: p.Strength > c.strength). Pre-fix the merge
+		// upgraded strength/family but left entropyOK false from the creator.
+		db, err := patterns.CompileForTest([]patterns.Pattern{pLoser, pWinner})
+		if err != nil {
+			t.Fatalf("CompileForTest: %v", err)
+		}
+		content := []byte("token=\"" + highEntropyVal + "\"")
+		sd, err := prepareDocument(Document{Kind: KindEnv, Content: content}, fixedTime(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := scanDocument(sd, db, defaultScanLimits())
+		if len(out.candidates) != 1 {
+			t.Fatalf("dedup must produce one candidate, got %d: %+v", len(out.candidates), out.candidates)
+		}
+		c := out.candidates[0]
+		if !hasFactor(c.confidence, "entropy") {
+			t.Errorf("winner requires entropy → entropy factor must be present; factors: %+v strength: %v family: %v", c.confidence.Factors, c.strength, c.family)
+		}
+		if c.strength != pWinner.Strength || c.family != pWinner.Family {
+			t.Errorf("strength/family must follow winner: got %v/%v want %v/%v", c.strength, c.family, pWinner.Strength, pWinner.Family)
+		}
+		if !c.entropyOK {
+			t.Error("entropyOK must be true from winner")
+		}
+	})
+
+	// Case 2: winner does NOT require entropy, loser does. The factor must
+	// be ABSENT (winner's contract), even though loser would have required it.
+	t.Run("winner no entropy", func(t *testing.T) {
+		pWinnerNoEnt := patterns.Pattern{
+			ID:       "zzz-winner-no-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.9,
+		}
+		pLoserWithEnt := patterns.Pattern{
+			ID:       "aaa-loser-with-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.5,
+			Entropy:  patterns.EntropyRule{MinShannon: 2.5, MinNormalized: 0.4, Class: patterns.ClassAlnum},
+		}
+		// ID-sorted processing makes the entropy-requiring loser ("aaa-") the
+		// creator and the stronger no-entropy winner ("zzz-") the merger: the
+		// dedup upgrade fires (0.9 > 0.5) and must overwrite the creator's
+		// entropyOK=true with the winner's false. (A lower-strength merger
+		// would never trigger the upgrade path, so the winner must carry the
+		// higher strength here too.)
+		db, err := patterns.CompileForTest([]patterns.Pattern{pLoserWithEnt, pWinnerNoEnt})
+		if err != nil {
+			t.Fatalf("CompileForTest: %v", err)
+		}
+		content := []byte("token=\"" + highEntropyVal + "\"")
+		sd, err := prepareDocument(Document{Kind: KindEnv, Content: content}, fixedTime(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := scanDocument(sd, db, defaultScanLimits())
+		if len(out.candidates) != 1 {
+			t.Fatalf("dedup must produce one candidate, got %d", len(out.candidates))
+		}
+		c := out.candidates[0]
+		if hasFactor(c.confidence, "entropy") {
+			t.Errorf("winner does not require entropy → entropy factor must be absent; factors: %+v", c.confidence.Factors)
+		}
+		if c.entropyOK {
+			t.Error("entropyOK must be false from winner")
+		}
+		if c.strength != pWinnerNoEnt.Strength {
+			t.Errorf("strength must follow winner: got %v want %v", c.strength, pWinnerNoEnt.Strength)
+		}
+	})
+
+	// Case 3: equal-strength determinism pin. Under ID-sorted processing the
+	// tie-break winner ("aaa-a-with-entropy", smaller ID) is always processed
+	// first and therefore always creates the candidate — the dedup merge never
+	// triggers on equal strength. This pins that the Phase-3 winner
+	// re-derivation (max strength, ID tie-break) agrees with creation order as
+	// defense-in-depth, not that the merge path handles ties.
+	t.Run("equal strength tie-break", func(t *testing.T) {
+		pA := patterns.Pattern{
+			ID:       "zzz-b-no-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.7,
+		}
+		pB := patterns.Pattern{
+			ID:       "aaa-a-with-entropy",
+			Type:     asset.SecretTypeAPIKey,
+			Provider: "test",
+			Family:   patterns.FamilyContextual,
+			Regex:    `(?i)token\s*[:=]\s*"?([A-Za-z0-9]{32})"?`,
+			Anchors:  []string{"token"},
+			Group:    1,
+			Strength: 0.7,
+			Entropy:  patterns.EntropyRule{MinShannon: 2.5, MinNormalized: 0.4, Class: patterns.ClassAlnum},
+		}
+		// pB ("aaa-", smaller ID) is processed first under ID-sorted compile
+		// order and creates the candidate; pA merges second without upgrading
+		// (equal strength never satisfies p.Strength > c.strength).
+		db, err := patterns.CompileForTest([]patterns.Pattern{pA, pB})
+		if err != nil {
+			t.Fatalf("CompileForTest: %v", err)
+		}
+		content := []byte("token=\"" + highEntropyVal + "\"")
+		sd, err := prepareDocument(Document{Kind: KindEnv, Content: content}, fixedTime(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := scanDocument(sd, db, defaultScanLimits())
+		if len(out.candidates) != 1 {
+			t.Fatalf("dedup tie must produce one, got %d", len(out.candidates))
+		}
+		c := out.candidates[0]
+		if !hasFactor(c.confidence, "entropy") {
+			t.Errorf("tie-break winner requires entropy → factor must be present; got %+v winner should be %q", c.confidence.Factors, pB.ID)
+		}
+	})
+}

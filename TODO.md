@@ -1493,19 +1493,61 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: adversarial corpus benchmark with the number pinned in parse.go's comment (§14); parse completes under pool deadline.
 
 ### NEW-27 (LOW) — secrentel anchor gate ASCII-lowercases but gated regexes match via Unicode simple fold: silent false negatives (internal/secrentel)
-- Status: OPEN
+- Status: IN PROGRESS (builder fix round 2026-08-21 — implemented + gates
+  green; orchestrator verifies and closes — never self-closed)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: scan.go:82-86 builds the anchor haystack with `toLowerASCII`; anchors gate `(?i)` regexes (scan.go:101-112), which match through Unicode simple folding (ſ↔s, U+212A K↔k). A document containing e.g. `aws_ſecret_access_key=` passes the regex yet lacks the ASCII anchor → pattern skipped, violating the "anchor is a necessary substring" contract (patterns/types.go:124-131).
 - Fix: fold-compare anchors (walk with `unicode.SimpleFold`) or restrict anchored families to ASCII-only matching explicitly.
+- Implementation (2026-08-21): unicode-fold fallback in scanDocument — a lazy
+  folded haystack (scan.go:94-102; buildFoldedHaystack/foldRuneToASCIILower at
+  scan.go:469/481 map each rune through SimpleFold to its ASCII-lower form,
+  matching RE2 (?i) semantics) consulted only when the ASCII fast path misses
+  AND the document is non-ASCII (scan.go:136-150). Non-ASCII presence is
+  memoized once per document (scan.go:104-115, call site scan.go:140 — review
+  follow-up: an unmemoized check paid a full O(n) byte scan per anchored
+  miss). Regression: TestScanAnchorHomoglyphRegression (scan_test.go:536) —
+  ſ-homoglyph anchor rescued through a custom compiled pattern AND the
+  production DB's own "secret" anchor. Gates this session, verbatim: gofmt -l
+  clean; go vet ./... ok; go build ./... ok; go test -count=1 ./internal/
+  secrentel -run TestScanAnchorHomoglyphRegression -v ok; go test -race
+  -count=1 ./internal/secrentel ok; go test -count=1 ./... ok (25 packages).
 - Verification: homoglyph regression row demonstrates match-without-anchor today, correctly anchored after fix.
 
 ### NEW-28 (LOW) — secrentel dedup merge upgrades strength/family but not entropyOK (internal/secrentel)
-- Status: OPEN
+- Status: IN PROGRESS (builder fix round 2026-08-21 — implemented + gates
+  green + pre-fix failure proven; orchestrator verifies and closes — never
+  self-closed)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: scan.go:176-184 merges duplicate candidates by upgrading strength/family from the winning pattern; `entropyOK` stays the creating pattern's. Phase 3 scores with the creating pattern's entropy flag while hints use the winning pattern — the factor list can contradict the winning pattern's entropy requirement (both directions possible).
 - Fix: recompute `entropyOK` from the winning pattern at merge time (or evaluate Phase 3 entropy from the winner).
+- Implementation (2026-08-21): entropyOK+provider now sync at BOTH points —
+  the dedup merge upgrade (scan.go:219-224: `p.Strength > c.strength` also
+  overwrites entropyOK/provider) and a Phase-3 winner re-derivation that
+  re-syncs strength/family/entropyOK/provider from the winning pattern (max
+  strength, ID tie-break) as defense-in-depth (scan.go:303-314). Regression:
+  TestScanDedupEntropyWinner (scan_test.go:585). REVIEW FOLLOW-UP fixed this
+  round: every subtest previously passed pre-fix because patterns.compile
+  sorts by ID (patterns/load.go:69-71), so the eventual winner ("aaa-") was
+  always processed first and WAS the creator — the dedup merge never
+  executed. IDs reordered so the LOSER sorts first (creator) and the winner
+  merges second: Case 1 creator "aaa-loser-no-entropy" (0.5) / merger
+  "zzz-winner-with-entropy" (0.9) upgrades entropyOK false→true
+  (scan_test.go:595,605); Case 2 mirrored creator "aaa-loser-with-entropy"
+  (0.5) / merger "zzz-winner-no-entropy" (0.9) overwrites true→false
+  (scan_test.go:649,659 — the merger must carry the higher strength or the
+  upgrade path never fires); Case 3 kept as an honest equal-strength
+  determinism pin (under sorted processing the tie-break winner is always
+  the creator, so it exercises only the Phase-3 re-derivation as
+  defense-in-depth). Pre-fix proof: with the NEW-28 hunks reverted on a
+  scratch copy, Case 1 fails (entropy factor absent, entropyOK false despite
+  strength 0.9 proving the merge ran) and Case 2 fails (spurious
+  {Name:entropy Weight:0.35} factor); both pass with the fix. Gates this
+  session, verbatim: gofmt -l clean; go vet ./... ok; go build ./... ok;
+  go test -count=1 ./internal/secrentel -run TestScanDedupEntropyWinner -v
+  ok (3/3 subtests); go test -race -count=1 ./internal/secrentel ok;
+  go test -count=1 ./... ok (25 packages).
 - Verification: two-pattern same-type dedup case where winner requires entropy and loser does not (and vice versa); factor list matches winner.
 
 ### NEW-29 (LOW) — sortQuery collapses ?x= and ?x into one URL identity (internal/asset)

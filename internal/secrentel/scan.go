@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
@@ -86,6 +87,32 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 		}
 		return lowerOnce
 	}
+	// Folded haystack for unicode case-fold fallback (ſ↔s, K↔k): matches
+	// RE2's (?i) simple-fold semantics where toLowerASCII misses. Built
+	// lazily only when the ASCII fast path misses and the document is
+	// non-ASCII.
+	var foldOnce string
+	var foldDone bool
+	folded := func() string {
+		if !foldDone {
+			foldOnce = buildFoldedHaystack(string(content))
+			foldDone = true
+		}
+		return foldOnce
+	}
+	strContent := string(content)
+	// Non-ASCII presence, computed at most once per document: every anchored
+	// miss consults it to decide the unicode-fold fallback, and an unmemoized
+	// check would pay a full O(n) byte scan per miss.
+	var nonASCII bool
+	var nonASCIIDone bool
+	hasNonASCII := func() bool {
+		if !nonASCIIDone {
+			nonASCII = containsNonASCII(strContent)
+			nonASCIIDone = true
+		}
+		return nonASCII
+	}
 
 	type key struct {
 		typ   asset.SecretType
@@ -96,7 +123,6 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	contextualValues := make(map[string]struct{})
 
 	// Phase 1: match, validate, dedup.
-	strContent := string(content)
 	for _, p := range pats {
 		if len(p.Anchors) > 0 {
 			hit := false
@@ -108,7 +134,21 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 				}
 			}
 			if !hit {
-				continue // anchor absent: no possible match, skip the regex
+				// Fallback unicode fold check: RE2 (?i) matches via simple
+				// folding (ſ↔s, K↔k) which toLowerASCII misses. Only for
+				// non-ASCII documents to keep the fast path pure ASCII.
+				if hasNonASCII() {
+					fh := folded()
+					for _, a := range p.Anchors {
+						if strings.Contains(fh, a) {
+							hit = true
+							break
+						}
+					}
+				}
+				if !hit {
+					continue // anchor absent: no possible match, skip the regex
+				}
 			}
 		}
 		matches := p.Match().FindAllStringSubmatchIndex(strContent, limits.maxMatchesPerPattern+1)
@@ -179,6 +219,8 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 				if p.Strength > c.strength {
 					c.strength = p.Strength
 					c.family = p.Family
+					c.entropyOK = p.Entropy.MinShannon > 0 || p.Entropy.MinNormalized > 0
+					c.provider = p.Provider
 				}
 				continue
 			}
@@ -256,13 +298,19 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	for i := range out.candidates {
 		c := &out.candidates[i]
 
-		// Winning pattern (max strength, ID tie-break) drives hints.
+		// Winning pattern (max strength, ID tie-break) drives hints and
+		// confidence. Sync stored fields to the winner so entropy, family,
+		// strength, and provider all match the hint source (NEW-28).
 		win := byID[c.patternIDs[0]]
 		for _, pid := range c.patternIDs {
 			if p, ok := byID[pid]; ok && (p.Strength > win.Strength || (p.Strength == win.Strength && p.ID < win.ID)) {
 				win = p
 			}
 		}
+		c.strength = win.Strength
+		c.family = win.Family
+		c.entropyOK = win.Entropy.MinShannon > 0 || win.Entropy.MinNormalized > 0
+		c.provider = win.Provider
 		c.context = extractContext(content, c.location.Offset,
 			c.location.Offset+len(c.value), c.provider, win.Hints, win.Positives, state)
 		c.fpFlags = fpCtx
@@ -402,4 +450,49 @@ func appendUniqueString(list []string, s string) []string {
 		}
 	}
 	return append(list, s)
+}
+
+// containsNonASCII reports whether s contains any non-ASCII byte.
+func containsNonASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildFoldedHaystack returns a case-folded lowercased copy of s where each
+// rune is mapped via unicode.SimpleFold to its ASCII lower equivalent when
+// one exists (ſ→s, K→k). This matches RE2's (?i) simple-fold semantics so
+// the anchor gate never skips a regex that would match via folding (NEW-27).
+func buildFoldedHaystack(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(foldRuneToASCIILower(r))
+	}
+	return b.String()
+}
+
+// foldRuneToASCIILower maps r to its ASCII lower form when its SimpleFold
+// equivalence class contains an ASCII letter (a-z). Otherwise it lowercases
+// via unicode.ToLower (covers remaining unicode case).
+func foldRuneToASCIILower(r rune) rune {
+	if r >= 'A' && r <= 'Z' {
+		return r + ('a' - 'A')
+	}
+	if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+		return r
+	}
+	orig := r
+	for rr := unicode.SimpleFold(orig); rr != orig; rr = unicode.SimpleFold(rr) {
+		if rr >= 'a' && rr <= 'z' {
+			return rr
+		}
+		if rr >= 'A' && rr <= 'Z' {
+			return rr + ('a' - 'A')
+		}
+	}
+	return unicode.ToLower(r)
 }
