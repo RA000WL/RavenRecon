@@ -1699,6 +1699,13 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   - Known issues for follow-up: (1) urllive cancelled at stage deadline with 1644 errors — needs per-URL timeout tuning or higher concurrency for 2k-URL corpora; (2) amass failed after contributing 0 (known slow-source); (3) urlintel completed 0 (gau/wayback empty for this target — tools ran 0.2s); (4) summary duration_ms still 0 (pipeline bracket wiring deferred from P0-5 — model ready, adapt/report.go single-now pending).
 - Verification: run outcome cancelled (urllive deadline), but all v1.5 deliverables demonstrated on an authorized real target.
 
+### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
+- Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
+- Reporter: master (field trial 2, NEW-36)
+- Problem: chaos v0.5.2 -json emits ONE object {"domain":"<apex>","subdomains":[...],"count":N}; the adapter read only "domain" → apex-only. Real cost: verily.com corpus was built from subfinder's 1,036 hosts alone; every unique chaos find (e.g. wildcard.verily.com, grudge-pandemic.verily.com) was missing from dns/probe/urllive.
+- Fix: parse subdomains array; expand labels against domain; FQDN elements as-is; legacy + text fallbacks kept.
+- Verification: TestChaosParseSubdomainsArray/FQDNNotDoubled/LegacyApexOnly hermetic; live chaos-only discover run = 1,044 hosts.
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this
