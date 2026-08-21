@@ -1337,7 +1337,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   waymore confirmed installed (user) — full-stack trial in progress.
 
 ### NEW-20 (HIGH) — v1.5 URL-hunting refinement (formerly v1.7): live attack-surface mapping (internal/httpprobe, internal/pipeline/adapt)
-- Status: OPEN (dispatch pending v1.4 close + field-trial evidence NEW-19)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-21): all v1.5 P0 items landed and verified — OPT-P0-1 quality gate b46a110 (NEW-22), OPT-P0-2 JS→URL 2d06b94, OPT-P0-3 urllive 7fc7e4c, OPT-P0-4 per-tool+health f44cecc, OPT-P0-5 honest duration 593177a; plus Chaos 184796a, Dnsx brute 0a19d67, Katana early-preview 1ab2e99; field validation pending next real-target run (dispatch pending v1.4 close + field-trial evidence NEW-19)
 - Reporter: master
 - Owner: (unassigned) | builder at dispatch
 - Problem: framework misses most bug-bounty-relevant URLs — httpprobe
