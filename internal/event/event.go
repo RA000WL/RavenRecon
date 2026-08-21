@@ -102,12 +102,22 @@ func (e Event) Validate() error {
 	if !e.Severity.Valid() {
 		return fmt.Errorf("event: kind %s carries invalid severity %d", e.Kind, int(e.Severity))
 	}
-	for name, v := range map[string]string{
-		"phase": e.Phase, "category": e.Category, "identity": e.Identity, "value": e.Value,
-	} {
-		if len(v) > maxLabelBytes {
-			return fmt.Errorf("event: kind %s %s field is %d bytes over bound %d", e.Kind, name, len(v), maxLabelBytes)
-		}
+	// Label bounds are plain length checks rather than a range over a map
+	// literal: Validate runs on every publish (the hottest observability
+	// path), explicit comparisons cost a few nanoseconds instead of a
+	// 4-entry map walk, the check order is deterministic, and no toolchain
+	// optimization is needed to keep the path allocation-free.
+	if len(e.Phase) > maxLabelBytes {
+		return fmt.Errorf("event: kind %s phase field is %d bytes over bound %d", e.Kind, len(e.Phase), maxLabelBytes)
+	}
+	if len(e.Category) > maxLabelBytes {
+		return fmt.Errorf("event: kind %s category field is %d bytes over bound %d", e.Kind, len(e.Category), maxLabelBytes)
+	}
+	if len(e.Identity) > maxLabelBytes {
+		return fmt.Errorf("event: kind %s identity field is %d bytes over bound %d", e.Kind, len(e.Identity), maxLabelBytes)
+	}
+	if len(e.Value) > maxLabelBytes {
+		return fmt.Errorf("event: kind %s value field is %d bytes over bound %d", e.Kind, len(e.Value), maxLabelBytes)
 	}
 	return validatePayload(e.Kind, e.Payload)
 }

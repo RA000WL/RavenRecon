@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Output-writing constants (fixed).
@@ -169,6 +171,12 @@ type fileSink struct {
 	parts    map[string]*sinkPart
 	order    []string
 	aborted  bool
+
+	// dirSync is the directory-durability step Commit applies after the
+	// renames. newFileSink initializes it to syncDirBestEffort; the
+	// indirection exists purely so tests can observe or stub the call.
+	// It is set only before the sink is used and never mutated afterwards.
+	dirSync func(dir string) error
 }
 
 // newFileSink creates the output directory (as needed) and returns a sink
@@ -187,6 +195,7 @@ func newFileSink(dir string, compress bool, pathFor func(part string) string) (*
 		compress: compress,
 		pathFor:  pathFor,
 		parts:    make(map[string]*sinkPart),
+		dirSync:  syncDirBestEffort,
 	}, nil
 }
 
@@ -319,7 +328,11 @@ func (s *fileSink) partsLocked() ([]sinkPartInfo, error) {
 // Commit atomically renames every validated temp file over its final name
 // (sorted by part name — the deterministic commit order). Each rename is
 // atomic; a multi-part commit is therefore atomic per file, never
-// transactional across files.
+// transactional across files. After the renames, the output directory is
+// fsynced best-effort so the committed names themselves survive power loss;
+// a directory-sync failure never fails the Commit (the files are already in
+// place — losing a rename leaves the previous good report or none, never a
+// partial one).
 func (s *fileSink) Commit() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,7 +348,42 @@ func (s *fileSink) Commit() error {
 			return fmt.Errorf("report: commit part %q: %w", info.Part, err)
 		}
 	}
+	_ = s.dirSync(s.dir)
 	return nil
+}
+
+// syncDirBestEffort fsyncs a directory so just-completed renames into it
+// are themselves durable across power loss (a rename is not guaranteed
+// durable until its parent directory entry has been synced). Filesystems
+// that cannot fsync directories fail with ENOSYS or EINVAL; those errors
+// are recognized and swallowed so best-effort callers need no special
+// cases. Any other error is returned for callers that want to count or log
+// it, though the atomic-write paths deliberately never fail an
+// already-completed write over it. It mirrors internal/cache's helper of
+// the same name; the ~15 lines are duplicated rather than shared because
+// no package sits between these two leaf engines.
+func syncDirBestEffort(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s for directory sync: %w", dir, err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !isUnsupportedDirSync(syncErr) {
+		return fmt.Errorf("fsync %s: %w", dir, syncErr)
+	}
+	if closeErr != nil && !isUnsupportedDirSync(closeErr) {
+		return fmt.Errorf("close %s: %w", dir, closeErr)
+	}
+	return nil
+}
+
+// isUnsupportedDirSync reports whether err means "this filesystem does not
+// support directory fsync" (ENOSYS, EINVAL). Such failures are expected on
+// some filesystems and platforms; they are not durability regressions and
+// are not worth surfacing from a best-effort step.
+func isUnsupportedDirSync(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL)
 }
 
 // memSink is an in-memory Sink for tests and previews. Parts are retained

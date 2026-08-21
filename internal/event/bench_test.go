@@ -8,6 +8,25 @@ import (
 	"time"
 )
 
+// BenchmarkValidate measures Event.Validate alone: the bus validates every
+// published event, so this is the floor of the publish path. It must stay
+// allocation-free and cheap — the label-bound checks are plain length
+// comparisons.
+func BenchmarkValidate(b *testing.B) {
+	b.ReportAllocs()
+	ev := New(KindTaskSubmitted, time.Unix(1_700_000_000, 0), TaskSubmitted{JobID: 7}).
+		WithPhase("discover").
+		WithCategory("subfinder").
+		WithIdentity("job 42").
+		WithValue("example.com")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ev.Validate(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkBusPublishFanout measures publish throughput with a draining
 // consumer: one subscriber reads as fast as it can while the benchmark
 // publishes. This is the canonical "event layer must not slow the run" shape

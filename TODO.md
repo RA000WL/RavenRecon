@@ -1642,20 +1642,22 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   ./internal/dns ./internal/pipeline/adapt ./internal/asset ok.
 
 ### NEW-33 (LOW) — atomic writes never fsync the parent directory after rename (internal/cache, internal/report)
-- Status: OPEN
+- Status: IN PROGRESS (builder @ 557a5cb, fix implemented, awaiting orchestrator verification)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: cache Put syncs the temp file then renames (cache/cache.go:282-291) with no directory fsync; report writer same (writer.go:148 Sync, :334 Rename). After power loss the rename itself may be lost — degrades to a cache miss / missing report, never corruption, but weakens the documented crash-safe guarantee.
 - Fix: best-effort open(dir)+Sync()+Close after rename in both writers, or scope the durability wording in docs.
 - Verification: injectable sync hook asserts dir sync invoked; docs updated.
+- Work note (builder): fsync fix implemented. Both packages gained `syncDirBestEffort(dir)` (open→Sync→Close; ENOSYS/EINVAL swallowed via `isUnsupportedDirSync` as "filesystem does not support dir fsync"; other errors returned for observability) and an injectable unexported `dirSync` field set at construction (same pattern as FS.beforeSelfHeal). cache/cache.go:104-109 (field), :135 (Open init), :305-311 (Put calls it after successful rename; failure never fails the Put), :314-345 (helper + errno filter). report/writer.go:171-179 (field), :198 (init), :351 (Commit syncs once after all renames), :355-387 (helper mirror — duplicated ~15 lines, no shared parent package). Put/Commit doc comments updated to state the best-effort semantics; README/ARCHITECTURE deliberately untouched (outside this task's allowed file list) — their existing "fsync + atomic rename" wording remains true and now understates the guarantee. Tests: TestPutFsyncsDirectoryAfterRename, TestPutSkipsDirSyncWhenRenameFails, TestPutSucceedsWhenDirSyncFails, TestSyncDirBestEffort (errno table) in cache_test.go; TestFileSinkCommitSyncsDirectory, TestFileSinkCommitSkipsDirSyncWhenCommitFails, TestFileSinkCommitToleratesDirSyncFailure, TestSyncDirBestEffort in writer_test.go. Gates this session: gofmt -l clean; go vet ./... ok; go build ./... ok; go test -count=1 ./internal/cache ./internal/report ./internal/event ok; go test -race -count=1 (same three) ok; go test -count=1 ./... ok.
 
 ### NEW-34 (LOW) — event.Validate allocates a map literal per published event (internal/event)
-- Status: OPEN
+- Status: IN PROGRESS (builder @ 557a5cb, fix implemented, awaiting orchestrator verification)
 - Reporter: reviewer
-- Owner: (unassigned)
+- Owner: builder
 - Problem: event.go:105-111 builds a 4-entry map per call; Validate runs on every publish — the hottest observability path.
 - Fix: four explicit length checks.
 - Verification: existing validation table passes unchanged; benchmark shows the allocation removed.
+- Work note (builder): map range replaced with four explicit length checks in deterministic order phase→category→identity→value, identical error text (event/event.go:106-121); comment records why. BenchmarkValidate added (event/bench_test.go:13-29). Measured on go1.26.5/amd64: BEFORE 125.1-128.7 ns/op, 0 B/op 0 allocs/op (the compiler already elides ranging over a small map literal, so the allocation premise is stale on this toolchain); AFTER 6.6-8.8 ns/op, still 0 allocs — ~15x faster, allocation-freedom now guaranteed by construction instead of by compiler optimization, and check order deterministic. Existing validation table (TestValidateRejectsCoreContractViolations etc.) passes unchanged. Gates this session: gofmt -l clean; go vet ./... ok; go build ./... ok; go test -count=1 ./internal/cache ./internal/report ./internal/event ok; go test -race -count=1 (same three) ok; go test -count=1 ./... ok.
 
 ### NF-4 (INFO) — config comment cites a discover --timeout flag that does not exist (internal/config)
 - Status: VERIFIED — fixed in 7f2f05a (config.go:168 comment corrected to Discovery.Timeout / scan --timeout)

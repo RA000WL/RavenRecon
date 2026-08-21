@@ -3,10 +3,13 @@ package report
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -320,4 +323,114 @@ func TestFileSinkRejectsInvalidPartNames(t *testing.T) {
 		t.Fatalf("legal part name rejected: %v", err)
 	}
 	sink.Abort()
+}
+
+// TestFileSinkCommitSyncsDirectory pins the crash-safe-write hardening:
+// after the renames, Commit applies its directory-durability step to the
+// output directory exactly once (NEW-33). The dirSync seam makes the call
+// observable without depending on filesystem sync semantics.
+func TestFileSinkCommitSyncsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "report.json")
+	sink, err := newFileSink(dir, false, func(string) string { return final })
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	var called []string
+	sink.dirSync = func(d string) error {
+		called = append(called, d)
+		return nil
+	}
+	w, err := sink.Writer("")
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	io.WriteString(w, `{"ok":true}`)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := sink.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(called) != 1 {
+		t.Fatalf("dirSync called %d times, want exactly 1", len(called))
+	}
+	if called[0] != dir {
+		t.Fatalf("dirSync called with %q, want output directory %q", called[0], dir)
+	}
+	if _, err := os.Stat(final); err != nil {
+		t.Fatalf("committed file missing: %v", err)
+	}
+}
+
+// TestFileSinkCommitSkipsDirSyncWhenCommitFails verifies the durability
+// step only follows successful renames: a commit that never renames (an
+// open part) must not report the directory as synced.
+func TestFileSinkCommitSkipsDirSyncWhenCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := newFileSink(dir, false, func(string) string { return filepath.Join(dir, "report.json") })
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	var calls int
+	sink.dirSync = func(string) error { calls++; return nil }
+	if _, err := sink.Writer(""); err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	// The part is still open: Parts fails and Commit returns before any
+	// rename.
+	if err := sink.Commit(); err == nil {
+		t.Fatal("expected Commit to fail with an open part")
+	}
+	if calls != 0 {
+		t.Fatalf("dirSync called %d times on failed commit, want 0", calls)
+	}
+	sink.Abort()
+}
+
+// TestFileSinkCommitToleratesDirSyncFailure pins the best-effort contract:
+// the files are already renamed into place when the directory sync runs,
+// so a dir-sync failure must never fail the Commit nor lose the report.
+func TestFileSinkCommitToleratesDirSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "report.json")
+	sink, err := newFileSink(dir, false, func(string) string { return final })
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	sink.dirSync = func(string) error { return errors.New("injected dir-sync failure") }
+	w, err := sink.Writer("")
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	io.WriteString(w, `{"ok":true}`)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := sink.Commit(); err != nil {
+		t.Fatalf("Commit must succeed despite dir-sync failure: %v", err)
+	}
+	data, err := os.ReadFile(final)
+	if err != nil || string(data) != `{"ok":true}` {
+		t.Fatalf("committed content lost after dir-sync failure: %q, %v", data, err)
+	}
+}
+
+// TestSyncDirBestEffort exercises the real helper on a live directory; on
+// filesystems without directory-fsync support the helper's ENOSYS/EINVAL
+// filter keeps it silent (see internal/cache for the errno table test).
+func TestSyncDirBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	if err := syncDirBestEffort(dir); err != nil {
+		t.Logf("directory fsync unsupported or failed on this filesystem (treated as best-effort): %v", err)
+	}
+	if err := syncDirBestEffort(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("syncDirBestEffort on a missing directory must report the open error")
+	}
+	if !isUnsupportedDirSync(fmt.Errorf("wrap: %w", syscall.ENOSYS)) {
+		t.Fatal("ENOSYS must classify as unsupported directory fsync")
+	}
+	if isUnsupportedDirSync(io.EOF) {
+		t.Fatal("ordinary errors must not classify as unsupported directory fsync")
+	}
 }

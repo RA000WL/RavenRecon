@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/event"
@@ -98,6 +100,13 @@ type FS struct {
 	// re-check. Tests set it to force interleavings with concurrent writers
 	// deterministically; it is nil in production.
 	beforeSelfHeal func()
+
+	// dirSync is the directory-durability step Put applies after a
+	// successful rename. Open initializes it to syncDirBestEffort; the
+	// indirection exists purely so tests can observe or stub the call
+	// (same pattern as beforeSelfHeal). It is set only before the cache is
+	// shared across goroutines and never mutated afterwards.
+	dirSync func(dir string) error
 }
 
 var _ Cache = (*FS)(nil)
@@ -123,7 +132,7 @@ func Open(dir string, opts ...Option) (*FS, error) {
 	if err := os.MkdirAll(entries, 0o700); err != nil {
 		return nil, fmt.Errorf("cache: create cache directory %s: %w", entries, err)
 	}
-	return &FS{dir: dir, ttl: o.ttl, now: o.now, observer: o.observer}, nil
+	return &FS{dir: dir, ttl: o.ttl, now: o.now, observer: o.observer, dirSync: syncDirBestEffort}, nil
 }
 
 // DefaultDir returns the default cache directory,
@@ -214,8 +223,12 @@ func (c *FS) evaluate(key Key, rec Record) Outcome {
 // record is serialized and validated, written to a unique temporary file in
 // the entry's directory, synced, and renamed over the final name. A reader
 // observes either the previous or the new complete entry, never a partial
-// one. Validation failures reject the Put before anything reaches the
-// filesystem, leaving any existing entry for key intact.
+// one. After the rename, the shard directory is fsynced best-effort so the
+// rename itself survives power loss; a directory-sync failure never fails
+// the Put (the entry is already complete and in place — losing the rename
+// degrades to a future cache miss, never corruption). Validation failures
+// reject the Put before anything reaches the filesystem, leaving any
+// existing entry for key intact.
 //
 // The cache indexes by key only and cannot verify that the record's identity
 // fields match the inputs that derived key. record.Operation and
@@ -289,7 +302,47 @@ func (c *FS) Put(ctx context.Context, key Key, record Record) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("cache put %s: rename into place: %w", key, err)
 	}
+	// Best-effort durability hardening: fsync the shard directory so the
+	// rename itself is durable across power loss. The entry is already
+	// complete and in place, so a failure here must not fail the Put — a
+	// lost rename degrades to a future cache miss, never to corruption or
+	// a partial read.
+	_ = c.dirSync(dir)
 	return nil
+}
+
+// syncDirBestEffort fsyncs a directory so a just-completed rename into it
+// is itself durable across power loss (a rename is not guaranteed durable
+// until its parent directory entry has been synced). Filesystems that
+// cannot fsync directories fail with ENOSYS or EINVAL; those errors are
+// recognized and swallowed so best-effort callers need no special cases.
+// Any other error is returned for callers that want to count or log it,
+// though the atomic-write paths deliberately never fail an
+// already-completed write over it. It mirrors internal/report's helper of
+// the same name; the ~15 lines are duplicated rather than shared because
+// no package sits between these two leaf engines.
+func syncDirBestEffort(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s for directory sync: %w", dir, err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !isUnsupportedDirSync(syncErr) {
+		return fmt.Errorf("fsync %s: %w", dir, syncErr)
+	}
+	if closeErr != nil && !isUnsupportedDirSync(closeErr) {
+		return fmt.Errorf("close %s: %w", dir, closeErr)
+	}
+	return nil
+}
+
+// isUnsupportedDirSync reports whether err means "this filesystem does not
+// support directory fsync" (ENOSYS, EINVAL). Such failures are expected on
+// some filesystems and platforms; they are not durability regressions and
+// are not worth surfacing from a best-effort step.
+func isUnsupportedDirSync(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL)
 }
 
 // Delete removes the entry for key. Deleting a missing key is not an error.

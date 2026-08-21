@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1131,5 +1132,104 @@ func TestDirectoryAtEntryPath(t *testing.T) {
 	}
 	if o := c.Get(context.Background(), key); !o.IsHit() {
 		t.Fatalf("expected hit after rewrite, got %s", o.State)
+	}
+}
+
+// TestPutFsyncsDirectoryAfterRename pins the crash-safe-write hardening:
+// after the atomic rename, Put applies its directory-durability step to the
+// shard directory exactly once (NEW-33). The dirSync seam makes the call
+// observable without depending on filesystem sync semantics.
+func TestPutFsyncsDirectoryAfterRename(t *testing.T) {
+	c, key := newTestFS(t)
+	var called []string
+	c.dirSync = func(dir string) error {
+		called = append(called, dir)
+		return nil
+	}
+	if err := c.Put(context.Background(), key, completedRecord("op", "host:example.com", nil)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	path, err := c.entryPath(key)
+	if err != nil {
+		t.Fatalf("entryPath: %v", err)
+	}
+	wantDir := filepath.Dir(path)
+	if len(called) != 1 {
+		t.Fatalf("dirSync called %d times, want exactly 1", len(called))
+	}
+	if called[0] != wantDir {
+		t.Fatalf("dirSync called with %q, want shard directory %q", called[0], wantDir)
+	}
+	if o := c.Get(context.Background(), key); !o.IsHit() {
+		t.Fatalf("expected hit after Put, got %s", o.State)
+	}
+}
+
+// TestPutSkipsDirSyncWhenRenameFails verifies the durability step only
+// follows a successful rename: a failed Put must not report the directory
+// as synced.
+func TestPutSkipsDirSyncWhenRenameFails(t *testing.T) {
+	c, key := newTestFS(t)
+	var calls int
+	c.dirSync = func(dir string) error {
+		calls++
+		return nil
+	}
+	path, err := c.entryPath(key)
+	if err != nil {
+		t.Fatalf("entryPath: %v", err)
+	}
+	// A directory at the entry path makes the rename fail.
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatalf("mkdir at entry path: %v", err)
+	}
+	defer os.RemoveAll(path)
+	if err := c.Put(context.Background(), key, completedRecord("op", "host:example.com", nil)); err == nil {
+		t.Fatal("expected Put to fail when the rename target is a directory")
+	}
+	if calls != 0 {
+		t.Fatalf("dirSync called %d times on failed rename, want 0", calls)
+	}
+}
+
+// TestPutSucceedsWhenDirSyncFails pins the best-effort contract: the entry
+// is already complete and in place when the directory sync runs, so a
+// dir-sync failure must never fail the Put nor leave an unreadable entry.
+func TestPutSucceedsWhenDirSyncFails(t *testing.T) {
+	c, key := newTestFS(t)
+	c.dirSync = func(dir string) error { return fmt.Errorf("injected dir-sync failure") }
+	if err := c.Put(context.Background(), key, completedRecord("op", "host:example.com", map[string]string{"k": "v"})); err != nil {
+		t.Fatalf("Put must succeed despite dir-sync failure: %v", err)
+	}
+	o := c.Get(context.Background(), key)
+	if !o.IsHit() {
+		t.Fatalf("expected hit despite dir-sync failure, got %s", o.State)
+	}
+}
+
+// TestSyncDirBestEffort exercises the real helper on a live directory and
+// pins which errnos count as "filesystem does not support directory fsync"
+// (ENOSYS, EINVAL) — those are swallowed by the helper, everything else is
+// reported.
+func TestSyncDirBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	if err := syncDirBestEffort(dir); err != nil {
+		t.Logf("directory fsync unsupported or failed on this filesystem (treated as best-effort): %v", err)
+	}
+	if err := syncDirBestEffort(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("syncDirBestEffort on a missing directory must report the open error")
+	}
+	for _, tc := range []struct {
+		err         error
+		unsupported bool
+	}{
+		{fmt.Errorf("wrap: %w", syscall.ENOSYS), true},
+		{fmt.Errorf("wrap: %w", syscall.EINVAL), true},
+		{fmt.Errorf("wrap: %w", syscall.EIO), false},
+		{fmt.Errorf("wrap: %w", os.ErrPermission), false},
+	} {
+		if got := isUnsupportedDirSync(tc.err); got != tc.unsupported {
+			t.Fatalf("isUnsupportedDirSync(%v) = %v, want %v", tc.err, got, tc.unsupported)
+		}
 	}
 }
