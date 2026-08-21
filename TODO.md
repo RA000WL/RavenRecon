@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-49).
+  next free `NEW-n` (currently NEW-50).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1827,6 +1827,27 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   or descope explicitly with a decision record.
 - Verification: scan --help shows the timeout documentation; dry-run smoke
   prints effective config; gates green.
+
+### NEW-49 (HIGH) — v1.6 Robustness and hostile-input hardening (ROADMAP v1.6)
+- Status: IN PROGRESS (orchestrator, 2026-08-21) — milestone tracker;
+  per-task records appended below as batches land
+- Reporter: master
+- Owner: builder (per-task dispatches)
+- Problem: ROADMAP v1.6 — parsers/ingestion paths treated as untrusted-input
+  boundaries. Items: OPT-P1-3 fuzz harnesses (asset ParseURL, discovery
+  parse, urlintel engine, jsintel lex/parse/fetch, secrentel scan, cache,
+  report, dns resolver) + property tests; OPT-P1-4 silent-truncation flags
+  (MergeTLSCertificates DNSNames cap drops silently per its own doc comment
+  ~tls_certificate.go:334; finding.go evidence/related/relationship caps
+  16/32); OPT-P1-5 jsintel TLS sentinel (fetch.go:678 strings.Contains
+  "tls:" fallback — verified still present); OPT-P2-4 hot-path allocations;
+  OPT-P2-6 scope/version dedup refactor.
+- Fix: batched delegation — batch 1: OPT-P1-5 + OPT-P1-4; batch 2: fuzz
+  harnesses + property tests; batch 3: parser hardening from fuzz results +
+  OPT-P2-4 + OPT-P2-6. Acceptance per ROADMAP v1.6 criteria.
+- Verification: each batch reviewer-gated; full gates + -race per landing;
+  fuzz targets run as seed-corpus tests in CI-normal `go test` (actual
+  fuzzing opt-in, evidence recorded).
 
 ## Operational warnings (all agents)
 
