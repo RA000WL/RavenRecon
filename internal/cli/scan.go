@@ -29,13 +29,13 @@ Usage:
 Runs the full deterministic pipeline for one domain target:
 
   discover → dns → httpprobe → urlintel → crawl → techintel → jsintel
-  → secrentel → priority → detect → report
+  → secrentel → urllive → priority → detect → report
 
 Options (after the target):
   --stages <a,b>          Restrict the run to the given stages (comma
                           separated). Known stages: discover, dns, httpprobe,
-                          urlintel, crawl, techintel, jsintel, secrentel, priority,
-                          detect, report. Default: all eleven, in pipeline order.
+                          urlintel, crawl, techintel, jsintel, secrentel, urllive, priority,
+                          detect, report. Default: all twelve, in pipeline order.
   --sources <a,b>         Restrict the discovery stage's passive sources
                           (subfinder, assetfinder, amass).
   --request-timeout <d>   Per-request timeout for the httpprobe stage (Go
@@ -98,11 +98,11 @@ RavenRecon is intended for authorized security testing and
 bug bounty programs where the target is explicitly in scope.
 `
 
-// stageVocabularyCLI lists the eleven pipeline stage names in pipeline order
+// stageVocabularyCLI lists the twelve pipeline stage names in pipeline order
 // for usage and validation errors. It mirrors pipeline.stageVocabulary,
 // which is deliberately unexported; the CLI keeps its own copy in sync
 // with pipeline.AllStages (pinned by TestScanStageVocabularyMatchesPipeline).
-const stageVocabularyCLI = "discover, dns, httpprobe, urlintel, crawl, techintel, jsintel, secrentel, priority, detect, report"
+const stageVocabularyCLI = "discover, dns, httpprobe, urlintel, crawl, techintel, jsintel, secrentel, urllive, priority, detect, report"
 
 // defaultOutputDir is the --output default: a directory under the current
 // working directory, created as needed by the report engine.
@@ -112,7 +112,7 @@ const defaultOutputDir = "ravenrecon-report"
 type scanOptions struct {
 	target string
 
-	// stages is the ordered stage selection; nil means all ten stages.
+	// stages is the ordered stage selection; nil means all twelve stages.
 	stages    []pipeline.StageName
 	stagesSet bool
 
@@ -382,7 +382,7 @@ func scanCache(cfg config.Config, opts scanOptions) (cache.Cache, error) {
 	return c, nil
 }
 
-// newScanStages returns the production eleven-stage pipeline: every adapter
+// newScanStages returns the production twelve-stage pipeline: every adapter
 // constructed with its production (nil) seams. The cfg parameter is
 // accepted for the runScan stages-func contract; the production adapters
 // derive everything from the StageInput the runner provides, so cfg is not
@@ -398,6 +398,7 @@ func scanCache(cfg config.Config, opts scanOptions) (cache.Cache, error) {
 //	techintel  fingerprints.Load — the compiled-in 145-fingerprint DB
 //	jsintel    the engine's bounded default transport
 //	secrentel  patterns.Load — the compiled-in pattern database
+//	urllive    the engine's bounded default transport (ProbeURLs)
 //	priority   the engine's production catalogs (nil/nil = production
 //	           tables)
 //	detect     the EMPTY registry (D2 — no rules ship with the framework)
@@ -413,6 +414,7 @@ func newScanStages(cfg pipeline.ScanConfig) []pipeline.Stage {
 		adapt.NewTechIntelStage(nil),
 		adapt.NewJSIntelStage(nil),
 		adapt.NewSecretIntelStage(nil),
+		adapt.NewUrlliveStage(nil),
 		adapt.NewPriorityStage(nil, nil),
 		adapt.NewDetectStage(nil),
 		adapt.NewReportStage(nil),
@@ -420,7 +422,7 @@ func newScanStages(cfg pipeline.ScanConfig) []pipeline.Stage {
 }
 
 // tuiSubscriberBuffer is the --tui subscriber buffer size. A full scan run
-// emits exactly ~22 stage events (one started + one finished per stage,
+// emits exactly 24 stage events (twelve stages × started+finished,
 // synchronously, on every path), so 64 gives comfortable headroom for the
 // controller's drain-at-close and for future instrumented stages (pool and
 // cache events) while staying a small fixed bound — the bus drops (and

@@ -35,9 +35,9 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
-// StageName identifies one of the eleven engine stages in the fixed pipeline
+// StageName identifies one of the twelve engine stages in the fixed pipeline
 // order: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
-// secrentel → priority → detect → report.
+// secrentel → urllive → priority → detect → report.
 type StageName string
 
 const (
@@ -49,6 +49,7 @@ const (
 	StageTechIntel   StageName = "techintel"
 	StageJSIntel     StageName = "jsintel"
 	StageSecretIntel StageName = "secrentel"
+	StageURLLive     StageName = "urllive"
 	StagePriority    StageName = "priority"
 	StageDetect      StageName = "detect"
 	StageReport      StageName = "report"
@@ -57,17 +58,17 @@ const (
 // pipelineOrder is the fixed, deterministic pipeline order.
 var pipelineOrder = []StageName{
 	StageDiscover, StageDNS, StageHTTPProbe, StageURLIntel, StageCrawl, StageTechIntel,
-	StageJSIntel, StageSecretIntel, StagePriority, StageDetect, StageReport,
+	StageJSIntel, StageSecretIntel, StageURLLive, StagePriority, StageDetect, StageReport,
 }
 
-// AllStages returns the eleven stage names in pipeline order as a fresh slice.
+// AllStages returns the twelve stage names in pipeline order as a fresh slice.
 func AllStages() []StageName {
 	out := make([]StageName, len(pipelineOrder))
 	copy(out, pipelineOrder)
 	return out
 }
 
-// ValidStage reports whether name is one of the eleven engine stage names.
+// ValidStage reports whether name is one of the twelve engine stage names.
 func ValidStage(name StageName) bool {
 	for _, s := range pipelineOrder {
 		if s == name {
@@ -199,7 +200,7 @@ type ScanConfig struct {
 	Target asset.Domain
 
 	// Stages is the ordered stage selection. Entries must be one of the
-	// ten StageName constants; order is exactly the run order; duplicates
+	// twelve StageName constants; order is exactly the run order; duplicates
 	// are rejected.
 	Stages []StageName
 

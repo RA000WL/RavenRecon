@@ -207,6 +207,7 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		Surfaces:        in.Results.Surfaces,
 		Groups:          in.Results.Groups,
 		AttackPaths:     in.Results.AttackPaths,
+		LiveRecords:     in.Results.LiveRecords,
 	}
 
 	return s.runReport(ctx, in, reg, rctx)

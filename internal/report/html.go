@@ -163,6 +163,7 @@ func writeHTML(ctx context.Context, bw *bufio.Writer, m *Model) error {
 		{"secrets", fmt.Sprintf("%d", st.SecretCount)},
 		{"relationships", fmt.Sprintf("%d", st.RelationshipCount)},
 		{"findings", fmt.Sprintf("%d", st.FindingCount)},
+		{"live urls", fmt.Sprintf("%d", st.LiveRecordCount)},
 		{"rules", fmt.Sprintf("%d", st.RuleCount)},
 		{"surfaces / groups / paths", fmt.Sprintf("%d / %d / %d", st.SurfaceCount, st.GroupCount, st.AttackPathCount)},
 		{"worker time", formatDuration(st.Runtime.WorkerTime)},
@@ -234,6 +235,52 @@ func writeHTML(ctx context.Context, bw *bufio.Writer, m *Model) error {
 		return err
 	}
 	if err := writeHTMLTruncationNote(writeln, len(m.Secrets), len(secretRows)); err != nil {
+		return err
+	}
+	if err := writeln("</details>"); err != nil {
+		return err
+	}
+
+	// Live URLs (urllive, OPT-P0-3) — presentation-only.
+	if err := writeln("<details id=\"live-urls\" open><summary>Live URLs (%d)</summary>", len(m.LiveRecords)); err != nil {
+		return err
+	}
+	if err := writeln("<p class=\"note\">URL liveness triage — status, redirect, and TLS observations (single GET, no body, redirect observed-not-followed).</p>"); err != nil {
+		return err
+	}
+	liveRows := make([][]string, 0, min(maxHTMLTableRows, len(m.LiveRecords)))
+	for _, lr := range m.LiveRecords {
+		if len(liveRows) >= maxHTMLTableRows {
+			break
+		}
+		status := fmt.Sprintf("%d", lr.Status)
+		if lr.Status == 0 && lr.Err != nil {
+			status = lr.Err.Error()
+			if len(status) > 64 {
+				status = status[:64] + "…"
+			}
+		} else if lr.Status == 0 {
+			status = "—"
+		}
+		redirect := "—"
+		if lr.RedirectObserved {
+			redirect = lr.RedirectLocation
+			if redirect == "" {
+				redirect = "yes"
+			}
+		}
+		tls := "—"
+		if lr.TLS != nil {
+			tls = lr.TLS.Fingerprint[:8]
+		} else if lr.TLSMeta != nil {
+			tls = "handshake"
+		}
+		liveRows = append(liveRows, []string{lr.URL.String(), status, redirect, tls, fmt.Sprintf("%v", lr.Truncated)})
+	}
+	if err := writeHTMLTable(bw, "", []string{"url", "status", "redirect", "tls", "truncated"}, liveRows); err != nil {
+		return err
+	}
+	if err := writeHTMLTruncationNote(writeln, len(m.LiveRecords), len(liveRows)); err != nil {
 		return err
 	}
 	if err := writeln("</details>"); err != nil {

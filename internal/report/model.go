@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
 
@@ -85,6 +86,11 @@ type Model struct {
 	Surfaces    []priority.SurfaceAsset `json:"surfaces,omitempty"`
 	Groups      []priority.Group        `json:"groups,omitempty"`
 	AttackPaths []priority.AttackPath   `json:"attack_paths,omitempty"`
+
+	// LiveRecords are the URL liveness observations (urllive, OPT-P0-3).
+	// They are presentation-only and never rescanned; the report renders
+	// them as a table/list in markdown/html.
+	LiveRecords []httpprobe.LiveRecord `json:"live_records,omitempty"`
 
 	// Recommendations is the deterministic projection of the surfaces'
 	// factor lists through priority.Recommend (surface order, factor
@@ -216,6 +222,9 @@ func NewModel(input Context) (*Model, error) {
 		return nil, err
 	}
 	if m.AttackPaths, err = normalizeAttackPaths(input.AttackPaths); err != nil {
+		return nil, err
+	}
+	if m.LiveRecords, err = normalizeLiveRecords(input.LiveRecords); err != nil {
 		return nil, err
 	}
 	if m.Errors, err = normalizeErrors(input.Errors, &m.errorRecords); err != nil {
@@ -696,6 +705,41 @@ func normalizeAttackPaths(list []priority.AttackPath) ([]priority.AttackPath, er
 	return deduped, nil
 }
 
+func normalizeLiveRecords(list []httpprobe.LiveRecord) ([]httpprobe.LiveRecord, error) {
+	if len(list) > maxModelPerKind {
+		return nil, overBound("live records", len(list), maxModelPerKind)
+	}
+	for i, r := range list {
+		if r.URL.IsZero() {
+			return nil, fmt.Errorf("report: live record %d has zero URL", i)
+		}
+		reparsed, err := asset.ParseURL(r.URL.String(), r.URL.Prov)
+		if err != nil {
+			return nil, fmt.Errorf("report: live record %d (%q): %w", i, r.URL.String(), err)
+		}
+		if reparsed.Identity() != r.URL.Identity() {
+			return nil, fmt.Errorf("report: live record %d (%q) is not canonical", i, r.URL.String())
+		}
+		if r.Status < 0 || r.Status > 599 {
+			return nil, fmt.Errorf("report: live record %d has invalid status %d", i, r.Status)
+		}
+	}
+	// Dedup by URL identity, first-seen wins, deterministic order.
+	byID := make(map[asset.Identity]int)
+	var out []httpprobe.LiveRecord
+	for _, r := range list {
+		if idx, ok := byID[r.URL.Identity()]; ok {
+			// Keep first-seen: merge if needed? For live records, keep earliest.
+			_ = idx
+			continue
+		}
+		byID[r.URL.Identity()] = len(out)
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].URL.String() < out[j].URL.String() })
+	return out, nil
+}
+
 // normalizeErrors canonicalizes every record, then sorts by (category,
 // stage, message) and merges identical adjacent records by summing counts.
 // The full merged record list is stored on the model (unexported — the
@@ -934,6 +978,7 @@ type digestPayload struct {
 	TLSCertificates []asset.TLSCertificate  `json:"tls_certificates,omitempty"`
 	SourceMaps      []asset.SourceMap       `json:"source_maps,omitempty"`
 	Relationships   []asset.Relationship    `json:"relationships,omitempty"`
+	LiveRecords     []httpprobe.LiveRecord  `json:"live_records,omitempty"`
 
 	Surfaces    []priority.SurfaceAsset `json:"surfaces,omitempty"`
 	Groups      []priority.Group        `json:"groups,omitempty"`
@@ -1011,6 +1056,7 @@ func computeDigest(m *Model) (string, error) {
 		TLSCertificates: m.TLSCertificates,
 		SourceMaps:      m.SourceMaps,
 		Relationships:   m.Relationships,
+		LiveRecords:     m.LiveRecords,
 		Surfaces:        m.Surfaces,
 		Groups:          m.Groups,
 		AttackPaths:     m.AttackPaths,

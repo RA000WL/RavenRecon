@@ -34,6 +34,7 @@ type Statistics struct {
 	TLSCertificateCount int `json:"tls_certificate_count"`
 	SourceMapCount      int `json:"source_map_count"`
 	RelationshipCount   int `json:"relationship_count"`
+	LiveRecordCount     int `json:"live_record_count"`
 
 	// Priority outputs.
 	SurfaceCount        int `json:"surface_count"`
@@ -161,6 +162,7 @@ func buildStatistics(m *Model) Statistics {
 		TLSCertificateCount: len(m.TLSCertificates),
 		SourceMapCount:      len(m.SourceMaps),
 		RelationshipCount:   len(m.Relationships),
+		LiveRecordCount:     len(m.LiveRecords),
 		SurfaceCount:        len(m.Surfaces),
 		GroupCount:          len(m.Groups),
 		AttackPathCount:     len(m.AttackPaths),

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
 
@@ -114,6 +115,14 @@ type Results struct {
 	// AttackPath.Root (see mergeResults), with the same non-truncation
 	// semantics documented on Groups.
 	AttackPaths []priority.AttackPath
+
+	// LiveRecords are the URL liveness observations (httpprobe.LiveRecord).
+	// Producer: the urllive stage family (OPT-P0-3). Each record is keyed by
+	// the canonical URL identity (asset.URL.Identity().String()), so the same
+	// URL observed by multiple sources deduplicates to the first-seen
+	// observation. The channel is bounded by MaxOutput and participates in
+	// the <channel>_truncated sticky-flag vocabulary as "live_records".
+	LiveRecords []httpprobe.LiveRecord
 }
 
 // mergeResults appends one stage's result additions to the run's
@@ -150,7 +159,7 @@ type Results struct {
 // order, from the documented vocabulary: ips, ports, services, endpoints,
 // javascript, parameters, technologies, secrets, evidence, findings,
 // tls_certificates, source_maps, relationships, surfaces, groups,
-// attack_paths. The runner records the "<name>_truncated" sticky flag and
+// attack_paths, live_records. The runner records the "<name>_truncated" sticky flag and
 // report.Truncated for each returned name (AGENTS §0.6 carve-out,
 // mirroring corpus_capped).
 //
@@ -200,6 +209,8 @@ func mergeResults(dst *Results, add Results, seen map[string]struct{}, cap int) 
 	note(cut, "groups")
 	dst.AttackPaths, cut = mergeChannel(dst.AttackPaths, add.AttackPaths, seen, "attack_paths", cap, func(p priority.AttackPath) string { return p.Root.String() })
 	note(cut, "attack_paths")
+	dst.LiveRecords, cut = mergeChannel(dst.LiveRecords, add.LiveRecords, seen, "live_records", cap, func(r httpprobe.LiveRecord) string { return r.URL.Identity().String() })
+	note(cut, "live_records")
 	return capped
 }
 

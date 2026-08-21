@@ -180,6 +180,7 @@ type t4Harness struct {
 	gauRunner       *fakeRunner
 	resolver        *fakeResolver
 	transport       *cannedTransport
+	liveTransport   http.RoundTripper
 	jsTransport     *rewriteTransport
 	jsRequests      func() int
 	detectReg       *detect.Registry
@@ -210,6 +211,7 @@ func newT4Harness(t *testing.T) *t4Harness {
 			headers: map[string]string{"Content-Type": "text/html"},
 		})
 	}
+	h.liveTransport = &liveTransport{}
 
 	_, h.jsTransport, h.jsRequests = t4JSLoopback(t)
 
@@ -219,13 +221,13 @@ func newT4Harness(t *testing.T) *t4Harness {
 	return h
 }
 
-// stages wires the full eleven-stage pipeline: the REAL discovery adapter
-// driving the ten real engines (the T3d3 shapes, re-used verbatim) plus the
-// crawl stage (hermetic empty). The discovery stage runs through the shared
-// fake runner, whose barrier is a pass-through until armed: the determinism
-// test arms it (armBarrier) so the three discovery executions genuinely
-// overlap inside the runner; the cache-hit test leaves it unarmed (zero
-// behavior change).
+// stages wires the full twelve-stage pipeline: the REAL discovery adapter
+// driving the eleven real engines (the T3d3 shapes, re-used verbatim) plus the
+// crawl stage (hermetic empty) and the urllive stage (hermetic 200 live).
+// The discovery stage runs through the shared fake runner, whose barrier is a
+// pass-through until armed: the determinism test arms it (armBarrier) so the
+// three discovery executions genuinely overlap inside the runner; the cache-hit
+// test leaves it unarmed (zero behavior change).
 func (h *t4Harness) stages() []pipeline.Stage {
 	return []pipeline.Stage{
 		NewDiscoveryStage(h.discoveryRunner, fakeLookup),
@@ -236,6 +238,7 @@ func (h *t4Harness) stages() []pipeline.Stage {
 		NewTechIntelStage(nil), // production fingerprint database
 		NewJSIntelStage(h.jsTransport),
 		NewSecretIntelStage(h.secretDB),
+		NewUrlliveStage(h.liveTransport),
 		NewPriorityStage(h.interesting, h.risk),
 		NewDetectStage(h.detectReg),
 		NewReportStage(h.reportReg),
@@ -248,7 +251,20 @@ func newFakeCrawlEmpty() *fakeCrawlSource {
 	}}
 }
 
-// t4ScanConfig is the full eleven-stage selection with the discovery stage's
+// liveTransport is a hermetic RoundTripper for the urllive stage: every URL
+// probe returns 200 without TLS (deterministic live).
+type liveTransport struct{}
+
+func (t *liveTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       http.NoBody,
+		Request:    req,
+	}, nil
+}
+
+// t4ScanConfig is the full twelve-stage selection with the discovery stage's
 // concurrency explicitly pinned to 4 (the pipeline default is already 4;
 // the explicit bound makes the race-condition proof self-documenting).
 // Rate stays at the pipeline default 0 — job-start rate limiting disabled
@@ -328,8 +344,8 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 	if r1.Outcome != pipeline.OutcomeCompleted {
 		t.Fatalf("Outcome = %q, want completed", r1.Outcome)
 	}
-	if len(r1.Stages) != 11 {
-		t.Fatalf("Stages = %d, want 11", len(r1.Stages))
+	if len(r1.Stages) != 12 {
+		t.Fatalf("Stages = %d, want 12", len(r1.Stages))
 	}
 	for i, sr := range r1.Stages {
 		if sr.Outcome != pipeline.OutcomeCompleted {

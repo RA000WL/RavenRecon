@@ -46,7 +46,7 @@ package adapt
 // (A/AAAA/CNAME — dns.hostTypes) fail -> the host is dns.StatusFailed
 // ("no usable observations", classifyHost: failed && !completed) -> the
 // adapter's per-host fold yields partial (anyFailed && anyCompleted) with
-// ItemsFailed = 1, and the runner's foldOutcome over partial + 9 completed
+// ItemsFailed = 1, and the runner's foldOutcome over partial + 10 completed
 // is partial (pipeline_test.go TestRunPartialWithCompleted: partial +
 // completed = partial; failed-with-completed is partial, never failed).
 //
@@ -103,6 +103,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -131,6 +132,7 @@ type t5Harness struct {
 	discoveryRunner *fakeRunner
 	gauRunner       *fakeRunner
 	transport       *cannedTransport
+	liveTransport   http.RoundTripper
 	jsTransport     *rewriteTransport
 	jsRequests      func() int
 	detectReg       *detect.Registry
@@ -170,6 +172,7 @@ func newT5Harness(t *testing.T) *t5Harness {
 			headers: map[string]string{"Content-Type": "text/html"},
 		})
 	}
+	h.liveTransport = &liveTransport{}
 	_, h.jsTransport, h.jsRequests = t4JSLoopback(t)
 	h.detectReg = newDetectRegistry(t, t3dTechListingRule(t))
 	h.reportReg = newReportRegistry(t, captureReporter("capture", func(m *report.Model) { h.models = append(h.models, m) }))
@@ -177,9 +180,9 @@ func newT5Harness(t *testing.T) *t5Harness {
 	return h
 }
 
-// t5Stages wires the full eleven-stage pipeline: the REAL discovery adapter
-// over the hermetic runner (the T4 seam) plus the ten real adapters (the
-// T3d3 shapes plus crawl). resolver is the failure-injection seam each test provides;
+// t5Stages wires the full twelve-stage pipeline: the REAL discovery adapter
+// over the hermetic runner (the T4 seam) plus the eleven real adapters (the
+// T3d3 shapes plus crawl and urllive). resolver is the failure-injection seam each test provides;
 // the report stage's commit target comes from the ScanConfig's OutputDir
 // (set per run by the tests).
 func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage {
@@ -192,6 +195,7 @@ func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage
 		NewTechIntelStage(nil), // production fingerprint database
 		NewJSIntelStage(h.jsTransport),
 		NewSecretIntelStage(h.secretDB),
+		NewUrlliveStage(h.liveTransport),
 		NewPriorityStage(h.interesting, h.risk),
 		NewDetectStage(h.detectReg),
 		NewReportStage(h.reportReg),
@@ -376,7 +380,7 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	}
 	r1 := run()
 
-	// --- Run-level outcome vocabulary: ONE partial stage among eleven
+	// --- Run-level outcome vocabulary: ONE partial stage among twelve
 	// completed stages folds the run to partial (pipeline_test.go
 	// TestRunPartialWithCompleted), never failed and never completed. ---
 	if r1.Outcome != pipeline.OutcomePartial {
@@ -386,8 +390,8 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		}
 		t.Fatalf("Outcome = %q, want partial", r1.Outcome)
 	}
-	if len(r1.Stages) != 11 {
-		t.Fatalf("Stages = %d, want 11", len(r1.Stages))
+	if len(r1.Stages) != 12 {
+		t.Fatalf("Stages = %d, want 12", len(r1.Stages))
 	}
 	for i, sr := range r1.Stages {
 		if i == 1 { // dns: the failing stage
@@ -660,11 +664,11 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	// stage order; the failing stage's finished payload mirrors its
 	// StageRecord field for field (T3a contract). ---
 	events := obs.snapshot()
-	if len(events) != 22 {
-		t.Fatalf("events = %d, want 22 (11 stages x started+finished)", len(events))
+	if len(events) != 24 {
+		t.Fatalf("events = %d, want 24 (12 stages x started+finished)", len(events))
 	}
-	wantKinds := make([]event.Kind, 0, 22)
-	for i := 0; i < 11; i++ {
+	wantKinds := make([]event.Kind, 0, 24)
+	for i := 0; i < 12; i++ {
 		wantKinds = append(wantKinds, event.KindStageStarted, event.KindStageFinished)
 	}
 	if got := t5stageEventKinds(events); !reflect.DeepEqual(got, wantKinds) {
@@ -701,9 +705,9 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	}
 	// The report stage (the last entry) still completed and emitted its
 	// finished event.
-	lastFin, ok := events[21].Payload.(event.StageFinished)
+	lastFin, ok := events[23].Payload.(event.StageFinished)
 	if !ok {
-		t.Fatalf("events[21] payload type = %T, want event.StageFinished", events[21].Payload)
+		t.Fatalf("events[23] payload type = %T, want event.StageFinished", events[23].Payload)
 	}
 	if lastFin.Name != string(pipeline.StageReport) || lastFin.Outcome != string(pipeline.OutcomeCompleted) {
 		t.Errorf("report finished payload = %+v, want completed (the pipeline reached the report)", lastFin)
@@ -721,11 +725,11 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		t.Errorf("discovery executions after run 2 = %d, want 8 (4 per cold run)", h.discoveryExecutions())
 	}
 	events = obs.snapshot()
-	if len(events) != 44 {
-		t.Fatalf("events after run 2 = %d, want 44", len(events))
+	if len(events) != 48 {
+		t.Fatalf("events after run 2 = %d, want 48", len(events))
 	}
-	if !reflect.DeepEqual(events[:22], events[22:]) {
-		t.Fatalf("the two runs' event streams differ:\nrun 1: %+v\nrun 2: %+v", events[:22], events[22:])
+	if !reflect.DeepEqual(events[:24], events[24:]) {
+		t.Fatalf("the two runs' event streams differ:\nrun 1: %+v\nrun 2: %+v", events[:24], events[24:])
 	}
 	// Run 2 captured its own model, identical to run 1's.
 	if len(h.models) != 2 {

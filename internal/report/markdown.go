@@ -231,6 +231,63 @@ func writeMarkdown(ctx context.Context, bw *bufio.Writer, m *Model) error {
 		}
 	}
 
+	// Live URLs (urllive, OPT-P0-3) — presentation-only, never rescans.
+	if err := writeln(""); err != nil {
+		return err
+	}
+	if err := writeln("## Live URLs"); err != nil {
+		return err
+	}
+	if err := writeln(""); err != nil {
+		return err
+	}
+	if len(m.LiveRecords) == 0 {
+		if err := writeln("_No live URL observations for this run._"); err != nil {
+			return err
+		}
+	} else {
+		rows := make([][]string, 0, min(maxMarkdownListRows, len(m.LiveRecords)))
+		for _, lr := range m.LiveRecords {
+			if len(rows) >= maxMarkdownListRows {
+				break
+			}
+			status := fmt.Sprintf("%d", lr.Status)
+			if lr.Status == 0 && lr.Err != nil {
+				status = lr.Err.Error()
+				if len(status) > 64 {
+					status = status[:64] + "…"
+				}
+			} else if lr.Status == 0 {
+				status = "—"
+			}
+			redirect := "—"
+			if lr.RedirectObserved {
+				redirect = lr.RedirectLocation
+				if redirect == "" {
+					redirect = "yes"
+				}
+			}
+			tls := "—"
+			if lr.TLS != nil {
+				tls = lr.TLS.Fingerprint[:8]
+			} else if lr.TLSMeta != nil {
+				tls = "handshake"
+			}
+			rows = append(rows, []string{lr.URL.String(), status, redirect, tls, fmt.Sprintf("%v", lr.Truncated)})
+		}
+		if err := writeMarkdownTable(bw, []string{"url", "status", "redirect", "tls", "truncated"}, rows); err != nil {
+			return err
+		}
+		if len(m.LiveRecords) > len(rows) {
+			if err := writeln(""); err != nil {
+				return err
+			}
+			if err := writeln("_And %d more live URLs — see the JSON export._", len(m.LiveRecords)-len(rows)); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Top findings.
 	if err := writeln(""); err != nil {
 		return err
@@ -406,6 +463,7 @@ func writeMarkdown(ctx context.Context, bw *bufio.Writer, m *Model) error {
 		{"secrets", fmt.Sprintf("%d", st.SecretCount)},
 		{"relationships", fmt.Sprintf("%d", st.RelationshipCount)},
 		{"findings", fmt.Sprintf("%d", st.FindingCount)},
+		{"live urls", fmt.Sprintf("%d", st.LiveRecordCount)},
 		{"rules", fmt.Sprintf("%d", st.RuleCount)},
 		{"surfaces / groups / paths", fmt.Sprintf("%d / %d / %d", st.SurfaceCount, st.GroupCount, st.AttackPathCount)},
 		{"worker time", formatDuration(st.Runtime.WorkerTime)},

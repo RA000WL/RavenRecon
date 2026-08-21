@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
 
@@ -65,6 +66,11 @@ type Context struct {
 	Surfaces    []priority.SurfaceAsset
 	Groups      []priority.Group
 	AttackPaths []priority.AttackPath
+
+	// LiveRecords are the URL liveness observations (urllive). They are
+	// presentation-only and never rescanned; the report renders them as a
+	// table/list in markdown/html.
+	LiveRecords []httpprobe.LiveRecord
 
 	// Errors is the run's error log for the error summary: one record per
 	// distinct error observation (identical records merge by summing
