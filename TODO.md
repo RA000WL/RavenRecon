@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-54).
+  next free `NEW-n` (currently NEW-56).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1836,8 +1836,14 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   prints effective config; gates green.
 
 ### NEW-49 (HIGH) — v1.6 Robustness and hostile-input hardening (ROADMAP v1.6)
-- Status: IN PROGRESS (orchestrator, 2026-08-21) — milestone tracker;
-  per-task records appended below as batches land
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-21): all ROADMAP v1.6
+  items landed and reviewer-gated — OPT-P1-5 9575e14, OPT-P1-4 d10d719,
+  OPT-P1-3 3b21401 (incl. sortQuery idempotence crasher fix), OPT-P2-6
+  4e31f8d (+F1/F2 fix round), OPT-P2-4 8c795eb; dns/resolver.go descope
+  recorded; acceptance criteria met (fuzz targets per parser, triage,
+  property tests, regressions, -race green, bench before/after recorded).
+  Follow-ups live on: NEW-53 (mechanical migrations), NEW-54 (httpprobe
+  race-flake family), NEW-55 (bench TLS/DNS branches), NEW-50/51/52.
 - Reporter: master
 - Owner: builder (per-task dispatches)
 - Problem: ROADMAP v1.6 — parsers/ingestion paths treated as untrusted-input
@@ -1951,6 +1957,58 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   fixed-point table row = coverage redundancy; equal-decode tie ordering
   pre-existing/documented). Gates: gofmt clean, build/vet OK, focused suites
   ok incl. -race; orchestrator full-suite + race green post-change.
+- Batch 3 (OPT-P2-6 + NEW-46 + OPT-P2-4) IMPLEMENTED (builders
+  ses_fdb52d166ffee3dqJAS5DZQ9um [3a] + ses_fdb39b8f1ffeoLygbCw6NMmjjf [3b];
+  three transport-failed dispatches before 3a landed via reduced-scope retry;
+  3b first-try): 3a — asset.InDomain + discovery.VersionPattern/ExtractVersion
+  single homes (duplication verified real: inDomain x4 incl. one dead copy,
+  versionPattern x3 byte-identical); validateScope triplicate deliberately NOT
+  unified (pinned per-package error prefixes); NEW-46 conversion hoist;
+  reviewer APPROVE WITH NITS → F1 (InDomain empty-input guard divergence from
+  guarded copies) + F2 (doc tense) closed same session; remaining migrations
+  filed NEW-53. 3b — techintel lowered-target cache (183→78 allocs/op on the
+  match-indicator hot path, −4% ns/op; measured build-time tradeoff +2.7%
+  HTMLParse); three §14 declines with benchmark evidence (priority
+  marshalSurface rare-path tie-break; httpprobe TLS clone 112ns vs ms
+  handshakes; event bus publish already 0 allocs and fan-out-under-lock IS
+  the sequence-ordering guarantee — premise false); reviewer APPROVE WITH
+  NITS after branch-by-branch verification. Also surfaced: httpprobe -race
+  flake family reproduced on clean HEAD (3-of-4 stashed runs, varying tests)
+  → NEW-54; bench TLS/DNS branch gap → NEW-55.
+
+### NEW-54 (MED) — `go test -race ./internal/httpprobe/` intermittently fails on clean HEAD across varying tests (internal/httpprobe)
+- Status: OPEN
+- Reporter: builder (OPT-P2-4 batch, NEW-49 batch 3b) + orchestrator sighting
+  during batch-3a race gate
+- Owner: (unassigned)
+- Problem: under full-package -race load, different probe tests fail
+  intermittently with transport-level errors (observed:
+  TestProbeTLSMetadataCapture `readLoopPeekFailLocked: %!w(<nil>)`;
+  builder's clean-HEAD reproduction at 8191cf9: TestProbeSpoofTLSNoMisclassification,
+  TestProbeSpoofHeaderCapNoMisclassification, TestProbeCompletedHTTPS — 3-of-4
+  stashed runs failing a DIFFERENT test each time, passing on rerun). All pass
+  in isolation. Same family as NEW-4 (TestProbeCompletedHTTPS). Blocks race-
+  gate trust for the package: a red -race run cannot be distinguished from a
+  real regression without reruns.
+- Fix: capture full `-race -v` output across repeated runs to identify the
+  shared fixture/sensitivity (suspects: loopback TLS listener connection
+  reuse under load, shared transport keep-alives, or test ordering);
+  make the affected tests deterministic (per-test transports, DisableKeepAlives)
+  or pin the trigger.
+- Verification: 20+ consecutive `go test -race -count=1 ./internal/httpprobe/`
+  full-package runs green.
+
+### NEW-55 (LOW) — BenchmarkMatchIndicatorAllKinds exercises no TLS/DNS branches (internal/techintel)
+- Status: OPEN
+- Reporter: reviewer (OPT-P2-4 review, NEW-49 batch 3b)
+- Owner: (unassigned)
+- Problem: benchFullObservation sets no TLS/DNS block, so the TLS issuer/CN/
+  ALPN and DNS-CNAME lowered-slice branches execute zero iterations — an
+  allocation regression reintroduced only in those branches would not move
+  the benchmark. Correctness remains covered by unit tests; coverage nicety.
+- Fix: add a synthetic TLS/DNS block to the bench fixture.
+- Verification: benchmark iterates those branches (assert ≥1 match fires from
+  each family); numbers recorded.
 
 ### NEW-51 (LOW) — adapt/doc.go overstates marker exposure as "the report" (internal/pipeline/adapt/doc.go)
 - Status: OPEN

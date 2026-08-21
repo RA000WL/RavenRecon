@@ -52,7 +52,7 @@ Every phase must satisfy these before it is complete:
 | v1.3 | End-to-end pipeline | ✅ Complete | T2d–T6 landed (ad791c3, f31cf3a, 9da5793, 9abe2d3, df3672d, 91074ff, 382e218); ROADMAP/NEW-13 closed. |
 | v1.4 | Live terminal observability | ✅ Complete | `scan --tui`/`--tui-compact` wired + NEW-21 render fix proven live (field trials 1–2); OPT-P2-3 + OPT-P1-1 landed; OPT-P1-5 deferred to v1.6 (jsintel still text-matches `"tls:"`). |
 | v1.5 | Real-world validation, URL hunting, discovery data quality | ✅ Complete | Quality gate b46a110; JS→URL 2d06b94; urllive 7fc7e4c; per-tool+health f44cecc; honest duration 08861f0; chaos 184796a; dnsx brute 0a19d67; katana crawl 1ab2e99; validated across 5 real-target field trials (NEW-19/36/38/39/40). Remainder: NEW-48 (OPT-P2-1 --dry-run/help docs). |
-| v1.6 | Robustness and hostile-input hardening | ⏳ Planned | Formerly v1.5 — fuzzing + parser hardening (renumbered 2026-08-20). Optimizations: `OPT-P1-3`/`OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5`. |
+| v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
 | v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). Optimizations: `OPT-P3-1` + `OPT-P2-4` bench baselines. |
 | v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-2`. |
 | v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-3` + `OPT-P1-2` isolation for third-party packs. |
@@ -316,44 +316,59 @@ schema change.
 
 ## v1.6 — Robustness and hostile-input hardening
 
-Status: planned (formerly v1.5; renumbered 2026-08-20 so roadmap order ==
-execution order)
+Status: ✅ Complete (closed 2026-08-21) — OPT-P1-5 9575e14; OPT-P1-4 d10d719;
+OPT-P1-3 3b21401 (8 fuzz targets + property tests + sortQuery idempotence
+crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb (one measured win, three
+evidence-backed declines). dns/resolver.go fuzz target honestly descoped
+(network I/O behind net.Resolver — no pure parse boundary; NEW-49 record).
 
 Goal: treat all parsers and ingestion paths as untrusted-input boundaries.
 
 > Audit companion: `OPTIMIZATION.md:4` — `OPT-P1-3`/`OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5`.
 
-- [ ] Go fuzzing harnesses — `OPT-P1-3` (`asset/ParseURL`, `discovery/parse.go:21`,
-      `urlintel/engine.go:554`, `jsintel/lex.go+parse.go+fetch.go`, `secrentel/scan.go:61`,
-      `cache/cache.go:407`, `report/*`, `dns/resolver.go`; seeded from `internal/asset/testdata`
-      + field-trial samples)
-- [ ] Property tests — `parse→Identity→parse` round-trip, `merge` idempotence, dedup invariants
-      (`testing/quick` + hand-rolled; `OPT-P1-3`)
-- [ ] JS fuzzing for `internal/jsintel` — `OPT-P1-3`
-- [ ] Secret fuzzing for `internal/secrentel` — `OPT-P1-3`
-- [ ] URL fuzzing for `internal/urlintel` — `OPT-P1-3`
-- [ ] Cache fuzzing for `internal/cache` — `OPT-P1-3`
-- [ ] Report fuzzing — `OPT-P1-3`
-- [ ] Parser hardening based on fuzz results — `OPT-P1-3`
-- [ ] Silent-truncation hardening — `OPT-P1-4` (`asset/tls_certificate.go:334` `32` DNSNames +
-      `asset/finding.go:313` `16/32` caps → `Truncated` flag / `StickyFlags`)
-- [ ] TLS classification hardening — `OPT-P1-5` (`jsintel/fetch.go:678` → `tlsHandshakeError`
-      sentinel mirroring `httpprobe/run.go:371,912`, remove `strings.Contains(,"tls:")` fallback)
-      if not already landed in v1.4
-- [ ] Hot-path allocation pass — `OPT-P2-4` (`techintel/analyze.go:580` cached lowercasing,
-      `priority/score.go:614` `json.Marshal` → tuple compare, `httpprobe/run.go:387` TLS config reuse,
-      `event/bus.go:97` snapshot-then-fan-out)
-- [ ] Scope/version dedup refactor — `OPT-P2-6` (`asset/scope.go` `InDomain`, single `versionPattern`)
+- [x] Go fuzzing harnesses — `OPT-P1-3` (eight native targets: asset ParseURL,
+      discovery parseHostLines, urlintel parseRawURL, jsintel parser,
+      secrentel scanDocument, cache stored-record decode/self-heal, report
+      renderCSV + error context; synthetic seeds; real invariants asserted in
+      each body; `dns/resolver.go` descoped — no pure boundary)
+- [x] Property tests — parse→Identity→parse round-trip, merge idempotence,
+      dedup invariants (`testing/quick` + hand-rolled; `OPT-P1-3`)
+- [x] JS fuzzing for `internal/jsintel` — `OPT-P1-3`
+- [x] Secret fuzzing for `internal/secrentel` — `OPT-P1-3`
+- [x] URL fuzzing for `internal/urlintel` — `OPT-P1-3`
+- [x] Cache fuzzing for `internal/cache` — `OPT-P1-3`
+- [x] Report fuzzing — `OPT-P1-3`
+- [x] Parser hardening based on fuzz results — canonicalization idempotence
+      fix in `asset/sortQuery` (fuzz crasher "A://0? %0& 0": same URL minted
+      two identities across parses → MergeURLs refused merges; regression
+      corpus + table pins)
+- [x] Silent-truncation hardening — `OPT-P1-4` (`TLSCertificate.DNSNamesTruncated`
+      + `Finding.Truncated`; four genuinely-silent finding cuts incl. metadata;
+      exactly-at-cap → false; adapter sticky flags `probe_tls_dns_names_truncated`,
+      `detect_finding_lists_truncated`)
+- [x] TLS classification hardening — `OPT-P1-5` (`jsintel/fetch.go` structural
+      `tlsHandshakeError` sentinel mirroring `httpprobe/run.go:360-429`;
+      `strings.Contains(,"tls:")` fallback removed; hostile-text
+      misclassification fixed; ServerName deviation documented vs httpprobe —
+      httpprobe's own IP-literal defect filed as NEW-50)
+- [x] Hot-path allocation pass — `OPT-P2-4` (techintel lowered-target cache:
+      183→78 allocs/op on the match-indicator hot path; three declines with
+      benchmark evidence: priority marshalSurface tie-break, httpprobe TLS
+      clone, event bus publish)
+- [x] Scope/version dedup refactor — `OPT-P2-6` (`asset.InDomain`,
+      `discovery.VersionPattern`/`ExtractVersion` single homes; remaining
+      mechanical migrations tracked as NEW-53)
 
 Acceptance criteria:
 
-- Each high-risk parser has at least one fuzz target.
-- Fuzz discoveries are triaged into fixed regressions, accepted behavior, or invalid inputs.
-- Crashers, hangs, and memory blowups are eliminated.
-- Property tests cover normalization, deduplication, and invariants.
-- Regression tests exist for every confirmed issue.
+- Each high-risk parser has at least one fuzz target. ✅ (dns/resolver.go
+  descoped with recorded rationale)
+- Fuzz discoveries are triaged into fixed regressions, accepted behavior, or invalid inputs. ✅
+- Crashers, hangs, and memory blowups are eliminated. ✅ (one crasher fixed)
+- Property tests cover normalization, deduplication, and invariants. ✅
+- Regression tests exist for every confirmed issue. ✅
 - `OPT-P1-4`/`OPT-P1-5`/`OPT-P2-6` landed with `go test -race` green; `OPT-P2-4` `go test -bench` before/after
-  shows no regression (bus `~0.5 µs/publish` held, feed `1024` not regressed).
+  shows no regression (bus `~0.5 µs/publish` held at 133–405 ns with 0 allocs; feed `1024` not regressed). ✅
 
 ---
 
