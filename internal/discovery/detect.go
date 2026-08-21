@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 
@@ -207,17 +206,4 @@ func detectExec(ctx context.Context, e toolEnv, args []string, mode detectMode) 
 		d.Reason = fmt.Sprintf("executable %s exists; %s produced no output, capability not verified", path, strings.Join(args, " "))
 		return d
 	}
-}
-
-// versionPattern matches the first semver-like token in tool output, with an
-// optional leading "v". It is intentionally tolerant: -version output formats
-// differ across tools and versions ("Current Version: v2.6.3", "v3.23.0", ...).
-var versionPattern = regexp.MustCompile(`[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:[-+._][0-9A-Za-z]+)*`)
-
-// extractVersion returns the first version-like token in out, or "".
-func extractVersion(out []byte) string {
-	if m := versionPattern.Find(out); m != nil {
-		return string(m)
-	}
-	return ""
 }

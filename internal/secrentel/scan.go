@@ -73,6 +73,12 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	lines := buildLineIndex(content)
 	entropy := newEntropyCache()
 
+	// One []byte→string conversion per document (NEW-46): the regex scan
+	// haystack, the ASCII-lowered fast path, and the unicode-folded haystack
+	// all derive from this single copy instead of each re-converting the
+	// document.
+	strContent := string(content)
+
 	// The anchor gate: one lowercased copy of the document, computed lazily
 	// on the first anchored pattern, gates every case-insensitive contextual
 	// family behind a substring check (see Pattern.Anchors). Without it the
@@ -82,7 +88,7 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	var lowerDone bool
 	lower := func() string {
 		if !lowerDone {
-			lowerOnce = toLowerASCII(string(content))
+			lowerOnce = toLowerASCII(strContent)
 			lowerDone = true
 		}
 		return lowerOnce
@@ -95,12 +101,11 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	var foldDone bool
 	folded := func() string {
 		if !foldDone {
-			foldOnce = buildFoldedHaystack(string(content))
+			foldOnce = buildFoldedHaystack(strContent)
 			foldDone = true
 		}
 		return foldOnce
 	}
-	strContent := string(content)
 	// Non-ASCII presence, computed at most once per document: every anchored
 	// miss consults it to decide the unicode-fold fallback, and an unmemoized
 	// check would pay a full O(n) byte scan per miss.

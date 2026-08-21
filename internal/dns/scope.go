@@ -2,7 +2,6 @@ package dns
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
@@ -38,14 +37,8 @@ func validateInputHost(h asset.Host, domain asset.Domain) error {
 	if got.Name != h.Name {
 		return fmt.Errorf("dns: host %q is not in canonical form (normalized %q)", h.Name, got.Name)
 	}
-	if got.Name != domain.Name && !strings.HasSuffix(got.Name, "."+domain.Name) {
+	if !asset.InDomain(got.Name, domain.Name) {
 		return fmt.Errorf("dns: host %q is outside target domain %q", got.Name, domain.Name)
 	}
 	return nil
-}
-
-// inDomain reports whether name is the domain itself or a subdomain of it.
-// Both arguments must already be canonical.
-func inDomain(name, domain string) bool {
-	return name == domain || strings.HasSuffix(name, "."+domain)
 }
