@@ -162,7 +162,18 @@ func benchFullHead() string {
 }
 
 // benchFullObservation is the full-path analyzer fixture: headers, cookies,
-// and a 64 KiB HTML body.
+// a 64 KiB HTML body, and synthetic TLS/DNS seams (NEW-55). Every TLS/DNS
+// value is chosen to fire at least one REAL database indicator so the
+// lowered-slice match branches (tls_issuer, tls_cn, tls_alpn, dns_cname)
+// execute non-zero iterations in every corpus consumer:
+//
+//   - Issuer "CN=WR2,O=Google Trust Services" fires google cdn's
+//     tls_issuer "google trust services";
+//   - Subject "s3.amazonaws.com" fires aws s3's tls_cn "s3.";
+//   - ALPN "h3" fires cloudflare's tls_alpn "h3" (and "h2" exercises a
+//     non-matching slot of the parallel lowered slice);
+//   - the CNAME chain fires akamai's dns_cname "akamaized.net" and
+//     vercel's dns_cname "cname.vercel-dns.com".
 func benchFullObservation(b *testing.B) Observation {
 	head := benchFullHead()
 	body := paddedHTML(head, "</div></div></div></body></html>", 64<<10)
@@ -182,6 +193,17 @@ func benchFullObservation(b *testing.B) Observation {
 			{Name: "grafana_session", Value: "deadbeef"},
 		},
 		body)
+	o.TLS = &TLSInfo{
+		ALPN:    []string{"h2", "h3"},
+		Issuer:  "CN=WR2,O=Google Trust Services",
+		Subject: "s3.amazonaws.com",
+	}
+	o.DNS = &DNSInfo{
+		CNAMEChain: []string{
+			"h0.example.com.www.edgesuite.net.akamaized.net",
+			"cname.vercel-dns.com",
+		},
+	}
 	return o
 }
 
@@ -354,13 +376,29 @@ func BenchmarkMatchIndicatorAllKinds(b *testing.B) {
 	}
 
 	// Sanity (hoisted): the corpus must fire at least one match somewhere —
-	// a benchmark that matches nothing measures nothing.
+	// a benchmark that matches nothing measures nothing — AND at least one
+	// match from each of the TLS/DNS lowered-slice families (NEW-55): a
+	// fixture without those seams would leave those matchIndicator branches
+	// at zero iterations, blind to allocation regressions there.
 	fired := 0
+	firedByKind := make(map[fingerprints.IndicatorKind]int)
 	for _, ind := range inds {
-		fired += len(matchIndicator(ind, &corpus))
+		n := len(matchIndicator(ind, &corpus))
+		fired += n
+		firedByKind[ind.Kind] += n
 	}
 	if fired == 0 {
 		b.Fatal("full corpus matched no indicator of the real DB")
+	}
+	for _, kind := range []fingerprints.IndicatorKind{
+		fingerprints.IndicatorTLSIssuer,
+		fingerprints.IndicatorTLSCN,
+		fingerprints.IndicatorTLSALPN,
+		fingerprints.IndicatorDNSCNAME,
+	} {
+		if firedByKind[kind] == 0 {
+			b.Fatalf("full corpus matched no %q indicator of the real DB", kind)
+		}
 	}
 
 	b.ReportAllocs()
