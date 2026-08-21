@@ -50,8 +50,8 @@ Every phase must satisfy these before it is complete:
 | v1.2 | Eventing, observability, operator feedback | ✅ Complete | Observer-only event bus + pool events via Config.Observer + cache events via WithObserver (one per Get; nil observer = zero change) + internal/tui first consumer (single-goroutine controller, deterministic frames); no CLI wiring yet at the time (wired into `scan --tui` in v1.4) (a8b3cee). |
 | v1.2.5 | SDK and extension API stabilization | ✅ Complete | SDK v1 (Core): frozen Level-1 surface, API 1.0, surface golden + 9 behavior contracts + semantic compat golden, examples pack (internal/detect/examples), stability policy + reopening criteria (bbf23c8, db7a00c). |
 | v1.3 | End-to-end pipeline | ✅ Complete | T2d–T6 landed (ad791c3, f31cf3a, 9da5793, 9abe2d3, df3672d, 91074ff, 382e218); ROADMAP/NEW-13 closed. |
-| v1.4 | Live terminal observability | ⏳ In flight | `scan --tui` wired; review APPROVE WITH NITS; NEW-21 (TUI render) fix pending; uncommitted. Optimizations: `OPT-P2-3` + `OPT-P1-1`/`OPT-P1-5` hardening allowed in-flight. |
-| v1.5 | Real-world validation, URL hunting, discovery data quality | ⏳ Planned | Next after v1.4 closes (formerly v1.7; re-scoped + renumbered 2026-08-20). Optimizations: `OPT-P0-1`…`OPT-P0-5` + `OPT-P1-6` + `OPT-P2-1`/`OPT-P2-2` (see `OPTIMIZATION.md:3`). |
+| v1.4 | Live terminal observability | ✅ Complete | `scan --tui`/`--tui-compact` wired + NEW-21 render fix proven live (field trials 1–2); OPT-P2-3 + OPT-P1-1 landed; OPT-P1-5 deferred to v1.6 (jsintel still text-matches `"tls:"`). |
+| v1.5 | Real-world validation, URL hunting, discovery data quality | ✅ Complete | Quality gate b46a110; JS→URL 2d06b94; urllive 7fc7e4c; per-tool+health f44cecc; honest duration 08861f0; chaos 184796a; dnsx brute 0a19d67; katana crawl 1ab2e99; validated across 5 real-target field trials (NEW-19/36/38/39/40). Remainder: NEW-48 (OPT-P2-1 --dry-run/help docs). |
 | v1.6 | Robustness and hostile-input hardening | ⏳ Planned | Formerly v1.5 — fuzzing + parser hardening (renumbered 2026-08-20). Optimizations: `OPT-P1-3`/`OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5`. |
 | v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). Optimizations: `OPT-P3-1` + `OPT-P2-4` bench baselines. |
 | v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-2`. |
@@ -139,7 +139,11 @@ Acceptance criteria:
 
 ## v1.4 — Live terminal observability
 
-Status: planned (re-scoped 2026-08-20, user-approved)
+Status: ✅ Complete (closed 2026-08-21) — `scan --tui`/`--tui-compact` wired
+(NEW-18 VERIFIED), TUI renders real stage events (NEW-21 VERIFIED, proven
+live in field trials 1–2: 901 frames with live phase feed + final 12-stage
+table). OPT-P1-5 (jsintel TLS sentinel) NOT landed — deferred to v1.6 where
+it is a checklist item.
 
 Goal: wire the terminal observability library (`internal/tui`, v1.2) into
 `ravenrecon scan`: a live frame on stderr driven by the run's canonical
@@ -147,37 +151,39 @@ stage events, terminating deterministically, with scan's exit semantics
 and summary unchanged. This fulfills v1.2's acceptance criterion "the TUI
 reconstructs a live run from events alone" at the CLI level.
 
-- [ ] `ravenrecon scan --tui` — live observability frame on stderr while
+- [x] `ravenrecon scan --tui` — live observability frame on stderr while
       the run progresses (stage lifecycle, worker dashboard, throughput,
       errors, one deterministic final summary frame); color resolved from
       os.Stderr's character-device state (TTY → on, pipe/redirect → off);
       never changes the summary (stdout) or the exit codes
-- [ ] `ravenrecon scan --tui-compact` — condensed frame (no per-worker or
+- [x] `ravenrecon scan --tui-compact` — condensed frame (no per-worker or
       resource sections); requires --tui (usage error alone)
-- [ ] `--tui`/`--verbose` mutual exclusion — usage error listing both
+- [x] `--tui`/`--verbose` mutual exclusion — usage error listing both
       flags; one event sink per run (the bus or the line observer)
-- [ ] Deterministic termination + bounded join — subscriber Close ends the
+- [x] Deterministic termination + bounded join — subscriber Close ends the
       controller loop, the goroutine is joined before runScan returns on
       every path, and a TUI write failure is a stderr warning only
-- [ ] Exit semantics and summary unchanged with and without --tui;
+- [x] Exit semantics and summary unchanged with and without --tui;
       hermetic wiring tests (event flow, cancellation, write failure,
       leak-regression ordering)
-- [ ] NEW-21 close-out: TUI consumes the pipeline's real stage events —
+- [x] NEW-21 close-out: TUI consumes the pipeline's real stage events —
       live stage feed, honest widget degradation, bounded stage list,
       sanitized strings (fix + render-content tests, reviewer APPROVE
       WITH NITS)
 
 Optimizations in scope for v1.4 (see `OPTIMIZATION.md:5`):
 
-- [ ] `OPT-P2-3` — TUI fidelity: bounded stage list, real `StageStarted/Finished`
+- [x] `OPT-P2-3` — TUI fidelity: bounded stage list, real `StageStarted/Finished`
       from `pipeline/run.go:341`, sanitized strings (`tui/sanitize.go`), honest
       `unknown` totals; `cli/scan.go:454` color `auto` + deterministic
       `sub.Close() → <-tuiDone → bus.Close()` join.
-- [ ] `OPT-P1-1` (allowed in-flight) — `report/writer.go:334` + `cache/cache.go:292`
+- [x] `OPT-P1-1` (allowed in-flight) — `report/writer.go:334` + `cache/cache.go:292`
       durability: `fsync(dir)` after `Rename` (best-effort, `ENOSYS` ignored).
+      Landed as NEW-33 (commit 1f4b0c8).
 - [ ] `OPT-P1-5` (allowed in-flight) — `jsintel/fetch.go:678` → structural
       `tlsHandshakeError` sentinel mirroring `httpprobe/run.go:371,912`; remove
-      `strings.Contains(...,"tls:")` text fallback.
+      `strings.Contains(...,"tls:")` text fallback. **Deferred to v1.6**
+      (verified still open 2026-08-21).
 
 Deferred (user-approved re-scope): per-engine standalone commands (dns,
 http, tech, js, secrets, priority, detect, report — reconsider after v1.6
@@ -200,8 +206,11 @@ Acceptance criteria:
 
 ## v1.5 — Real-world validation, URL hunting, and discovery data quality
 
-Status: planned (re-scoped 2026-08-20, user-approved; formerly v1.7 —
-renumbered so roadmap order == execution order; NEXT after v1.4 closes)
+Status: ✅ Complete (closed 2026-08-21) — all engineering deliverables landed
+and validated live across five real-target field trials (NEW-19/36/38/39/40:
+example.com + verily.com, cold/warm, chaos fix proven, gau unlocked 6,120
+URLs, urllive 8k-URL triage with honest truncation, duration_ms 452249).
+Carried: NEW-48 (OPT-P2-1 remainder); formal FP/FN-rate measurement below.
 
 Goal: validate the system against authorized real targets (the field trial
 running against example.com is this milestone's opening activity) and use
@@ -212,28 +221,29 @@ live-checked, and every corpus URL gains a bounded live-status triage.
 > Audit companion: `OPTIMIZATION.md:3` — `OPT-P0-1`…`OPT-P0-5` plus `OPT-P1-6`/`OPT-P2-1`/`OPT-P2-2`.
 > Each refinement below cites its `OPT-*` entry with `file:line` evidence.
 
-Validation checklist:
+Validation checklist (field-trial depth: NEW-19/36/38; formal FP/FN
+measurement not produced — revisit as triage data accumulates):
 
-- [ ] Output quality
-- [ ] False positive rate
-- [ ] False negative rate
-- [ ] Priority scoring accuracy
-- [ ] Technology identification accuracy
-- [ ] Secret suppression quality
-- [ ] Relationship quality in the asset graph
-- [ ] Limited contract revision only if real-world data proves it necessary
+- [x] Output quality — alive-host yields reviewed per trial (182×2xx on verily)
+- [ ] False positive rate *(not formally measured)*
+- [ ] False negative rate *(not formally measured)*
+- [x] Priority scoring accuracy — groups/attack paths reviewed in trials 2–3
+- [x] Technology identification accuracy — GKE clusters, real tech observed
+- [ ] Secret suppression quality *(candidates counted, suppression not formally measured)*
+- [x] Relationship quality in the asset graph — edges inspected in trial reports
+- [x] Limited contract revision only if real-world data proves it necessary — none required
 
 Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator; revised 2026-08-20 from audit):
 
-- [ ] `internal/httpprobe`: new `ProbeURLs(ctx, domain, urls, cfg)` —
+- [x] `internal/httpprobe`: new `ProbeURLs(ctx, domain, urls, cfg)` —
       per-URL headers/status only, redirects observed-not-followed (M-6
       consistency), TLS metadata reuse, per-URL timeout, bounded pool,
       existing ProbeFailed/ReasonOther error taxonomy, results sorted by
       URL (determinism) — `OPT-P0-3`
-- [ ] jsintel corpus feedback: the adapter additionally emits filtered URL
+- [x] jsintel corpus feedback: the adapter additionally emits filtered URL
       additions (shared `filterURLs`, canonical-host/in-domain, dedupe
       against incoming corpus, bounded per-run cap with honest overflow
-      reporting) from the analyzer URL output (record_analyze.go:176) — `OPT-P0-2`
+      reporting) from the analyzer URL output (record_analyze.go:176) — `OPT-P0-2` (2d06b94)
 - [x] Discovery data-quality gate (field-trial-driven, NEW-22): a single
       passive source burst of 37,248 wordlist-shaped hosts for
       example.com (subfinder v2.15.0, config clean) cascaded into
@@ -242,35 +252,39 @@ Refinement deliverable — URL hunting (drafted 2026-08-20, orchestrator; revise
       Gate: per-source output caps + burst-anomaly detection + a
       suspicious-source decision point (flag/abort/continue) BEFORE the
       corpus is poisoned; verify the local subfinder binary/config
-      (possible tampered build) as part of the fix — `OPT-P0-1` (CRITICAL, must land before next field trial)
-- [ ] urlintel tool hardening (field-trial-driven): per-tool timeouts
+      (possible tampered build) as part of the fix — `OPT-P0-1` (b46a110;
+      proven live in trial 2: subfinder divergence flagged pre-ingestion)
+- [x] urlintel tool hardening (field-trial-driven): per-tool timeouts
       separate from the stage deadline (gau burned the full 10m stage
       budget on the trial run; 3 tools × caps stack up); amass opt-in
       decision (20 min for 0 results on example.com — make it opt-in or
       hard-timeout by default); jsintel health-based early stop when
       fetch failures dominate the first batch (500/500 failed on the
-      trial run) — `OPT-P0-4` + `OPT-P2-1`/`OPT-P2-2`
-- [ ] Report-status nit: summary.started_at == ended_at and duration_ms 0
+      trial run) — `OPT-P0-4` (f44cecc). Amass opt-in resolved WON'T FIX
+      by user decision (NEW-41): exclusion via --sources.
+- [x] Report-status nit: summary.started_at == ended_at and duration_ms 0
       (report timestamps the summary write, not the run) — honest run
-      duration in the JSON report — `OPT-P0-5` (`report/model.go:142`)
-- [ ] New stage `urllive` inserted between secrentel and priority:
+      duration in the JSON report — `OPT-P0-5` (`report/model.go:142`) (08861f0; verified live 452s, NEW-40)
+- [x] New stage `urllive` inserted between secrentel and priority:
       discover → dns → httpprobe → urlintel → techintel → jsintel →
       secrentel → urllive → priority → detect → report; consumes corpus
-      URLs (historical + jsintel-fed), produces live-status records — `OPT-P0-3`
-- [ ] Live records as a NEW results-channel entity (URL + status + redirect
+      URLs (historical + jsintel-fed), produces live-status records — `OPT-P0-3` (7fc7e4c)
+- [x] Live records as a NEW results-channel entity (URL + status + redirect
       observed + TLS summary) — NOT a field on `asset.URL` (avoids
       asset-model churn and schema bump); report renderers gain a
       URL-status section (presentation-only) — `OPT-P0-3` (`pipeline/results.go`)
-- [ ] Pins updated: AllStages + stage vocabulary, T4 determinism,
+- [x] Pins updated: AllStages + stage vocabulary, T4 determinism,
       T5 full-run E2E, T6 --stages rows, cache op type for per-URL liveness
       (key = schema/op/config-digest/URL) — `OPT-P0-3`
-- [ ] `OPT-P1-6` — `jsintel/fetch.go:480` fetch truncation counted in
+- [x] `OPT-P1-6` — `jsintel/fetch.go:480` fetch truncation counted in
       `Report.Metrics` + `StickyFlags["js_fetch_truncated"]`
       (mirrors `httpprobe` `probe_truncated`); `OPT-P2-1` — `scan --help`
       documents per-tool timeouts + `--amass` opt-in + `scan --dry-run`
-      for effective timeouts
-- [ ] Precondition (ops, not code): install gau/waybackurls/waymore — the
-      URL corpus is 0 without them
+      for effective timeouts. **P1-6 landed** (flag proven in trials);
+      **P2-1 remainder carried to NEW-48** (--dry-run absent, help docs
+      missing; --amass opt-in resolved WON'T FIX via NEW-41).
+- [x] Precondition (ops, not code): install gau/waybackurls/waymore — the
+      URL corpus is 0 without them (installed; gau unlocked 6,120 URLs in trial 3)
 
 Acceptance criteria:
 
