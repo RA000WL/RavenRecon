@@ -131,19 +131,41 @@ type obsCorpus struct {
 	headers     []headerLine
 	cookies     []cookieEntry
 	cookieFlags []cookieFlagObs
-	scripts     []string
-	css         []string
-	metas       []metaEntry
-	attrs       []attrEntry
-	sourcemaps  []string
-	generators  []string
-	body        string
-	bodyLower   string // single lowercase copy, reused by every case-insensitive matcher
-	path        string // canonical URL path (endpoint_path target)
-	tls         *TLSInfo
-	dns         *DNSInfo
-	truncated   bool // a candidate cap dropped extracted material
-	overflow    Overflow
+	// scriptBases[i] is scriptBase(scripts[i]); scriptsLower/basesLower are
+	// the lowered forms of scripts/scriptBases. All three are parallel to
+	// scripts and built once here, so per-indicator matching never
+	// re-lowercases the corpus (the same caching contract as headerLine.lower
+	// and bodyLower).
+	scripts         []string
+	scriptBases     []string
+	scriptsLower    []string
+	basesLower      []string
+	css             []string
+	cssLower        []string // parallel lowered copy of css
+	metas           []metaEntry
+	metasLower      []string // parallel lowered copy of metas[i].name
+	attrs           []attrEntry
+	attrsLower      []string // parallel lowered copy of attrs[i].name
+	sourcemaps      []string
+	sourcemapsLower []string // parallel lowered copy of sourcemaps
+	generators      []string
+	body            string
+	bodyLower       string // single lowercase copy, reused by every case-insensitive matcher
+	path            string // canonical URL path (endpoint_path target)
+	pathLower       string // lowercase of path, for case-insensitive matching
+	tls             *TLSInfo
+	// Lowered TLS/DNS match targets, built once when the seam is present
+	// (parallel to tls/dns; empty when the seam is nil).
+	tlsIssuerLower  string
+	tlsSubjectLower string
+	alpnLower       []string // parallel lowered copy of tls.ALPN
+	dns             *DNSInfo
+	cnameLower      []string // parallel lowered copy of dns.CNAMEChain
+	// Lowered cookie match targets, parallel to cookies.
+	cookieNamesLower  []string
+	cookieValuesLower []string
+	truncated         bool // a candidate cap dropped extracted material
+	overflow          Overflow
 }
 
 // buildCorpus extracts the match corpus from one observation. It performs
@@ -166,13 +188,19 @@ func buildCorpus(o Observation) obsCorpus {
 	}
 
 	// Cookies: caller-provided first, then header-parsed, capped in order.
+	// Lowered name/value match targets are kept parallel to cookies so
+	// per-indicator matching never re-lowercases the corpus.
 	c.cookies = make([]cookieEntry, 0, len(o.Cookies))
+	c.cookieNamesLower = make([]string, 0, len(o.Cookies))
+	c.cookieValuesLower = make([]string, 0, len(o.Cookies))
 	appendCookie := func(name, value string) {
 		if len(c.cookies) >= maxObservationCookies {
 			c.overflow.Cookies = true
 			return
 		}
 		c.cookies = append(c.cookies, cookieEntry{name: name, value: value})
+		c.cookieNamesLower = append(c.cookieNamesLower, strings.ToLower(name))
+		c.cookieValuesLower = append(c.cookieValuesLower, strings.ToLower(value))
 	}
 	for _, ck := range o.Cookies {
 		appendCookie(ck.Name, ck.Value)
@@ -238,7 +266,66 @@ func buildCorpus(o Observation) obsCorpus {
 		c.generators = h.generators
 		c.truncated = c.truncated || h.truncated
 	}
+
+	// Lowered match targets, built ONCE here (the same caching contract as
+	// bodyLower): per-indicator matching below only reads them. scriptBase
+	// is computed on the ORIGINAL src — case folding is not order-preserving
+	// with ASCII trimming in general (e.g. "a?\u0130" trims to "a?" but folds
+	// the İ to i), so the base must be derived before lowering.
+	if len(c.scripts) > 0 {
+		c.scriptBases = make([]string, len(c.scripts))
+		c.scriptsLower = make([]string, len(c.scripts))
+		c.basesLower = make([]string, len(c.scripts))
+		for i, s := range c.scripts {
+			base := scriptBase(s)
+			c.scriptBases[i] = base
+			c.basesLower[i] = strings.ToLower(base)
+			c.scriptsLower[i] = strings.ToLower(s)
+		}
+	}
+	if len(c.css) > 0 {
+		c.cssLower = lowerAll(c.css)
+	}
+	if len(c.sourcemaps) > 0 {
+		c.sourcemapsLower = lowerAll(c.sourcemaps)
+	}
+	if len(c.metas) > 0 {
+		names := make([]string, len(c.metas))
+		for i := range c.metas {
+			names[i] = c.metas[i].name
+		}
+		c.metasLower = lowerAll(names)
+	}
+	if len(c.attrs) > 0 {
+		names := make([]string, len(c.attrs))
+		for i := range c.attrs {
+			names[i] = c.attrs[i].name
+		}
+		c.attrsLower = lowerAll(names)
+	}
+	if c.path != "" {
+		c.pathLower = strings.ToLower(c.path)
+	}
+	if t := o.TLS; t != nil {
+		c.tlsIssuerLower = strings.ToLower(t.Issuer)
+		c.tlsSubjectLower = strings.ToLower(t.Subject)
+		if len(t.ALPN) > 0 {
+			c.alpnLower = lowerAll(t.ALPN)
+		}
+	}
+	if d := o.DNS; d != nil && len(d.CNAMEChain) > 0 {
+		c.cnameLower = lowerAll(d.CNAMEChain)
+	}
 	return c
+}
+
+// lowerAll returns a lowered copy of src (parallel slice, same order).
+func lowerAll(src []string) []string {
+	out := make([]string, len(src))
+	for i, s := range src {
+		out[i] = strings.ToLower(s)
+	}
+	return out
 }
 
 // splitCookiePair splits one "name=value" cookie pair. A pair without '=' is
@@ -583,9 +670,9 @@ func matchIndicator(ind fingerprints.Indicator, c *obsCorpus) []match {
 		}
 	case fingerprints.IndicatorCookie:
 		for i, ck := range c.cookies {
-			if containsFold(strings.ToLower(ck.name), matchStr) {
+			if containsFold(c.cookieNamesLower[i], matchStr) {
 				add(i, ck.name, "")
-			} else if containsFold(strings.ToLower(ck.value), matchStr) {
+			} else if containsFold(c.cookieValuesLower[i], matchStr) {
 				add(i, ck.value, "")
 			}
 		}
@@ -619,51 +706,50 @@ func matchIndicator(ind fingerprints.Indicator, c *obsCorpus) []match {
 		}
 	case fingerprints.IndicatorMetaName:
 		for i, m := range c.metas {
-			if containsFold(strings.ToLower(m.name), matchStr) {
+			if containsFold(c.metasLower[i], matchStr) {
 				add(i, m.name, "")
 			}
 		}
 	case fingerprints.IndicatorScriptName:
-		for i, s := range c.scripts {
-			base := scriptBase(s)
-			if containsFold(strings.ToLower(base), matchStr) {
-				add(i, base, "")
+		for i := range c.scripts {
+			if containsFold(c.basesLower[i], matchStr) {
+				add(i, c.scriptBases[i], "")
 			}
 		}
 	case fingerprints.IndicatorScriptPath:
 		for i, s := range c.scripts {
-			if containsFold(strings.ToLower(s), matchStr) {
+			if containsFold(c.scriptsLower[i], matchStr) {
 				add(i, s, "")
 			}
 		}
 	case fingerprints.IndicatorCSSPath:
 		for i, s := range c.css {
-			if containsFold(strings.ToLower(s), matchStr) {
+			if containsFold(c.cssLower[i], matchStr) {
 				add(i, s, "")
 			}
 		}
 	case fingerprints.IndicatorAttribute:
 		for i, a := range c.attrs {
-			if containsFold(strings.ToLower(a.name), matchStr) {
+			if containsFold(c.attrsLower[i], matchStr) {
 				add(i, a.name, a.value)
 			}
 		}
 	case fingerprints.IndicatorEndpointPath:
-		if containsFold(strings.ToLower(c.path), matchStr) {
+		if containsFold(c.pathLower, matchStr) {
 			add(0, c.path, "")
 		}
 	case fingerprints.IndicatorTLSIssuer:
-		if c.tls != nil && containsFold(strings.ToLower(c.tls.Issuer), matchStr) {
+		if c.tls != nil && containsFold(c.tlsIssuerLower, matchStr) {
 			add(0, c.tls.Issuer, "")
 		}
 	case fingerprints.IndicatorTLSCN:
-		if c.tls != nil && containsFold(strings.ToLower(c.tls.Subject), matchStr) {
+		if c.tls != nil && containsFold(c.tlsSubjectLower, matchStr) {
 			add(0, c.tls.Subject, "")
 		}
 	case fingerprints.IndicatorTLSALPN:
 		if c.tls != nil {
 			for i, p := range c.tls.ALPN {
-				if containsFold(strings.ToLower(p), matchStr) {
+				if containsFold(c.alpnLower[i], matchStr) {
 					add(i, p, "")
 				}
 			}
@@ -671,14 +757,14 @@ func matchIndicator(ind fingerprints.Indicator, c *obsCorpus) []match {
 	case fingerprints.IndicatorDNSCNAME:
 		if c.dns != nil {
 			for i, cn := range c.dns.CNAMEChain {
-				if containsFold(strings.ToLower(cn), matchStr) {
+				if containsFold(c.cnameLower[i], matchStr) {
 					add(i, cn, "")
 				}
 			}
 		}
 	case fingerprints.IndicatorSourceMapPath:
 		for i, s := range c.sourcemaps {
-			if containsFold(strings.ToLower(s), matchStr) {
+			if containsFold(c.sourcemapsLower[i], matchStr) {
 				add(i, s, "")
 			}
 		}

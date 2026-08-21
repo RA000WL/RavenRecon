@@ -142,6 +142,45 @@ func BenchmarkEngineScore100KWarmCache(b *testing.B) {
 	}
 }
 
+// BenchmarkBetterResultScoreTie isolates the merge tie-break path
+// (OPT-P2-4): two completed results with EQUAL scores, so betterResult must
+// fall through to the serialized-surface comparison (marshalSurface on both
+// sides). The surfaces are realistic scored assets (factors, timestamps,
+// distinct identities) built once, hoisted out of the timed loop.
+func BenchmarkBetterResultScoreTie(b *testing.B) {
+	tie := func(id string) AssetResult {
+		return AssetResult{
+			Status: StatusCompleted,
+			Surface: &SurfaceAsset{
+				Identity:        asset.Identity{Kind: asset.KindURL, Value: id},
+				Kind:            asset.KindURL,
+				Score:           0.5,
+				Level:           LevelMedium,
+				Interestingness: 0.4,
+				Confidence:      0.6,
+				Factors: []Factor{
+					{Name: "admin_path", Weight: 0.3, Evidence: []string{"/api/v2/admin"}},
+					{Name: "tech", Weight: 0.1, Evidence: []string{"express"}},
+				},
+				FirstSeen: fixedTime(1),
+				ScoredAt:  fixedTime(2),
+			},
+		}
+	}
+	a, c := tie("https://a.example.com/"), tie("https://c.example.com/")
+	if betterResult(a, c) == betterResult(c, a) {
+		b.Fatal("exactly one direction must strictly beat the other under the total order")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !betterResult(a, c) && !betterResult(c, a) {
+			b.Fatal("tie-break produced no winner")
+		}
+	}
+}
+
 // openBenchCache opens a cache in a fresh temp dir for benchmarks.
 func openBenchCache(b *testing.B) *cache.FS {
 	b.Helper()

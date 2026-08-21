@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -257,6 +258,38 @@ func BenchmarkProbeColdConcurrency(b *testing.B) {
 		b.Run(fmt.Sprintf("Concurrency%d", c), func(b *testing.B) {
 			benchProbeAt(b, sweepWorkload, false, c)
 		})
+	}
+}
+
+// BenchmarkTLSConfigClonePerDial isolates the per-connection TLS config
+// preparation inside DialTLSContext (OPT-P2-4): the Clone plus the
+// ServerName inference performed before every tls.Client handshake. It is
+// measurement-only evidence for the reuse question: the per-dial Clone is
+// unavoidable in the common case (ServerName is set per target host and a
+// *tls.Config passed to tls.Client must not be mutated afterwards), so the
+// benchmark pins its cost relative to a full loopback handshake.
+func BenchmarkTLSConfigClonePerDial(b *testing.B) {
+	t := newTransport()
+	const addr = "h0.example.com:443"
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var sink *tls.Config
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cfg := t.TLSClientConfig.Clone()
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		if cfg.ServerName == "" && net.ParseIP(host) == nil {
+			cfg.ServerName = host
+		}
+		sink = cfg
+	}
+	if sink == nil || sink.ServerName != "h0.example.com" {
+		b.Fatal("config preparation produced no usable ServerName")
 	}
 }
 

@@ -335,6 +335,53 @@ func benchHeaderIndicators(fps []fingerprints.Fingerprint) []fingerprints.Indica
 	return out
 }
 
+// BenchmarkMatchIndicatorAllKinds isolates the per-indicator matching hot
+// path (OPT-P2-4): every indicator of the real compiled database — all
+// kinds — matched against one full realistic corpus (headers, cookies,
+// scripts, css, metas, attributes, sourcemaps, path, TLS, DNS). The corpus
+// and indicator list are hoisted (untimed); the timed loop runs only
+// matchIndicator. Determinism is pinned the same way BenchmarkHeaderAnalysis
+// pins it: the match total must not vary between iterations.
+func BenchmarkMatchIndicatorAllKinds(b *testing.B) {
+	_, fps := benchDB(b)
+	corpus := buildCorpus(benchFullObservation(b))
+	var inds []fingerprints.Indicator
+	for _, fp := range fps {
+		inds = append(inds, fp.Indicators...)
+	}
+	if len(inds) < 100 {
+		b.Fatalf("only %d indicators in the DB, want a meaningful inner loop", len(inds))
+	}
+
+	// Sanity (hoisted): the corpus must fire at least one match somewhere —
+	// a benchmark that matches nothing measures nothing.
+	fired := 0
+	for _, ind := range inds {
+		fired += len(matchIndicator(ind, &corpus))
+	}
+	if fired == 0 {
+		b.Fatal("full corpus matched no indicator of the real DB")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	first := -1
+	for i := 0; i < b.N; i++ {
+		total := 0
+		for _, ind := range inds {
+			total += len(matchIndicator(ind, &corpus))
+		}
+		if first < 0 {
+			first = total
+		} else if total != first {
+			b.Fatalf("match total changed between iterations: %d then %d (nondeterministic matching)", first, total)
+		}
+	}
+	if first <= 0 {
+		b.Fatal("inner loop matched nothing")
+	}
+}
+
 // BenchmarkHTMLParse measures the body-corpus build: one lowercase copy and
 // ONE single-pass tag scan (scripts, css, metas, attributes, sourcemap
 // tokens) over a 256 KiB synthetic HTML page. The page is built once
