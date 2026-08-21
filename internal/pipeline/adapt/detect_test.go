@@ -2,6 +2,7 @@ package adapt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -533,5 +534,105 @@ func TestDetectStageFoldAndTruncationIndependent(t *testing.T) {
 	}
 	if !res.Truncated || !res.StickyFlags[detectFindingsTruncatedFlag] {
 		t.Errorf("Truncated=%v StickyFlags=%v, want the flag set alongside Truncated", res.Truncated, res.StickyFlags)
+	}
+}
+
+// detectMarkedFinding builds a minimal finding asset carrying the asset
+// model's Truncated marker (a MergeFindings union cut at one of the model's
+// per-list bounds). buildDetectResult copies findings verbatim, so the
+// marker mapping is pinned at that boundary with a synthetic report.
+func detectMarkedFinding(t testing.TB, marked bool) asset.Finding {
+	t.Helper()
+	return asset.Finding{
+		RuleID:    "synthetic.rule",
+		Subject:   asset.Identity{Kind: asset.KindURL, Value: "https://example.com/x"},
+		Truncated: marked,
+	}
+}
+
+// TestDetectStageFindingListsTruncatedFlag pins the OPT-P1-4 adapter
+// wiring: a returned finding carrying Finding.Truncated sets Truncated and
+// the detect_finding_lists_truncated sticky flag while the outcome stays
+// whatever the rules earned (completed + flag is the legal §0.6 carve-out);
+// an unmarked finding sets neither, and the run-level flag stays distinct.
+func TestDetectStageFindingListsTruncatedFlag(t *testing.T) {
+	s := &detectStage{}
+	rep := detect.Report{
+		Outcome:  detect.OutcomeCompleted,
+		Findings: []asset.Finding{detectMarkedFinding(t, true)},
+	}
+	res := s.buildDetectResult(rep, foldDetectOutcome(rep.Outcome), nil)
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Errorf("outcome = %s, want completed (the marker never changes the outcome)", res.Outcome)
+	}
+	if !res.Truncated {
+		t.Error("Truncated = false, want true (an asset-level drop marker is never swallowed)")
+	}
+	if !res.StickyFlags[detectFindingListsTruncatedFlag] {
+		t.Errorf("StickyFlags = %v, want %q set", res.StickyFlags, detectFindingListsTruncatedFlag)
+	}
+	if res.StickyFlags[detectFindingsTruncatedFlag] {
+		t.Errorf("StickyFlags = %v, want %q NOT set (the run-level cap did not fire)",
+			res.StickyFlags, detectFindingsTruncatedFlag)
+	}
+
+	clean := detect.Report{
+		Outcome:  detect.OutcomeCompleted,
+		Findings: []asset.Finding{detectMarkedFinding(t, false)},
+	}
+	resClean := s.buildDetectResult(clean, foldDetectOutcome(clean.Outcome), nil)
+	if resClean.Truncated || len(resClean.StickyFlags) != 0 {
+		t.Errorf("unmarked findings: Truncated=%v StickyFlags=%v, want no signal",
+			resClean.Truncated, resClean.StickyFlags)
+	}
+}
+
+// TestDetectStageFindingFlagsAccumulate pins that the run-level
+// maxFindingsPerRun signal and the asset-level list-cut marker can fire
+// together and their flags ACCUMULATE (no clobbering).
+func TestDetectStageFindingFlagsAccumulate(t *testing.T) {
+	s := &detectStage{}
+	rep := detect.Report{
+		Outcome:           detect.OutcomeIncomplete,
+		FindingsTruncated: true,
+		Findings:          []asset.Finding{detectMarkedFinding(t, true)},
+	}
+	res := s.buildDetectResult(rep, foldDetectOutcome(rep.Outcome), nil)
+	if !res.Truncated {
+		t.Fatal("Truncated = false, want true when both signals fire")
+	}
+	if len(res.StickyFlags) != 2 ||
+		!res.StickyFlags[detectFindingsTruncatedFlag] ||
+		!res.StickyFlags[detectFindingListsTruncatedFlag] {
+		t.Errorf("StickyFlags = %v, want both %q and %q set",
+			res.StickyFlags, detectFindingsTruncatedFlag, detectFindingListsTruncatedFlag)
+	}
+}
+
+// TestDetectStageFindingTruncatedCacheRoundTrip pins the §0.6 chain for the
+// marker across a cache round trip: the flag survives encode → decode (what
+// a warm run serves from a stored record) and STILL fires on the replayed
+// findings — computed from whatever the stage returns, on every path.
+func TestDetectStageFindingTruncatedCacheRoundTrip(t *testing.T) {
+	s := &detectStage{}
+	data, err := json.Marshal(detectMarkedFinding(t, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed asset.Finding
+	if err := json.Unmarshal(data, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.Truncated {
+		t.Fatal("marker lost in encode → decode; the warm run could never fire the flag")
+	}
+	rep := detect.Report{
+		Outcome:  detect.OutcomeCompleted,
+		Findings: []asset.Finding{replayed},
+	}
+	res := s.buildDetectResult(rep, foldDetectOutcome(rep.Outcome), nil)
+	if !res.Truncated || !res.StickyFlags[detectFindingListsTruncatedFlag] {
+		t.Errorf("warm-run replay: Truncated=%v StickyFlags=%v, want the flag to fire from the replayed marker",
+			res.Truncated, res.StickyFlags)
 	}
 }

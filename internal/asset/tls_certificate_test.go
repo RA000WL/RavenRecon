@@ -765,3 +765,162 @@ func TestTLSCertificateZeroValue(t *testing.T) {
 		t.Errorf("ChainDepth = %d, want 3", got.ChainDepth)
 	}
 }
+
+// TestMergeTLSCertificatesDNSNamesTruncatedFlag pins the OPT-P1-4 contract:
+// a merge that CUTS the sorted/deduped DNS-name union at
+// maxTLSCertificateDNSNames sets DNSNamesTruncated on the merged result;
+// an exactly-at-cap or sub-cap union leaves it false (no false positives);
+// and the marker is sticky across chained merges. Pre-fix, the drop was
+// silent (no field existed): the assertions on DNSNamesTruncated fail to
+// compile against pre-fix code by construction, and the retained-set rows
+// document exactly what used to be lost without any signal.
+func TestMergeTLSCertificatesDNSNamesTruncatedFlag(t *testing.T) {
+	fp := testTLSFingerprint(0x60)
+	p1 := Provenance{Source: "s1", DiscoveredAt: fixedTime(10)}
+	p2 := Provenance{Source: "s2", DiscoveredAt: fixedTime(12)}
+	zero := time.Time{}
+
+	mkCert := func(t *testing.T, prov Provenance, names []string) TLSCertificate {
+		t.Helper()
+		return fullCert(t, fp, prov, "", "", "", "", "", 0, false, 1, names, zero, zero)
+	}
+	disjoint := func(from, to int) []string {
+		names := make([]string, 0, to-from)
+		for i := from; i < to; i++ {
+			names = append(names, fmt.Sprintf("san-%03d", i))
+		}
+		return names
+	}
+
+	// Over-cap union (20 + 20 disjoint = 40 unique names): the merge drops
+	// 8 entries and MUST say so.
+	a := mkCert(t, p1, disjoint(0, 20))
+	b := mkCert(t, p2, disjoint(20, 40))
+	m, err := MergeTLSCertificates(a, b)
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates: %v", err)
+	}
+	if !m.DNSNamesTruncated {
+		t.Fatal("DNSNamesTruncated = false, want true: a 40-name union was cut at 32 (the pre-fix silent drop)")
+	}
+	if len(m.DNSNames) != maxTLSCertificateDNSNames {
+		t.Fatalf("retained %d DNS names, want the %d cap", len(m.DNSNames), maxTLSCertificateDNSNames)
+	}
+	want := disjoint(0, maxTLSCertificateDNSNames) // zero-padded names sort numerically
+	if !reflect.DeepEqual(m.DNSNames, want) {
+		t.Errorf("retained set is not exactly the capped 32 sorted names: %v", m.DNSNames)
+	}
+	if !sort.StringsAreSorted(m.DNSNames) {
+		t.Errorf("retained DNS names must be sorted")
+	}
+	// Order-independence extends to the flag.
+	mBA, err := MergeTLSCertificates(b, a)
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates b,a: %v", err)
+	}
+	if mBA.DNSNamesTruncated != m.DNSNamesTruncated {
+		t.Errorf("flag depends on merge order: a,b=%v b,a=%v", m.DNSNamesTruncated, mBA.DNSNamesTruncated)
+	}
+
+	// Exactly-at-cap union (16 + 16 disjoint = 32 unique names): nothing
+	// dropped, so the flag stays FALSE — no false positives.
+	e1 := mkCert(t, p1, disjoint(0, 16))
+	e2 := mkCert(t, p2, disjoint(16, 32))
+	exact, err := MergeTLSCertificates(e1, e2)
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates exact: %v", err)
+	}
+	if len(exact.DNSNames) != maxTLSCertificateDNSNames {
+		t.Fatalf("exactly-at-cap union retained %d names, want %d", len(exact.DNSNames), maxTLSCertificateDNSNames)
+	}
+	if exact.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = true for an exactly-at-cap union with nothing dropped, want false")
+	}
+	// A single observation already at the cap merges with an empty one
+	// without a cut.
+	full := mkCert(t, p1, disjoint(0, 32))
+	empty := mkCert(t, p2, nil)
+	atCap, err := MergeTLSCertificates(full, empty)
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates at-cap: %v", err)
+	}
+	if atCap.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = true when merging a full list with an empty one (no entries dropped), want false")
+	}
+	// Sub-cap overlapping union: deduplicated well under the cap.
+	s1 := mkCert(t, p1, []string{"san-002", "san-001", "san-000"})
+	s2 := mkCert(t, p2, []string{"san-001", "san-003"})
+	sub, err := MergeTLSCertificates(s1, s2)
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates sub-cap: %v", err)
+	}
+	if sub.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = true for a sub-cap union, want false")
+	}
+
+	// Stickiness across chained merges: a flagged result merged with a
+	// fresh small observation keeps the flag even though no new cut
+	// occurs — a truncated retained set can never heal back to complete.
+	chained, err := MergeTLSCertificates(m, mkCert(t, p2, []string{"san-999"}))
+	if err != nil {
+		t.Fatalf("chained MergeTLSCertificates: %v", err)
+	}
+	if !chained.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = false after re-merging a flagged result, want true (sticky)")
+	}
+	// The flag survives regardless of argument order.
+	chainedBA, err := MergeTLSCertificates(mkCert(t, p2, []string{"san-999"}), m)
+	if err != nil {
+		t.Fatalf("chained MergeTLSCertificates b,a: %v", err)
+	}
+	if !chainedBA.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = false after re-merging a flagged result (b,a order), want true (sticky)")
+	}
+	// Either input carrying the flag marks the result.
+	flagged := mkCert(t, p1, []string{"san-000"})
+	flagged.DNSNamesTruncated = true
+	fromInput, err := MergeTLSCertificates(flagged, mkCert(t, p2, []string{"san-001"}))
+	if err != nil {
+		t.Fatalf("MergeTLSCertificates flagged input: %v", err)
+	}
+	if !fromInput.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated = false when one input carried the flag, want true (sticky)")
+	}
+}
+
+// TestTLSCertificateDNSNamesTruncatedJSON pins the wire compatibility of the
+// marker: it round-trips through JSON, and records written before the field
+// existed decode with it false.
+func TestTLSCertificateDNSNamesTruncatedJSON(t *testing.T) {
+	c, err := NewTLSCertificate(testTLSFingerprint(0x61), Provenance{Source: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.DNSNamesTruncated = true
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back TLSCertificate
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.DNSNamesTruncated {
+		t.Error("DNSNamesTruncated did not survive a JSON round trip")
+	}
+	if !strings.Contains(string(data), `"dns_names_truncated":true`) {
+		t.Errorf("marshaled form lacks the dns_names_truncated key: %s", data)
+	}
+	// Old record (no marker key): decodes false, everything else intact.
+	old := `{"fingerprint":"` + testTLSCertFingerprint + `","dns_names":["a.example.com"]}`
+	var legacy TLSCertificate
+	if err := json.Unmarshal([]byte(old), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.DNSNamesTruncated {
+		t.Error("legacy record without the marker key decoded DNSNamesTruncated=true, want false")
+	}
+	if len(legacy.DNSNames) != 1 || legacy.DNSNames[0] != "a.example.com" {
+		t.Errorf("legacy record fields corrupted: %#v", legacy.DNSNames)
+	}
+}

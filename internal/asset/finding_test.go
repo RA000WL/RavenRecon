@@ -417,3 +417,235 @@ func TestMethodDetectionInVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeFindingsTruncatedFlag pins the OPT-P1-4 contract for findings:
+// every genuinely-silent over-cap DROP in MergeFindings (evidence at
+// maxFindingEvidence, related assets at maxFindingRelated, relationships at
+// maxFindingRelationships, metadata at maxFindingMetadataEntries) sets
+// Truncated on the merged result; an exactly-at-cap union leaves it false
+// (no false positives); normalization never sets it (NewFinding rejects
+// over-cap input outright); and the marker is sticky across chained merges.
+// Pre-fix, these cuts were silent (no field existed): the assertions on
+// Truncated fail to compile against pre-fix code by construction, and the
+// retained-set rows document exactly what used to be lost without a signal.
+func TestMergeFindingsTruncatedFlag(t *testing.T) {
+	base := findingFixture(t)
+	subject := base.Subject
+
+	mkEvidence := func(from, to int) []Evidence {
+		evs := make([]Evidence, 0, to-from)
+		for i := from; i < to; i++ {
+			ev, err := NewEvidence(MethodDetection, "demo.rule",
+				fmt.Sprintf("signal %02d", i), subject, Provenance{})
+			if err != nil {
+				t.Fatalf("NewEvidence: %v", err)
+			}
+			evs = append(evs, ev)
+		}
+		return evs
+	}
+	mkRelated := func(from, to int) []Identity {
+		ids := make([]Identity, 0, to-from)
+		for i := from; i < to; i++ {
+			ids = append(ids, Identity{Kind: KindHost, Value: fmt.Sprintf("host-%02d.example.com", i)})
+		}
+		return ids
+	}
+	mkRelationships := func(from, to int) []Relationship {
+		rels := make([]Relationship, 0, to-from)
+		for i := from; i < to; i++ {
+			rel, err := NewRelationship(subject, RelationshipKind("observed-on"),
+				Identity{Kind: KindHost, Value: fmt.Sprintf("edge-%02d.example.com", i)})
+			if err != nil {
+				t.Fatalf("NewRelationship: %v", err)
+			}
+			rels = append(rels, rel)
+		}
+		return rels
+	}
+	mkMetadata := func(from, to int) map[string]string {
+		m := make(map[string]string, to-from)
+		for i := from; i < to; i++ {
+			m[fmt.Sprintf("key-%02d", i)] = "synthetic"
+		}
+		return m
+	}
+	mkFinding := func(evidence []Evidence, related []Identity, rels []Relationship, meta map[string]string) Finding {
+		f, err := NewFinding(Finding{
+			RuleID: base.RuleID, RuleName: base.RuleName, Category: base.Category,
+			Subject: subject, Confidence: 0.5,
+			Evidence: evidence, RelatedAssets: related, Relationships: rels,
+			Priority: "low", Status: "open", Created: base.Created, Metadata: meta,
+		})
+		if err != nil {
+			t.Fatalf("NewFinding: %v", err)
+		}
+		return f
+	}
+	merge := func(a, b Finding) Finding {
+		m, err := MergeFindings(a, b)
+		if err != nil {
+			t.Fatalf("MergeFindings: %v", err)
+		}
+		return m
+	}
+
+	t.Run("evidence cut sets the flag", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, maxFindingEvidence), nil, nil, nil)
+		b := mkFinding(mkEvidence(maxFindingEvidence, 2*maxFindingEvidence), nil, nil, nil)
+		m := merge(a, b)
+		if len(m.Evidence) != maxFindingEvidence {
+			t.Fatalf("retained %d evidence records, want the %d bound", len(m.Evidence), maxFindingEvidence)
+		}
+		if !m.Truncated {
+			t.Fatal("Truncated = false after an evidence union was cut, want true (the pre-fix silent drop)")
+		}
+	})
+	t.Run("evidence exactly at cap stays false", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, maxFindingEvidence/2), nil, nil, nil)
+		b := mkFinding(mkEvidence(maxFindingEvidence/2, maxFindingEvidence), nil, nil, nil)
+		m := merge(a, b)
+		if len(m.Evidence) != maxFindingEvidence {
+			t.Fatalf("exactly-at-cap union retained %d records, want %d", len(m.Evidence), maxFindingEvidence)
+		}
+		if m.Truncated {
+			t.Error("Truncated = true for an exactly-at-cap evidence union with nothing dropped, want false")
+		}
+	})
+	t.Run("related assets cut sets the flag", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), mkRelated(0, 20), nil, nil)
+		b := mkFinding(mkEvidence(1, 2), mkRelated(20, 40), nil, nil)
+		m := merge(a, b)
+		if len(m.RelatedAssets) != maxFindingRelated {
+			t.Fatalf("retained %d related assets, want the %d bound", len(m.RelatedAssets), maxFindingRelated)
+		}
+		if !m.Truncated {
+			t.Fatal("Truncated = false after a related-asset union was cut, want true")
+		}
+	})
+	t.Run("related assets exactly at cap stay false", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), mkRelated(0, 16), nil, nil)
+		b := mkFinding(mkEvidence(1, 2), mkRelated(16, 32), nil, nil)
+		m := merge(a, b)
+		if len(m.RelatedAssets) != maxFindingRelated {
+			t.Fatalf("exactly-at-cap union retained %d identities, want %d", len(m.RelatedAssets), maxFindingRelated)
+		}
+		if m.Truncated {
+			t.Error("Truncated = true for an exactly-at-cap related-asset union, want false")
+		}
+	})
+	t.Run("relationships cut sets the flag", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), nil, mkRelationships(0, 20), nil)
+		b := mkFinding(mkEvidence(1, 2), nil, mkRelationships(20, 40), nil)
+		m := merge(a, b)
+		if len(m.Relationships) != maxFindingRelationships {
+			t.Fatalf("retained %d relationships, want the %d bound", len(m.Relationships), maxFindingRelationships)
+		}
+		if !m.Truncated {
+			t.Fatal("Truncated = false after a relationship union was cut, want true")
+		}
+	})
+	t.Run("relationships exactly at cap stay false", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), nil, mkRelationships(0, 16), nil)
+		b := mkFinding(mkEvidence(1, 2), nil, mkRelationships(16, 32), nil)
+		m := merge(a, b)
+		if len(m.Relationships) != maxFindingRelationships {
+			t.Fatalf("exactly-at-cap union retained %d edges, want %d", len(m.Relationships), maxFindingRelationships)
+		}
+		if m.Truncated {
+			t.Error("Truncated = true for an exactly-at-cap relationship union, want false")
+		}
+	})
+	t.Run("metadata cut sets the flag", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), nil, nil, mkMetadata(0, 10))
+		b := mkFinding(mkEvidence(1, 2), nil, nil, mkMetadata(10, 20))
+		m := merge(a, b)
+		if len(m.Metadata) != maxFindingMetadataEntries {
+			t.Fatalf("retained %d metadata entries, want the %d bound", len(m.Metadata), maxFindingMetadataEntries)
+		}
+		if !m.Truncated {
+			t.Fatal("Truncated = false after a metadata union was cut, want true")
+		}
+	})
+	t.Run("metadata exactly at cap stays false", func(t *testing.T) {
+		a := mkFinding(mkEvidence(0, 1), nil, nil, mkMetadata(0, 8))
+		b := mkFinding(mkEvidence(1, 2), nil, nil, mkMetadata(8, 16))
+		m := merge(a, b)
+		if len(m.Metadata) != maxFindingMetadataEntries {
+			t.Fatalf("exactly-at-cap union retained %d entries, want %d", len(m.Metadata), maxFindingMetadataEntries)
+		}
+		if m.Truncated {
+			t.Error("Truncated = true for an exactly-at-cap metadata union, want false")
+		}
+	})
+	t.Run("sticky across chained merges", func(t *testing.T) {
+		cut := merge(
+			mkFinding(mkEvidence(0, maxFindingEvidence), nil, nil, nil),
+			mkFinding(mkEvidence(maxFindingEvidence, 2*maxFindingEvidence), nil, nil, nil),
+		)
+		if !cut.Truncated {
+			t.Fatal("precondition failed: the cut finding is not flagged")
+		}
+		chained := merge(cut, mkFinding(mkEvidence(100, 101), nil, nil, nil))
+		if !chained.Truncated {
+			t.Error("Truncated = false after re-merging a flagged finding with no new cut, want true (sticky)")
+		}
+		// Either input carrying the flag marks the result.
+		flagged := base
+		flagged.Truncated = true
+		fromInput := merge(flagged, mkFinding(mkEvidence(200, 201), nil, nil, nil))
+		if !fromInput.Truncated {
+			t.Error("Truncated = false when one input carried the flag, want true (sticky)")
+		}
+	})
+	t.Run("normalization never sets the flag", func(t *testing.T) {
+		if base.Truncated {
+			t.Error("NewFinding set Truncated on an ordinary in-bounds finding, want false")
+		}
+		maxed := mkFinding(mkEvidence(0, maxFindingEvidence),
+			mkRelated(0, maxFindingRelated), mkRelationships(0, maxFindingRelationships),
+			mkMetadata(0, maxFindingMetadataEntries))
+		if maxed.Truncated {
+			t.Error("NewFinding set Truncated on an exactly-at-cap finding, want false (normalization rejects, never truncates)")
+		}
+		// Over-cap input is REJECTED, not truncated — the honest path.
+		if _, err := NewFinding(Finding{
+			RuleID: base.RuleID, RuleName: base.RuleName, Category: base.Category,
+			Subject: subject, Confidence: 0.5,
+			Evidence: mkEvidence(0, maxFindingEvidence+1),
+			Priority: "low", Status: "open", Created: base.Created,
+		}); err == nil {
+			t.Error("NewFinding accepted over-bound evidence, want an error (never a silent truncate)")
+		}
+	})
+}
+
+// TestFindingTruncatedJSON pins the wire compatibility of the marker: it
+// round-trips through JSON, and records written before the field existed
+// decode with it false.
+func TestFindingTruncatedJSON(t *testing.T) {
+	f := findingFixture(t)
+	f.Truncated = true
+	data, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Finding
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Truncated {
+		t.Error("Truncated did not survive a JSON round trip")
+	}
+	if !strings.Contains(string(data), `"truncated":true`) {
+		t.Errorf("marshaled form lacks the truncated key: %s", data)
+	}
+	// Old record (no marker key): decodes false.
+	var legacy Finding
+	if err := json.Unmarshal([]byte(`{"rule_id":"r","subject":{"kind":"url","value":"https://example.com/"}}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Truncated {
+		t.Error("legacy record without the marker key decoded Truncated=true, want false")
+	}
+}

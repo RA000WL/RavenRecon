@@ -78,8 +78,39 @@
 // Sticky-flag naming convention: a truncation flag is <engine>_<what>_
 // truncated — dns_answers_truncated (dns.go), probe_truncated (httpprobe.go),
 // discovery_truncated (discovery.go), urlintel_parameters_truncated
-// (urlintel.go) — never a bare generic like "truncated", which could collide
-// across engines in the report's StickyFlags map.
+// (urlintel.go), probe_tls_dns_names_truncated (httpprobe.go),
+// detect_finding_lists_truncated (detect.go) — never a bare generic like
+// "truncated", which could collide across engines in the report's StickyFlags
+// map.
+//
+// Asset-level truncation markers (OPT-P1-4). Two asset models carry their
+// own sticky drop markers, and the adapters that return those assets OR the
+// markers into stage sticky flags:
+//
+//   - asset.TLSCertificate.DNSNamesTruncated — set by MergeTLSCertificates
+//     exactly when its sorted/deduped SAN-name union was CUT at the model's
+//     32-name cap (exactly-at-cap unions leave it false; sticky across
+//     chained merges). The httpprobe adapter ORs it across the certificates
+//     it returns into probe_tls_dns_names_truncated.
+//   - asset.Finding.Truncated — set by MergeFindings exactly when any of its
+//     four list unions (evidence, related assets, relationships, metadata)
+//     was CUT at its bound (exactly-at-cap unions leave it false; sticky
+//     across chained merges). The detect adapter ORs it across the findings
+//     it returns into detect_finding_lists_truncated.
+//
+// Both flags are computed from the RETURNED/REPLAYED assets on EVERY path —
+// success, engine error, and cache replay alike — so the AGENTS §0.6 chain
+// holds trivially: the marker is written into the stored record, replayed
+// from cache as part of the decoded asset, re-ORed into the sticky flag on
+// the warm run, merged stickily by the runner, and exposed through the
+// report. The markers are outputs only — never part of an asset identity and
+// never an input to any cache key — so no cache schema-version bump or key
+// change accompanies them, and records written before the fields existed
+// decode with the marker false. An asset-level marker fires alongside
+// whatever outcome the stage earned (completed + flag is the legal §0.6
+// carve-out for a retained set cut at a cap); engine-level caps keep their
+// existing outcome downgrades, and both signals' flags accumulate when they
+// fire together.
 //
 // v1.3 note: IP assets are not part of the pipeline corpus, so the
 // httpprobe adapter passes a nil ips map (the ip→port relationship edges

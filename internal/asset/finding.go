@@ -100,6 +100,24 @@ type Finding struct {
 	// map[string]string — never an anonymous map — with bounded entry
 	// count, keys, and values.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// Truncated reports that a merge DROPPED bounded-list entries from this
+	// finding's retained set. The only operation that sets it is
+	// MergeFindings: it unions both observations' evidence, related-asset,
+	// relationship, and metadata lists and caps each union at its bound
+	// (maxFindingEvidence, maxFindingRelated, maxFindingRelationships,
+	// maxFindingMetadataEntries respectively), silently cutting entries
+	// beyond the cap (drop-not-error). The flag is set when ANY of the four
+	// unions was actually cut — unions at or under their bounds leave it
+	// false — and it is sticky across chained merges: merging with an
+	// observation that carries the flag keeps it set even when no new cut
+	// occurs, so a truncated retained set can never heal back to "complete"
+	// by merging. Normalization never sets it: NewFinding rejects over-cap
+	// input outright instead of truncating, and its dedup passes drop no
+	// distinct entries. It is an output marker only — never part of the
+	// identity and never an input to any cache key — and decodes as false
+	// from records written before it existed.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // NewFinding builds a validated, normalized Finding.
@@ -310,15 +328,17 @@ func (f Finding) String() string { return f.Identity().Value }
 //
 // The evidence, related-asset, relationship, and metadata lists union
 // deterministically up to their per-list bounds. When a union exceeds its
-// bound the cut is DETERMINISTIC but not signaled: the merged lists are
+// bound the cut is DETERMINISTIC and SIGNALED: the merged lists are
 // already sorted, so the retained records are the sorted prefix — evidence
 // keeps the maxFindingEvidence smallest identities, related assets the
 // maxFindingRelated smallest identity strings, relationships the
 // maxFindingRelationships smallest edge IDs, and metadata drops the
-// lexicographically largest keys beyond maxFindingMetadataEntries. A merge
-// therefore never returns the full union of two maximal lists (two
-// 16-record evidence lists merge to 16 records, not 32); callers that need
-// to detect the cut must compare lengths before and after.
+// lexicographically largest keys beyond maxFindingMetadataEntries — and any
+// actual cut sets the merged finding's Truncated flag (sticky: either
+// input's flag survives the merge), so a truncated retained set is never
+// silently presented as complete. A merge therefore never returns the full
+// union of two maximal lists (two 16-record evidence lists merge to 16
+// records, not 32) and never drops that fact: Truncated=true names it.
 func MergeFindings(a, b Finding) (Finding, error) {
 	if !a.Identity().Equal(b.Identity()) {
 		return Finding{}, mergeMismatch(KindFinding, a.Identity(), b.Identity())
@@ -342,25 +362,38 @@ func MergeFindings(a, b Finding) (Finding, error) {
 	m.Evidence = dedupeEvidence(append(append([]Evidence{}, a.Evidence...), b.Evidence...))
 	m.RelatedAssets = dedupeFindingIdentities(append(append([]Identity{}, a.RelatedAssets...), b.RelatedAssets...))
 	m.Relationships = dedupeFindingRelationships(append(append([]Relationship{}, a.Relationships...), b.Relationships...))
-	m.Metadata = mergeFindingMetadata(a.Metadata, b.Metadata)
+	var metadataCut bool
+	m.Metadata, metadataCut = mergeFindingMetadata(a.Metadata, b.Metadata)
+	// Truncation is sticky: either input's marker survives, and an actual
+	// cut of any of this merge's four unions sets it fresh (see
+	// MergeFindings).
+	truncated := a.Truncated || b.Truncated || metadataCut
 	if len(m.Evidence) > maxFindingEvidence {
 		m.Evidence = m.Evidence[:maxFindingEvidence]
+		truncated = true
 	}
 	if len(m.RelatedAssets) > maxFindingRelated {
 		m.RelatedAssets = m.RelatedAssets[:maxFindingRelated]
+		truncated = true
 	}
 	if len(m.Relationships) > maxFindingRelationships {
 		m.Relationships = m.Relationships[:maxFindingRelationships]
+		truncated = true
 	}
+	m.Truncated = truncated
 	return m, nil
 }
 
 // mergeFindingMetadata unions two metadata maps; an existing non-empty value
 // wins over an empty one, and otherwise the receiver's value is kept — the
-// result never depends on map iteration order.
-func mergeFindingMetadata(a, b map[string]string) map[string]string {
+// result never depends on map iteration order. When the union exceeds
+// maxFindingMetadataEntries the lexicographically largest keys are dropped
+// (drop-not-error), and the second return value reports whether any entries
+// were actually cut — true exactly when the union exceeded the bound, so an
+// exactly-at-cap union reports false.
+func mergeFindingMetadata(a, b map[string]string) (map[string]string, bool) {
 	if len(a) == 0 && len(b) == 0 {
-		return nil
+		return nil, false
 	}
 	out := make(map[string]string, len(a)+len(b))
 	for k, v := range b {
@@ -371,6 +404,7 @@ func mergeFindingMetadata(a, b map[string]string) map[string]string {
 			out[k] = v
 		}
 	}
+	cut := false
 	if len(out) > maxFindingMetadataEntries {
 		keys := make([]string, 0, len(out))
 		for k := range out {
@@ -380,6 +414,7 @@ func mergeFindingMetadata(a, b map[string]string) map[string]string {
 		for _, k := range keys[:len(keys)-maxFindingMetadataEntries] {
 			delete(out, k)
 		}
+		cut = true
 	}
-	return out
+	return out, cut
 }

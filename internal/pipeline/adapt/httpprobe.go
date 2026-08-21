@@ -23,6 +23,21 @@ import (
 // report), never swallowed (AGENTS §0.6).
 const HTTPProbeStickyFlag = "probe_truncated"
 
+// HTTPProbeTLSDNSNamesStickyFlag is the sticky flag this adapter records
+// when any TLS certificate it returns carries the asset model's
+// DNSNamesTruncated marker (asset.TLSCertificate.DNSNamesTruncated — a
+// MergeTLSCertificates union was cut at maxTLSCertificateDNSNames, dropping
+// SAN names from the retained set). It is preserved end-to-end (result →
+// RunReport → report), never swallowed (AGENTS §0.6).
+//
+// The name follows the package convention (adapt/doc.go): a sticky flag is
+// <engine>_<what>_truncated. "probe" is this engine's token
+// (HTTPProbeStickyFlag); "tls_dns_names" names exactly what was cut — kept
+// distinct from the runner's channel-level tls_certificates_truncated flag
+// (a results-channel MaxOutput cut) and from HTTPProbeStickyFlag (the
+// per-probe redirect/header/body caps), which can fire alongside it.
+const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
+
 // HTTPProbeStage adapts the httpprobe engine to the pipeline.Stage contract
 // (internal/pipeline/adapt/doc.go).
 //
@@ -64,9 +79,16 @@ const HTTPProbeStickyFlag = "probe_truncated"
 // Truncation (engine probe status "truncated-incomplete" / ProbeResult.
 // Truncated — a redirect, header, or body cap): sets Truncated=true and
 // StickyFlags[HTTPProbeStickyFlag]=true. The adapter never produces
-// completed+Truncated (a truncated probe forces the engine's host status to
-// StatusIncomplete, which folds to partial), so the runner's completed+
-// Truncated+empty-flags downgrade never triggers on this adapter.
+// completed+Truncated from THAT signal (a truncated probe forces the
+// engine's host status to StatusIncomplete, which folds to partial). A
+// second, asset-level signal exists: a returned certificate carrying
+// TLSCertificate.DNSNamesTruncated (a MergeTLSCertificates union cut at the
+// model's 32-name cap) sets Truncated=true and
+// StickyFlags[HTTPProbeTLSDNSNamesStickyFlag]=true while the host outcome
+// stays whatever the probes earned — completed + flag is the legal §0.6
+// carve-out for a retained set cut at a cap, because the flag is recomputed
+// from the returned/replayed certificates on every path (success AND cache
+// replay). Both signals can fire together; their flags accumulate.
 //
 // Counters: ItemsProcessed is the number of host results in the engine report
 // (one per input host); ItemsFailed is the number of hosts whose overall
@@ -224,9 +246,26 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		ItemsFailed:    failedHostCount(report),
 		Err:            err,
 	}
+	// Truncation markers are never swallowed (AGENTS §0.6): the per-probe
+	// caps (probeTruncated) and the asset-level SAN-name merge cut on the
+	// returned certificates each set Truncated and their own named sticky
+	// flag. Both flags are computed from the returned/replayed report on
+	// EVERY path — success, engine error, and cache replay alike — because
+	// the engine replays stored certificates as decoded assets on a cache
+	// hit: the marker rides the record and the flag is recomputed from
+	// whatever the stage returns, so the §0.6 chain holds trivially.
+	certs := report.AllTLSCertificates()
+	flags := map[string]bool{}
 	if probeTruncated(report) {
 		res.Truncated = true
-		res.StickyFlags = map[string]bool{HTTPProbeStickyFlag: true}
+		flags[HTTPProbeStickyFlag] = true
+	}
+	if tlsDNSNamesTruncated(certs) {
+		res.Truncated = true
+		flags[HTTPProbeTLSDNSNamesStickyFlag] = true
+	}
+	if len(flags) > 0 {
+		res.StickyFlags = flags
 	}
 	res.Additions = pipeline.StageAdditions{
 		Hosts: pipeline.FilterHosts(declared, report.AllHosts()),
@@ -246,7 +285,7 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		Ports:           report.AllPorts(),
 		Services:        report.AllServices(),
 		Endpoints:       report.AllEndpoints(),
-		TLSCertificates: report.AllTLSCertificates(),
+		TLSCertificates: certs,
 		Relationships:   report.AllRelationships(),
 	}
 	return res
@@ -316,6 +355,22 @@ func probeTruncated(report httpprobe.Report) bool {
 			if pr.Status == httpprobe.ProbeTruncated || pr.Truncated {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// tlsDNSNamesTruncated reports whether any returned certificate carries the
+// asset model's DNSNamesTruncated marker (a MergeTLSCertificates union was
+// cut at maxTLSCertificateDNSNames, dropping SAN names). The marker is never
+// swallowed: the caller sets Truncated and the sticky flag from it. It is
+// computed from the returned/replayed certificates on EVERY path — success
+// and cache replay alike — so a marker stored in a cache record still fires
+// on a warm run.
+func tlsDNSNamesTruncated(certs []asset.TLSCertificate) bool {
+	for _, c := range certs {
+		if c.DNSNamesTruncated {
+			return true
 		}
 	}
 	return false

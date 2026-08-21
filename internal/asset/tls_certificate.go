@@ -71,6 +71,21 @@ type TLSCertificate struct {
 	// (MergeTLSCertificates emits the sorted unique union).
 	DNSNames []string `json:"dns_names,omitempty"`
 
+	// DNSNamesTruncated reports that a merge DROPPED SAN DNS names from
+	// this certificate's retained set. The only operation that sets it is
+	// MergeTLSCertificates: it unions both observations' name lists and
+	// caps the sorted union at maxTLSCertificateDNSNames, silently cutting
+	// entries beyond the cap (drop-not-error). The flag is set exactly when
+	// entries were actually cut — a union at or under the cap leaves it
+	// false — and it is sticky across chained merges: merging with an
+	// observation that carries the flag keeps it set even when no new cut
+	// occurs, so a truncated retained set can never heal back to "complete"
+	// by merging. Builders never set it: WithDNSNames rejects over-cap
+	// input outright instead of truncating. It is an output marker only —
+	// never part of the identity and never an input to any cache key — and
+	// decodes as false from records written before it existed.
+	DNSNamesTruncated bool `json:"dns_names_truncated,omitempty"`
+
 	// NotBefore is the observed validity window start.
 	NotBefore time.Time `json:"not_before"`
 
@@ -333,10 +348,14 @@ func (c TLSCertificate) NotYetValid(now time.Time) bool { return now.Before(c.No
 //     a
 //   - DNSNames: unioned, sorted, and deduplicated, capped at
 //     maxTLSCertificateDNSNames; entries beyond the cap are DROPPED, never an
-//     error — mirroring MergeParameters' drop-not-error cap semantics (the
-//     certificate model has no sticky Truncated flag, so the drop is silent
-//     and documented here). The sorted-canonical form makes the merge
-//     order-independent
+//     error — mirroring MergeParameters' drop-not-error cap semantics. The
+//     drop is NOT silent: the merged result carries DNSNamesTruncated=true
+//     exactly when entries were cut (a union at or under the cap leaves the
+//     flag false). The flag is sticky — merge(a, b) is flagged when either
+//     input carried it OR the union was cut — so a truncated retained set
+//     stays marked across chained merges. The sorted-canonical form makes
+//     the merge order-independent (the flag is symmetric, so it preserves
+//     that property)
 //   - ChainDepth: the max of the two observations
 //
 // The result is deterministic and order-independent: merge(a, b) equals
@@ -357,7 +376,11 @@ func MergeTLSCertificates(a, b TLSCertificate) (TLSCertificate, error) {
 	m.NotBefore = preferTLSCertificateTime(a, b, a.NotBefore, b.NotBefore)
 	m.NotAfter = preferTLSCertificateTime(a, b, a.NotAfter, b.NotAfter)
 	m.SelfSigned = preferTLSCertificateSelfSigned(a, b)
-	m.DNSNames = mergeTLSCertificateDNSNames(a, b)
+	names, dnsNamesCut := mergeTLSCertificateDNSNames(a, b)
+	m.DNSNames = names
+	// Truncation is sticky: either input's marker survives, and an actual
+	// cut of this merge's union sets it fresh (see MergeTLSCertificates).
+	m.DNSNamesTruncated = a.DNSNamesTruncated || b.DNSNamesTruncated || dnsNamesCut
 	m.ChainDepth = a.ChainDepth
 	if b.ChainDepth > m.ChainDepth {
 		m.ChainDepth = b.ChainDepth
@@ -448,11 +471,12 @@ func preferTLSCertificateSelfSigned(a, b TLSCertificate) bool {
 // sorted, deduplicated list capped at maxTLSCertificateDNSNames. The result
 // is order-independent: both argument orders produce the identical list.
 // The union is computed over the full input (duplicates are removed before
-// the cap is applied); names beyond the cap are dropped silently, mirroring
-// MergeParameters' drop-not-error cap semantics (documented on
-// MergeTLSCertificates). The returned slice is fresh and aliases neither
-// input.
-func mergeTLSCertificateDNSNames(a, b TLSCertificate) []string {
+// the cap is applied); names beyond the cap are dropped (drop-not-error,
+// mirroring MergeParameters' cap semantics), and the second return value
+// reports whether any entries were actually cut — true exactly when the
+// deduplicated union exceeded the cap, so an exactly-at-cap union reports
+// false. The returned slice is fresh and aliases neither input.
+func mergeTLSCertificateDNSNames(a, b TLSCertificate) ([]string, bool) {
 	seen := make(map[string]struct{}, len(a.DNSNames)+len(b.DNSNames))
 	for _, n := range a.DNSNames {
 		seen[n] = struct{}{}
@@ -465,11 +489,13 @@ func mergeTLSCertificateDNSNames(a, b TLSCertificate) []string {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	cut := false
 	if len(names) > maxTLSCertificateDNSNames {
 		names = names[:maxTLSCertificateDNSNames]
+		cut = true
 	}
 	if len(names) == 0 {
-		return nil
+		return nil, false
 	}
-	return names
+	return names, cut
 }

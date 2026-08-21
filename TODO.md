@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-51).
+  next free `NEW-n` (currently NEW-53).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1873,6 +1873,66 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   passing restored). Reviewer: APPROVE WITH NITS → nit closed this session;
   no CRITICAL/HIGH; -race clean. Gates: gofmt clean, build OK, vet OK,
   focused suites ok; orchestrator full-suite gates green post-change.
+- Batch 1 / Task B (OPT-P1-4) IMPLEMENTED (builder session
+  ses_fdba2ce4bffemTudTvFc3pd0VU; one transport-failed dispatch before the
+  successful background resume): internal/asset — TLSCertificate.DNSNamesTruncated
+  + Finding.Truncated (omitempty bools, output-only: probeKey/ruleKey verified
+  to hash no asset payloads → no schema bump/key change); MergeTLSCertificates
+  sets its flag iff the deduped DNSNames union was CUT at 32 (exactly-at-cap →
+  false); MergeFindings sets Truncated on FOUR genuinely-silent union cuts —
+  evidence>16, related>32, relationships>32, plus metadata>16 (fourth cut
+  found by builder, confirmed silent pre-diff by reviewer); sticky across
+  chained merges; NewFinding still rejects over-cap input (never truncates).
+  Adapters — httpprobe buildResult ORs cert markers into
+  probe_tls_dns_names_truncated; detect buildDetectResult ORs finding markers
+  into detect_finding_lists_truncated; both accumulate with existing flags,
+  outcome untouched, computed on every path incl. cache replay; adapt/doc.go
+  documents vocabulary + §0.6 chain. Reviewer APPROVE WITH NITS: check 1
+  VERIFIED — stage flags surface via CLI stage lines (scan.go:636-649) +
+  RunReport.Truncated (run.go:336), exactly the priority_groups_truncated
+  convention; two non-obvious replay hazards hunted and safe (detect
+  validateFinding canonical round-trip survives because NewFinding normalizes
+  in place preserving the marker; httpprobe storeProbe→replay copies TLSMeta
+  verbatim into sticky-OR merge). Follow-ups filed: NEW-51 (doc wording),
+  NEW-52 (engine-level warm-run pin); INFO notes: exported
+  HTTPProbeTLSDNSNamesStickyFlag deviates from repo-wide unexported adapter
+  pattern (matches its own file's precedent, unused externally — optional
+  future cleanup alongside HTTPProbeStickyFlag); markers hand-settable on
+  literals is out-of-contract usage, doc comments scope it accurately.
+  Gates: gofmt clean, build/vet OK, asset+adapt suites ok incl. -race;
+  orchestrator full-suite + race green post-change.
+
+### NEW-51 (LOW) — adapt/doc.go overstates marker exposure as "the report" (internal/pipeline/adapt/doc.go)
+- Status: OPEN
+- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
+- Owner: docs
+- Problem: the "Asset-level truncation markers" section says flags are
+  "exposed through the report"; rendered report artifacts (internal/report
+  html/markdown) surface neither stage sticky flags nor RunReport.Truncated —
+  actual exposure is RunReport.Stages[].StickyFlags + the CLI stage summary
+  line. Phrasing copies pre-existing house comments, so not a regression.
+- Fix: one-line reword in the next docs pass: "exposed via
+  RunReport.Stages[].StickyFlags, RunReport.Truncated, and the scan summary's
+  per-stage flags= rendering".
+- Verification: wording matches run.go/scan.go behavior; no code change.
+
+### NEW-52 (LOW) — engine-level warm-run pin for marked assets missing (internal/detect, internal/httpprobe)
+- Status: OPEN
+- Reporter: reviewer (OPT-P1-4 review, NEW-49 batch 1)
+- Owner: (unassigned)
+- Problem: OPT-P1-4 round-trip coverage is asset-level (marshal→unmarshal +
+  buildResult), not the full engine chain (storeProbe→decodeStoredProbe→
+  replay; encodeStoredFindings→decodeStoredFindings→validateFinding). Every
+  link verified safe by inspection, but the load-bearing link — NewFinding's
+  in-place normalization preserving Truncated through validateFinding's
+  canonical round-trip — is unpinned: a future refactor of NewFinding to
+  rebuild-style normalization would silently reject cached records containing
+  marked findings.
+- Fix: add an engine-level warm-run test injecting a crafted cache record
+  containing a marked Finding (and ideally a marked TLSCertificate) and
+  asserting the record is served and the sticky flag fires on the warm run.
+- Verification: test fails if NewFinding stops preserving the field; gates
+  green.
 
 ### NEW-50 (MED) — httpprobe DialTLSContext leaves ServerName empty for IP-literal targets: local config rejection recorded as a TLS negative without any handshake (internal/httpprobe/run.go)
 - Status: OPEN

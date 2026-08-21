@@ -2,6 +2,7 @@ package adapt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
@@ -878,4 +880,128 @@ func TestHTTPProbeStageTruncatedFlag(t *testing.T) {
 	}
 	httpProbeRequireStrings(t, "Additions.URLs", httpProbeURLStrings(res.Additions.URLs),
 		[]string{"http://www.example.com/", "https://www.example.com/"})
+}
+
+// httpProbeMarkedCert builds a synthetic TLS certificate asset carrying the
+// asset model's DNSNamesTruncated marker (a MergeTLSCertificates union cut
+// at the model's 32-name cap). The marker cannot arise from a live probe
+// today (same-fingerprint observations carry identical SAN lists, so the
+// engine's union never exceeds the cap), which is exactly why the adapter
+// wiring is pinned at the buildResult boundary with a synthetic report.
+func httpProbeMarkedCert(t testing.TB, marked bool) asset.TLSCertificate {
+	t.Helper()
+	c, err := asset.NewTLSCertificate(fmt.Sprintf("%064x", 1), asset.Provenance{Source: "synthetic"})
+	if err != nil {
+		t.Fatalf("NewTLSCertificate: %v", err)
+	}
+	c.DNSNamesTruncated = marked
+	return c
+}
+
+// TestHTTPProbeStageTLSDNSNamesTruncatedFlag pins the OPT-P1-4 adapter
+// wiring: a returned certificate carrying TLSCertificate.DNSNamesTruncated
+// sets Truncated and the probe_tls_dns_names_truncated sticky flag while the
+// outcome stays whatever the probes earned (completed + flag is the legal
+// §0.6 carve-out); an unmarked certificate sets neither.
+func TestHTTPProbeStageTLSDNSNamesTruncatedFlag(t *testing.T) {
+	target := httpProbeMustDomain(t, "example.com")
+	host := httpProbeMustHost(t, "www.example.com")
+
+	marked := httpprobe.Report{
+		Target: target,
+		Results: []httpprobe.HostResult{{
+			Host:            host,
+			Status:          httpprobe.StatusCompleted,
+			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, true)},
+		}},
+	}
+	res := buildResult(target, marked, pipeline.OutcomeCompleted, nil)
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Errorf("outcome = %s, want completed (the marker never changes the outcome)", res.Outcome)
+	}
+	if !res.Truncated {
+		t.Error("Truncated = false, want true (an asset-level drop marker is never swallowed)")
+	}
+	if !res.StickyFlags[HTTPProbeTLSDNSNamesStickyFlag] {
+		t.Errorf("StickyFlags = %v, want %q set", res.StickyFlags, HTTPProbeTLSDNSNamesStickyFlag)
+	}
+	if len(res.Results.TLSCertificates) != 1 || !res.Results.TLSCertificates[0].DNSNamesTruncated {
+		t.Error("the returned certificates must carry the marker through unchanged")
+	}
+
+	clean := httpprobe.Report{
+		Target: target,
+		Results: []httpprobe.HostResult{{
+			Host:            host,
+			Status:          httpprobe.StatusCompleted,
+			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, false)},
+		}},
+	}
+	resClean := buildResult(target, clean, pipeline.OutcomeCompleted, nil)
+	if resClean.Truncated || len(resClean.StickyFlags) != 0 {
+		t.Errorf("unmarked certs: Truncated=%v StickyFlags=%v, want no signal",
+			resClean.Truncated, resClean.StickyFlags)
+	}
+}
+
+// TestHTTPProbeStageTruncationFlagsAccumulate pins that the per-probe cap
+// signal and the asset-level SAN-name merge marker can fire together and
+// their flags ACCUMULATE (no clobbering).
+func TestHTTPProbeStageTruncationFlagsAccumulate(t *testing.T) {
+	target := httpProbeMustDomain(t, "example.com")
+	host := httpProbeMustHost(t, "www.example.com")
+	rep := httpprobe.Report{
+		Target: target,
+		Results: []httpprobe.HostResult{{
+			Host:            host,
+			Status:          httpprobe.StatusIncomplete,
+			Probes:          []httpprobe.ProbeResult{{Status: httpprobe.ProbeTruncated, Truncated: true}},
+			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, true)},
+		}},
+	}
+	res := buildResult(target, rep, pipeline.OutcomePartial, nil)
+	if !res.Truncated {
+		t.Fatal("Truncated = false, want true when both signals fire")
+	}
+	if len(res.StickyFlags) != 2 ||
+		!res.StickyFlags[HTTPProbeStickyFlag] ||
+		!res.StickyFlags[HTTPProbeTLSDNSNamesStickyFlag] {
+		t.Errorf("StickyFlags = %v, want both %q and %q set",
+			res.StickyFlags, HTTPProbeStickyFlag, HTTPProbeTLSDNSNamesStickyFlag)
+	}
+}
+
+// TestHTTPProbeStageTLSDNSNamesMarkerCacheRoundTrip pins the §0.6 chain for
+// the marker across a cache round trip: the flag survives encode → decode
+// (what a warm run serves from a stored record) and STILL fires on the
+// replayed assets — computed from whatever the stage returns, on every path.
+func TestHTTPProbeStageTLSDNSNamesMarkerCacheRoundTrip(t *testing.T) {
+	target := httpProbeMustDomain(t, "example.com")
+	host := httpProbeMustHost(t, "www.example.com")
+
+	data, err := json.Marshal(httpProbeMarkedCert(t, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed asset.TLSCertificate
+	if err := json.Unmarshal(data, &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.DNSNamesTruncated {
+		t.Fatal("marker lost in encode → decode; the warm run could never fire the flag")
+	}
+
+	rep := httpprobe.Report{
+		Target: target,
+		Results: []httpprobe.HostResult{{
+			Host:            host,
+			Status:          httpprobe.StatusCompleted,
+			TLSCertificates: []asset.TLSCertificate{replayed},
+		}},
+	}
+	res := buildResult(target, rep, pipeline.OutcomeCompleted, nil)
+	if !res.Truncated || !res.StickyFlags[HTTPProbeTLSDNSNamesStickyFlag] {
+		t.Errorf("warm-run replay: Truncated=%v StickyFlags=%v, want the flag to fire from the replayed marker",
+			res.Truncated, res.StickyFlags)
+	}
 }

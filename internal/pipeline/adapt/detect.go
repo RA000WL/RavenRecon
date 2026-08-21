@@ -23,6 +23,20 @@ import (
 // is the engine's canonical term for the retained set the cap cuts.
 const detectFindingsTruncatedFlag = "detect_findings_truncated"
 
+// detectFindingListsTruncatedFlag is the sticky flag this adapter records
+// when any finding it returns carries the asset model's Truncated marker
+// (asset.Finding.Truncated — a MergeFindings union was cut at one of the
+// model's per-list bounds: evidence, related assets, relationships, or
+// metadata). It is preserved end-to-end (result → RunReport → report),
+// never swallowed (AGENTS §0.6).
+//
+// The name follows the package convention (adapt/doc.go): a sticky flag is
+// <engine>_<what>_truncated. "finding_lists" names exactly what was cut —
+// the bounded lists INSIDE merged findings — and is kept distinct from
+// detectFindingsTruncatedFlag (the run-level maxFindingsPerRun cap on the
+// number of findings), which can fire alongside it.
+const detectFindingListsTruncatedFlag = "detect_finding_lists_truncated"
+
 // detectStage adapts internal/detect (detect.Run) into a pipeline.Stage.
 //
 // Construction is explicit — there is no registry: NewDetectStage returns
@@ -150,7 +164,15 @@ func (s *detectStage) Name() pipeline.StageName { return pipeline.StageDetect }
 // StickyFlags[detectFindingsTruncatedFlag]=true, never swallowed. The
 // engine reports the truncated run's outcome as incomplete, so the mapped
 // stage outcome is partial with the flag set — the flag, never the outcome
-// alone, marks the retained set incomplete (AGENTS §0.6).
+// alone, marks the retained set incomplete (AGENTS §0.6). A second,
+// asset-level signal exists: a returned finding carrying Finding.Truncated
+// (a MergeFindings union cut at one of the model's per-list bounds) sets
+// Truncated=true and StickyFlags[detectFindingListsTruncatedFlag]=true
+// while the outcome stays whatever the rules earned — completed + flag is
+// the legal §0.6 carve-out for a retained set cut at a cap, because the
+// marker is recomputed from the returned/replayed findings on every path
+// (success AND cache replay). Both signals can fire together; their flags
+// accumulate.
 func (s *detectStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
@@ -300,9 +322,28 @@ func (s *detectStage) buildDetectResult(rep detect.Report, outcome pipeline.Outc
 	// the rules emitted them over the in-scope snapshot, and findings carry
 	// no scope-boundary semantics of their own (adapt/doc.go T3d).
 	res.Results.Findings = rep.Findings
+	// Truncation markers are never swallowed (AGENTS §0.6): the engine's
+	// run-level FindingsTruncated cap and the asset-level Finding.Truncated
+	// merge marker on any returned finding each set Truncated and their own
+	// named sticky flag. Both are computed from the returned/replayed
+	// findings on EVERY path — success, engine error, and cache replay
+	// alike — because a cache hit serves stored findings as decoded assets:
+	// the marker rides the record and the flag is recomputed from whatever
+	// the stage returns, so the §0.6 chain holds trivially.
+	flags := map[string]bool{}
 	if rep.FindingsTruncated {
 		res.Truncated = true
-		res.StickyFlags = map[string]bool{detectFindingsTruncatedFlag: true}
+		flags[detectFindingsTruncatedFlag] = true
+	}
+	for _, f := range rep.Findings {
+		if f.Truncated {
+			res.Truncated = true
+			flags[detectFindingListsTruncatedFlag] = true
+			break
+		}
+	}
+	if len(flags) > 0 {
+		res.StickyFlags = flags
 	}
 	return res
 }
