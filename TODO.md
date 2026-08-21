@@ -1469,7 +1469,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: fake resolver stalling past BruteTimeout → flag fires, outcome != completed, attempted-only counters; regression fails pre-fix.
 
 ### NEW-24 (MED) — techintel cache key lacks observation-content digest: changed page serves stale detections (internal/techintel)
-- Status: OPEN
+- Status: VERIFIED — fixed in 51abd2d (observationContentHash SHA-256 over Body/Headers/Cookies/TLS/DNS, ContentHash omitempty, decode 64 lower-hex, lookup self-heal, 5 hermetic tests)
 - Reporter: reviewer
 - Owner: (unassigned)
 - Problem: `techKey` (record.go:26-36) binds identity + schema + db_digest + sources mask only; `storedTech` carries no content hash. Siblings solve this: secrentel digests document content into its key (document.go:261), jsintel cross-validates `AnalyzedHash` at lookup and self-heals (record_analyze.go:155-166). Until TTL expiry, a materially changed page replays old detections as zero-analysis cache hits.
