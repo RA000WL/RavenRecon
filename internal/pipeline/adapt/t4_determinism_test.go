@@ -47,6 +47,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/crawl"
 	"github.com/RA000WL/RavenRecon/internal/detect"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
 	"github.com/RA000WL/RavenRecon/internal/dns"
@@ -218,18 +219,20 @@ func newT4Harness(t *testing.T) *t4Harness {
 	return h
 }
 
-// stages wires the full ten-stage pipeline: the REAL discovery adapter
-// driving the nine real engines (the T3d3 shapes, re-used verbatim). The
-// discovery stage runs through the shared fake runner, whose barrier is a
-// pass-through until armed: the determinism test arms it (armBarrier) so
-// the three discovery executions genuinely overlap inside the runner; the
-// cache-hit test leaves it unarmed (zero behavior change).
+// stages wires the full eleven-stage pipeline: the REAL discovery adapter
+// driving the ten real engines (the T3d3 shapes, re-used verbatim) plus the
+// crawl stage (hermetic empty). The discovery stage runs through the shared
+// fake runner, whose barrier is a pass-through until armed: the determinism
+// test arms it (armBarrier) so the three discovery executions genuinely
+// overlap inside the runner; the cache-hit test leaves it unarmed (zero
+// behavior change).
 func (h *t4Harness) stages() []pipeline.Stage {
 	return []pipeline.Stage{
 		NewDiscoveryStage(h.discoveryRunner, fakeLookup),
 		NewDNSStage(h.resolver),
 		NewHTTPProbeStage(h.transport),
 		NewURLIntelStage(h.gauRunner, fakeLookup),
+		NewCrawlStage(newFakeCrawlEmpty()),
 		NewTechIntelStage(nil), // production fingerprint database
 		NewJSIntelStage(h.jsTransport),
 		NewSecretIntelStage(h.secretDB),
@@ -239,7 +242,13 @@ func (h *t4Harness) stages() []pipeline.Stage {
 	}
 }
 
-// t4ScanConfig is the full ten-stage selection with the discovery stage's
+func newFakeCrawlEmpty() *fakeCrawlSource {
+	return &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{}, nil
+	}}
+}
+
+// t4ScanConfig is the full eleven-stage selection with the discovery stage's
 // concurrency explicitly pinned to 4 (the pipeline default is already 4;
 // the explicit bound makes the race-condition proof self-documenting).
 // Rate stays at the pipeline default 0 — job-start rate limiting disabled
@@ -319,8 +328,8 @@ func TestT4FullRunDeterminismWithRealDiscovery(t *testing.T) {
 	if r1.Outcome != pipeline.OutcomeCompleted {
 		t.Fatalf("Outcome = %q, want completed", r1.Outcome)
 	}
-	if len(r1.Stages) != 10 {
-		t.Fatalf("Stages = %d, want 10", len(r1.Stages))
+	if len(r1.Stages) != 11 {
+		t.Fatalf("Stages = %d, want 11", len(r1.Stages))
 	}
 	for i, sr := range r1.Stages {
 		if sr.Outcome != pipeline.OutcomeCompleted {

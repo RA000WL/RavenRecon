@@ -35,8 +35,8 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
-// StageName identifies one of the ten engine stages in the fixed pipeline
-// order: discover → dns → httpprobe → urlintel → techintel → jsintel →
+// StageName identifies one of the eleven engine stages in the fixed pipeline
+// order: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
 // secrentel → priority → detect → report.
 type StageName string
 
@@ -45,6 +45,7 @@ const (
 	StageDNS         StageName = "dns"
 	StageHTTPProbe   StageName = "httpprobe"
 	StageURLIntel    StageName = "urlintel"
+	StageCrawl       StageName = "crawl"
 	StageTechIntel   StageName = "techintel"
 	StageJSIntel     StageName = "jsintel"
 	StageSecretIntel StageName = "secrentel"
@@ -55,18 +56,18 @@ const (
 
 // pipelineOrder is the fixed, deterministic pipeline order.
 var pipelineOrder = []StageName{
-	StageDiscover, StageDNS, StageHTTPProbe, StageURLIntel, StageTechIntel,
+	StageDiscover, StageDNS, StageHTTPProbe, StageURLIntel, StageCrawl, StageTechIntel,
 	StageJSIntel, StageSecretIntel, StagePriority, StageDetect, StageReport,
 }
 
-// AllStages returns the ten stage names in pipeline order as a fresh slice.
+// AllStages returns the eleven stage names in pipeline order as a fresh slice.
 func AllStages() []StageName {
 	out := make([]StageName, len(pipelineOrder))
 	copy(out, pipelineOrder)
 	return out
 }
 
-// ValidStage reports whether name is one of the ten engine stage names.
+// ValidStage reports whether name is one of the eleven engine stage names.
 func ValidStage(name StageName) bool {
 	for _, s := range pipelineOrder {
 		if s == name {

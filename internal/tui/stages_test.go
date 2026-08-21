@@ -27,7 +27,7 @@ func stageFinished(ms int, name, outcome string, truncated bool, processed, fail
 		WithPhase("stage").WithIdentity(name)
 }
 
-// stageStream is the canonical production stage-event stream: the ten
+// stageStream is the canonical production stage-event stream: the eleven
 // pipeline stages (discover → report) in order, each an alternating
 // started/finished pair, exactly as pipeline.Run emits them on a healthy
 // full run. The outcome/counter values are scenario data; the event SHAPE
@@ -42,18 +42,20 @@ func stageStream() []event.Event {
 		stageFinished(25, "httpprobe", "completed", false, 4, 1, 30*time.Second, ""),
 		stageStarted(30, "urlintel"),
 		stageFinished(35, "urlintel", "failed", false, 7, 2, 40*time.Second, "waymore failed"),
-		stageStarted(40, "techintel"),
-		stageFinished(45, "techintel", "completed", false, 3, 0, 50*time.Second, ""),
-		stageStarted(50, "jsintel"),
-		stageFinished(55, "jsintel", "completed", false, 1, 0, 60*time.Second, ""),
-		stageStarted(60, "secrentel"),
-		stageFinished(65, "secrentel", "partial", true, 2, 0, 70*time.Second, ""),
-		stageStarted(70, "priority"),
-		stageFinished(75, "priority", "completed", false, 2, 0, 80*time.Second, ""),
-		stageStarted(80, "detect"),
-		stageFinished(85, "detect", "completed", false, 0, 0, 90*time.Second, ""),
-		stageStarted(90, "report"),
-		stageFinished(95, "report", "completed", false, 0, 0, 100*time.Second, ""),
+		stageStarted(40, "crawl"),
+		stageFinished(45, "crawl", "completed", false, 3, 0, 50*time.Second, ""),
+		stageStarted(50, "techintel"),
+		stageFinished(55, "techintel", "completed", false, 3, 0, 60*time.Second, ""),
+		stageStarted(60, "jsintel"),
+		stageFinished(65, "jsintel", "completed", false, 1, 0, 70*time.Second, ""),
+		stageStarted(70, "secrentel"),
+		stageFinished(75, "secrentel", "partial", true, 2, 0, 80*time.Second, ""),
+		stageStarted(80, "priority"),
+		stageFinished(85, "priority", "completed", false, 2, 0, 90*time.Second, ""),
+		stageStarted(90, "detect"),
+		stageFinished(95, "detect", "completed", false, 0, 0, 100*time.Second, ""),
+		stageStarted(100, "report"),
+		stageFinished(105, "report", "completed", false, 0, 0, 110*time.Second, ""),
 	}
 }
 
@@ -74,19 +76,19 @@ func TestStateStageProjection(t *testing.T) {
 	if s.progress.phase != "report" {
 		t.Fatalf("phase = %q, want report (the last started stage survives its finished)", s.progress.phase)
 	}
-	if s.stages.startedCount != 10 || s.stages.completedCount != 10 {
-		t.Fatalf("stage counters = %d/%d, want 10/10", s.stages.startedCount, s.stages.completedCount)
+	if s.stages.startedCount != 11 || s.stages.completedCount != 11 {
+		t.Fatalf("stage counters = %d/%d, want 11/11", s.stages.startedCount, s.stages.completedCount)
 	}
 	if s.stages.current != "report" {
 		t.Fatalf("current = %q, want report", s.stages.current)
 	}
-	if !s.stages.startedAt.Equal(testBase.Add(90 * time.Millisecond)) {
-		t.Fatalf("current stage start = %v, want t0+90ms", s.stages.startedAt)
+	if !s.stages.startedAt.Equal(testBase.Add(100 * time.Millisecond)) {
+		t.Fatalf("current stage start = %v, want t0+100ms", s.stages.startedAt)
 	}
-	if len(s.stages.records) != 10 {
-		t.Fatalf("finished list = %d entries, want 10", len(s.stages.records))
+	if len(s.stages.records) != 11 {
+		t.Fatalf("finished list = %d entries, want 11", len(s.stages.records))
 	}
-	first, last := s.stages.records[0], s.stages.records[9]
+	first, last := s.stages.records[0], s.stages.records[10]
 	if first.name != "discover" || first.outcome != "completed" || first.itemsProcessed != 5 || first.duration != 10*time.Second {
 		t.Fatalf("first finished record = %+v", first)
 	}
@@ -130,16 +132,16 @@ func TestStateStageEventsThroughConsume(t *testing.T) {
 	for _, e := range stageStream() {
 		c.consume(e)
 	}
-	if c.consumed != 20 {
-		t.Fatalf("consumed = %d, want 20", c.consumed)
+	if c.consumed != 22 {
+		t.Fatalf("consumed = %d, want 22", c.consumed)
 	}
 	if c.state.progress.phase != "report" {
 		t.Fatalf("phase = %q, want report", c.state.progress.phase)
 	}
-	if c.state.stages.completedCount != 10 || c.state.stages.startedCount != 10 {
-		t.Fatalf("stage counters = %d/%d, want 10/10", c.state.stages.startedCount, c.state.stages.completedCount)
+	if c.state.stages.completedCount != 11 || c.state.stages.startedCount != 11 {
+		t.Fatalf("stage counters = %d/%d, want 11/11", c.state.stages.startedCount, c.state.stages.completedCount)
 	}
-	if got := c.state.Summary(); len(got.Stages) != 10 || got.StagesCompleted != 10 || got.CurrentStage != "" {
+	if got := c.state.Summary(); len(got.Stages) != 11 || got.StagesCompleted != 11 || got.CurrentStage != "" {
 		t.Fatalf("summary stage projection = %+v", got)
 	}
 }
@@ -197,8 +199,8 @@ func TestStateStageListBound(t *testing.T) {
 // percentage and a stage total are never faked.
 func TestRenderStageFrameHonestDegradation(t *testing.T) {
 	s := NewState(highRate)
-	// Mid-run: five stages concluded, jsintel in flight.
-	for _, e := range stageStream()[:11] {
+	// Mid-run: six stages concluded, jsintel in flight (crawl inserted after urlintel).
+	for _, e := range stageStream()[:13] {
 		s.Apply(e)
 	}
 	fixedResources(s)
@@ -207,7 +209,7 @@ func TestRenderStageFrameHonestDegradation(t *testing.T) {
 	for _, want := range []string{
 		"ravenrecon — untitled run",
 		"phase jsintel",
-		"stages 5/unknown",
+		"stages 6/unknown",
 		"tasks 0/unknown",
 		"elapsed 5.0s",
 		"resources heap",
@@ -221,7 +223,7 @@ func TestRenderStageFrameHonestDegradation(t *testing.T) {
 			t.Fatalf("frame must not contain %q (no data source; never fabricated zeros):\n%s", forbidden, frame)
 		}
 	}
-	if strings.Contains(frame, "%") || strings.Contains(frame, "stages 5/10") {
+	if strings.Contains(frame, "%") || strings.Contains(frame, "stages 5/11") {
 		t.Fatalf("frame must never fake a percentage or a stage total:\n%s", frame)
 	}
 }
@@ -240,17 +242,17 @@ func TestRenderStageFinalSummary(t *testing.T) {
 	if !strings.Contains(frame, "phase report") {
 		t.Fatalf("final frame must keep the last stage as the phase:\n%s", frame)
 	}
-	if !strings.Contains(frame, "stages 10/unknown") {
+	if !strings.Contains(frame, "stages 11/unknown") {
 		t.Fatalf("final frame must show the completed stage progress:\n%s", frame)
 	}
 	for _, want := range []string{
 		"── summary ──",
-		"stages completed 10 · current —",
+		"stages completed 11 · current —",
 		"  discover completed · 5 processed · 0 failed · 10.0s",
 		"  dns completed · 2 processed · 0 failed · 20.0s",
 		"  urlintel failed · 7 processed · 2 failed · 40.0s · err: waymore failed",
-		"  secrentel partial · 2 processed · 0 failed · 1m10s · truncated",
-		"  report completed · 0 processed · 0 failed · 1m40s",
+		"  secrentel partial · 2 processed · 0 failed · 1m20s · truncated",
+		"  report completed · 0 processed · 0 failed · 1m50s",
 	} {
 		if !strings.Contains(frame, want) {
 			t.Fatalf("final frame must contain %q:\n%s", want, frame)
@@ -280,7 +282,7 @@ func TestRenderStagePlusTaskStreamMixed(t *testing.T) {
 	for _, want := range []string{
 		"ravenrecon — example.com",
 		"phase report", // the stage stream's last started stage wins the phase
-		"stages 10/unknown",
+		"stages 11/unknown",
 		"workers running 0", // the scriptedRun's worker events open the dashboard
 		"queue depth 0",
 		"throughput assets",
@@ -314,7 +316,7 @@ func TestControllerStageStreamLiveFrame(t *testing.T) {
 		bus.Publish(e)
 	}
 	bus.Publish(stageStarted(60, "secrentel"))
-	for i := 0; i < 21; i++ {
+	for i := 0; i < 23; i++ {
 		waitConsumed(t, c)
 	}
 
@@ -324,7 +326,7 @@ func TestControllerStageStreamLiveFrame(t *testing.T) {
 	if !strings.Contains(buf.text(), "phase secrentel") {
 		t.Fatalf("live frame must name the current stage:\n%s", buf.text())
 	}
-	if !strings.Contains(buf.text(), "stages 10/unknown") {
+	if !strings.Contains(buf.text(), "stages 11/unknown") {
 		t.Fatalf("live frame must show the completed stage progress:\n%s", buf.text())
 	}
 	for _, forbidden := range []string{"workers running", "queue depth", "throughput"} {
@@ -344,14 +346,14 @@ func TestControllerStageStreamLiveFrame(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after the subscriber closed")
 	}
-	if c.consumed != 21 {
-		t.Fatalf("consumed = %d, want 21", c.consumed)
+	if c.consumed != 23 {
+		t.Fatalf("consumed = %d, want 23", c.consumed)
 	}
 	final := buf.text()
 	if !strings.Contains(final, "── summary ──") {
 		t.Fatalf("final frame must carry the summary:\n%s", final)
 	}
-	if !strings.Contains(final, "stages completed 10 · current secrentel") {
+	if !strings.Contains(final, "stages completed 11 · current secrentel") {
 		t.Fatalf("final frame must report the in-flight stage honestly:\n%s", final)
 	}
 	if !strings.Contains(final, "  dns completed · 2 processed · 0 failed · 20.0s") {

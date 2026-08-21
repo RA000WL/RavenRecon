@@ -55,7 +55,7 @@ func (s *fakeScanStage) Run(_ context.Context, _ pipeline.StageInput) (pipeline.
 	return s.result, nil
 }
 
-// fakeScanStages returns a stages seam providing all ten stage names in
+// fakeScanStages returns a stages seam providing all eleven stage names in
 // pipeline order. results[i] shapes stage i; missing results default to a
 // vacuous completed result. The optional cfgSink captures the ScanConfig
 // the runner-wiring passed to the seam.
@@ -969,7 +969,7 @@ func TestResolveTUIColor(t *testing.T) {
 
 // TestRunScanTUIWiring pins the full --tui wiring end to end: the bus is
 // the run's single event sink (ScanConfig.Observer non-nil on the seam
-// capture), all 20 stage events (10 stages × started+finished) reach the
+// capture), all 22 stage events (11 stages × started+finished) reach the
 // controller's subscriber in order with bus-assigned sequences, the seam
 // receives Enabled/Compact from the flags and os.Stderr as the writer,
 // Controller.Run returns before runScan returns, and the summary is
@@ -1014,8 +1014,8 @@ func TestRunScanTUIWiring(t *testing.T) {
 			if snap.cfg.Compact != tc.wantCompact {
 				t.Fatalf("seam config Compact = %v, want %v", snap.cfg.Compact, tc.wantCompact)
 			}
-			if len(snap.events) != 20 {
-				t.Fatalf("controller consumed %d events, want 20 (10 stages × started+finished)", len(snap.events))
+			if len(snap.events) != 22 {
+				t.Fatalf("controller consumed %d events, want 22 (11 stages × started+finished)", len(snap.events))
 			}
 			for i, ev := range snap.events {
 				wantKind := event.KindStageStarted
@@ -1347,8 +1347,8 @@ func (t *smokeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 var _ http.RoundTripper = (*smokeTransport)(nil)
 
-// smokeScanStages builds the production-shaped ten-stage seam for the
-// hermetic smoke tests: the same ten adapters newScanStages constructs,
+// smokeScanStages builds the production-shaped eleven-stage seam for the
+// hermetic smoke tests: the same eleven adapters newScanStages constructs,
 // with ONLY the exec- and network-capable seams substituted (a scripted
 // discovery.Runner and fake LookupFunc for discover + urlintel, a fake
 // dns.Resolver, and a canned http.RoundTripper for httpprobe AND jsintel —
@@ -1365,6 +1365,7 @@ func smokeScanStages(runner *smokeRunner, tr *smokeTransport, cfgSink *pipeline.
 			adapt.NewDNSStage(&smokeResolver{}),
 			adapt.NewHTTPProbeStage(tr),
 			adapt.NewURLIntelStage(runner, smokeLookup),
+			adapt.NewCrawlStage(nil),
 			adapt.NewTechIntelStage(nil),
 			adapt.NewJSIntelStage(tr),
 			adapt.NewSecretIntelStage(nil),

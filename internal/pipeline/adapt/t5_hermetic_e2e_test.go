@@ -110,6 +110,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/crawl"
 	"github.com/RA000WL/RavenRecon/internal/detect"
 	"github.com/RA000WL/RavenRecon/internal/dns"
 	"github.com/RA000WL/RavenRecon/internal/event"
@@ -176,9 +177,9 @@ func newT5Harness(t *testing.T) *t5Harness {
 	return h
 }
 
-// t5Stages wires the full ten-stage pipeline: the REAL discovery adapter
-// over the hermetic runner (the T4 seam) plus the nine real adapters (the
-// T3d3 shapes). resolver is the failure-injection seam each test provides;
+// t5Stages wires the full eleven-stage pipeline: the REAL discovery adapter
+// over the hermetic runner (the T4 seam) plus the ten real adapters (the
+// T3d3 shapes plus crawl). resolver is the failure-injection seam each test provides;
 // the report stage's commit target comes from the ScanConfig's OutputDir
 // (set per run by the tests).
 func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage {
@@ -187,6 +188,7 @@ func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage
 		NewDNSStage(resolver),
 		NewHTTPProbeStage(h.transport),
 		NewURLIntelStage(h.gauRunner, fakeLookup),
+		NewCrawlStage(newFakeCrawlEmptyT5()),
 		NewTechIntelStage(nil), // production fingerprint database
 		NewJSIntelStage(h.jsTransport),
 		NewSecretIntelStage(h.secretDB),
@@ -194,6 +196,12 @@ func (h *t5Harness) stages(t *testing.T, resolver dns.Resolver) []pipeline.Stage
 		NewDetectStage(h.detectReg),
 		NewReportStage(h.reportReg),
 	}
+}
+
+func newFakeCrawlEmptyT5() *fakeCrawlSource {
+	return &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{}, nil
+	}}
 }
 
 // t5DiscoveryExecutions counts the discovery stage's executions through the
@@ -368,7 +376,7 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	}
 	r1 := run()
 
-	// --- Run-level outcome vocabulary: ONE partial stage among ten
+	// --- Run-level outcome vocabulary: ONE partial stage among eleven
 	// completed stages folds the run to partial (pipeline_test.go
 	// TestRunPartialWithCompleted), never failed and never completed. ---
 	if r1.Outcome != pipeline.OutcomePartial {
@@ -378,8 +386,8 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		}
 		t.Fatalf("Outcome = %q, want partial", r1.Outcome)
 	}
-	if len(r1.Stages) != 10 {
-		t.Fatalf("Stages = %d, want 10", len(r1.Stages))
+	if len(r1.Stages) != 11 {
+		t.Fatalf("Stages = %d, want 11", len(r1.Stages))
 	}
 	for i, sr := range r1.Stages {
 		if i == 1 { // dns: the failing stage
@@ -598,10 +606,10 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		t.Errorf("app.js document: Truncated=%v, carries the synthetic key = %v",
 			appDoc.Truncated, strings.Contains(string(appDoc.Content), awsKey(7)))
 	}
-	if got := r1.Stages[5].ItemsProcessed; got != len(r1.Documents) {
+	if got := r1.Stages[6].ItemsProcessed; got != len(r1.Documents) {
 		t.Errorf("jsintel ItemsProcessed = %d, want %d (one processed entry per document)", got, len(r1.Documents))
 	}
-	if got := r1.Stages[6].ItemsProcessed; got != len(r1.Documents) {
+	if got := r1.Stages[7].ItemsProcessed; got != len(r1.Documents) {
 		t.Errorf("secrentel ItemsProcessed = %d, want %d (every pipeline document scanned)", got, len(r1.Documents))
 	}
 
@@ -652,11 +660,11 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	// stage order; the failing stage's finished payload mirrors its
 	// StageRecord field for field (T3a contract). ---
 	events := obs.snapshot()
-	if len(events) != 20 {
-		t.Fatalf("events = %d, want 20 (10 stages x started+finished)", len(events))
+	if len(events) != 22 {
+		t.Fatalf("events = %d, want 22 (11 stages x started+finished)", len(events))
 	}
-	wantKinds := make([]event.Kind, 0, 20)
-	for i := 0; i < 10; i++ {
+	wantKinds := make([]event.Kind, 0, 22)
+	for i := 0; i < 11; i++ {
 		wantKinds = append(wantKinds, event.KindStageStarted, event.KindStageFinished)
 	}
 	if got := t5stageEventKinds(events); !reflect.DeepEqual(got, wantKinds) {
@@ -693,9 +701,9 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	}
 	// The report stage (the last entry) still completed and emitted its
 	// finished event.
-	lastFin, ok := events[19].Payload.(event.StageFinished)
+	lastFin, ok := events[21].Payload.(event.StageFinished)
 	if !ok {
-		t.Fatalf("events[19] payload type = %T, want event.StageFinished", events[19].Payload)
+		t.Fatalf("events[21] payload type = %T, want event.StageFinished", events[21].Payload)
 	}
 	if lastFin.Name != string(pipeline.StageReport) || lastFin.Outcome != string(pipeline.OutcomeCompleted) {
 		t.Errorf("report finished payload = %+v, want completed (the pipeline reached the report)", lastFin)
@@ -713,11 +721,11 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		t.Errorf("discovery executions after run 2 = %d, want 8 (4 per cold run)", h.discoveryExecutions())
 	}
 	events = obs.snapshot()
-	if len(events) != 40 {
-		t.Fatalf("events after run 2 = %d, want 40", len(events))
+	if len(events) != 44 {
+		t.Fatalf("events after run 2 = %d, want 44", len(events))
 	}
-	if !reflect.DeepEqual(events[:20], events[20:]) {
-		t.Fatalf("the two runs' event streams differ:\nrun 1: %+v\nrun 2: %+v", events[:20], events[20:])
+	if !reflect.DeepEqual(events[:22], events[22:]) {
+		t.Fatalf("the two runs' event streams differ:\nrun 1: %+v\nrun 2: %+v", events[:22], events[22:])
 	}
 	// Run 2 captured its own model, identical to run 1's.
 	if len(h.models) != 2 {
