@@ -229,7 +229,7 @@ func normalizeInputURLs(urls []asset.URL, domain asset.Domain) ([]asset.URL, err
 			return nil, fmt.Errorf("httpprobe: invalid url %q: %w", u.String(), err)
 		}
 		host := canonicalScopeHost(parsed.Hostname())
-		if host == "" || !inDomain(host, domain.Name) {
+		if host == "" || !asset.InDomain(host, domain.Name) {
 			return nil, fmt.Errorf("httpprobe: url %q is outside target domain %q", u.String(), domain.Name)
 		}
 		if seen[u.Identity()] {

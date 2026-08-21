@@ -47,11 +47,8 @@ func validateInputHost(h asset.Host, domain asset.Domain) error {
 	return nil
 }
 
-// inDomain reports whether name is the domain itself or a subdomain of it.
-// Both arguments must already be canonical.
-func inDomain(name, domain string) bool {
-	return name == domain || strings.HasSuffix(name, "."+domain)
-}
+// in-domain scope membership goes through asset.InDomain (the single
+// definition of the concept); this package keeps no private copy.
 
 // RedirectHop is one observed Location target in a probe's redirect chain.
 //
@@ -112,7 +109,7 @@ func recordHop(cur asset.URL, loc string, domain asset.Domain, clock runtime.Clo
 	// literals are never in scope — a redirect into an address is an
 	// out-of-scope observation by construction, which also prevents
 	// redirect-driven rebinding to arbitrary addresses.
-	if host := canonicalScopeHost(resolved.Hostname()); host != "" && inDomain(host, domain.Name) {
+	if host := canonicalScopeHost(resolved.Hostname()); host != "" && asset.InDomain(host, domain.Name) {
 		u, err := asset.ParseURL(resolved.String(), asset.Provenance{
 			Source:       "http-probe",
 			DiscoveredAt: clock.Now().UTC(),

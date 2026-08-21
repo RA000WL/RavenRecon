@@ -268,7 +268,7 @@ func validateStoredURL(u asset.URL, domain asset.Domain, what string) error {
 	if err != nil {
 		return fmt.Errorf("stored %s %q does not parse: %w", what, u.String(), err)
 	}
-	if host := canonicalScopeHost(parsed.Hostname()); host == "" || !inDomain(host, domain.Name) {
+	if host := canonicalScopeHost(parsed.Hostname()); host == "" || !asset.InDomain(host, domain.Name) {
 		return fmt.Errorf("stored %s %q is outside target domain %q", what, u.String(), domain.Name)
 	}
 	// Credential defense at decode time: asset.URL.Original preserves

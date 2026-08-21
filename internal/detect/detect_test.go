@@ -610,6 +610,44 @@ func TestStoredFindingsRoundTripAndTampering(t *testing.T) {
 	}
 }
 
+// TestStoredFindingsTruncatedMarkerSurvivesWarmDecode pins the NEW-52
+// load-bearing link at the decode boundary: a crafted stored-findings cache
+// record whose finding carries the sticky asset.Finding.Truncated marker
+// (OPT-P1-4) is SERVED by decodeStoredFindings with the marker intact.
+//
+// The marker survives only because validateFinding's canonical round-trip
+// re-validates through asset.NewFinding and asset.NewFinding preserves the
+// field in place (its normalization mutates the input copy instead of
+// rebuilding the struct field-by-field). A rebuild-style refactor of
+// NewFinding would drop Truncated, the round-trip equality would break, and
+// this test fails — every record containing a marked finding would be
+// silently rejected (deleted, recomputed, unmarked) on warm runs.
+func TestStoredFindingsTruncatedMarkerSurvivesWarmDecode(t *testing.T) {
+	snap := testSnapshot(t)
+	corpus, err := normalizeSnapshot(snap)
+	if err != nil {
+		t.Fatalf("normalizeSnapshot: %v", err)
+	}
+	rule := makeRule(t, "a.b", nil)
+	f, err := testFinding(nil, rule.ID, rule.Name, rule.Category, 0)
+	if err != nil {
+		t.Fatalf("testFinding: %v", err)
+	}
+	f.Truncated = true
+
+	rec, err := encodeStoredFindings(rule.ID, []asset.Finding{f}, time.Now())
+	if err != nil {
+		t.Fatalf("encodeStoredFindings: %v", err)
+	}
+	decoded, err := decodeStoredFindings(rec, rule, corpus.observed)
+	if err != nil {
+		t.Fatalf("decodeStoredFindings rejected a record containing a marked finding: %v", err)
+	}
+	if len(decoded) != 1 || !decoded[0].Truncated {
+		t.Fatalf("decoded findings = %+v (want the single marked finding served with Truncated=true)", decoded)
+	}
+}
+
 func TestBenchmarkDetector(t *testing.T) {
 	rule := makeRule(t, "a.b", nil)
 	snap := testSnapshot(t)

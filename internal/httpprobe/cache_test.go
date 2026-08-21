@@ -570,6 +570,64 @@ func TestCacheTLSMetadataRoundTrip(t *testing.T) {
 	}
 }
 
+// TestWarmRunServesMarkedTLSCertificate pins the NEW-52 engine-level warm
+// run for a marked TLSCertificate: a crafted stored record whose embedded
+// certificate asset carries asset.TLSCertificate.DNSNamesTruncated (the
+// OPT-P1-4 sticky merge marker) is SERVED by the full chain
+// storeProbe→lookupProbe→decodeStoredProbe→probeResultFromStored on a warm
+// Probe, with zero requests and the marker intact on the replayed result.
+//
+// validateStoredTLS rebuilds the embedded certificate through the Phase 2
+// builders for field validation but never writes the rebuilt struct back,
+// so the marker survives decode; probeResultFromStored copies s.TLS
+// verbatim. If either link ever dropped DNSNamesTruncated (or began
+// rejecting marked records outright), this test fails.
+func TestWarmRunServesMarkedTLSCertificate(t *testing.T) {
+	domain := mustDomain(t, "example.com")
+	host := mustHost(t, "www.example.com")
+	target := mustParseURL(t, "https://www.example.com/")
+
+	meta := validStoredTLSMeta(t)
+	meta.Certificate.DNSNamesTruncated = true
+	st := storedTLSPayload(t, meta)
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal stored payload: %v", err)
+	}
+	rec := cache.Record{
+		Operation: Operation,
+		Target:    target.Identity().String(),
+		Status:    cache.StatusCompleted,
+		Meta:      map[string]string{"scheme": "https"},
+		Data:      data,
+	}
+
+	cfg := testConfig()
+	cfg.Cache = openTestCache(t, func() time.Time { return fixedTime }, 0)
+	// Hermetic fallthrough guard: if the crafted record were ever rejected,
+	// the probe would dial a refused loopback port — never the network —
+	// and surface as a non-cached result instead of a pass.
+	refused := newTestTransport(refusedLoopbackAddr(t), nil)
+	cfg.Transport = schemeRouter{httpRT: refused, httpsRT: refused}
+
+	key := probeKeyFor(t, host, "https", domain)
+	if err := cfg.Cache.Put(context.Background(), key, rec); err != nil {
+		t.Fatalf("cache put: %v", err)
+	}
+
+	rep, err := Probe(context.Background(), domain, []asset.Host{host}, nil, cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	pr := probeResultFor(hostByName(t, rep, host.Name), "https")
+	if pr.Status != ProbeCompleted || !pr.Cached {
+		t.Fatalf("https probe = %+v (want a completed CACHE HIT: the marked record must be served, not discarded and recomputed)", pr)
+	}
+	if pr.TLSMeta == nil || !pr.TLSMeta.Certificate.DNSNamesTruncated {
+		t.Fatalf("replayed TLS metadata = %+v (want DNSNamesTruncated=true to survive decodeStoredProbe→replay)", pr.TLSMeta)
+	}
+}
+
 // storedTLSPayload is a valid stored completed-https payload carrying TLS
 // metadata, used by the decode validation table below.
 func storedTLSPayload(t *testing.T, meta *TLSMetadata) storedProbe {

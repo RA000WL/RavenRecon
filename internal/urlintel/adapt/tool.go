@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 
@@ -266,16 +265,10 @@ func (t Tool) detect(ctx context.Context, e env) discovery.Detection {
 	return d
 }
 
-// versionPattern matches the first semver-like token in tool output, with an
-// optional leading "v". It mirrors internal/discovery's tolerant pattern
-// (unexported there): version outputs differ across tools and versions
-// ("Current Version: v2.6.3", "waymore v1.0.0", "gau 2.1.1", ...).
-var versionPattern = regexp.MustCompile(`[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:[-+._][0-9A-Za-z]+)*`)
-
-// extractVersion returns the first semver-like token in out, or "".
+// extractVersion returns the first semver-like token in out, or "". It is
+// the package-internal spelling of the single version-pattern definition,
+// discovery.ExtractVersion (the tolerant pattern lives there alone);
+// tool detection here keeps no private copy.
 func extractVersion(out []byte) string {
-	if m := versionPattern.Find(out); m != nil {
-		return string(m)
-	}
-	return ""
+	return discovery.ExtractVersion(out)
 }

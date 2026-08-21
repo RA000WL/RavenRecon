@@ -529,6 +529,73 @@ func TestRunCacheHitSkipsExecution(t *testing.T) {
 	}
 }
 
+// TestRunCacheHitPreservesTruncatedMarker pins the NEW-52 full engine chain
+// for marked assets: a rule whose detector reports a finding carrying the
+// sticky asset.Finding.Truncated marker (OPT-P1-4) stores a completed
+// record, and the warm run SERVES that record from the cache — zero
+// executions — with the marker still set on the served finding.
+//
+// The chain is store→encodeStoredFindings / lookup→decodeStoredFindings→
+// validateFinding; the load-bearing link is asset.NewFinding's in-place
+// normalization preserving Truncated through validateFinding's canonical
+// round-trip. A rebuild-style refactor of NewFinding would break the
+// round-trip equality and reject every record containing a marked finding
+// (silently unmarking cached results on warm runs) — this test fails first.
+func TestRunCacheHitPreservesTruncatedMarker(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := cache.Open(dir)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	var executions int32
+	marked := makeRule(t, "marked.x", &ruleOptions{detector: func(ctx context.Context, dctx *Context) ([]asset.Finding, error) {
+		atomic.AddInt32(&executions, 1)
+		f, err := testFinding(dctx, "marked.x", "Rule marked.x", CategoryInformation, 0)
+		if err != nil {
+			return nil, err
+		}
+		f.Truncated = true
+		return []asset.Finding{f}, nil
+	}})
+	reg := newTestRegistry(t, marked)
+	snap := testSnapshot(t)
+
+	cfg := DefaultEngineConfig(reg)
+	cfg.Cache = fs
+	rep1, err := Run(context.Background(), cfg, snap)
+	if err != nil {
+		t.Fatalf("cold Run: %v", err)
+	}
+	if atomic.LoadInt32(&executions) != 1 {
+		t.Fatalf("cold run executions %d, want 1", executions)
+	}
+	r1 := resultOf(t, rep1, "marked.x")
+	if r1.Status != RuleStatusCompleted || r1.Findings != 1 {
+		t.Fatalf("cold result: %+v (the marked finding must pass fresh-path validation and store)", r1)
+	}
+	if len(rep1.Findings) != 1 || !rep1.Findings[0].Truncated {
+		t.Fatalf("cold findings = %+v (want the Truncated marker preserved through validation+merge+store)", rep1.Findings)
+	}
+
+	cfg2 := DefaultEngineConfig(reg)
+	cfg2.Cache = fs
+	rep2, err := Run(context.Background(), cfg2, snap)
+	if err != nil {
+		t.Fatalf("warm Run: %v", err)
+	}
+	if atomic.LoadInt32(&executions) != 1 {
+		t.Fatalf("warm run must serve the stored record with ZERO executions: %d", executions)
+	}
+	r2 := resultOf(t, rep2, "marked.x")
+	if !r2.Cached || r2.Status != RuleStatusCompleted || rep2.CacheHits != 1 {
+		t.Fatalf("warm result: %+v (hits %d) — the marked record must be SERVED, not rejected and recomputed",
+			r2, rep2.CacheHits)
+	}
+	if len(rep2.Findings) != 1 || !rep2.Findings[0].Truncated {
+		t.Fatalf("warm findings = %+v (want the Truncated marker to survive decode on the warm run)", rep2.Findings)
+	}
+}
+
 // TestRunEmitOnCacheHit pins that the emit hook fires for cache-served
 // findings too, not only fresh ones.
 func TestRunEmitOnCacheHit(t *testing.T) {

@@ -177,7 +177,7 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 							valid = false
 							break
 						}
-						if h, ok := urlHost(u); !ok || !inDomain(domain, h) {
+						if h, ok := urlHost(u); !ok || !asset.InDomain(h.Name, domain.Name) {
 							valid = false
 							break
 						}
@@ -389,7 +389,7 @@ func parseKatanaOutput(stdout []byte, domain asset.Domain) ([]asset.URL, int, st
 			malformed++
 			continue
 		}
-		if !inDomain(domain, h) {
+		if !asset.InDomain(h.Name, domain.Name) {
 			// Out-of-domain: drop, not malformed.
 			continue
 		}
@@ -439,24 +439,11 @@ func filterHosts(domain asset.Domain, hosts []asset.Host) []asset.Host {
 		if h.Name == "" {
 			continue
 		}
-		if inDomain(domain, h) {
+		if asset.InDomain(h.Name, domain.Name) {
 			out = append(out, h)
 		}
 	}
 	return out
-}
-
-// inDomain reports whether host is the declared domain or a subdomain.
-func inDomain(declared asset.Domain, host asset.Host) bool {
-	d := declared.Name
-	h := host.Name
-	if d == "" || h == "" {
-		return false
-	}
-	if h == d {
-		return true
-	}
-	return strings.HasSuffix(h, "."+d)
 }
 
 // urlHost extracts canonical hostname from URL asset.

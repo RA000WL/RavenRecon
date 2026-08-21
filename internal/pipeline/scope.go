@@ -1,8 +1,6 @@
 package pipeline
 
 import (
-	"strings"
-
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
 
@@ -19,16 +17,11 @@ import (
 //
 // A host that equals the declared domain (a bare host) is in-domain. An
 // empty declared domain or host never matches.
+//
+// This is the typed spelling of the single domain-scope membership check,
+// asset.InDomain; this package keeps no private copy of the logic.
 func InDomain(declared asset.Domain, host asset.Host) bool {
-	d := declared.Name
-	h := host.Name
-	if d == "" || h == "" {
-		return false
-	}
-	if h == d {
-		return true
-	}
-	return strings.HasSuffix(h, "."+d)
+	return asset.InDomain(host.Name, declared.Name)
 }
 
 // FilterHosts returns the hosts in hosts that are in-domain, in input
