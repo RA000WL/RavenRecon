@@ -1719,6 +1719,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 ### NEW-40 (INFO) — OPT-P0-5 completion: honest duration verified on a real run
 - Status: VERIFIED — pipeline bracket wired in 08861f0; field run 5 (verily.com, fresh cache) reports started_at 14:23:21 → ended_at 14:30:53, duration_ms 452249 (7m32s). Digest stable (timing excluded). The last P0-5 piece is closed.
 
+### NEW-41 (INFO) — amass strategy decision: keep as-is (orchestrator, user directive)
+- Status: WON'T FIX (user decision, 2026-08-21) — "just skip amass" / "leave it as is": no opt-in change, no removal. Amass remains a built-in source; operators who don't want its runtime cost can already exclude it via --sources subfinder,assetfinder,chaos. Field-trial evidence (20m→0 on example.com, failed on verily.com) recorded under NEW-36/38 for anyone tuning later.
+
 ## Operational warnings (all agents)
 ### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
 - Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
@@ -1737,6 +1740,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 
 ### NEW-40 (INFO) — OPT-P0-5 completion: honest duration verified on a real run
 - Status: VERIFIED — pipeline bracket wired in 08861f0; field run 5 (verily.com, fresh cache) reports started_at 14:23:21 → ended_at 14:30:53, duration_ms 452249 (7m32s). Digest stable (timing excluded). The last P0-5 piece is closed.
+
+### NEW-41 (INFO) — amass strategy decision: keep as-is (orchestrator, user directive)
+- Status: WON'T FIX (user decision, 2026-08-21) — "just skip amass" / "leave it as is": no opt-in change, no removal. Amass remains a built-in source; operators who don't want its runtime cost can already exclude it via --sources subfinder,assetfinder,chaos. Field-trial evidence (20m→0 on example.com, failed on verily.com) recorded under NEW-36/38 for anyone tuning later.
 
 ## Operational warnings (all agents)
 
