@@ -82,6 +82,76 @@ func TestChaosParseJSON(t *testing.T) {
 	}
 }
 
+// TestChaosParseSubdomainsArray pins the chaos v0.5+ single-object output
+// shape: one JSON line {"domain":"<apex>","subdomains":[...],"count":N} where
+// each element is a label or partial FQDN relative to the queried domain.
+// Field-trial evidence (verily.com): the old parser read only "domain" and
+// silently discarded 1,047 of 1,048 real subdomains.
+func TestChaosParseSubdomainsArray(t *testing.T) {
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
+		"chaos -d verily.com -silent -json": func(Cmd) (RunResult, error) {
+			return RunResult{Stdout: []byte(`{"domain":"verily.com","subdomains":["lp","dev.vapi","files","a.verily.com"],"count":4}` + "\n")}, nil
+		},
+	})
+	c := chaos{env: chaosEnv(r, newFakeLookup())}
+	c.env.name = "chaos"
+	dres, err := c.Discover(context.Background(), mustDomain(t, "verily.com"))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	want := []string{"a.verily.com", "dev.vapi.verily.com", "files.verily.com", "lp.verily.com"}
+	if len(dres.Hosts) != len(want) {
+		t.Fatalf("hosts = %v, want %d (%v)", names(dres.Hosts), len(want), want)
+	}
+	for i, w := range want {
+		if dres.Hosts[i].Name != w {
+			t.Fatalf("hosts[%d] = %q, want %q (all: %v)", i, dres.Hosts[i].Name, w, names(dres.Hosts))
+		}
+	}
+	if dres.Malformed != 0 {
+		t.Fatalf("malformed = %d, want 0", dres.Malformed)
+	}
+}
+
+// TestChaosParseSubdomainsFQDNNotDoubled: an element that is already a full
+// FQDN under the domain is used as-is, never "<fqdn>.<domain>".
+func TestChaosParseSubdomainsFQDNNotDoubled(t *testing.T) {
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
+		"chaos -d example.com -silent -json": func(Cmd) (RunResult, error) {
+			return RunResult{Stdout: []byte(`{"domain":"example.com","subdomains":["www","www.example.com"]}` + "\n")}, nil
+		},
+	})
+	c := chaos{env: chaosEnv(r, newFakeLookup())}
+	c.env.name = "chaos"
+	dres, err := c.Discover(context.Background(), mustDomain(t, "example.com"))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	want := []string{"www.example.com"} // both elements dedupe to the same host
+	if len(dres.Hosts) != 1 || dres.Hosts[0].Name != want[0] {
+		t.Fatalf("hosts = %v, want [%s]", names(dres.Hosts), want[0])
+	}
+}
+
+// TestChaosParseLegacyApexOnly: a JSON object with a domain but no subdomains
+// array still yields the apex itself (legacy per-line shape).
+func TestChaosParseLegacyApexOnly(t *testing.T) {
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
+		"chaos -d x.com -silent -json": func(Cmd) (RunResult, error) {
+			return RunResult{Stdout: []byte(`{"domain":"x.com"}` + "\n")}, nil
+		},
+	})
+	c := chaos{env: chaosEnv(r, newFakeLookup())}
+	c.env.name = "chaos"
+	dres, err := c.Discover(context.Background(), mustDomain(t, "x.com"))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(dres.Hosts) != 1 || dres.Hosts[0].Name != "x.com" {
+		t.Fatalf("hosts = %v, want [x.com]", names(dres.Hosts))
+	}
+}
+
 func TestChaosFallbackToTextLines(t *testing.T) {
 	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
 		"chaos -d example.com -silent -json": func(Cmd) (RunResult, error) {

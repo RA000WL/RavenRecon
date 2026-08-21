@@ -94,7 +94,7 @@ func (c chaos) Discover(ctx context.Context, target asset.Domain) (DiscoverResul
 	if err != nil {
 		return DiscoverResult{}, fmt.Errorf("%s: %w", c.Name(), err)
 	}
-	hosts, malformed := parseChaosLines(res.Stdout, e.provenance())
+	hosts, malformed := parseChaosLines(res.Stdout, target.Name, e.provenance())
 	dres := DiscoverResult{Hosts: hosts, Malformed: malformed, Truncated: res.StdoutTruncated}
 	if res.ExitCode != 0 {
 		return dres, fmt.Errorf("%s: exited with code %d", c.Name(), res.ExitCode)
@@ -103,60 +103,84 @@ func (c chaos) Discover(ctx context.Context, target asset.Domain) (DiscoverResul
 }
 
 // parseChaosLines converts chaos stdout — untrusted input — into normalized
-// Phase 2 hosts. Each non-blank line is expected to be JSON
-// {"domain":"..."}; a plain text line is accepted via fallback first-token
-// parsing (mirroring parseHostLines) so variations in output are not fatal.
-// Every candidate is normalized only through asset.NewHost; lines that do not
-// normalize are counted and skipped. Duplicates are removed by identity and the
-// result is sorted by canonical name.
-func parseChaosLines(stdout []byte, prov asset.Provenance) ([]asset.Host, int) {
+// Phase 2 hosts. Two JSON shapes are accepted:
+//
+//   - the v0.5+ single-object form: one line
+//     {"domain":"<apex>","subdomains":["label","a.label",...],"count":N}
+//     where each element is a label or partial FQDN relative to the queried
+//     domain (elements already ending in "."+domain are used as-is);
+//   - the legacy per-line form {"domain":"..."} (the apex itself).
+//
+// A plain text line is accepted via fallback first-token parsing (mirroring
+// parseHostLines) so variations in output are not fatal. Every candidate is
+// normalized only through asset.NewHost; lines that do not normalize are
+// counted and skipped. Duplicates are removed by identity and the result is
+// sorted by canonical name.
+func parseChaosLines(stdout []byte, domain string, prov asset.Provenance) ([]asset.Host, int) {
 	var hosts []asset.Host
 	seen := make(map[asset.Identity]struct{})
 	malformed := 0
+	add := func(candidate string) {
+		h, err := asset.NewHost(candidate, prov)
+		if err != nil {
+			malformed++
+			return
+		}
+		if _, dup := seen[h.Identity()]; dup {
+			return
+		}
+		seen[h.Identity()] = struct{}{}
+		hosts = append(hosts, h)
+	}
 	for _, raw := range splitLines(stdout) {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
-		domain := ""
-		// Try JSON: expected {"domain":"..."}; tolerate extra fields.
 		if strings.HasPrefix(line, "{") {
 			var rec struct {
-				Domain string `json:"domain"`
+				Domain     string   `json:"domain"`
+				Subdomains []string `json:"subdomains"`
 			}
 			if err := json.Unmarshal([]byte(line), &rec); err == nil {
-				domain = strings.TrimSpace(rec.Domain)
-			}
-			if domain == "" {
-				// JSON did not contain a usable domain — fall back to first-token
-				// parsing so a plain host per line is still accepted; if the
-				// first token is not a valid host it will be counted malformed.
-				fields := strings.Fields(line)
-				if len(fields) > 0 {
-					domain = fields[0]
+				rec.Domain = strings.TrimSpace(rec.Domain)
+				if len(rec.Subdomains) > 0 {
+					// v0.5+ single-object form: expand every element against
+					// the queried domain.
+					for _, sub := range rec.Subdomains {
+						sub = strings.TrimSpace(sub)
+						if sub == "" {
+							continue
+						}
+						switch {
+						case strings.HasSuffix(sub, "."+domain):
+							add(sub)
+						default:
+							add(sub + "." + domain)
+						}
+					}
+					continue
 				}
+				if rec.Domain != "" {
+					add(rec.Domain)
+					continue
+				}
+				// JSON without a usable domain and without subdomains — fall
+				// through to first-token parsing so a plain host per line is
+				// still accepted; if the first token is not a valid host it
+				// will be counted malformed.
 			}
-		} else {
 			fields := strings.Fields(line)
-			if len(fields) == 0 {
-				continue
+			if len(fields) > 0 {
+				add(fields[0])
 			}
-			domain = fields[0]
-		}
-		if domain == "" {
-			malformed++
 			continue
 		}
-		h, err := asset.NewHost(domain, prov)
-		if err != nil {
-			malformed++
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		if _, dup := seen[h.Identity()]; dup {
-			continue
-		}
-		seen[h.Identity()] = struct{}{}
-		hosts = append(hosts, h)
+		add(fields[0])
 	}
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
 	return hosts, malformed
