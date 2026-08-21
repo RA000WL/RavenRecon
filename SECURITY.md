@@ -8,6 +8,8 @@ RavenRecon is intended for authorized security research, bug bounty programs, an
 
 Security issues in RavenRecon should be reported privately to the project maintainers rather than immediately publishing exploit details.
 
+Contact: security@ravenrecon.local or open a GitHub Security Advisory.
+
 ## Security requirements
 
 Contributors must consider:

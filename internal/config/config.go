@@ -167,8 +167,9 @@ func Default() Config {
 		Concurrency: 10,
 		// 120s: passive enumeration tools (subfinder, amass) routinely
 		// exceed short deadlines on real targets; 10s killed every source
-		// before it could produce output. Operator overrides: the discover
-		// command's --timeout flag, or Discovery.Timeout in configuration.
+		// before it could produce output. Operator overrides: Discovery.Timeout
+		// in configuration, or per-stage StageBounds via scan --timeout
+		// (discover exposes only --sources and --no-cache).
 		Timeout:   120 * time.Second,
 		Rate:      5,
 		UserAgent: "RavenRecon/1.4.0",

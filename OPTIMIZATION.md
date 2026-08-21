@@ -428,8 +428,8 @@ hardening — per `AGENTS.md:5` scope policy.
 
 | ID | Title | Severity | File:line | Roadmap | Status |
 |----|-------|----------|-----------|---------|--------|
-| OPT-P0-1 | Burst anomaly gate — discovery poisoning | CRITICAL | `ROADMAP.md:v1.5` `discovery/parse.go:21` | v1.5 | OPEN |
-| OPT-P0-2 | JS → URL feedback | HIGH | `jsintel/record_analyze.go:176` `pipeline/document.go` | v1.5 | OPEN |
+| OPT-P0-1 | Burst anomaly gate — discovery poisoning | CRITICAL | `ROADMAP.md:v1.5` `discovery/parse.go:21` | v1.5 | VERIFIED |
+| OPT-P0-2 | JS → URL feedback | HIGH | `jsintel/record_analyze.go:176` `pipeline/document.go` | v1.5 | VERIFIED |
 | OPT-P0-3 | Live URL triage `urllive` | HIGH | `httpprobe/run.go:208` `pipeline/results.go` | v1.5 | OPEN |
 | OPT-P0-4 | Per-tool deadlines + amass opt-in | HIGH | `urlintel/adapt/source.go:525` | v1.5 | OPEN |
 | OPT-P0-5 | Honest run duration in report | LOW | `report/model.go:142` | v1.5 | OPEN |
