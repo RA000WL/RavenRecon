@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-22).
+  next free `NEW-n` (currently NEW-49).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -1493,8 +1493,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: adversarial corpus benchmark with the number pinned in parse.go's comment (§14); parse completes under pool deadline.
 
 ### NEW-27 (LOW) — secrentel anchor gate ASCII-lowercases but gated regexes match via Unicode simple fold: silent false negatives (internal/secrentel)
-- Status: IN PROGRESS (builder fix round 2026-08-21 — implemented + gates
-  green; orchestrator verifies and closes — never self-closed)
+- Status: VERIFIED — fixed in 4803cf1 (unicode-fold fallback scan.go:90-152,
+  foldRuneToASCIILower :479-497 matching RE2 (?i) simple-fold semantics;
+  regression fails pre-fix); reviewer APPROVE this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: scan.go:82-86 builds the anchor haystack with `toLowerASCII`; anchors gate `(?i)` regexes (scan.go:101-112), which match through Unicode simple folding (ſ↔s, U+212A K↔k). A document containing e.g. `aws_ſecret_access_key=` passes the regex yet lacks the ASCII anchor → pattern skipped, violating the "anchor is a necessary substring" contract (patterns/types.go:124-131).
@@ -1515,9 +1516,10 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: homoglyph regression row demonstrates match-without-anchor today, correctly anchored after fix.
 
 ### NEW-28 (LOW) — secrentel dedup merge upgrades strength/family but not entropyOK (internal/secrentel)
-- Status: IN PROGRESS (builder fix round 2026-08-21 — implemented + gates
-  green + pre-fix failure proven; orchestrator verifies and closes — never
-  self-closed)
+- Status: VERIFIED — fixed in 4803cf1 (merge upgrade scan.go:219-224 +
+  Phase-3 winner re-derivation :301-313 as defense-in-depth; both entropy
+  directions pinned, vacuous-pass trap defused via creator-sorts-first ID
+  ordering); reviewer APPROVE this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: scan.go:176-184 merges duplicate candidates by upgrading strength/family from the winning pattern; `entropyOK` stays the creating pattern's. Phase 3 scores with the creating pattern's entropy flag while hints use the winning pattern — the factor list can contradict the winning pattern's entropy requirement (both directions possible).
@@ -1551,7 +1553,9 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Verification: two-pattern same-type dedup case where winner requires entropy and loser does not (and vice versa); factor list matches winner.
 
 ### NEW-29 (LOW) — sortQuery collapses ?x= and ?x into one URL identity (internal/asset)
-- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
+- Status: VERIFIED — fixed in 557a5cb (hasValue tracks strings.Cut found;
+  "?x="→"x=" vs "?x"→"x" distinct; identity split is over-splitting only —
+  no false cache hits possible); reviewer APPROVE this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: url.go:286-290 writes `=` only when the value is non-empty, so distinct raw forms `?x=` and `?x` serialize identically — contradicting the type doc's "distinct raw forms never collapse" principle (url.go:30-34).
@@ -1570,7 +1574,10 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   ok (25 pkgs); go test -race -count=1 ./internal/asset ok.
 
 ### NEW-30 (LOW) — dns wildcard probe bypasses the central query limiter (internal/dns)
-- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
+- Status: VERIFIED — fixed in 557a5cb (documented-exception route: doc.go:47-54
+  scopes the limiter promise to Resolve pool jobs + states the IsWildcard
+  exception with rationale; brute.go note matches; behavior verified
+  unchanged); reviewer APPROVE this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: `IsWildcard` (brute.go:130-165) issues `resolver.Lookup` directly (brute.go:143), outside Resolve's env; dns/doc.go:40 promises every outbound query waits on the shared token-bucket limiter regardless of concurrency. Called per-run from adapt/dns.go:449.
@@ -1590,7 +1597,10 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   ./internal/dns ok.
 
 ### NEW-31 (LOW) — dnsx_resolvers StageParam parsed then discarded; "validates shape" claim inaccurate (internal/pipeline/adapt/dns.go)
-- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
+- Status: VERIFIED — fixed in 557a5cb (netip.ParseAddr shape validation +
+  dns_brute_resolvers_ignored sticky flag on every brute-enabled path,
+  traced incl. wildcard-abort/empty/full merges; "NOT honored" comments);
+  reviewer APPROVE this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: `dnsBruteResolvers` (adapt/dns.go:416-438) result discarded at :464 (`_ =`); operator-supplied resolvers are silently ignored. The comment claims parsing validates shape but no IP validation occurs (comma split only).
@@ -1614,7 +1624,10 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   go test -race -count=1 ./internal/pipeline/adapt ok.
 
 ### NEW-32 (LOW) — dns brute truncation flag false-positives at exactly-at-cap (internal/pipeline/adapt/dns.go)
-- Status: IN PROGRESS — implemented 2026-08-21, awaiting review (orchestrator closes)
+- Status: VERIFIED — fixed in 557a5cb (GenerateBruteCandidates returns
+  explicit cap-hit bool; exactly-at-cap → no flag, above-cap → flag;
+  pre-fix proof by restoring the length-inference line); reviewer APPROVE
+  this session
 - Reporter: reviewer
 - Owner: builder
 - Problem: `candidateTruncated := len(candidates) >= dns.MaxBruteHostsPerDomain || wordlistTruncated` (:492) fires when generation produced exactly MaxBruteHostsPerDomain candidates without dropping anything (the generator truncates only above cap) → spurious `dns_brute_truncated` sticky flag.
@@ -1722,27 +1735,98 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 ### NEW-41 (INFO) — amass strategy decision: keep as-is (orchestrator, user directive)
 - Status: WON'T FIX (user decision, 2026-08-21) — "just skip amass" / "leave it as is": no opt-in change, no removal. Amass remains a built-in source; operators who don't want its runtime cost can already exclude it via --sources subfinder,assetfinder,chaos. Field-trial evidence (20m→0 on example.com, failed on verily.com) recorded under NEW-36/38 for anyone tuning later.
 
-## Operational warnings (all agents)
-### NEW-37 (HIGH) — chaos adapter discarded 1,047 of 1,048 subdomains: v0.5+ output shape unhandled (internal/discovery/chaos.go)
-- Status: VERIFIED — fixed in 0dc7611 (parseChaosLines expands subdomains array against queried domain; FQDN elements as-is; legacy shapes preserved; live-verified 1,044 hosts on verily.com)
-- Reporter: master (field trial 2, NEW-36)
-- Problem: chaos v0.5.2 -json emits ONE object {"domain":"<apex>","subdomains":[...],"count":N}; the adapter read only "domain" → apex-only. Real cost: verily.com corpus was built from subfinder's 1,036 hosts alone; every unique chaos find (e.g. wildcard.verily.com, grudge-pandemic.verily.com) was missing from dns/probe/urllive.
-- Fix: parse subdomains array; expand labels against domain; FQDN elements as-is; legacy + text fallbacks kept.
-- Verification: TestChaosParseSubdomainsArray/FQDNNotDoubled/LegacyApexOnly hermetic; live chaos-only discover run = 1,044 hosts.
+### NEW-42 (LOW) — agent definitions underperforming: rewritten (.opencode/agents/*.md)
+- Status: VERIFIED (orchestrator, 2026-08-21) — all five definitions reviewed:
+  YAML frontmatter parses (python3 yaml), no dead placeholders, V2 permissions
+  arrays correct (reviewer edit-deny; research edit+shell deny), real roster,
+  self-contained delegation contract. Live evidence: this session's harness is
+  running the new master.md verbatim (no TESTER/DOCS agents in prompt) and a
+  reviewer dispatch behaved exactly per the new definition (read-only, evidence-
+  based verdict). Operator service restart no longer outstanding.
+- Reporter: ox-alpha (session ses_fdbf942d8ffeqwyIEwAF546Qfy)
+- Owner: n/a (dev tooling, not engine code)
+- Problem: builder/debugger/reviewer each mandated reading AGENTS+README+ARCHITECTURE+ROADMAP in full (~280KB / ~65-70k tokens per subagent spawn; ARCHITECTURE.md alone is 3487 lines / 190KB) before any task work — contradicting AGENTS.md §4 and starving task context. Rules duplicated AGENTS.md (auto-injected into every session) in drifted form: TODO.md board duty (§13) and tier classification (§1) missing from builder/debugger. master.md delegated to non-existent TESTER/DOCS agents, lacked a self-contained-prompt rule for fresh-context subagents, and omitted the orchestrator's TODO-closing duty. Dead template placeholders ([INSERT EXACT TASK HERE], [CAPABILITY], [PASTE BUG HERE]) sat in static prompts. research/reviewer used legacy V1 `permission:` frontmatter with the V1 `bash` action name.
+- Fix: rewrote all five definitions per /home/raven/.opencode/plan/optimize-agents-plan.md — targeted grep/glob inspection instead of full-doc reads; AGENTS.md referenced by section, not re-read; placeholders removed; V2 `permissions` arrays (reviewer edit-deny; research edit+shell deny); master roster corrected to real agents (+ built-in explore) with self-contained delegation contract and TODO-closing duty; TODO duties restored to builder/debugger.
+- Verification: YAML frontmatter of all five files parses (python3 yaml); net −320 prompt lines (git diff --stat). Remaining: restart the OpenCode service (`opencode2 service restart`) so new definitions load, then smoke-test each agent once (builder/debugger update TODO.md; master delegates only to real agents). Restart deferred to the operator — restarting the service hosting a live session risks killing it mid-work.
 
-### NEW-39 (MED) — urllive stage deadline starvation on large corpora (internal/httpprobe/urls.go, internal/pipeline/adapt/urllive.go)
-- Status: VERIFIED — fixed in 990c810 (triage defaults 5s/20-concurrency; cut-short triage marks Truncated+urllive_truncated)
-- Reporter: master (field trial 3, NEW-38)
-- Problem: 8,254-URL corpus — 10s per dead host starved the shared stage budget; run cancelled with 1,635 errors and no truncation marker.
-- Fix: ProbeURLs triage defaults (RequestTimeout 5s, Concurrency 20, QueueSize=Concurrency when unset; explicit config wins); adapter marks Truncated+flag when the budget fires mid-triage.
-- Verification: TestProbeURLsTriageDefaults (blocking transport, ~5s cut), cancellation test asserts flag; all gates + race green.
-- Post-fix field run 4 (verily.com, fresh cache): urllive still hits the shared stage deadline at 8,199-URL scale (1,587 errors) BUT now carries Truncated+urllive_truncated honestly; alive 172, 3xx 2,361, 4xx 4,078. The remaining lever is a dedicated urllive stage budget (StageBounds Timeout for urllive) or higher concurrency via StageParams — operator-tunable today: --stages with per-stage bounds. Not a defect; recorded as tuning guidance.
+### NEW-43 (LOW) — TODO.md tail duplicated: NEW-37/39/40/41 blocks and an "Operational warnings" heading appear twice
+- Status: VERIFIED (orchestrator, 2026-08-21) — duplicated tail deleted
+  (lines 1733-1754: stray heading + second NEW-37/39/40/41 copies);
+  `grep -c '^### NEW-41'` = 1, single `## Operational warnings` section,
+  NEW list contiguous NEW-42→43→44.
+- Reporter: ox-alpha (session ses_fdbf942d8ffeqwyIEwAF546Qfy)
+- Problem: after the first NEW-41 entry, a stray `## Operational warnings (all agents)` heading is immediately followed by a second copy of the NEW-37, NEW-39, NEW-40 and NEW-41 blocks, then the real Operational warnings section repeats with its actual bullet list. `grep -n '^### NEW-41' TODO.md` returns two hits; both copies carry identical VERIFIED/WON'T FIX text. Agents scanning the board read every entry twice and the stray heading breaks the section structure.
+- Fix: delete the duplicated tail (second NEW-37/39/40/41 copies + the stray heading), keeping one contiguous NEW list followed by a single Operational warnings section; then re-check the "next free NEW-n" pointer.
+- Verification: `grep -c '^### NEW-4[01]' TODO.md` returns 2 (one each); only one `^## Operational warnings` remains.
 
-### NEW-40 (INFO) — OPT-P0-5 completion: honest duration verified on a real run
-- Status: VERIFIED — pipeline bracket wired in 08861f0; field run 5 (verily.com, fresh cache) reports started_at 14:23:21 → ended_at 14:30:53, duration_ms 452249 (7m32s). Digest stable (timing excluded). The last P0-5 piece is closed.
+### NEW-44 (LOW) — AGENTS.md rewritten: discipline over ceremony (AGENTS.md)
+- Status: VERIFIED (orchestrator, 2026-08-21) — full diff reviewed: §0–§17
+  headings and substance preserved, preamble added, cross-references resolve
+  (ROADMAP §5/§0.4 checked; "Tier C" vocabulary retained deliberately for
+  ARCHITECTURE.md reader map + master.md). Committed with this closure.
+- Reporter: ox-alpha (session ses_fdbf942d8ffeqwyIEwAF546Qfy)
+- Owner: n/a (governance doc, not engine code)
+- Problem: AGENTS.md read as shackles, not discipline: §1 imposed a tier/reading matrix (meaningless since AGENTS.md auto-injects into every session — agents were told to "read" a doc already in their context); §13/§17 framed gates as ritual ("you may not describe a change as complete until…", an 11-item checklist re-listing other sections); §16 mandated a 10-item PR write-up; §12 duplicated §0.8. Nothing in the file told agents that judgment outranks procedure outside §0.
+- Fix: rewrote in place preserving ALL §0–§17 numbers and meanings (≈50 cross-references in TODO/ROADMAP/ARCHITECTURE/.opencode/agents keep resolving — verified every referenced number has a heading). Changes: new preamble (guardrails-not-procedure; judgment wins except §0); §1 became "rigor scales with blast radius" — tier vocabulary kept (ARCHITECTURE.md reader map + master.md reference Tier C) but reading requirements deleted; §5 compressed to the ownership rule + stop-and-propose trigger; §7 12 items → 9 (merged redundancies); §13 reframed as know-don't-assume incl. explicit "if a check cannot run, say so" clause; §16 loosened to on-request/architectural; §17 11-item checklist → 5-line closure habit. §0 nine constraints unchanged in substance.
+- Verification: heading set {0..17} covers every §N used elsewhere (grep cross-check); harness reloaded the file (new text active in-session). No Go code touched; gofmt/vet/build/test not runnable here (no toolchain on machine — see NEW-42 note).
 
-### NEW-41 (INFO) — amass strategy decision: keep as-is (orchestrator, user directive)
-- Status: WON'T FIX (user decision, 2026-08-21) — "just skip amass" / "leave it as is": no opt-in change, no removal. Amass remains a built-in source; operators who don't want its runtime cost can already exclude it via --sources subfinder,assetfinder,chaos. Field-trial evidence (20m→0 on example.com, failed on verily.com) recorded under NEW-36/38 for anyone tuning later.
+### NEW-45 (LOW) — comma-only dnsx_resolvers value raises no ignored-flag (internal/pipeline/adapt/dns.go)
+- Status: OPEN
+- Reporter: reviewer (NEW-27..32 closure review, 2026-08-21)
+- Owner: (unassigned)
+- Problem: a supplied-but-empty resolvers value (e.g. `dnsx_resolvers=","` or
+  `",,"`) passes the `TrimSpace != ""` guard, splits into only empty segments,
+  and yields `(nil, 0)` from dnsBruteResolvers (adapt/dns.go:520-537) → no
+  `dns_brute_resolvers_ignored` flag although an operator supplied something.
+  Morally identical to the whitespace-only case the spec exempts; builder
+  disclosed the corner in the commit message.
+- Fix: have dnsBruteResolvers also report `supplied = trimmedRaw != ""` and set
+  the flag on `supplied` regardless of per-entry outcomes.
+- Verification: table row `","`/`",,"` → flag set; existing rows unchanged;
+  gates green.
+
+### NEW-46 (INFO) — secrentel scan converts []byte→string three times per document (internal/secrentel)
+- Status: OPEN (note — allocation hygiene, no behavior change)
+- Reporter: reviewer (NEW-27..32 closure review, 2026-08-21)
+- Owner: (unassigned)
+- Problem: scan.go:85/98/103 each convert `content` independently (fast-path
+  lower, folded haystack, strContent); each conversion can allocate a
+  document-sized copy on large inputs.
+- Fix: hoist one `strContent` and derive `lower()`/`folded()` from it.
+- Verification: existing secrentel tests pass unchanged; optional alloc
+  benchmark before/after (§14).
+
+### NEW-47 (INFO) — ctx firing during the IsWildcard probe reports brute stage completed with no marker (internal/pipeline/adapt/dns.go)
+- Status: OPEN
+- Reporter: reviewer (NEW-27..32 closure review, 2026-08-21)
+- Owner: (unassigned)
+- Problem: if the stage context fires during the IsWildcard probe, runBrute
+  returns `({}, false, false)` (adapt/dns.go:547-553) and Run falls through to
+  bare baseRes (:218-225): opt-in brute silently skipped while the stage can
+  record `completed`, no sticky marker. Runner-level teardown observes the
+  cancellation elsewhere, so impact is minimal. Pre-existing, not introduced
+  by NEW-32.
+- Fix: surface a `dns_brute_skipped_cancelled`-style sticky flag (or fold to
+  partial/cancelled per the mapping table) when the probe context has fired.
+- Verification: fake resolver blocking past deadline with brute enabled →
+  marker present; regression fails pre-fix.
+
+### NEW-48 (LOW) — v1.5 OPT-P2-1 remainder: scan --help does not document per-tool timeouts; no --dry-run (internal/cli)
+- Status: OPEN
+- Reporter: master (ROADMAP v1.5 close-out, 2026-08-21)
+- Owner: (unassigned)
+- Problem: ROADMAP v1.5's OPT-P2-1 line required "scan --help documents
+  per-tool timeouts + --amass opt-in + scan --dry-run for effective
+  timeouts". Landed: per-tool timeout exists as config Discovery.Timeout
+  (config.go:149) but scan --help doesn't surface it; --amass opt-in was
+  resolved as WON'T FIX via NEW-41 (exclusion via --sources); --dry-run does
+  not exist (repo grep clean). The remainder must not be lost with the v1.5
+  flip to Complete.
+- Fix: add per-tool-timeout documentation to scan usage text; implement
+  `scan --dry-run` printing effective stage bounds/timeouts without running,
+  or descope explicitly with a decision record.
+- Verification: scan --help shows the timeout documentation; dry-run smoke
+  prints effective config; gates green.
 
 ## Operational warnings (all agents)
 
