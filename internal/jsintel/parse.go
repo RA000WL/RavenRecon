@@ -45,6 +45,21 @@ const maxTemplateExprNesting = 64
 //     heuristic.
 const maxLookaheadTokens = 1024
 
+// maxTotalScanSteps caps the TOTAL number of tokens examined by all
+// window scans in one parse. Per-scan maxLookaheadTokens bounds each scan to
+// 1024 steps, but an adversarial input with ~500k import keywords (2 tokens
+// per "import x", 1M token cap) would still drive ~512M steps
+// (500k × 1024) without a global budget. The total budget makes the walk
+// LINEAR overall: after budget exhaustion every remaining scan returns
+// immediately with Truncated set, so adversarial corpora complete in
+// milliseconds rather than minutes. Legitimate inputs stay far under the
+// budget (a 1k-import bundle with typical 3-token binding lists costs ~3k
+// steps), so the cap never fires on real sources — only on adversarial
+// repeats. Window exhaustion and budget exhaustion share the same honesty
+// contract: the result is an incomplete prefix marked Truncated, never
+// served as a complete cache hit.
+const maxTotalScanSteps = 100000
+
 // Source map reference markers, matched against the TRIMMED text of a line
 // or block comment (the exact forms from the source map v3 spec; no-space
 // variants such as //#sourceMappingURL= are not matched).
@@ -65,6 +80,7 @@ type walker struct {
 	truncated      bool
 	malformed      int
 	droppedStrings int
+	scanSteps      int // total tokens examined by window scans (budgeted by maxTotalScanSteps)
 }
 
 // walk processes every token exactly once.
@@ -176,18 +192,31 @@ func (w *walker) dynamicSpec(j int) (string, ImportKind) {
 // extract. A depth-0 `;` also stops the scan — `from` after the statement
 // terminator belongs to a later statement (for example
 // `import.meta.url; import x from "m"` must not report an import on the
-// import.meta line). Window exhaustion marks the parse Truncated: an import
-// statement whose binding list spans the full window may still resolve
-// beyond it, so reporting no import without flagging would silently drop a
-// true observation — the truncated result is an honest prefix, consistent
-// with the token cap.
+// import.meta line). A depth-0 `import` or `export` also stops the scan:
+// it is the start of the next statement, and `from` beyond it belongs to
+// that statement — this makes adversarial repeats such as
+// `import x import x ...` linear (2 steps per scan) instead of
+// 1024 steps per scan. Window exhaustion or total-budget exhaustion marks
+// the parse Truncated: an import statement whose binding list spans the
+// full window may still resolve beyond it, so reporting no import without
+// flagging would silently drop a true observation — the truncated result is
+// an honest prefix, consistent with the token cap.
 func (w *walker) findFromSpecifier(j int) (string, bool) {
+	if w.scanSteps >= maxTotalScanSteps {
+		w.truncated = true
+		return "", false
+	}
 	limit := j + maxLookaheadTokens
 	if limit > len(w.toks) {
 		limit = len(w.toks)
 	}
 	depth := 0
 	for j < limit {
+		if w.scanSteps >= maxTotalScanSteps {
+			w.truncated = true
+			return "", false
+		}
+		w.scanSteps++
 		t := w.toks[j]
 		switch t.kind {
 		case tokPunct:
@@ -205,11 +234,17 @@ func (w *walker) findFromSpecifier(j int) (string, bool) {
 				}
 			}
 		case tokIdent:
-			if depth == 0 && t.text(w.src) == "from" {
-				if j+1 < len(w.toks) && w.toks[j+1].kind == tokString {
-					return decodeString(w.toks[j+1].text(w.src)), true
+			if depth == 0 {
+				txt := t.text(w.src)
+				if txt == "import" || txt == "export" {
+					return "", false // next statement — not window exhaustion
 				}
-				return "", false
+				if txt == "from" {
+					if j+1 < len(w.toks) && w.toks[j+1].kind == tokString {
+						return decodeString(w.toks[j+1].text(w.src)), true
+					}
+					return "", false
+				}
 			}
 		case tokString, tokTemplate:
 			if depth == 0 {
@@ -304,6 +339,12 @@ func (w *walker) exportList(j, line int) {
 	// exist beyond it: the parse is marked Truncated (honest prefix, same
 	// contract as the token cap). When the window reaches EOF without a
 	// closing brace the list is genuinely unterminated: nothing to observe.
+	// The scan also respects the global maxTotalScanSteps budget (see
+	// findFromSpecifier): budget exhaustion also marks Truncated.
+	if w.scanSteps >= maxTotalScanSteps {
+		w.truncated = true
+		return
+	}
 	depth := 0
 	end := -1
 	limit := j + maxLookaheadTokens
@@ -311,6 +352,11 @@ func (w *walker) exportList(j, line int) {
 		limit = len(w.toks)
 	}
 	for k := j; k < limit; k++ {
+		if w.scanSteps >= maxTotalScanSteps {
+			w.truncated = true
+			return
+		}
+		w.scanSteps++
 		t := w.toks[k]
 		if t.kind == tokPunct {
 			switch t.text(w.src) {
@@ -329,6 +375,8 @@ func (w *walker) exportList(j, line int) {
 	}
 	if end < 0 {
 		if limit < len(w.toks) {
+			w.truncated = true
+		} else if w.scanSteps >= maxTotalScanSteps {
 			w.truncated = true
 		}
 		return // unterminated list: nothing to observe

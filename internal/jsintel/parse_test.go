@@ -816,3 +816,81 @@ func TestParseLookaheadWindowEnvelope(t *testing.T) {
 		})
 	}
 }
+
+// TestParseAdversarialImportWindow pins NEW-26: findFromSpecifier's
+// lookahead window (maxLookaheadTokens=1024) makes adversarial repeats
+// superlinear. Input like "import x " repeated to the token cap is
+// 500k import keywords, each scanning 1024 tokens → ~512M steps without a
+// global budget — tens of seconds, and Parse has no context so pool
+// deadlines cannot interrupt it. The fix caps total window-scan steps
+// (maxTotalScanSteps=100k) and terminates a scan early at the next
+// statement keyword (import/export) at depth 0, making the walk linear.
+// This test ensures adversarial corpora complete quickly (<100ms) and
+// honestly report Truncated when the budget is exceeded, while remaining
+// deterministic and not breaking legitimate imports.
+func TestParseAdversarialImportWindow(t *testing.T) {
+	cases := []struct {
+		name          string
+		src           string
+		wantTruncated *bool // nil means don't assert; just check liveness + determinism
+		budget        time.Duration
+	}{
+		{
+			name:   "import-x-repeated-10k-fast",
+			src:    strings.Repeat("import x ", 10000),
+			budget: 100 * time.Millisecond,
+		},
+		{
+			name:   "import-x-repeated-10k-trailing-from-fast",
+			src:    strings.Repeat("import x ", 10000) + "from \"a\";",
+			budget: 100 * time.Millisecond,
+		},
+		{
+			name:          "import-x-repeated-60k-exceeds-budget-truncated",
+			src:           strings.Repeat("import x ", 60000),
+			wantTruncated: boolPtr(true),
+			budget:        100 * time.Millisecond,
+		},
+		{
+			name:   "legit-import-still-resolves",
+			src:    `import { a, b as c } from "m"; export { c };`,
+			budget: 100 * time.Millisecond,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			r1, err := NewParser().Parse([]byte(tc.src))
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if elapsed > tc.budget {
+				t.Errorf("adversarial parse took %s, exceeding %s budget (superlinear window scan not bounded)", elapsed, tc.budget)
+			}
+			if tc.wantTruncated != nil && r1.Truncated != *tc.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", r1.Truncated, *tc.wantTruncated)
+			}
+			// Deterministic second parse.
+			r2, err := NewParser().Parse([]byte(tc.src))
+			if err != nil {
+				t.Fatalf("second Parse: %v", err)
+			}
+			if !reflect.DeepEqual(r1, r2) {
+				t.Errorf("nondeterministic parse")
+			}
+			// Legit case must resolve.
+			if tc.name == "legit-import-still-resolves" {
+				if want := []string{"m"}; !reflect.DeepEqual(importSpecs(r1.Imports), want) {
+					t.Errorf("imports = %v, want %v", importSpecs(r1.Imports), want)
+				}
+				if r1.Truncated {
+					t.Errorf("Truncated = true, want false for legit import")
+				}
+			}
+			t.Logf("parse %q: %s truncated=%v imports=%d", tc.name, elapsed, r1.Truncated, len(r1.Imports))
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
