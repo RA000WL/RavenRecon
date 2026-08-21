@@ -836,3 +836,141 @@ func TestDNSBruteEmptyCorpusWithBrute(t *testing.T) {
 	}
 	requireEqualStrings(t, "empty corpus brute", hostNames(res.Additions.Hosts), []string{"www.example.com"})
 }
+
+// stallingResolver is a hermetic resolver for brute timeout tests: it
+// returns quickly for the wildcard probe and for hosts listed in fast,
+// otherwise it blocks until the query context is cancelled (BruteTimeout
+// path) and returns a typed cancellation error. This simulates a resolver
+// that stalls past BruteTimeout without actually sleeping 60s — the parent
+// context has a shorter deadline so bruteCtx fires quickly.
+type stallingResolver struct {
+	mu    sync.Mutex
+	fast  map[string][]string
+	delay time.Duration
+	seen  map[string]int
+}
+
+func newStallingResolver(fast map[string][]string, delay time.Duration) *stallingResolver {
+	if fast == nil {
+		fast = make(map[string][]string)
+	}
+	return &stallingResolver{fast: fast, delay: delay, seen: make(map[string]int)}
+}
+
+func (s *stallingResolver) Lookup(ctx context.Context, host string, rt dns.RecordType) ([]string, error) {
+	s.mu.Lock()
+	if s.seen == nil {
+		s.seen = make(map[string]int)
+	}
+	s.seen[host]++
+	fastKey := host + "\x00" + string(rt)
+	ans, ok := s.fast[fastKey]
+	s.mu.Unlock()
+	// Wildcard probe must never stall — otherwise IsWildcard would block
+	// and the test would not reach brute candidate resolution.
+	if strings.HasPrefix(host, "ravenrecon-wildcard-check.") {
+		return []string{}, nil
+	}
+	if ok {
+		return ans, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, &dns.QueryError{Kind: dns.ErrCancelled, Host: host, Type: rt, Err: ctx.Err()}
+	case <-time.After(s.delay):
+		return []string{}, nil
+	}
+}
+
+// TestDNSBruteTimeoutTruncated is the NEW-23 regression: when
+// dns.BruteTimeout fires mid-resolution the brute must not be recorded
+// completed with no flag. It must set dns_brute_truncated + Truncated,
+// downgrade outcome, and count only attempted hosts.
+func TestDNSBruteTimeoutTruncated(t *testing.T) {
+	target := mustDomain(t, "example.com")
+
+	t.Run("all stalled cancelled", func(t *testing.T) {
+		// All brute candidates stall past the parent deadline.
+		sr := newStallingResolver(nil, 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "a,b"}
+		res, _ := NewDNSStage(sr).Run(ctx, in)
+		if res.Outcome == pipeline.OutcomeCompleted {
+			t.Fatalf("Outcome = completed, want cancelled/partial for timeout-truncated brute (flag=%v truncated=%v)", res.StickyFlags, res.Truncated)
+		}
+		if !res.Truncated {
+			t.Fatalf("Truncated = false, want true for brute timeout")
+		}
+		if !res.StickyFlags[dnsBruteTruncatedFlag] {
+			t.Fatalf("StickyFlags = %v, want %q set for brute timeout", res.StickyFlags, dnsBruteTruncatedFlag)
+		}
+		// Attempted-only counters: both candidates were submitted and
+		// attempted (Types non-empty with cancellation), so ItemsProcessed
+		// is 2, not 0 and not wordlist length 0. Pre-fix returned 0 with
+		// no flag.
+		if res.ItemsProcessed != 2 {
+			t.Fatalf("ItemsProcessed = %d, want 2 (attempted hosts)", res.ItemsProcessed)
+		}
+		if len(res.Additions.Hosts) != 0 {
+			t.Fatalf("Additions.Hosts = %v, want empty (all stalled)", hostNames(res.Additions.Hosts))
+		}
+	})
+
+	t.Run("mixed fast and stalled partial", func(t *testing.T) {
+		fast := map[string][]string{
+			"fast.example.com\x00A": {"93.184.216.34"},
+		}
+		sr := newStallingResolver(fast, 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		in := dnsInput(target, nil)
+		in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "fast,slow"}
+		res, _ := NewDNSStage(sr).Run(ctx, in)
+		if res.Outcome != pipeline.OutcomePartial {
+			t.Fatalf("Outcome = %q, want %q for mixed success+timeout", res.Outcome, pipeline.OutcomePartial)
+		}
+		if !res.Truncated || !res.StickyFlags[dnsBruteTruncatedFlag] {
+			t.Fatalf("Truncated=%v StickyFlags=%v, want truncated with %q", res.Truncated, res.StickyFlags, dnsBruteTruncatedFlag)
+		}
+		requireEqualStrings(t, "mixed hosts", hostNames(res.Additions.Hosts), []string{"fast.example.com"})
+		if res.ItemsProcessed != 2 {
+			t.Fatalf("ItemsProcessed = %d, want 2 (fast attempted + slow cancelled)", res.ItemsProcessed)
+		}
+		if res.ItemsFailed != 0 {
+			t.Fatalf("ItemsFailed = %d, want 0", res.ItemsFailed)
+		}
+	})
+
+	t.Run("overflow attempted only counters", func(t *testing.T) {
+		// Many candidates, small queue/concurrency so some are never
+		// attempted due to queue overflow when the deadline fires while
+		// Submit is blocked. ItemsProcessed must be attempted-only, not
+		// len(filtered).
+		sr := newStallingResolver(nil, 200*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		in := dnsInput(target, nil)
+		in.Bounds.MaxConcurrency = 1
+		in.Bounds.QueueSize = 2
+		// 10 candidates, filtered will be 10, but only 1 running +2 queued can be submitted before timeout
+		in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "w0,w1,w2,w3,w4,w5,w6,w7,w8,w9"}
+		res, _ := NewDNSStage(sr).Run(ctx, in)
+		if res.Outcome == pipeline.OutcomeCompleted {
+			t.Fatalf("Outcome = completed, want cancelled/partial for overflow timeout")
+		}
+		if !res.Truncated || !res.StickyFlags[dnsBruteTruncatedFlag] {
+			t.Fatalf("Truncated=%v StickyFlags=%v, want truncated with %q", res.Truncated, res.StickyFlags, dnsBruteTruncatedFlag)
+		}
+		// Attempted hosts are those with Types non-empty (only the
+		// running job had a chance to record Types). Pre-fix counted
+		// len(filtered)=10.
+		if res.ItemsProcessed == 10 {
+			t.Fatalf("ItemsProcessed = 10, want <10 (attempted-only, not len(filtered))")
+		}
+		if res.ItemsProcessed <= 0 || res.ItemsProcessed > 3 {
+			t.Fatalf("ItemsProcessed = %d, want 1..3 for overflow (attempted only)", res.ItemsProcessed)
+		}
+	})
+}

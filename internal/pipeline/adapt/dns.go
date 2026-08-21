@@ -180,17 +180,60 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 		baseRes.StickyFlags[dnsBruteWildcardFlag] = true
 		return baseRes, baseErr
 	}
-	if len(bruteRes.Additions.Hosts) == 0 && len(bruteRes.Results.IPs) == 0 {
-		// No brute hosts resolved (or truncated without hosts): preserve the
-		// truncation flag if the wordlist/candidate cap was hit.
+	// If brute produced no new hosts, we may still need to propagate
+	// truncation, counters and a downgraded outcome (timeout case).
+	// Historic path returned baseRes unchanged except for the wordlist cap
+	// flag; the new path also propagates a timeout-truncated brute that
+	// carried no resolving hosts (all cancelled).
+	hasBruteHosts := len(bruteRes.Additions.Hosts) > 0 || len(bruteRes.Results.IPs) > 0
+	if !hasBruteHosts {
+		needsPropagation := bruteRes.Truncated || len(bruteRes.StickyFlags) > 0 || bruteRes.ItemsProcessed > 0 || (bruteRes.Outcome != "" && bruteRes.Outcome != pipeline.OutcomeCompleted)
 		if bruteTruncated {
-			if baseRes.StickyFlags == nil {
-				baseRes.StickyFlags = make(map[string]bool)
-			}
-			baseRes.StickyFlags[dnsBruteTruncatedFlag] = true
-			baseRes.Truncated = true
+			needsPropagation = true
 		}
-		return baseRes, baseErr
+		if !needsPropagation {
+			return baseRes, baseErr
+		}
+		merged := baseRes
+		if len(bruteRes.StickyFlags) > 0 {
+			if merged.StickyFlags == nil {
+				merged.StickyFlags = make(map[string]bool)
+			}
+			for k, v := range bruteRes.StickyFlags {
+				merged.StickyFlags[k] = v
+			}
+		}
+		if bruteTruncated {
+			if merged.StickyFlags == nil {
+				merged.StickyFlags = make(map[string]bool)
+			}
+			merged.StickyFlags[dnsBruteTruncatedFlag] = true
+			merged.Truncated = true
+		}
+		if bruteRes.Truncated {
+			merged.Truncated = true
+		}
+		merged.ItemsProcessed = baseRes.ItemsProcessed + bruteRes.ItemsProcessed
+		merged.ItemsFailed = baseRes.ItemsFailed + bruteRes.ItemsFailed
+		if bruteRes.Outcome != "" && bruteRes.Outcome != pipeline.OutcomeCompleted {
+			switch bruteRes.Outcome {
+			case pipeline.OutcomeCancelled:
+				merged.Outcome = pipeline.OutcomeCancelled
+			case pipeline.OutcomePartial, pipeline.OutcomeIncomplete:
+				if merged.Outcome == pipeline.OutcomeCompleted {
+					merged.Outcome = pipeline.OutcomePartial
+				}
+			case pipeline.OutcomeFailed:
+				if merged.Outcome == pipeline.OutcomeCompleted {
+					merged.Outcome = pipeline.OutcomePartial
+				}
+			default:
+				if merged.Outcome == pipeline.OutcomeCompleted {
+					merged.Outcome = bruteRes.Outcome
+				}
+			}
+		}
+		return merged, baseErr
 	}
 	// Merge brute hosts into the base result's corpus additions and results.
 	merged := mergeBruteAdditions(baseRes, bruteRes, in.Target)
@@ -201,10 +244,27 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 		merged.StickyFlags[dnsBruteTruncatedFlag] = true
 		merged.Truncated = true
 	}
-	// Preserve base outcome/counters: add brute processed count.
+	// Preserve base counters: add brute attempted-only counts.
 	merged.ItemsProcessed = baseRes.ItemsProcessed + bruteRes.ItemsProcessed
-	// ItemsFailed counts hosts with no usable observation — brute failures
-	// are not counted here because only resolving brute hosts are emitted.
+	merged.ItemsFailed = baseRes.ItemsFailed + bruteRes.ItemsFailed
+	if bruteRes.Outcome != "" && bruteRes.Outcome != pipeline.OutcomeCompleted {
+		switch bruteRes.Outcome {
+		case pipeline.OutcomeCancelled:
+			merged.Outcome = pipeline.OutcomeCancelled
+		case pipeline.OutcomePartial, pipeline.OutcomeIncomplete:
+			if merged.Outcome == pipeline.OutcomeCompleted {
+				merged.Outcome = pipeline.OutcomePartial
+			}
+		case pipeline.OutcomeFailed:
+			if merged.Outcome == pipeline.OutcomeCompleted {
+				merged.Outcome = pipeline.OutcomePartial
+			}
+		default:
+			if merged.Outcome == pipeline.OutcomeCompleted {
+				merged.Outcome = bruteRes.Outcome
+			}
+		}
+	}
 	return merged, baseErr
 }
 
@@ -509,11 +569,64 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 		// Engine error on brute: treat as failed brute with no additions.
 		return pipeline.StageResult{}, candidateTruncated, false
 	}
+	// Inspect the raw resolve report for cancellation/timeout. When
+	// BruteTimeout fires mid-resolution dns.Resolve returns nil error but
+	// hosts remain with StatusCancelled (or Types with cancelled/timedOut);
+	// the resolving filter would otherwise silently drop them and the
+	// adapter would record a completed result with no truncation flag
+	// (AGENTS §0.6 violation). Detect any cancelled host and treat the
+	// brute as truncated.
+	var anyCancelled, anyCompleted, anyFailedHR, anyIncomplete bool
+	var attempted, failed int
+	var anyAnswersTruncated bool
+	for _, hr := range rep.Results {
+		wasAttempted := len(hr.Types) > 0
+		if wasAttempted {
+			attempted++
+		}
+		switch hr.Status {
+		case dns.StatusCompleted:
+			anyCompleted = true
+		case dns.StatusFailed:
+			anyFailedHR = true
+			if wasAttempted {
+				failed++
+			}
+		case dns.StatusIncomplete:
+			anyIncomplete = true
+		case dns.StatusCancelled:
+			anyCancelled = true
+		}
+		for _, tr := range hr.Types {
+			if tr.Truncated {
+				anyAnswersTruncated = true
+			}
+		}
+	}
+	bruteTimeout := anyCancelled
+	if !bruteTimeout && bruteCtx.Err() != nil {
+		if isContextError(bruteCtx.Err()) {
+			bruteTimeout = true
+		}
+	}
+	if !bruteTimeout && bruteCtx.Err() != nil {
+		for _, hr := range rep.Results {
+			for _, tr := range hr.Types {
+				if tr.Status == dns.TypeCancelled || tr.Status == dns.TypeTimedOut {
+					bruteTimeout = true
+					break
+				}
+			}
+			if bruteTimeout {
+				break
+			}
+		}
+	}
+
 	// Filter brute hosts to only those that actually resolved (have at least
 	// one address or CNAME observation). NXDOMAIN / NODATA hosts are not
 	// useful brute discoveries and must not pollute the corpus.
 	var resolving []asset.Host
-	var resolvingIPs []asset.IP
 	for _, hr := range rep.Results {
 		if len(hr.IPs) > 0 || len(hr.Targets) > 0 {
 			// Host resolved to at least one IP or CNAME target.
@@ -523,45 +636,97 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 			resolving = append(resolving, hr.Targets...)
 		}
 	}
+	// Helper to build a truncated result for the empty-host case (timeout
+	// or cap) that still carries honest counters, flags and a downgraded
+	// outcome. This preserves AGENTS §0.6: a truncated retained set is
+	// never silently completed.
+	buildEmptyResult := func() (pipeline.StageResult, bool, bool) {
+		if !bruteTimeout && !anyAnswersTruncated && !candidateTruncated {
+			return pipeline.StageResult{}, candidateTruncated, false
+		}
+		res := pipeline.StageResult{
+			ItemsProcessed: attempted,
+			ItemsFailed:    failed,
+		}
+		if bruteTimeout {
+			if anyCompleted || anyIncomplete {
+				res.Outcome = pipeline.OutcomePartial
+			} else if anyFailedHR && !anyCompleted && !anyIncomplete {
+				res.Outcome = pipeline.OutcomeFailed
+			} else {
+				res.Outcome = pipeline.OutcomeCancelled
+			}
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = make(map[string]bool)
+			}
+			res.StickyFlags[dnsBruteTruncatedFlag] = true
+		} else {
+			res.Outcome = pipeline.OutcomeCompleted
+		}
+		if anyAnswersTruncated {
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = make(map[string]bool)
+			}
+			res.StickyFlags[dnsAnswersTruncated] = true
+		}
+		if candidateTruncated {
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = make(map[string]bool)
+			}
+			res.StickyFlags[dnsBruteTruncatedFlag] = true
+		}
+		return res, candidateTruncated, false
+	}
+
 	if len(resolving) == 0 {
-		return pipeline.StageResult{}, candidateTruncated, false
+		return buildEmptyResult()
 	}
 	// Deduplicate resolving hosts by identity and filter to in-domain.
 	resolving = dedupeHosts(resolving)
 	resolving = pipeline.FilterHosts(in.Target, resolving)
 	if len(resolving) == 0 {
-		return pipeline.StageResult{}, candidateTruncated, false
+		return buildEmptyResult()
 	}
 	// Collect IPs for the results channel (only for resolving hosts) —
 	// use the report's merged IPs filtered to resolving hosts' contributions.
 	// Simplest: use rep.AllIPs which already contains only resolving hosts'
 	// IPs (non-resolving hosts have none).
-	resolvingIPs = pipelineFilterIPs(resolving, rep.AllIPs())
+	resolvingIPs := pipelineFilterIPs(resolving, rep.AllIPs())
 
 	bruteResult := pipeline.StageResult{
 		Outcome:        pipeline.OutcomeCompleted,
-		ItemsProcessed: len(filtered),
-		ItemsFailed:    0,
+		ItemsProcessed: attempted,
+		ItemsFailed:    failed,
 		Additions:      pipeline.StageAdditions{Hosts: resolving},
 		Results:        pipeline.Results{IPs: resolvingIPs},
 	}
-	// Propagate any per-type truncation from the brute resolve as well
-	// (answer cap). If any brute type was truncated, the stage's truncation
-	// marker must not be swallowed.
-	for _, hr := range rep.Results {
-		for _, tr := range hr.Types {
-			if tr.Truncated {
-				bruteResult.Truncated = true
-				if bruteResult.StickyFlags == nil {
-					bruteResult.StickyFlags = make(map[string]bool)
-				}
-				bruteResult.StickyFlags[dnsAnswersTruncated] = true
-				break
-			}
+	if anyAnswersTruncated {
+		bruteResult.Truncated = true
+		if bruteResult.StickyFlags == nil {
+			bruteResult.StickyFlags = make(map[string]bool)
 		}
-		if bruteResult.Truncated {
-			break
+		bruteResult.StickyFlags[dnsAnswersTruncated] = true
+	}
+	if bruteTimeout {
+		bruteResult.Truncated = true
+		if bruteResult.StickyFlags == nil {
+			bruteResult.StickyFlags = make(map[string]bool)
 		}
+		bruteResult.StickyFlags[dnsBruteTruncatedFlag] = true
+		if len(resolving) > 0 || anyCompleted || anyIncomplete {
+			bruteResult.Outcome = pipeline.OutcomePartial
+		} else {
+			bruteResult.Outcome = pipeline.OutcomeCancelled
+		}
+	} else if candidateTruncated {
+		bruteResult.Truncated = true
+		if bruteResult.StickyFlags == nil {
+			bruteResult.StickyFlags = make(map[string]bool)
+		}
+		bruteResult.StickyFlags[dnsBruteTruncatedFlag] = true
 	}
 	return bruteResult, candidateTruncated, false
 }
