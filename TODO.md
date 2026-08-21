@@ -1642,7 +1642,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
   ./internal/dns ./internal/pipeline/adapt ./internal/asset ok.
 
 ### NEW-33 (LOW) — atomic writes never fsync the parent directory after rename (internal/cache, internal/report)
-- Status: IN PROGRESS (builder @ 557a5cb, fix implemented, awaiting orchestrator verification)
+- Status: VERIFIED — fixed in 1f4b0c8 (dir fsync best-effort + Validate length checks; reviewer gates green)
 - Reporter: reviewer
 - Owner: builder
 - Problem: cache Put syncs the temp file then renames (cache/cache.go:282-291) with no directory fsync; report writer same (writer.go:148 Sync, :334 Rename). After power loss the rename itself may be lost — degrades to a cache miss / missing report, never corruption, but weakens the documented crash-safe guarantee.
@@ -1651,7 +1651,7 @@ Existing pipeline tests pass unmodified — the T3d3 delta adds one new
 - Work note (builder): fsync fix implemented. Both packages gained `syncDirBestEffort(dir)` (open→Sync→Close; ENOSYS/EINVAL swallowed via `isUnsupportedDirSync` as "filesystem does not support dir fsync"; other errors returned for observability) and an injectable unexported `dirSync` field set at construction (same pattern as FS.beforeSelfHeal). cache/cache.go:104-109 (field), :135 (Open init), :305-311 (Put calls it after successful rename; failure never fails the Put), :314-345 (helper + errno filter). report/writer.go:171-179 (field), :198 (init), :351 (Commit syncs once after all renames), :355-387 (helper mirror — duplicated ~15 lines, no shared parent package). Put/Commit doc comments updated to state the best-effort semantics; README/ARCHITECTURE deliberately untouched (outside this task's allowed file list) — their existing "fsync + atomic rename" wording remains true and now understates the guarantee. Tests: TestPutFsyncsDirectoryAfterRename, TestPutSkipsDirSyncWhenRenameFails, TestPutSucceedsWhenDirSyncFails, TestSyncDirBestEffort (errno table) in cache_test.go; TestFileSinkCommitSyncsDirectory, TestFileSinkCommitSkipsDirSyncWhenCommitFails, TestFileSinkCommitToleratesDirSyncFailure, TestSyncDirBestEffort in writer_test.go. Gates this session: gofmt -l clean; go vet ./... ok; go build ./... ok; go test -count=1 ./internal/cache ./internal/report ./internal/event ok; go test -race -count=1 (same three) ok; go test -count=1 ./... ok.
 
 ### NEW-34 (LOW) — event.Validate allocates a map literal per published event (internal/event)
-- Status: IN PROGRESS (builder @ 557a5cb, fix implemented, awaiting orchestrator verification)
+- Status: VERIFIED — fixed in 1f4b0c8 (dir fsync best-effort + Validate length checks; reviewer gates green)
 - Reporter: reviewer
 - Owner: builder
 - Problem: event.go:105-111 builds a 4-entry map per call; Validate runs on every publish — the hottest observability path.
