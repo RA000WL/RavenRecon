@@ -26,7 +26,11 @@ const (
 	// cause a correctly installed tool to be reported missing.
 	StatusWarn Status = "warn"
 
-	// StatusMissing: the executable could not be found at all.
+	// StatusMissing: the executable could not be found at all — or, for
+	// chaos specifically, exists but cannot be used because PDCP_API_KEY is
+	// not configured (a source that cannot run must be skipped, and skip
+	// logic keys on this status). The two cases are distinguishable via
+	// Detection.Exists and Reason.
 	StatusMissing Status = "missing"
 )
 

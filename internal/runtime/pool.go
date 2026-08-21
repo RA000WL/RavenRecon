@@ -444,10 +444,13 @@ func (p *Pool) execute(i int, job Job) {
 	if d <= 0 {
 		d = p.timeout
 	}
-	ctx, cancel := context.WithCancel(p.abortCtx)
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if d > 0 {
-		cancel() // release the placeholder child; the timeout context replaces it
 		ctx, cancel = context.WithTimeout(p.abortCtx, d)
+	} else {
+		// No deadline: the job's context is just the pool abort signal.
+		ctx, cancel = context.WithCancel(p.abortCtx)
 	}
 	defer cancel()
 

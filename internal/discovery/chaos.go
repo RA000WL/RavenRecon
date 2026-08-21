@@ -25,6 +25,15 @@ import (
 // it the dataset cannot be queried; Detect surfaces a missing key as
 // StatusMissing so doctor and pre-run detection make the configuration gap
 // explicit (the binary may exist but is unusable without the key).
+//
+// The missing-key state is deliberately StatusMissing rather than a WARN or
+// a dedicated "unconfigured" status: the pipeline skips a source only on
+// StatusMissing, so a WARN would send chaos into execution keyless and turn
+// a clean skip into a guaranteed run failure, and a new status value would
+// ripple through Label(), skip logic, doctor rendering, and every test that
+// pins the three-value vocabulary. Not-installed vs not-configured remains
+// distinguishable: Detection.Exists stays true here, and Reason names the
+// exact gap ("installed but not configured").
 type chaos struct{ env toolEnv }
 
 // Name implements Source.
@@ -45,11 +54,14 @@ func (c chaos) Detect(ctx context.Context) Detection {
 	d.Exists = true
 	// Chaos requires PDCP_API_KEY: without it the tool cannot query the Chaos
 	// dataset. Report this as missing (not warn) so the doctor output reads
-	// "chaos: missing (PDCP_API_KEY not set)" and the operator knows the tool
-	// is not usable in this environment. The key is free tier 10k req/m.
+	// "chaos: missing (...)" and — critically — the pipeline skips the source
+	// instead of running it keyless. The Reason leads with "installed but not
+	// configured" so the operator can tell this state apart from a genuinely
+	// absent binary; Detection.Exists also stays true. The key is free tier
+	// 10k req/m.
 	if v := strings.TrimSpace(os.Getenv("PDCP_API_KEY")); v == "" {
 		d.Status = StatusMissing
-		d.Reason = fmt.Sprintf("executable %s exists but PDCP_API_KEY not set (chaos requires PDCP_API_KEY; free tier 10k req/m)", path)
+		d.Reason = fmt.Sprintf("installed but not configured: executable %s exists but PDCP_API_KEY not set (chaos requires PDCP_API_KEY; free tier 10k req/m)", path)
 		return d
 	}
 	res, err := e.runner.Run(ctx, Cmd{Path: path, Args: []string{"-version"}}, Limits{MaxOutput: 4 << 10})

@@ -116,7 +116,6 @@ func MergeEndpoints(a, b Endpoint) (Endpoint, error) {
 	}
 	out := a
 	out.URL = mergedURL
-	out.Method = a.Method
 	out.Prov = earliestProv(a.Prov, b.Prov)
 	return out, nil
 }
@@ -294,7 +293,10 @@ func preferJavaScriptFinalURL(a, b JavaScript) URL {
 // (existing values are never evicted) and Truncated is set when either side
 // was truncated or the union exceeded the cap. FirstSeen is the earliest
 // and LastSeen the latest of the two observations; Sources are unioned in
-// order, deduplicated; provenance is the earliest observation's.
+// order, deduplicated, capped at maxParameterSources with the same
+// drop-not-error semantics — a cut sets SourcesTruncated, which is sticky
+// across chained merges like Truncated. Provenance is the earliest
+// observation's.
 func MergeParameters(a, b Parameter) (Parameter, error) {
 	if !a.Identity().Equal(b.Identity()) {
 		return Parameter{}, mergeMismatch(KindParameter, a.Identity(), b.Identity())
@@ -324,11 +326,20 @@ func MergeParameters(a, b Parameter) (Parameter, error) {
 	if b.LastSeen.After(a.LastSeen) {
 		m.LastSeen = b.LastSeen
 	}
+	sourcesTruncated := a.SourcesTruncated
 	for _, s := range b.Sources {
-		if !containsString(m.Sources, s) {
-			m.Sources = append(m.Sources, s)
+		if containsString(m.Sources, s) {
+			continue
 		}
+		if len(m.Sources) >= maxParameterSources {
+			sourcesTruncated = true
+			continue
+		}
+		m.Sources = append(m.Sources, s)
 	}
+	// Truncation is sticky: either input's marker survives, and an actual
+	// cut of this merge's union sets it fresh (see MergeParameters).
+	m.SourcesTruncated = sourcesTruncated || b.SourcesTruncated
 	m.Truncated = truncated || b.Truncated
 	m.Prov = earliestProv(a.Prov, b.Prov)
 	return m, nil

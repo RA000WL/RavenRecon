@@ -17,6 +17,16 @@ import (
 // consumers know the observed list is incomplete.
 const maxParameterValues = 1024
 
+// maxParameterSources bounds the number of distinct sources retained per
+// parameter, mirroring the ObservedValues bound: sources arrive from
+// validated but otherwise uncontrolled strings (up to maxParameterSourceBytes
+// each), so Without a cap a stream of distinct source names could grow
+// Sources without bound. Retention matches the value list: sources already
+// recorded are never evicted; only NEW sources beyond the cap are dropped,
+// and the Parameter's SourcesTruncated marker is set so consumers know the
+// source list is incomplete.
+const maxParameterSources = 64
+
 // Single-observation bounds applied by NewParameter and WithValue.
 const (
 	// maxParameterNameBytes bounds a parameter name. Names are embedded in
@@ -61,8 +71,21 @@ type Parameter struct {
 	LastSeen time.Time `json:"last_seen"`
 
 	// Sources is the ordered, deduplicated list of sources that observed
-	// this parameter.
+	// this parameter, capped at maxParameterSources. SourcesTruncated
+	// reports dropped sources.
 	Sources []string `json:"sources,omitempty"`
+
+	// SourcesTruncated reports that a NEW source was DROPPED from this
+	// parameter's retained source list because maxParameterSources was
+	// reached. It is set by WithValue and MergeParameters exactly when
+	// entries were actually cut — an exactly-at-cap list leaves it false —
+	// and it is sticky: once true it stays true across further observations
+	// and merges, so a truncated retained set can never heal back to
+	// "complete". Builders never set it: NewParameter rejects over-bounds
+	// input outright instead of truncating. It is an output marker only —
+	// never part of the identity and never an input to any cache key — and
+	// decodes as false from records written before it existed.
+	SourcesTruncated bool `json:"sources_truncated,omitempty"`
 
 	// Truncated reports whether observations were dropped because the
 	// ObservedValues cap was reached. It is sticky: once true it stays true.
@@ -126,9 +149,10 @@ func (p Parameter) String() string { return p.Location + ":" + percentEncode(p.N
 // deduplicated), but the observation itself is still recorded: LastSeen
 // advances and source is added to Sources once. When the ObservedValues
 // cap (maxParameterValues) is reached, NEW values are dropped — existing
-// values are never evicted — and Truncated is set. FirstSeen and Prov are
-// never changed here; only MergeParameters combines two observation
-// histories.
+// values are never evicted — and Truncated is set; the Sources cap
+// (maxParameterSources) behaves identically for NEW sources, setting
+// SourcesTruncated. FirstSeen and Prov are never changed here; only
+// MergeParameters combines two observation histories.
 func WithValue(p Parameter, value string, source string, at time.Time) (Parameter, error) {
 	if err := validateParameterValue(value); err != nil {
 		return Parameter{}, err
@@ -144,7 +168,11 @@ func WithValue(p Parameter, value string, source string, at time.Time) (Paramete
 		out.LastSeen = at
 	}
 	if !containsString(out.Sources, source) {
-		out.Sources = append(out.Sources, source)
+		if len(out.Sources) >= maxParameterSources {
+			out.SourcesTruncated = true
+		} else {
+			out.Sources = append(out.Sources, source)
+		}
 	}
 	if !containsString(out.ObservedValues, value) {
 		if len(out.ObservedValues) >= maxParameterValues {

@@ -496,3 +496,203 @@ func TestParameterSerializationRoundTrip(t *testing.T) {
 		t.Errorf("identity changed after serialization: %q != %q", back.ID(), prm.ID())
 	}
 }
+
+// TestParameterSourceCap pins the Sources bound: NEW sources beyond
+// maxParameterSources are dropped (existing ones never evicted) and
+// SourcesTruncated is set exactly when a cut occurred — an exactly-at-cap
+// list stays unflagged. Mirrors the ObservedValues cap semantics.
+func TestParameterSourceCap(t *testing.T) {
+	at := fixedTime(10)
+	p := Provenance{Source: "manual", DiscoveredAt: at}
+	prm, err := NewParameter("q", "query", "v0", "src-0", at, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < maxParameterSources; i++ {
+		prm, err = WithValue(prm, "v"+strconv.Itoa(i), "src-"+strconv.Itoa(i), at)
+		if err != nil {
+			t.Fatalf("WithValue(%d): %v", i, err)
+		}
+	}
+	if len(prm.Sources) != maxParameterSources || prm.SourcesTruncated {
+		t.Fatalf("at cap: len=%d truncated=%v", len(prm.Sources), prm.SourcesTruncated)
+	}
+
+	// One more NEW source is dropped; existing sources are never evicted.
+	prm, err = WithValue(prm, "overflow", "overflow-src", fixedTime(11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prm.SourcesTruncated {
+		t.Error("SourcesTruncated must be set when a new source is dropped")
+	}
+	if len(prm.Sources) != maxParameterSources {
+		t.Errorf("len = %d, want %d (no eviction)", len(prm.Sources), maxParameterSources)
+	}
+	if containsString(prm.Sources, "overflow-src") {
+		t.Error("new source beyond the cap must be dropped")
+	}
+
+	// A known source at the cap records the observation without a cut.
+	prm, err = WithValue(prm, "more", "src-0", fixedTime(12))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prm.LastSeen != fixedTime(12) {
+		t.Errorf("known-source observation must advance LastSeen: %v", prm.LastSeen)
+	}
+	if len(prm.Sources) != maxParameterSources {
+		t.Errorf("duplicate source at cap changed length: %d", len(prm.Sources))
+	}
+}
+
+// TestMergeParametersSourcesTruncatedFlag pins the marker contract for the
+// merged source list, mirroring MergeTLSCertificates' DNSNamesTruncated:
+// a union beyond maxParameterSources is cut and flags the result; an
+// exactly-at-cap union with nothing dropped leaves it false in both orders;
+// the flag is sticky across chained merges.
+func TestMergeParametersSourcesTruncatedFlag(t *testing.T) {
+	at := fixedTime(10)
+	p := Provenance{Source: "manual", DiscoveredAt: at}
+
+	build := func(name string, n int) Parameter {
+		t.Helper()
+		prm, err := NewParameter(name, "query", "v0", "src-0", at, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < n; i++ {
+			prm, err = WithValue(prm, "v"+strconv.Itoa(i), "src-"+strconv.Itoa(i), at)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return prm
+	}
+
+	full := build("q", maxParameterSources)
+	extraSrc := build("q", 1)
+	extraSrc, err := WithValue(extraSrc, "extra", "extra-src", fixedTime(12))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A union beyond the cap drops b's new source and flags both orders.
+	mAB, err := MergeParameters(full, extraSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mBA, err := MergeParameters(extraSrc, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []Parameter{mAB, mBA} {
+		if !m.SourcesTruncated {
+			t.Error("SourcesTruncated = false after a source union was cut, want true (the silent drop)")
+		}
+		if len(m.Sources) != maxParameterSources {
+			t.Errorf("len = %d, want %d (no eviction)", len(m.Sources), maxParameterSources)
+		}
+	}
+	// The cut is order-dependent on WHICH entry drops (retention keeps
+	// earlier-seen entries), but never silent: whichever side's latecomer
+	// lost, the result is flagged and capped.
+	if containsString(mAB.Sources, "extra-src") {
+		t.Error("b's new source beyond the cap must be dropped (a,b order)")
+	}
+	if containsString(mBA.Sources, "src-"+strconv.Itoa(maxParameterSources-1)) {
+		t.Error("a's late source beyond the cap must be dropped (b,a order)")
+	}
+
+	// An exactly-at-cap union with nothing dropped stays unflagged.
+	dupOfFull := build("q", maxParameterSources)
+	exact, err := MergeParameters(full, dupOfFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exact.SourcesTruncated {
+		t.Error("SourcesTruncated = true for an exactly-at-cap union with nothing dropped, want false")
+	}
+	if len(exact.Sources) != maxParameterSources {
+		t.Errorf("len = %d, want %d", len(exact.Sources), maxParameterSources)
+	}
+
+	// Sticky: re-merging a flagged result keeps it flagged even when no new
+	// cut occurs, in both argument orders.
+	chained, err := MergeParameters(mAB, dupOfFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chained.SourcesTruncated {
+		t.Error("SourcesTruncated = false after re-merging a flagged result, want true (sticky)")
+	}
+	chainedBA, err := MergeParameters(dupOfFull, mAB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !chainedBA.SourcesTruncated {
+		t.Error("SourcesTruncated = false after re-merging a flagged result (b,a order), want true (sticky)")
+	}
+
+	// Builders never set it.
+	fresh := build("fresh", 1)
+	if fresh.SourcesTruncated {
+		t.Error("NewParameter/WithValue must not set SourcesTruncated below the cap")
+	}
+}
+
+// TestParameterSourcesTruncatedJSON pins the wire compatibility of the
+// marker: it serializes under its own key and round trips; it is absent
+// (omitempty) from JSON of an unflagged parameter so pre-existing consumers
+// see no change; and legacy records written before the field existed decode
+// with it false.
+func TestParameterSourcesTruncatedJSON(t *testing.T) {
+	at := fixedTime(10)
+	p := Provenance{Source: "manual", DiscoveredAt: at}
+	prm, err := NewParameter("q", "query", "v", "s1", at, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prm, err = WithValue(prm, "v2", "s2", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := json.Marshal(prm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Parameter
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back, prm) {
+		t.Errorf("round trip mismatch:\n got %#v\nwant %#v", back, prm)
+	}
+
+	// omitempty: an unflagged parameter's JSON carries no marker key.
+	clean, _ := NewParameter("a", "query", "x", "s1", at, p)
+	cleanJSON, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cleanJSON), "sources_truncated") {
+		t.Errorf("unflagged parameter serialized the marker key: %s", cleanJSON)
+	}
+
+	// Legacy record without the key decodes false.
+	var legacy Parameter
+	if err := json.Unmarshal([]byte(`{"name":"q","location":"query","observed_values":["v"],"first_seen":"0001-01-01T00:00:00Z","last_seen":"0001-01-01T00:00:00Z","sources":["s1"]}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.SourcesTruncated {
+		t.Error("legacy record without the marker key decoded SourcesTruncated=true, want false")
+	}
+
+	// The marker is not part of the identity.
+	flagged := clean
+	flagged.SourcesTruncated = true
+	if flagged.ID() != clean.ID() {
+		t.Error("SourcesTruncated must not affect the identity")
+	}
+}
