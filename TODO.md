@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-59).
+  next free `NEW-n` (currently NEW-60).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -102,6 +102,19 @@ orchestrator; every agent may append or update its own entries.
   mid-task. Their constants are unexported, so detectors must be in-package.
 - Fix: add bounds_c4_test.go to both packages pinning the documented values.
 - Verification: tests pass; constants drift would fail them.
+
+### NEW-59 (HIGH) — v1.8 Universal Asset Ingestion Framework (ROADMAP v1.8)
+- Status: IN PROGRESS (orchestrator, 2026-08-23) — milestone tracker; per-task records appended below as batches land
+- Reporter: master
+- Owner: builder (per-task dispatches)
+- Problem: ROADMAP v1.8 — importer adapters behind one interface, auto format detection without --type, streaming bounded memory (10MB/100MB/1GB+), provenance, dedup via identity/merge, cache integration (content hash + config + schema + importer version), pipeline enrichment, ingest CLI, reporting attribution (Discovered/Imported/Enriched/Generated). Research round completed (ses_fd6274180ffe5S6QP1RyA3jfpI + ses_fd6274179ffeaKw7DHmFFC3Gje); reality: internal/importer does not exist (greenfield, ~10-13 new files, ~8-10 touched), asset builders are single normalization point, cache keys are schema+op+target+material config+tool, pipeline is twelve stages via AllStages()=12 with T4 harness seams, go.mod stdlib-only 1.26.5.
+- Locked decisions (orchestrator, from research):
+  D1 detection = signature→structure→MIME→extension waterfall with peek 32 KiB + line-shape classifier for plain family (asset.ParseURL/NewHost + netip), confidence desc + Name asc, generic fallback last, peek buffered once + Seek(0,0)
+  D2 streaming = incremental line/token parsing: bufio.Reader 8 KiB + ReadSlice maxLine+1 cap (never > effectiveMaxLine+1) + drained bounded chunks + gzip cap 100 MiB via MaxDecompressedBytes, json.Decoder streaming, xml.Decoder token loop, progress every 64 KiB/10k, ctx per record, truncated → partial/incomplete sticky import_truncated
+  D3 interface = single generic Importer (Name/Version/CanImport/Import) + ImportEnv (Clock/Observer/Cache/ProvenanceBase/Bounds) + Sink (AddDomain/Host/URL/IP/CIDR/JS/Finding with seen-map dedup) + Registry Register/Seal/List/Detect (sort Name, post-seal lock) — no importer owns runtime/cache/reporting
+  D4 cache = per-file key via cache.NewKey Operation ingest.import Target import:<sha256-hex> Config {schema, importer_version, max_output, max_line_bytes, max_decompressed_bytes} Tool Name/Version, Data = bounded identities+stats (not raw bytes, MaxRecordSize 16 MiB), repeat unchanged → hit without re-parse via streaming sha256
+  D5 provenance = sidecar ImportDetail map keyed by Identity.String() (importer/tool/filename/importedAt/originalRecord 4 KiB truncated/confidence/metadata) threaded via pipeline Results → report Context→Model, asset Provenance.Source="import:<importer>" + earliest-wins merge, Origin vocabulary Discovered/Imported/Enriched/Generated derived at report assembly
+- Batch 1 (T1-T5 core + plain) IMPLEMENTED + REVIEWED (builder ses_fd622d475ffeXCsSQhyXh04kXE + fixes ses_fd5ee7590ffeIEb3JYkTwtowmt + ses_fd5e2b575ffeIOna79Nq54AKwN; reviewer ses_fd6002b21ffeqLq4JuO2d3lOIv REQUEST CHANGES 2 HIGH 2 MEDIUM 1 LOW → ses_fd5cb3a81ffeuTesk0828utOIg APPROVE): internal/importer/* created (doc/importer/registry/detect/reader/provenance/cache + plain_domains/urls/generic/ips/js/adapt_helpers), registry Register/Seal determinism, detection waterfall + line-shape classifier, streaming bounded 8 KiB ReadSlice + drain bounded + gzip 100 MiB cap, cache keys include max_line_bytes+max_decompressed_bytes, plain importers 7 (domains/subdomains/urls/alive/js/ips/cidrs) via asset builders only, CIDR via netip.ParsePrefix canonical, provenance sidecar, Sink dedup, ImportStats truncated+StickyFlags. Evidence: gofmt/vet/build/test/race green (importer 0.64s/3.5s race, full 22 pkgs incl discovery 113s), heap guard 10 MB synthetic <5 MiB delta, regression tests for HIGH1/2 + MEDIUM1/2 + LOW redaction. Fixes: ReadString→ReadSlice bounded, max_line_bytes+max_decompressed_bytes in key, gzip cap, scannerFor removed, importPathError redaction.
 
 ## Operational warnings (all agents)
 
