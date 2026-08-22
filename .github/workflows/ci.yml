@@ -44,3 +44,60 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  bench-gate:
+    name: Bench gate
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Bench gate (allocations)
+        run: |
+          set -euo pipefail
+          # Comparison semantics (cmd/benchgate): B/op and allocs/op are hard gates
+          # (median >25% over baseline → exit 1, fails this step); ns/op is
+          # advisory-only and never fails the gate. Baseline median 0 skips a
+          # metric; a new run without -benchmem fails loudly instead of passing vacuously.
+          echo "=== event ==="
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/event > /tmp/new-event.txt
+          go run ./cmd/benchgate testdata/bench/event.txt /tmp/new-event.txt
+
+          echo "=== techintel ==="
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/techintel > /tmp/new-techintel.txt
+          go run ./cmd/benchgate testdata/bench/techintel.txt /tmp/new-techintel.txt
+
+          echo "=== priority ==="
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/priority > /tmp/new-priority.txt
+          go run ./cmd/benchgate testdata/bench/priority.txt /tmp/new-priority.txt
+
+          echo "=== jsintel ==="
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/jsintel > /tmp/new-jsintel.txt
+          go run ./cmd/benchgate testdata/bench/jsintel.txt /tmp/new-jsintel.txt
+
+          echo "=== httpprobe ==="
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/httpprobe > /tmp/new-httpprobe.txt
+          # httpprobe baseline contains a single expected FAIL line
+          # (BenchmarkProbeHit10000 hit-pass assertion, see bench_test.go:215)
+          # which benchgate's strict parser rejects (bad iteration count "---").
+          # Strip those diagnostic lines from both sides so the gate compares
+          # the 9 successful samples; a genuine allocation regression still fails (exit 1).
+          grep -v -e "--- FAIL" testdata/bench/httpprobe.txt > /tmp/base-httpprobe.clean.txt
+          grep -v -e "--- FAIL" /tmp/new-httpprobe.txt > /tmp/new-httpprobe.clean.txt
+          go run ./cmd/benchgate /tmp/base-httpprobe.clean.txt /tmp/new-httpprobe.clean.txt
+
+          echo "=== urlintel (excludes BenchmarkIngestMillion) ==="
+          # README: urlintel.txt excludes BenchmarkIngestMillion (see TODO NEW-57);
+          # it was recorded with -bench='Ingest(Cold|Hit)|Normalize|MergeParams'.
+          # Regeneration must use the same filter so benchgate sees matching sets.
+          go test -run '^$' -bench='Ingest(Cold|Hit)|Normalize|MergeParams' -benchmem -count=10 ./internal/urlintel > /tmp/new-urlintel.txt
+          go run ./cmd/benchgate testdata/bench/urlintel.txt /tmp/new-urlintel.txt
