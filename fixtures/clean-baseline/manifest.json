@@ -1,0 +1,53 @@
+{
+  "profile": "clean-baseline",
+  "target": "example.com",
+  "discovery": {
+    "detections": {
+      "subfinder -version": { "stdout": "Current Version: v2.6.3\n" },
+      "assetfinder -h": { "stderr": "Usage: assetfinder [domain]\n", "exit_code": 2 },
+      "amass -version": { "stdout": "v3.23.0\n" },
+      "chaos -version": { "stdout": "chaos v0.5.3\n" }
+    },
+    "runs": {
+      "subfinder -d example.com -silent": { "stdout": "api.example.com\nwww.example.com\n" },
+      "assetfinder example.com": { "stdout": "www.example.com\nadmin.example.com\n" },
+      "amass enum -passive -d example.com": { "stdout": "admin.example.com\n" },
+      "chaos -d example.com -silent -json": { "stdout": "{\"domain\":\"admin.example.com\"}\n" }
+    }
+  },
+  "dns": {
+    "www.example.com": { "A": ["93.184.216.34"] },
+    "api.example.com": { "A": ["93.184.216.35"] },
+    "admin.example.com": { "A": ["93.184.216.36"] }
+  },
+  "http": {
+    "www.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "api.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "admin.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    }
+  },
+  "urlintel": [
+    "http://www.example.com/app.js",
+    "http://api.example.com/lib.js?v=2",
+    "http://www.example.com/graphql",
+    "http://www.example.com/app.js"
+  ],
+  "js": {
+    "/app.js": { "file": "app.js" },
+    "/lib.js": {
+      "body": "const orders = \"/api/v2/orders\";\nconst gkey = \"AIzaSyA-test-key-123456789012345678901234\";\nwindow.__webpack_require__ = {};\n"
+    },
+    "/shared.js": { "body": "window.ready = true;\n" }
+  }
+}

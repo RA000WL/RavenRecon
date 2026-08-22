@@ -158,6 +158,28 @@ orchestrator; every agent may append or update its own entries.
   pipeline MaxDocumentBytes self-justification and techintel HTML-cap
   wording deserve explicit doc lines.
 
+- Batch E (clean-profile fixtures → goldens) IMPLEMENTED + REVIEWED
+  (builder sessions ses_fd696227effeKav1ggph44mtXF verification/fixes +
+  ses_fd67b47e1ffeY9992V4okwUJYo review-condition fixes; reviewer APPROVE,
+  2026-08-22): fixture_manifest.go gains resolveProfilePath containment
+  (LOW-2 hardened; lexical-only caveat documented); parser/loader tests
+  cover every rejection branch incl. the previously-untested parse-failure
+  wrap; acceptance_clean_test.go materializes fixtures/clean-baseline
+  through the EXISTING T4 seams (fixed clock, fresh temp-dir cache, loopback
+  JS serving) producing normalized RunReport golden + 12 stage-named goldens
+  + markdown report golden under internal/pipeline/adapt/testdata/
+  acceptance_clean/ via shared internal/golden -update semantics; redaction
+  scrub order made deterministic (longest-first, 64-iteration pin).
+  Evidence: determinism 3× (+5× by reviewer), perturbation swap fails
+  exactly the two swapped stage subtests (stage name IS the failing subtest),
+  -update round-trip byte-stable, hermeticity proven with PATH=/nonexistent,
+  -race green. Review conditions applied: timestampMaskKeys completed
+  (StartedAt/EndedAt/At/started_at/ended_at/not_before/not_after),
+  lexical-containment doc sentence. Staging note: ONLY clean-baseline lands
+  with this batch — messy-contradictory/ + hostile-adversarial/ stay
+  untracked until their consuming batch (F); HIGH-2 resolved by consumer +
+  tests landing together with the format.
+
 ### NEW-57 (MED) — BenchmarkIngestMillion fails its own assertion: ~1.8% store shortfall at 1M lines (internal/urlintel)
 - Status: OPEN
 - Reporter: builder (v1.7 batch D, NEW-56)

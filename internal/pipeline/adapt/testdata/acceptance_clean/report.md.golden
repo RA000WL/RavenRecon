@@ -1,0 +1,128 @@
+# RavenRecon Report — example.com
+
+**Target:** example.com
+
+- Started: 2026-08-13T12:00:00Z
+- Ended: 2026-08-13T12:00:00Z
+- Duration: 0ms
+- Model digest: `ee0a9fd5c107a1cb6a4109375d6489951399ebd07f7f4937f72b61b9af0c0453`
+
+## Summary
+
+| metric | value |
+| --- | --- |
+| assets | 58 |
+| hosts | 3 |
+| urls | 12 |
+| javascript | 10 |
+| secrets | 2 |
+| findings | 1 |
+| rules | 0 |
+| relationships | 40 |
+| recommendations | 3 |
+| cache hits / misses | 0 / 0 |
+| worker time | 0ms |
+
+## Interesting Assets
+
+| surface | score | level | top factor |
+| --- | --- | --- | --- |
+| host:admin.example.com | 0.6000 | medium | admin host admin |
+| url:http://admin.example.com/ | 0.6000 | medium | admin host admin |
+| url:https://admin.example.com/ | 0.6000 | medium | admin host admin |
+| host:api.example.com | 0.0000 | unknown |  |
+| host:www.example.com | 0.0000 | unknown |  |
+| url:http://api.example.com/ | 0.0000 | unknown |  |
+| url:http://api.example.com/api/v2/orders | 0.0000 | unknown |  |
+| url:http://api.example.com/lib.js?v=2 | 0.0000 | unknown |  |
+| url:http://www.example.com/ | 0.0000 | unknown |  |
+| url:http://www.example.com/api/v1/users | 0.0000 | unknown |  |
+| url:http://www.example.com/app.js | 0.0000 | unknown |  |
+| url:http://www.example.com/graphql | 0.0000 | unknown |  |
+| url:http://www.example.com/shared.js | 0.0000 | unknown |  |
+| url:https://api.example.com/ | 0.0000 | unknown |  |
+| url:https://www.example.com/ | 0.0000 | unknown |  |
+
+## Technologies
+
+| name | category | version | confidence |
+| --- | --- | --- | --- |
+| webpack | build_tool |  | 0.70 |
+| react | framework |  | 0.50 |
+| graphql | graphql |  | 0.80 |
+
+## Secrets
+
+_Detected candidates only — never verified, never severity-rated._
+| type | value | source | confidence |
+| --- | --- | --- | --- |
+| aws | AKIAAAAAAAAAAAAA0007 | javascript:http://www.example.com/app.js |  |
+| google | AIzaSyA-test-key-1234567890123456789012 | javascript:http://api.example.com/lib.js?v=2 |  |
+
+## Live URLs
+
+| url | status | redirect | tls | truncated |
+| --- | --- | --- | --- | --- |
+| http://admin.example.com/ | 200 | — | — | false |
+| http://api.example.com/ | 200 | — | — | false |
+| http://api.example.com/api/v2/orders | 200 | — | — | false |
+| http://api.example.com/lib.js?v=2 | 200 | — | — | false |
+| http://www.example.com/ | 200 | — | — | false |
+| http://www.example.com/api/v1/users | 200 | — | — | false |
+| http://www.example.com/app.js | 200 | — | — | false |
+| http://www.example.com/graphql | 200 | — | — | false |
+| http://www.example.com/shared.js | 200 | — | — | false |
+| https://admin.example.com/ | 200 | — | — | false |
+| https://api.example.com/ | 200 | — | — | false |
+| https://www.example.com/ | 200 | — | — | false |
+
+## Top Findings
+
+| rule | category | subject | confidence | priority |
+| --- | --- | --- | --- | --- |
+| t3d.integration.tech-listing | information | technology:build_tool/webpack | 0.9000 | info |
+
+## Attack Surface
+
+| group anchor | score | level | members |
+| --- | --- | --- | --- |
+| domain:example.com | 0.6000 | medium | 15 |
+
+_Reconnaissance reading orders (hypotheses, never exploitation chains):_
+
+- **domain:example.com** (score 0.6000, medium)
+  - `domain:example.com` — correlation root: 15 scored surface(s) group under this anchor
+  - `host:admin.example.com` — admin host admin
+  - `url:http://admin.example.com/` — admin host admin
+  - `url:https://admin.example.com/` — admin host admin
+
+## Recommendations
+
+_Reconnaissance guidance only; every item cites the evidence it came from._
+
+- **host:admin.example.com** (interestingness:interestingness, weight 0.9000): test guidance admin
+
+- **url:http://admin.example.com/** (interestingness:interestingness, weight 0.9000): test guidance admin
+
+- **url:https://admin.example.com/** (interestingness:interestingness, weight 0.9000): test guidance admin
+
+## Statistics
+
+| metric | value |
+| --- | --- |
+| hosts | 3 |
+| urls | 12 |
+| endpoints | 12 |
+| technologies | 3 |
+| secrets | 2 |
+| relationships | 40 |
+| findings | 1 |
+| live urls | 12 |
+| rules | 0 |
+| surfaces / groups / paths | 15 / 1 / 1 |
+| worker time | 0ms |
+| execution time | 0ms |
+
+## Errors
+
+_No errors recorded for this run._
