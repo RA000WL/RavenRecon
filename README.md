@@ -4,7 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v1.4.0**
+**v1.7.0 — Integration and acceptance testing complete**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -12,11 +12,19 @@ cancellable, rate-limited runtime engine (`internal/runtime`), and its first
 consumer: passive subdomain discovery (`internal/discovery`) with adapters
 for subfinder, assetfinder, and amass (passive mode only).
 
-An end-to-end pipeline (`internal/pipeline`) composes
-discover → dns → httpprobe → urlintel → techintel → jsintel → secrentel →
-priority → detect → report into one deterministic, cancellable run, exposed
-as the `ravenrecon scan <domain>` command (v1.3) with live terminal
-observability (`scan --tui`, v1.4) driven by the run's canonical events.
+An end-to-end pipeline (`internal/pipeline`, `AllStages()` = 12 via `internal/pipeline/config.go:64`) composes
+discover → dns → httpprobe → urlintel → crawl → techintel → jsintel → secrentel → urllive →
+priority → detect → report into one deterministic, cancellable run (twelve stages, v1.5 `crawl` + `urllive`
+included), exposed as the `ravenrecon scan <domain>` command (v1.3) with live terminal
+observability (`scan --tui`, v1.4) driven by the run's canonical events. v1.7 closes the acceptance
+framework: `fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/` manifests (`fixtures/<profile>/manifest.json`
++ `internal/pipeline/adapt/fixture_manifest.go`) materialized through the existing T4 seams (fixed clock, fresh
+temp-dir cache, loopback JS; see `fixtures/README.md`), per-stage goldens (`internal/pipeline/adapt/testdata/acceptance_{clean,messy,hostile}/`
+normalized `RunReport` + 12 stage-named goldens + markdown via shared `internal/golden` with `go test -update`
+regeneration — failing subtest IS the stage name; determinism 3×/5×, hermetic `PATH=/nonexistent`; see `internal/golden/README.md`),
+bench baselines (`testdata/bench/*.txt` `-count=10 -benchmem` + `cmd/benchgate` stdlib-only comparator, median `B/op`/`allocs/op` `>25%` hard gate,
+`ns/op` advisory; no `benchstat` dep per D4 — see `testdata/bench/README.md`), memory guards (`bounds_c4_test.go` drift detectors + `HeapInuse`
+delta `32 MiB`, `SKIPPED` under `-race`), and CI drift gate (`.github/workflows/ci.yml` `bench-gate` job).
 
 Active infrastructure is landing incrementally: the DNS pipeline
 (`internal/dns`, roadmap v0.6 sub-milestone 5A) and the HTTP probing
@@ -754,7 +762,7 @@ go run ./cmd/ravenrecon scan example.com
 go run ./cmd/ravenrecon scan example.com --stages discover,dns,httpprobe --output out/
 ```
 
-`scan` runs all ten stages in pipeline order (or the `--stages` selection),
+`scan` runs all twelve stages in pipeline order (`AllStages()` = 12: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel → secrentel → urllive → priority → detect → report; or the `--stages` selection),
 writes the report into the output directory (default `ravenrecon-report`),
 and exits 0 on completed and partial runs and 1 on failed, cancelled, and
 incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources

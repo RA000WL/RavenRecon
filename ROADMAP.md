@@ -53,7 +53,7 @@ Every phase must satisfy these before it is complete:
 | v1.4 | Live terminal observability | ✅ Complete | `scan --tui`/`--tui-compact` wired + NEW-21 render fix proven live (field trials 1–2); OPT-P2-3 + OPT-P1-1 landed; OPT-P1-5 deferred to v1.6 (jsintel still text-matches `"tls:"`). |
 | v1.5 | Real-world validation, URL hunting, discovery data quality | ✅ Complete | Quality gate b46a110; JS→URL 2d06b94; urllive 7fc7e4c; per-tool+health f44cecc; honest duration 08861f0; chaos 184796a; dnsx brute 0a19d67; katana crawl 1ab2e99; validated across 5 real-target field trials (NEW-19/36/38/39/40). Remainder: NEW-48 (OPT-P2-1 --dry-run/help docs). |
 | v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
-| v1.7 | Integration and acceptance testing | ⏳ Planned | Formerly v1.6 — fixtures, snapshots, baselines, CI (renumbered 2026-08-20). Optimizations: `OPT-P3-1` + `OPT-P2-4` bench baselines. |
+| v1.7 | Integration and acceptance testing | ✅ Complete | Closed 2026-08-23 — fixtures/goldens/bench-gate landed (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; NEW-56/57/58): `fixtures/<profile>/` hybrid manifests, per-stage goldens via `internal/golden` (`-update`), `testdata/bench/*.txt` + `cmd/benchgate` stdlib comparator (D4, no `benchstat`), CI bench-gate job, memory guards (C-4 drift + HeapInuse), D6 interaction suite across 12 stages; validated deterministic, `gofmt`/`vet`/`build`/`test`/`-race` green. |
 | v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-2`. |
 | v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-3` + `OPT-P1-2` isolation for third-party packs. |
 
@@ -374,29 +374,38 @@ Acceptance criteria:
 
 ## v1.7 — Integration and acceptance testing
 
-Status: planned (formerly v1.6; renumbered 2026-08-20 so roadmap order ==
-execution order)
+Status: ✅ Complete (closed 2026-08-23; formerly v1.6, renumbered 2026-08-20 so roadmap order ==
+execution order — commits 53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; TODO.closed.md NEW-56/57/58)
 
 Goal: prove the platform works reliably across realistic fixture targets.
 
 > Audit companion: `OPTIMIZATION.md:6` — `OPT-P3-1` + `OPT-P2-4` bench baselines; metrics in `OPTIMIZATION.md:9`.
+> Acceptance framework: `fixtures/<profile>/` hybrid weighted-static manifests materialized through the
+> existing T4 harness seams (fixed clock + fresh temp-dir cache + loopback JS), per-stage goldens via
+> shared `internal/golden` (`go test -update` regenerates, LCS diff, atomic write), `testdata/bench/*.txt`
+> baselines (`-count=10 -benchmem`) + stdlib-only `cmd/benchgate` comparator (decision D4 — hand-rolled,
+> no `benchstat` dependency; ROADMAP wording conflict recorded, see `testdata/bench/README.md`), CI
+> `.github/workflows/ci.yml` bench-gate job (continue-on-error first), memory guards (structural C-4
+> drift detectors + HeapInuse delta guards, SKIPPED under `-race`). Pipeline is twelve stages
+> (`AllStages()` = 12 via `internal/pipeline/config.go:64`; see ARCHITECTURE.md pipeline sections) —
+> goldens and D6 interaction suite cover all 12.
 
-- [ ] Fixture targets — `fixtures/<target>/` (`OPT-P3-1`)
-- [ ] Expected outputs — `testdata/*.golden` snapshot tests (`go test -update` regenerates; `OPT-P3-1`)
-- [ ] Snapshot tests — stage-regressed failure names the stage (`OPT-P3-1`)
-- [ ] Performance baselines — `go test -bench` + `benchstat` recorded (`OPT-P2-4` before/after)
-- [ ] Memory baselines — `benchmem` + bounded-memory assertions (`discovery 4 MiB`, `jsintel 2 MiB`, etc.; `OPTIMIZATION.md:7 C-4`)
-- [ ] CI integration — output drift + perf regression gates (`OPT-P3-1`)
-- [ ] Regression suite for core engine interactions — `OPT-P3-1`
+- [x] Fixture targets — `fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/` hybrid weighted-static (`OPT-P3-1`, D1) — manifests `fixtures/<profile>/manifest.json`, materialized via T4 seams, not a forked harness
+- [x] Expected outputs — `internal/pipeline/adapt/testdata/acceptance_{clean,messy,hostile}/` normalized `RunReport` + 12 stage-named goldens + markdown report goldens (`OPT-P3-1`, D2) — shared `internal/golden` home, second consumer justifies it; `detect` migrated
+- [x] Snapshot tests — failing subtest IS the stage name (`OPT-P3-1`, D2) — `go test -update` round-trips byte-stable, perturbation swap fails exactly swapped stages, hermetic (`PATH=/nonexistent`, loopback)
+- [x] Performance baselines — `go test -bench` + `cmd/benchgate` stdlib comparator recorded (`OPT-P2-4` before/after; ROADMAP said `benchstat` but D4 landed hand-rolled comparator, no `benchstat` dep) — `testdata/bench/*.txt` (`-count=10 -benchmem`, 6 packages: event/techintel/priority/jsintel/httpprobe/urlintel filtered) vs `benchstat` wording conflict resolved per D4
+- [x] Memory baselines — `benchmem` + bounded-memory assertions (structural C-4 drift detectors pinning every `OPTIMIZATION.md:7 C-4` constant where it lives + byte-tier `HeapInuse` delta guards `32 MiB` ceiling, `SKIPPED` under `-race`; no exact-MiB equality) — C-4 clarified (`pipeline.MaxDocumentBytes` + `techintel` caps one line each)
+- [x] CI integration — output drift + perf regression gates (`OPT-P3-1`, D5) — `.github/workflows/ci.yml` `bench-gate` job (`needs:test`, `continue-on-error:true`, `timeout 25m`, `go test -benchmem` + `cmd/benchgate` per pkg, `urlintel` filtered, `httpprobe` `grep -v FAIL` both sides, `median B/op`/`allocs/op` `>25%` fails, `ns/op` advisory)
+- [x] Regression suite for core engine interactions — `OPT-P3-1` + D6 (pipeline-level corrupt-cache recovery, sticky truncation cold→warm, mid-run cancellation across all 12 stages — `internal/pipeline/adapt/interaction_test.go` + `acceptance_profiles_test.go`)
 
 Acceptance criteria:
 
-- Core fixtures produce stable, versioned outputs.
-- CI detects output drift and performance regressions.
-- The suite covers common and edge-case recon scenarios.
-- Baselines are documented and reproducible locally.
-- A failing snapshot clearly identifies which stage regressed.
-- `OPT-P3-1` gates green: `gofmt`, `go vet`, `go build`, `go test`, `go test -race`, `go test -bench` recorded.
+- [x] Core fixtures produce stable, versioned outputs. (3 profiles × `RunReport` + 12 stage goldens + markdown; `-update` round-trip byte-stable; 3×/5× determinism, hermetic)
+- [x] CI detects output drift and performance regressions. (goldens via `go test` fail on drift; bench-gate fails `>25%` median `B/op`/`allocs/op`, advisory `ns/op`; `continue-on-error` until calibrated)
+- [x] The suite covers common and edge-case recon scenarios. (clean/messy/hostile profiles: 1025-host sticky truncation, corrupt-cache self-heal, cancellation before/during/after each stage, over-cap document drop, poisoned DNS)
+- [x] Baselines are documented and reproducible locally. (`testdata/bench/README.md` exact `-count=10 -benchmem` commands, `internal/golden` docs, `ARCHITECTURE.md` pipeline/acceptance mentions; reproducible via `go test -update`/`benchgate`)
+- [x] A failing snapshot clearly identifies which stage regressed. (per-stage golden file + subtest name = stage name; perturbation swap proves isolation)
+- [x] `OPT-P3-1` gates green: `gofmt`, `go vet`, `go build`, `go test`, `go test -race`, `go test -bench` recorded. (all green: batch D 18s adapt, E/F 17s, `internal/event`/`techintel`/`priority`/`jsintel`/`httpprobe`/`urlintel` baselines)
 
 ---
 

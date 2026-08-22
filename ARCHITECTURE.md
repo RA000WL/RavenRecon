@@ -3388,8 +3388,9 @@ Implemented:
   this struct (corpus + every results channel, copied whole)
   (`internal/pipeline`)
 * pipeline full-run determinism + the discovery clock seam (see
-  "Pipeline requirements" above; v1.3 T4): the full ten-stage pipeline
-  with the REAL discovery adapter is pinned deterministic at any pool
+  "Pipeline requirements" above; v1.3 T4) + acceptance framework (v1.7): the full twelve-stage pipeline
+  (`AllStages()` = 12: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
+  secrentel → urllive → priority → detect → report) with the REAL discovery adapter is pinned deterministic at any pool
   concurrency — per-source discovery result order is selection order
   (the engine pre-allocates the Results slot array; each job writes only
   its own slot, never pool-completion order), per-source host lists are
@@ -3448,9 +3449,9 @@ Implemented:
   channel; secrentel consumes the channel, never the
   `Results.JavaScript` field) (`internal/pipeline`)
 * pipeline scan command (see "Pipeline requirements" above; v1.3 T6): the
-  `ravenrecon scan <domain>` CLI command wires the full ten-stage pipeline
-  — discover → dns → httpprobe → urlintel → techintel → jsintel →
-  secrentel → priority → detect → report — with `--stages` selection
+  `ravenrecon scan <domain>` CLI command wires the full twelve-stage pipeline
+  (`AllStages()` = 12: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
+  secrentel → urllive → priority → detect → report) — with `--stages` selection
   (validated against the fixed vocabulary), `--sources` (discovery),
   `--request-timeout` (httpprobe param), `--concurrency`/`--timeout`
   (per-stage bounds for every selected stage), `--cache`/`--no-cache`
@@ -3475,6 +3476,22 @@ Implemented:
   default resolver/transport, compiled-in fingerprint/pattern databases,
   the EMPTY detect registry per D2, the four builtin reporters)
   (`internal/cli`, `internal/pipeline/adapt`)
+* pipeline acceptance framework (v1.7, `internal/pipeline/adapt` + `fixtures/` + `testdata/bench/` + `internal/golden`):
+  hybrid weighted-static fixtures (`fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/`
+  manifests materialized through the existing T4 harness seams — fixed clock, fresh temp-dir cache,
+  loopback JS bodies — deterministic via `internal/pipeline/adapt/fixture_manifest.go`); per-stage goldens
+  (`internal/pipeline/adapt/testdata/acceptance_{clean,messy,hostile}/` normalized `RunReport` + 12
+  stage-named `RunReport` shards + markdown report golden via shared `internal/golden` with `-update`,
+  LCS diff, atomic write; failing subtest IS the stage name); bench baselines (`testdata/bench/*.txt`
+  `-count=10 -benchmem` per package + `cmd/benchgate` stdlib-only comparator: median `B/op`/`allocs/op`
+  `>25%` fails `exit 1`, `ns/op` advisory-only; no `benchstat` dep per D4; see `testdata/bench/README.md`);
+  memory guards (structural `bounds_c4_test.go` drift detectors pinning every `OPTIMIZATION.md:7 C-4` constant
+  + `HeapInuse` delta guards `32 MiB`, `SKIPPED` under `-race`); D6 interaction suite (`interaction_test.go`:
+  corrupt-cache recovery, sticky `Truncated` cold→warm, mid-run cancellation across all 12 stages;
+  `acceptance_profiles_test.go` messy/hostile determinism); CI bench-gate (`.github/workflows/ci.yml`
+  `bench-gate` job: `needs:test`, `continue-on-error:true`, `timeout 25m`, `go-version-file`, per-pkg
+  `benchgate` with `urlintel` filtered, `httpprobe` `grep -v FAIL` both sides)
+  (`internal/pipeline/adapt`, `internal/golden`, `cmd/benchgate`, `fixtures/`, `testdata/bench/`)
 
 Planned, not yet implemented:
 

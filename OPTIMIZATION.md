@@ -34,8 +34,8 @@
 bounded concurrency, crash-safe self-healing cache, single normalization point, deterministic
 merges/digests, observer-only event bus, and recon-only adapter safety are all systematically
 enforced and test-pinned. The biggest unlock is **not a new engine** — it is feeding the
-existing ten-stage pipeline (`discover → dns → httpprobe → urlintel → techintel → jsintel →
-secrentel → priority → detect → report`) with **honest, bounded, live-checked inputs**.
+existing twelve-stage pipeline (`discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
+secrentel → urllive → priority → detect → report`) with **honest, bounded, live-checked inputs**.
 
 **Three gaps block effectiveness today** (field-trial evidence in `ROADMAP.md:v1.5`):
 
@@ -302,11 +302,20 @@ hardening → operator experience → future platform work, each with evidence a
 ### OPT-P3-1 — Integration & acceptance testing (`v1.7`)
 
 - **Evidence:** `ROADMAP.md:v1.7` — fixtures, expected outputs, snapshot tests, performance/memory baselines,
-  CI regression suite. None landed yet.
+  CI regression suite. **Landed in v1.7** (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555 — TODO.closed.md NEW-56
+  + NEW-58, NEW-57 fix): `fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/` hybrid
+  weighted-static manifests materialized through the existing T4 harness seams (fixed clock + fresh
+  temp-dir cache + loopback JS), per-stage goldens via shared `internal/golden` (`-update` regenerates,
+  LCS diff, atomic write), structural + HeapInuse memory guards, `testdata/bench/*.txt` (`-count=10
+  -benchmem`) + stdlib-only `cmd/benchgate` comparator (decision D4 — no `benchstat` dep; see
+  `testdata/bench/README.md`), CI `.github/workflows/ci.yml` bench-gate job (continue-on-error first),
+  D6 interaction suite (corrupt-cache recovery, sticky cold→warm, mid-run cancellation across 12 stages).
 - **Fix:** Add `fixtures/<target>/` + `testdata/*.golden` snapshot tests (`go test -update` regenerates),
-  `Benchmark*` baselines recorded (`benchstat`), CI detects output drift + regression. Cover common +
-  edge-case recon scenarios; snapshot failure names the regressed stage.
-- **Verify:** `go test ./...` + `go test -bench` recorded; CI matrix `go 1.26.x`.
+  `Benchmark*` baselines recorded via `testdata/bench/*.txt` (`-count=10 -benchmem`, stdlib-only
+  `cmd/benchgate` comparator — ROADMAP said `benchstat` but decision D4 landed the hand-rolled
+  comparator with no `benchstat` dependency; see `testdata/bench/README.md`), CI detects output drift
+  + regression. Cover common + edge-case recon scenarios; snapshot failure names the regressed stage.
+- **Verify:** `go test ./...` + `go test -bench` recorded; CI matrix `go 1.26.x` — all v1.7 fixtures/goldens/bench-gate green.
 
 ### OPT-P3-2 — Universal Asset Ingestion Framework (`v1.8`)
 
@@ -369,7 +378,11 @@ hardening → operator experience → future platform work, each with evidence a
 ### C-4 Output bounding
 
 - Every stream capped: `discovery 4 MiB`, `urlintel line 32 KiB`, `httpprobe 64 KiB/128/1 MiB/10 redirects`,
-  `jsintel 2 MiB JS / 1 MiB HTML`, `techintel 128/512 HTML caps`, `secrentel 64 candidates/8 evidence`,
+  `jsintel 2 MiB JS / 1 MiB HTML` (fetch `MaxJSBytes` 2 MiB mirrored as `pipeline.MaxDocumentBytes` 2 MiB for the
+  secrentel document channel — same bound, not self-justifying; see `internal/pipeline/document.go:9` →
+  `internal/secrentel` ingest cap), `techintel 128 technologies / 512 indicators per observation`
+  (`MaxTechnologiesPerObservation`/`MaxIndicatorsPerObservation`, not HTML byte caps — the HTML
+  caps are the jsintel 1 MiB above; see `internal/techintel/engine.go:83-84`), `secrentel 64 candidates/8 evidence`,
   `priority` capped, `detect 4096 findings`, `report 100k/modelPerKind`. Lowering caps re-truncates;
   raising caps retains more but never invalidates keys (fixed constants by design).
 
@@ -428,24 +441,24 @@ hardening — per `AGENTS.md:5` scope policy.
 
 | ID | Title | Severity | File:line | Roadmap | Status |
 |----|-------|----------|-----------|---------|--------|
-| OPT-P0-1 | Burst anomaly gate — discovery poisoning | CRITICAL | `ROADMAP.md:v1.5` `discovery/parse.go:21` | v1.5 | VERIFIED |
-| OPT-P0-2 | JS → URL feedback | HIGH | `jsintel/record_analyze.go:176` `pipeline/document.go` | v1.5 | VERIFIED |
-| OPT-P0-3 | Live URL triage `urllive` | HIGH | `httpprobe/run.go:208` `pipeline/results.go` | v1.5 | VERIFIED |
-| OPT-P0-4 | Per-tool deadlines + amass opt-in | HIGH | `urlintel/adapt/source.go:525` | v1.5 | OPEN |
-| OPT-P0-5 | Honest run duration in report | LOW | `report/model.go:142` | v1.5 | OPEN |
-| OPT-P1-1 | Dir fsync durability | MEDIUM | `report/writer.go:334` `cache/cache.go:292` | — | OPEN |
-| OPT-P1-2 | Shared `Context`/`Model` alias | MEDIUM | `detect/context.go:68` `report/model.go:147` | v2.0 gate | OPEN |
-| OPT-P1-3 | Fuzz harnesses | MEDIUM | `ROADMAP.md:v1.6` | v1.6 | OPEN |
-| OPT-P1-4 | Silent truncation merges | LOW | `tls_certificate.go:334` `finding.go:313` | v1.6 | OPEN |
-| OPT-P1-5 | Weak `jsintel` TLS fallback | LOW | `jsintel/fetch.go:678` | — | OPEN |
-| OPT-P1-6 | Fetch truncation flag | LOW | `jsintel/fetch.go:480` `jsintel/engine.go:966` | v1.5 | OPEN |
-| OPT-P2-1 | Split timeouts UX | MEDIUM | `urlintel/adapt/source.go:355` `cli/scan.go:158` | v1.5 | OPEN |
-| OPT-P2-2 | Health early stop | MEDIUM | `jsintel/engine.go:648` | v1.5 | OPEN |
-| OPT-P2-3 | TUI fidelity NEW-21 | MEDIUM | `tui/controller.go:156` `TODO.md:NEW-21` | v1.4 | IN PROGRESS |
-| OPT-P2-4 | Hot-path allocs | LOW | `techintel/analyze.go:580` `priority/score.go:614` `event/bus.go:97` | v1.6 | OPEN |
+| OPT-P0-1 | Burst anomaly gate — discovery poisoning | CRITICAL | `ROADMAP.md:v1.5` `discovery/parse.go:21` | v1.5 | VERIFIED (b46a110, TODO.closed.md NEW-22) |
+| OPT-P0-2 | JS → URL feedback | HIGH | `jsintel/record_analyze.go:176` `pipeline/document.go` | v1.5 | VERIFIED (2d06b94, TODO.closed.md NEW-20) |
+| OPT-P0-3 | Live URL triage `urllive` | HIGH | `httpprobe/run.go:208` `pipeline/results.go` | v1.5 | VERIFIED (7fc7e4c, TODO.closed.md NEW-20) |
+| OPT-P0-4 | Per-tool deadlines + amass opt-in | HIGH | `urlintel/adapt/source.go:525` | v1.5 | VERIFIED (f44cecc, TODO.closed.md NEW-20) |
+| OPT-P0-5 | Honest run duration in report | LOW | `report/model.go:142` | v1.5 | VERIFIED (593177a + 08861f0, TODO.closed.md NEW-40) |
+| OPT-P1-1 | Dir fsync durability | MEDIUM | `report/writer.go:334` `cache/cache.go:292` | — | VERIFIED (1f4b0c8, TODO.closed.md NEW-33) |
+| OPT-P1-2 | Shared `Context`/`Model` alias | MEDIUM | `detect/context.go:68` `report/model.go:147` | v2.0 gate | OPEN (deferred to v2.0) |
+| OPT-P1-3 | Fuzz harnesses | MEDIUM | `ROADMAP.md:v1.6` | v1.6 | VERIFIED (3b21401, TODO.closed.md NEW-49) |
+| OPT-P1-4 | Silent truncation merges | LOW | `tls_certificate.go:334` `finding.go:313` | v1.6 | VERIFIED (d10d719, TODO.closed.md NEW-49) |
+| OPT-P1-5 | Weak `jsintel` TLS fallback | LOW | `jsintel/fetch.go:678` | — | VERIFIED (9575e14, TODO.closed.md NEW-49) |
+| OPT-P1-6 | Fetch truncation flag | LOW | `jsintel/fetch.go:480` `jsintel/engine.go:966` | v1.5 | VERIFIED (ec4b7e7 original + field-proven NEW-36/38 `js_fetch_truncated`) |
+| OPT-P2-1 | Split timeouts UX | MEDIUM | `urlintel/adapt/source.go:355` `cli/scan.go:158` | v1.5 | VERIFIED (8dffa1c, TODO.closed.md NEW-48) |
+| OPT-P2-2 | Health early stop | MEDIUM | `jsintel/engine.go:648` | v1.5 | VERIFIED (f44cecc, TODO.closed.md NEW-20 `jsintel_health_abort`) |
+| OPT-P2-3 | TUI fidelity NEW-21 | MEDIUM | `tui/controller.go:156` `TODO.md:NEW-21` | v1.4 | VERIFIED (e3be8e1 + ad791c3, TODO.closed.md NEW-21) |
+| OPT-P2-4 | Hot-path allocs | LOW | `techintel/analyze.go:580` `priority/score.go:614` `event/bus.go:97` | v1.6 | VERIFIED (8c795eb + 4e31f8d declines with bench evidence, TODO.closed.md NEW-49) |
 | OPT-P2-5 | Standalone CLIs | INFO | `AGENTS.md:2` | post-v1.6 | DEFERRED |
-| OPT-P2-6 | Dedup helpers | INFO | `dns/scope.go:15` `discovery/detect.go:215` | — | OPEN |
-| OPT-P3-1 | Fixtures/snapshots/bench | — | `ROADMAP.md:v1.7` | v1.7 | PLANNED |
+| OPT-P2-6 | Dedup helpers | INFO | `dns/scope.go:15` `discovery/detect.go:215` | — | VERIFIED (4e31f8d + 321c55d, TODO.closed.md NEW-49/53) |
+| OPT-P3-1 | Fixtures/snapshots/bench | — | `ROADMAP.md:v1.7` | v1.7 | VERIFIED (53f2f46 + 2dcdc96 + 9370f3f + 14f61a9 + e043555, TODO.closed.md NEW-56) |
 | OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | PLANNED |
 | OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` | v2.0 | PLANNED |
 | OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` | post-v1.4 | PLANNED |
