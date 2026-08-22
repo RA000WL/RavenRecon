@@ -180,6 +180,34 @@ orchestrator; every agent may append or update its own entries.
   untracked until their consuming batch (F); HIGH-2 resolved by consumer +
   tests landing together with the format.
 
+- Batch F (messy/hostile profiles + D6) IMPLEMENTED + REVIEWED
+  (builder ses_fd65a83beffes97LOKLGsrjXVq; reviewer APPROVE 2026-08-23; hardening
+  builder ses_fd63e5b99ffeD8zW78gYeoaN8a): extends cannedTransport with byPath +
+  oversized (path-precedence RoundTrip, deterministic >1/2 MiB bodies), merges
+  dns_poison after clean DNS (poison overwrites via fakeResolver), handles
+  body_oversized / oversized flags; acceptance_profiles_test.go materializes
+  messy-contradictory + hostile-adversarial via same seams → normalized
+  RunReport + 12 stage-named goldens each under
+  internal/pipeline/adapt/testdata/acceptance_{messy,hostile}/; interaction_test.go
+  adds D6: a) corrupt-cache recovery (truncated JSON/wrong-schema/empty across
+  dns.resolve/http.probe/passive-discovery, self-heal proven via DeepEqual +
+  SchemaVersion rewrite), b) sticky truncation cold→warm (65 answers → partial
+  + Truncated/dns_answers_truncated, warm hit vs re-exec, Duration-zero DeepEqual),
+  c) mid-run cancellation across all 12 stages (before_0..12 + during_0..11 +
+  resume_after_cancel, OutcomeCancelled, bounded pool drain, resume DeepEqual).
+  Evidence: 3× determinism each profile, perturbation swap fails exactly swapped
+  stages, -update byte-stable, hermetic PATH=/nonexistent + loopback, -race green
+  (21s). Review hardening applied: parens guard, deterministic corrupt filter
+  (fail instead of fallback), event-bus wait vs Sleep + sync.Once guards.
+
+- D5 bench-gate CI IMPLEMENTED + REVIEWED
+  (builder ses_fd65f063cffe9px1onHpShV05p; reviewer APPROVE 2026-08-23):
+  extends .github/workflows/ci.yml with bench-gate job (needs:test,
+  continue-on-error:true, timeout 25m, checkout@v4 + setup-go@v5 via
+  go-version-file); regenerates 6 packages with exact README commands
+  (-count=10 -benchmem; urlintel filtered, httpprobe grep -v FAIL both sides)
+  and runs cmd/benchgate per package (exit 1 regression, ns/op advisory).
+
 ### NEW-57 (MED) — BenchmarkIngestMillion fails its own assertion: ~1.8% store shortfall at 1M lines (internal/urlintel)
 - Status: VERIFIED — implemented (debugger, 2026-08-23) and reviewer APPROVE 2026-08-23: root cause was inode exhaustion on 2^20-inode tmpfs (1M entry FILES + 65k shard dirs) silently absorbed — Puts failed with ENOSPC, only per-entry Err captured, run returned nil. Fix: (1) production record.go storeURL now surfaces cache-put failures as bounded run diagnostics via recordCacheDiagnostic (mirroring read side, cancellation filtered); (2) bench_test.go capacity arithmetic volumeFitsInodes + shardDirBound + inodeHeadroom with pre-flight millionCacheDir fallback to user cache dir (disk-backed dynamic inodes) and loud skip when no volume qualifies; assertNoEntryDiagnostics pins honesty; header documents ~50 min wall time. Honesty guaranteed by dual channels (entry Err + run diagnostics). Baseline re-inclusion deferred: workload takes ~50 min and is -short-gated; urlintel.txt correctly stays without the million line (benchgate handles missing). Archived to TODO.closed.md on next close.
 - Reporter: builder (v1.7 batch D, NEW-56)

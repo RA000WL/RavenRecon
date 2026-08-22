@@ -122,40 +122,74 @@ func newFixtureHarness(t *testing.T, m fixtureManifest) *fixtureHarness {
 		}
 	}
 
-	// HTTP probing: the canned transport matches scheme://host, so bare
-	// host keys register both schemes (cannedHost) and explicit
-	// scheme://host keys register that scheme alone. Path-scoped responses
-	// have no canned-transport expression and are rejected.
-	if len(m.DNSPoison) > 0 {
-		t.Fatal("fixture manifest: dns_poison belongs to the cache-poisoning scenario (messy profile) and is not consumed by this batch")
+	// HTTP probing: the canned transport now supports three key shapes
+	// (in precedence):
+	//   1. scheme://host/path — path-scoped (e.g. "http://login.example.com/auth")
+	//      answered only for that exact path;
+	//   2. scheme://host       — scheme-specific host root;
+	//   3. host                — both schemes for the host root.
+	// BodyOversized generates a body larger than the engine's retention cap
+	// (1 MiB for httpprobe, 2 MiB for js fetches served via the same
+	// transport) so truncation is exercised honestly. DNSPoison entries are
+	// merged into the resolver AFTER the clean DNS set: poisoned answers
+	// overwrite the clean ones, modelling a poisoned warm cache where
+	// poisoned records survive even though the fresh resolver would return
+	// clean data (the messy profile's contradictory-data scenario).
+	for _, host := range sortedManifestKeys(m.DNSPoison) {
+		recs := m.DNSPoison[host]
+		if len(recs.A) > 0 {
+			h.resolver.set(host, dns.TypeA, recs.A...)
+		}
+		if len(recs.AAAA) > 0 {
+			h.resolver.set(host, dns.TypeAAAA, recs.AAAA...)
+		}
+		if len(recs.CNAME) > 0 {
+			h.resolver.set(host, dns.TypeCNAME, recs.CNAME...)
+		}
 	}
 	h.transport = &cannedTransport{}
 	for _, key := range sortedManifestKeys(m.HTTP) {
 		resp := m.HTTP[key]
-		if resp.BodyOversized {
-			t.Fatalf("fixture manifest: http %s: oversized canned responses are not supported by this batch's materializer", key)
-		}
-		cr := cannedResponse{status: resp.Status, body: resp.Body, headers: resp.Headers}
+		cr := cannedResponse{status: resp.Status, body: resp.Body, headers: resp.Headers, oversized: resp.BodyOversized}
 		if !strings.Contains(key, "://") {
+			// Bare host — both schemes, path-agnostic (root probes).
 			cannedHost(h.transport, key, cr)
 			continue
 		}
-		scheme, host, ok := splitSchemeHost(key)
-		if !ok || strings.Contains(host, "/") {
-			t.Fatalf("fixture manifest: http key %q: path-scoped canned responses have no cannedTransport expression", key)
+		scheme, rest, ok := splitSchemeHost(key)
+		if !ok {
+			t.Fatalf("fixture manifest: http key %q: invalid scheme://host form", key)
 		}
-		cannedHostScheme(h.transport, host, scheme, cr)
+		host, path := rest, ""
+		if idx := strings.Index(rest, "/"); idx != -1 {
+			host = rest[:idx]
+			path = rest[idx:]
+		}
+		if host == "" {
+			t.Fatalf("fixture manifest: http key %q: empty host", key)
+		}
+		if path != "" {
+			cannedHostPath(h.transport, host, scheme, path, cr)
+		} else {
+			cannedHostScheme(h.transport, host, scheme, cr)
+		}
 	}
 
 	// JS intelligence: loopback server serving the manifest bodies by URL
 	// path behind the shared rewrite transport (the engine never leaves
-	// the loopback).
+	// the loopback). Oversized entries generate a body larger than the
+	// engine's MaxJSBytes (2 MiB) so truncation is exercised honestly; the
+	// status and headers from the manifest are still honoured.
 	bodies := make(map[string]fixtureJSBody, len(m.JS))
-	for path, jb := range m.JS {
+	for p, jb := range m.JS {
 		if jb.Oversized {
-			t.Fatalf("fixture manifest: js %s: oversized bodies are not supported by this batch's materializer", path)
+			// Preserve the manifest's status/headers, but generate a body
+			// exceeding defaultMaxJSBytes (2 MiB). Use a deterministic
+			// repeat so the content is stable and synthetic.
+			jb.Body = strings.Repeat("x\n", (2<<20)/2+1024)
+			jb.File = ""
 		}
-		bodies[path] = jb
+		bodies[p] = jb
 	}
 	var mu sync.Mutex
 	n := 0

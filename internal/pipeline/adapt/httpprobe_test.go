@@ -39,23 +39,34 @@ var _ runtime.Clock = httpProbeFixedClock{}
 
 // cannedResponse is one deterministic fake response for a probe target.
 type cannedResponse struct {
-	status  int
-	body    string
-	headers map[string]string
-	err     error // when set, RoundTrip returns it (classifies the probe)
+	status    int
+	body      string
+	headers   map[string]string
+	err       error // when set, RoundTrip returns it (classifies the probe)
+	oversized bool  // when true, RoundTrip returns a body exceeding engine caps (1 MiB for httpprobe)
 }
 
 // cannedTransport is a hermetic http.RoundTripper: it answers every request
-// from a per-host map (host -> scheme -> response), records the requests it
+// from a per-host map (host -> scheme -> response) plus an optional
+// path-scoped map (scheme://host/path -> response), records the requests it
 // served, and never dials anything. An absent entry fails the probe with a
 // DNS-style error (ProbeFailed/ReasonDNS), so "host not served" is expressed
 // deterministically without touching the network. When blockUntil is non-nil
 // (never closed), RoundTrip blocks until the request's context is done — the
 // seam for in-flight cancellation and per-request-deadline tests.
+//
+// Path-scoped entries take precedence over host-only entries: a request for
+// http://host/path is first looked up by its exact scheme://host/path key
+// (including query when present), then by host/scheme. Bare-host entries
+// (registered via cannedHost) answer both schemes for any path not
+// explicitly registered; scheme-specific host entries answer one scheme.
+// Oversized entries generate a body larger than the engine's retention cap
+// (1 MiB for httpprobe) so truncation is exercised honestly.
 type cannedTransport struct {
 	mu         sync.Mutex
 	byHost     map[string]map[string]cannedResponse
-	requests   []string // "scheme://host" of every served request
+	byPath     map[string]cannedResponse // "scheme://host/path[?query]" -> response
+	requests   []string                  // "scheme://host" of every served request
 	blockUntil chan struct{}
 }
 
@@ -64,10 +75,21 @@ func (t *cannedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	key := req.URL.Scheme + "://" + req.URL.Host
 	t.mu.Lock()
 	t.requests = append(t.requests, key)
-	byScheme, ok := t.byHost[req.URL.Host]
-	var resp cannedResponse
-	if ok {
-		resp = byScheme[req.URL.Scheme]
+	// Path-scoped lookup first: exact scheme://host + path (+ query when present).
+	pathKey := req.URL.Scheme + "://" + req.URL.Host + req.URL.Path
+	if req.URL.RawQuery != "" {
+		pathKey += "?" + req.URL.RawQuery
+	}
+	resp, pathOk := t.byPath[pathKey]
+	var hostOk bool
+	var byScheme map[string]cannedResponse
+	if !pathOk {
+		byScheme, hostOk = t.byHost[req.URL.Host]
+		if hostOk {
+			resp = byScheme[req.URL.Scheme]
+		}
+	} else {
+		hostOk = true
 	}
 	block := t.blockUntil
 	t.mu.Unlock()
@@ -83,8 +105,22 @@ func (t *cannedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.err != nil {
 		return nil, resp.err
 	}
-	if !ok || resp.status == 0 {
+	if (!hostOk && !pathOk) || resp.status == 0 {
 		return nil, &net.DNSError{Err: "no such host", Name: req.URL.Host, IsTimeout: false}
+	}
+	body := resp.body
+	if resp.oversized {
+		// Exceed httpprobe MaxBodyBytes (1 MiB) and jsintel MaxJSBytes (2 MiB)
+		// when the same transport is used for js fetches via the rewrite
+		// seam — generate deterministically sized content so truncation is
+		// honest without storing a huge literal in the manifest.
+		body = strings.Repeat("x", (1<<20)+4096)
+		// For the js path the body will be served via the same transport
+		// in some tests; the larger 2 MiB+ body is also produced when the
+		// request path indicates a js fetch (heuristic: ends with .js).
+		if strings.HasSuffix(req.URL.Path, ".js") {
+			body = strings.Repeat("x\n", (2<<20)/2+512)
+		}
 	}
 	h := make(http.Header, len(resp.headers))
 	for k, v := range resp.headers {
@@ -94,8 +130,8 @@ func (t *cannedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		StatusCode:    resp.status,
 		Status:        fmt.Sprintf("%d %s", resp.status, http.StatusText(resp.status)),
 		Header:        h,
-		Body:          io.NopCloser(strings.NewReader(resp.body)),
-		ContentLength: int64(len(resp.body)),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
 		Request:       req,
 	}, nil
 }
@@ -155,6 +191,17 @@ func cannedHost(tr *cannedTransport, host string, resp cannedResponse) {
 		tr.byHost = make(map[string]map[string]cannedResponse)
 	}
 	tr.byHost[host] = map[string]cannedResponse{"http": resp, "https": resp}
+}
+
+// cannedHostPath registers one path-scoped canned response for a single
+// scheme/host/path triple. It takes precedence over the host-only entries
+// in RoundTrip: an exact scheme://host/path lookup is tried before the
+// host/scheme fallback.
+func cannedHostPath(tr *cannedTransport, host, scheme, path string, resp cannedResponse) {
+	if tr.byPath == nil {
+		tr.byPath = make(map[string]cannedResponse)
+	}
+	tr.byPath[scheme+"://"+host+path] = resp
 }
 
 // testStage returns the adapter under test with the given transport seam.

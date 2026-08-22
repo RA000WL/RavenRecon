@@ -1,0 +1,87 @@
+{
+  "profile": "hostile-adversarial",
+  "target": "example.com",
+  "discovery": {
+    "detections": {
+      "subfinder -version": { "stdout": "Current Version: v2.6.3\n" },
+      "assetfinder -h": { "stderr": "Usage: assetfinder [domain]\n", "exit_code": 2 },
+      "amass -version": { "stdout": "v3.23.0\n" },
+      "chaos -version": { "stdout": "chaos v0.5.3\n" }
+    },
+    "runs": {
+      "subfinder -d example.com -silent": { "stdout": "api.example.com\nwww.example.com\n" },
+      "assetfinder example.com": { "stdout": "www.example.com\nadmin.example.com\n" },
+      "amass enum -passive -d example.com": { "stdout": "admin.example.com\nburst0.example.com\nburst1.example.com\nburst2.example.com\nburst3.example.com\nburst4.example.com\n" },
+      "chaos -d example.com -silent -json": { "stdout": "{\"domain\":\"heavy.example.com\"}\n" }
+    }
+  },
+  "dns": {
+    "www.example.com": { "A": ["93.184.216.34"] },
+    "api.example.com": { "A": ["93.184.216.35"] },
+    "admin.example.com": { "A": ["93.184.216.36"] },
+    "heavy.example.com": { "A": ["93.184.216.50"] },
+    "burst0.example.com": { "A": ["93.184.216.60"] },
+    "burst1.example.com": { "A": ["93.184.216.61"] },
+    "burst2.example.com": { "A": ["93.184.216.62"] }
+  },
+  "http": {
+    "www.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "api.example.com": {
+      "status": 418,
+      "headers": {
+        "Content-Type": "text/html",
+        "Server": "hostile/0.0 (adversarial)",
+        "X-Signature": "MEUCIQD0hostile0000000000000000000000000000000000== padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding",
+        "Set-Cookie": "session=x; Path=/; SameSite=None; Secure"
+      },
+      "body": "<!doctype html><html><body>teapot</body></html>"
+    },
+    "admin.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "heavy.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "application/octet-stream" },
+      "body_oversized": true
+    },
+    "burst0.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>b0</body></html>"
+    },
+    "burst1.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>b1</body></html>"
+    },
+    "burst2.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>b2</body></html>"
+    }
+  },
+  "urlintel": [
+    "http://www.example.com/app.js",
+    "http://api.example.com/lib.js?v=2",
+    "http://www.example.com/graphql",
+    "http://heavy.example.com/huge.js"
+  ],
+  "js": {
+    "/app.js": { "file": "app.js" },
+    "/lib.js": {
+      "body": "const orders = \"/api/v2/orders\";\nconst gkey = \"AIzaSyA-test-key-123456789012345678901234\";\nwindow.__webpack_require__ = {};\n",
+      "headers": { "ETag": "\"W/\"hostile-etag-0f3a-long-value-with-dashes\"\"" }
+    },
+    "/shared.js": { "body": "window.ready = true;\n" },
+    "/huge.js": { "oversized": true }
+  },
+  "stage_params": {
+    "discover": { "quality_max_per_source": "3" }
+  }
+}

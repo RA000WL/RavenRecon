@@ -1,0 +1,97 @@
+{
+  "profile": "messy-contradictory",
+  "target": "example.com",
+  "discovery": {
+    "detections": {
+      "subfinder -version": { "stdout": "Current Version: v2.6.3\n" },
+      "assetfinder -h": { "stderr": "Usage: assetfinder [domain]\n", "exit_code": 2 },
+      "amass -version": { "stdout": "v3.23.0\n" },
+      "chaos -version": { "stdout": "chaos v0.5.3\n" }
+    },
+    "runs": {
+      "subfinder -d example.com -silent": { "stdout": "api.example.com\nwww.example.com\n" },
+      "assetfinder example.com": { "stdout": "www.example.com\nadmin.example.com\n" },
+      "amass enum -passive -d example.com": { "stdout": "admin.example.com\nvpn1.example.com\n" },
+      "chaos -d example.com -silent -json": { "stdout": "{\"domain\":\"admin.example.com\"}\n{\"domain\":\"WWW.example.com\"}\n{\"domain\":\"vpn2.example.com\"}\n" }
+    }
+  },
+  "dns": {
+    "www.example.com": { "A": ["93.184.216.34"] },
+    "api.example.com": { "A": ["93.184.216.35"], "CNAME": ["sso.example.com"] },
+    "admin.example.com": { "A": ["93.184.216.36"] },
+    "sso.example.com": { "A": ["93.184.216.37"] },
+    "login.example.com": { "A": ["93.184.216.38"] },
+    "vpn1.example.com": { "A": ["93.184.216.40"] },
+    "vpn2.example.com": { "A": ["93.184.216.40"] }
+  },
+  "dns_poison": {
+    "www.example.com": { "A": ["203.0.113.99"] },
+    "api.example.com": { "A": ["203.0.113.98"] }
+  },
+  "http": {
+    "www.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "api.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "admin.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>hello</body></html>"
+    },
+    "sso.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>sso</body></html>"
+    },
+    "http://sso.example.com": {
+      "status": 301,
+      "headers": { "Location": "http://www.example.com/" },
+      "body": ""
+    },
+    "login.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>login form</body></html>"
+    },
+    "http://login.example.com": {
+      "status": 302,
+      "headers": { "Location": "http://login.example.com/auth" },
+      "body": ""
+    },
+    "http://login.example.com/auth": {
+      "status": 200,
+      "headers": { "Content-Type": "text/html" },
+      "body": "<!doctype html><html><body>auth page</body></html>"
+    },
+    "vpn1.example.com": {
+      "status": 200,
+      "headers": { "Content-Type": "application/json" },
+      "body": "{\"status\":\"ok\"}"
+    },
+    "vpn2.example.com": {
+      "status": 503,
+      "headers": { "Content-Type": "text/plain", "Retry-After": "60" },
+      "body": "maintenance"
+    }
+  },
+  "urlintel": [
+    "http://www.example.com/app.js",
+    "https://www.example.com/app.js",
+    "http://api.example.com/lib.js?v=2",
+    "http://www.example.com/graphql",
+    "http://www.example.com/app.js"
+  ],
+  "js": {
+    "/app.js": { "file": "app.js" },
+    "/lib.js": {
+      "body": "const orders = \"/api/v2/orders\";\nconst gkey = \"AIzaSyA-test-key-123456789012345678901234\";\nwindow.__webpack_require__ = {};\n"
+    },
+    "/shared.js": { "body": "window.ready = true;\n" }
+  }
+}
