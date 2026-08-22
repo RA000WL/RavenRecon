@@ -2,8 +2,11 @@ package urlintel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -33,6 +36,33 @@ import (
 // pass, and n pure cache hits on the hit pass — the hit pass's zero-work
 // assertion (via the engine's Metrics counters) pins that no extraction or
 // store happens in the timed loop.
+//
+// Capacity reality: a cold pass materializes n real cache entry FILES plus
+// up to 65,792 shard directories (256×256 two-level shards + first level),
+// so the scratch volume must provide at least n + ~66k free INODES — a
+// constraint independent of bytes and of record sizes. A volume that cannot
+// hold them fails mid-pass with ENOSPC ("no space left on device" from
+// CreateTemp), which is an environmental limit, not an engine defect; the
+// million-line benchmark therefore pre-flights inode capacity and moves to
+// the user cache directory when the default temp volume cannot host it,
+// skipping loudly only when no candidate volume qualifies.
+
+// shardDirBound is the maximum number of directories the Phase 3 FS cache's
+// two-level shard tree can create under one root: 65,536 second-level
+// (256×256 hex prefixes) plus 256 first-level.
+const shardDirBound = 256*256 + 256
+
+// inodeHeadroom covers the temp-directory hierarchy, transient Put temp
+// files, and concurrent system activity on the same volume.
+const inodeHeadroom = 8192
+
+// volumeFitsInodes reports whether a volume reporting freeInodes free
+// inodes can hold a full FS cache for want entries: want entry files, the
+// bounded shard tree, and headroom. Pure arithmetic so the threshold is
+// testable without a filesystem.
+func volumeFitsInodes(free, want uint64) bool {
+	return free >= want+shardDirBound+inodeHeadroom
+}
 
 // benchWorkload is one benchmark sizing.
 type benchWorkload struct {
@@ -150,6 +180,7 @@ func benchIngest(b *testing.B, wl benchWorkload, hitPass bool) {
 	if len(rep.Entries) != wl.urls {
 		b.Fatalf("entries = %d, want %d", len(rep.Entries), wl.urls)
 	}
+	assertNoEntryDiagnostics(b, "cold/hit workload", rep)
 }
 
 func BenchmarkIngestCold10(b *testing.B)    { benchIngest(b, benchWorkloads[0], false) }
@@ -192,18 +223,97 @@ func (g *genSource) Next(ctx context.Context) (string, error) {
 	return fmt.Sprintf("http://h%d.example.com/p?a=%d", i, i), nil
 }
 
+// assertNoEntryDiagnostics fails the benchmark when any report entry carries
+// a non-completed status or an error diagnostic. URLEntry.Err is where cache
+// read/write warnings land (bounded per entry), so a silent store shortfall —
+// any environmental ENOSPC, permission failure, or self-healing discard —
+// can never hide behind the run-level Metrics counters again: the counters
+// and the per-entry diagnostics must agree that every observation was both
+// extracted and persisted.
+func assertNoEntryDiagnostics(b *testing.B, what string, rep Report) {
+	b.Helper()
+	bad := 0
+	var sample string
+	for i := range rep.Entries {
+		e := &rep.Entries[i]
+		if e.Status != StatusCompleted || e.Err != nil {
+			bad++
+			if sample == "" {
+				sample = fmt.Sprintf("status=%s err=%v", e.Status, e.Err)
+			}
+		}
+	}
+	if bad != 0 {
+		b.Fatalf("%s: %d of %d entries carry a non-completed status or error diagnostic; first: %s",
+			what, bad, len(rep.Entries), sample)
+	}
+}
+
+// millionCacheDir returns a cache root that can physically host a full FS
+// cache for want entries: the default temp volume when its free-inode count
+// covers want entry files + the bounded shard tree + headroom, otherwise a
+// fresh directory under the user's cache dir (typically disk-backed with
+// dynamic inodes). It skips loudly when no candidate volume qualifies or its
+// capacity cannot be established: running anyway would fail mid-pass with
+// ENOSPC once inodes ran out — an environmental limit (see NEW-57), not an
+// engine defect, and the benchmark must never measure a partial cold pass.
+func millionCacheDir(b *testing.B, want int) string {
+	b.Helper()
+	dir := b.TempDir()
+	if free, ok := freeInodesOnVolume(dir); ok && volumeFitsInodes(free, uint64(want)) {
+		return dir
+	}
+	// cause records why the user-cache fallback chain failed, so the skip
+	// message names the real environmental problem (an unwritable cache
+	// directory reads very differently from a volume out of inodes).
+	var cause error
+	base, err := os.UserCacheDir()
+	if err != nil {
+		cause = err
+	} else {
+		root := filepath.Join(base, "ravenrecon-bench")
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			cause = err
+		} else if fallback, err := os.MkdirTemp(root, "ingest-million-"); err != nil {
+			cause = err
+		} else {
+			b.Cleanup(func() { _ = os.RemoveAll(fallback) })
+			if free, ok := freeInodesOnVolume(fallback); ok && volumeFitsInodes(free, uint64(want)) {
+				return fallback
+			} else if ok {
+				cause = fmt.Errorf("fallback volume holds only %d free inodes", free)
+			} else {
+				cause = errors.New("fallback volume free-inode count could not be established")
+			}
+		}
+	}
+	b.Skip(fmt.Sprintf("no scratch volume can hold %d cache entries (+%d shard directories, +%d headroom inodes); "+
+		"run on a volume with sufficient inode capacity (last fallback error: %v)",
+		want, shardDirBound, inodeHeadroom, cause))
+	return "" // unreachable
+}
+
 // BenchmarkIngestMillion runs one full cold pass of a synthetic
 // 1,000,000-line stream (1M distinct URLs) through the real pipeline: 1M
 // parses, extractions, cache misses, and fsync-bound cache writes, with
 // wall throughput and allocations reported (-benchmem). It takes ≈50
 // minutes — run with -benchtime=1x on a quiet machine; under -short it is
 // skipped (see the file header for the measured duration).
+//
+// The full-cold-pass assertion below is exact by design. The corpus's hosts
+// are pairwise distinct (h0..hN-1.example.com), so all 1M canonical URLs are
+// distinct records; and the pipeline has no dedup-on-store — every line is
+// extracted and stored independently (duplicate identities would last-write-
+// win into the same key, still counting as stores) — so Stored == Lines iff
+// every Put succeeded. A shortfall can therefore only mean failed stores,
+// which surface both here and as per-entry diagnostics (asserted via
+// assertNoEntryDiagnostics).
 func BenchmarkIngestMillion(b *testing.B) {
 	if testing.Short() {
 		b.Skip("the 1M-line cold pass takes ≈50 minutes; skipped under -short")
 	}
 	const n = 1_000_000
-	cfg := benchConfig(b, b.TempDir())
+	cfg := benchConfig(b, millionCacheDir(b, n))
 	ctx := context.Background()
 
 	for i := 0; i < b.N; i++ {
@@ -224,6 +334,8 @@ func BenchmarkIngestMillion(b *testing.B) {
 			snap.Stored != n || snap.Reads != n || snap.Malformed != 0 {
 			b.Fatalf("metrics = %+v, want a full cold pass (1M read/extracted/stored)", snap)
 		}
+		assertNoEntryDiagnostics(b, "million-line cold pass", rep)
+		b.Logf("million-line cold pass metrics: %+v", snap)
 	}
 }
 

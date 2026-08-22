@@ -406,6 +406,13 @@ func storeURL(ctx context.Context, u asset.URL, entry URLEntry, e *env) URLEntry
 	}
 	if perr := e.cache.Put(storeCtx, key, rec); perr != nil {
 		entry.Err = errors.Join(entry.Err, fmt.Errorf("urlintel: %s: cache put: %w", u.String(), perr))
+		// Surface write failures as bounded run diagnostics too, mirroring
+		// lookupURL's read-side diagnostics: a persistently failing cache
+		// (for example a full filesystem) must be visible in the run error
+		// summary, never silently absorbed into per-entry Err alone.
+		// Cancellation-class errors stay filtered out — they surface
+		// through entry statuses (see recordCacheDiagnostic).
+		e.recordCacheDiagnostic(u, "cache put", perr)
 	} else {
 		e.metricsStored()
 	}

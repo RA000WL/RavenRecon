@@ -181,9 +181,9 @@ orchestrator; every agent may append or update its own entries.
   tests landing together with the format.
 
 ### NEW-57 (MED) — BenchmarkIngestMillion fails its own assertion: ~1.8% store shortfall at 1M lines (internal/urlintel)
-- Status: OPEN
+- Status: VERIFIED — implemented (debugger, 2026-08-23) and reviewer APPROVE 2026-08-23: root cause was inode exhaustion on 2^20-inode tmpfs (1M entry FILES + 65k shard dirs) silently absorbed — Puts failed with ENOSPC, only per-entry Err captured, run returned nil. Fix: (1) production record.go storeURL now surfaces cache-put failures as bounded run diagnostics via recordCacheDiagnostic (mirroring read side, cancellation filtered); (2) bench_test.go capacity arithmetic volumeFitsInodes + shardDirBound + inodeHeadroom with pre-flight millionCacheDir fallback to user cache dir (disk-backed dynamic inodes) and loud skip when no volume qualifies; assertNoEntryDiagnostics pins honesty; header documents ~50 min wall time. Honesty guaranteed by dual channels (entry Err + run diagnostics). Baseline re-inclusion deferred: workload takes ~50 min and is -short-gated; urlintel.txt correctly stays without the million line (benchgate handles missing). Archived to TODO.closed.md on next close.
 - Reporter: builder (v1.7 batch D, NEW-56)
-- Owner: (unassigned)
+- Owner: debugger
 - Problem: internal/urlintel/bench_test.go:225 BenchmarkIngestMillion
   observes {Lines:1000000 Canonicalized:1000000 Extracted:1000000
   Stored:981506 Reads:1000000 Malformed:0} and fails wanting a full cold
