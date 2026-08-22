@@ -27,7 +27,9 @@ func isXMLSignature(peek []byte) bool {
 }
 
 // isJSONStructure reports whether peek is JSON (object/array) via json.Valid
-// after trimming leading BOM/whitespace.
+// after trimming leading BOM/whitespace. For NDJSON (multiple JSON values
+// separated by newline) json.Valid on the whole peek will be false (multiple
+// top-level values), so we also probe via Decoder for the first value.
 func isJSONStructure(peek []byte) bool {
 	trim := bytes.TrimSpace(peek)
 	// strip UTF-8 BOM
@@ -38,7 +40,146 @@ func isJSONStructure(peek []byte) bool {
 	if trim[0] != '{' && trim[0] != '[' {
 		return false
 	}
-	return json.Valid(trim)
+	if json.Valid(trim) {
+		return true
+	}
+	// NDJSON or streaming array: check if first value is JSON
+	return isJSONLike(peek)
+}
+
+// isJSONLike reports whether peek starts with a JSON object/array and the first
+// value decodes successfully. This handles NDJSON (one JSON per line) where
+// json.Valid on the whole peek is false but the first line is valid JSON.
+func isJSONLike(peek []byte) bool {
+	trim := bytes.TrimSpace(peek)
+	trim = bytes.TrimPrefix(trim, []byte{0xef, 0xbb, 0xbf})
+	if len(trim) == 0 {
+		return false
+	}
+	if trim[0] != '{' && trim[0] != '[' {
+		return false
+	}
+	dec := json.NewDecoder(bytes.NewReader(trim))
+	dec.UseNumber()
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return false
+	}
+	// Ensure the decoded first value itself is valid JSON object/array
+	rv := bytes.TrimSpace(raw)
+	if len(rv) == 0 {
+		return false
+	}
+	if rv[0] == '{' || rv[0] == '[' {
+		return json.Valid(rv)
+	}
+	return false
+}
+
+// jsonProbeShape classifies the JSON peek into one of the JSON importer
+// shapes: httpx, dnsx, naabu, katana, nuclei, or generic. Returns "" if not
+// JSON. It decodes only the first JSON value (bounded 32 KiB peek) and inspects
+// its keys without loading the whole file. For JSON arrays, it inspects the
+// first element.
+func jsonProbeShape(peek []byte) string {
+	trim := bytes.TrimSpace(peek)
+	trim = bytes.TrimPrefix(trim, []byte{0xef, 0xbb, 0xbf})
+	if len(trim) == 0 {
+		return ""
+	}
+	if trim[0] != '{' && trim[0] != '[' {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(trim))
+	dec.UseNumber()
+	var first json.RawMessage
+	if err := dec.Decode(&first); err != nil {
+		return ""
+	}
+	rv := bytes.TrimSpace(first)
+	if len(rv) == 0 {
+		return ""
+	}
+	// Array case: inspect first element
+	if rv[0] == '[' {
+		var arr []map[string]json.RawMessage
+		if err := json.Unmarshal(first, &arr); err != nil {
+			return "generic"
+		}
+		if len(arr) == 0 {
+			return "generic"
+		}
+		return classifyJSONObject(arr[0])
+	}
+	if rv[0] == '{' {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(first, &m); err != nil {
+			return ""
+		}
+		return classifyJSONObject(m)
+	}
+	return "generic"
+}
+
+func hasKey(m map[string]json.RawMessage, keys ...string) bool {
+	for _, k := range keys {
+		if _, ok := m[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyJSONObject(m map[string]json.RawMessage) string {
+	// Nuclei has highest specificity: template-id family
+	if hasKey(m, "template-id", "templateID", "template_id", "templateId") {
+		return "nuclei"
+	}
+	// Naabu: port + ip/host (port is integer)
+	if hasKey(m, "port") && (hasKey(m, "ip") || hasKey(m, "host")) {
+		return "naabu"
+	}
+	// DNSx: host + a/cname/resolver (but not port)
+	if hasKey(m, "host") && (hasKey(m, "a") || hasKey(m, "aaaa") || hasKey(m, "cname") || hasKey(m, "resolver") || hasKey(m, "answer")) {
+		return "dnsx"
+	}
+	// httpx vs katana: both have url
+	if hasKey(m, "url") {
+		hasStatus := hasKey(m, "status_code", "status-code", "statusCode", "status")
+		hasTech := hasKey(m, "title", "tech", "technologies", "webserver", "content_length", "content-length", "contentLength", "body_preview", "body-preview")
+		hasMethod := hasKey(m, "method")
+		if hasStatus || hasTech {
+			return "httpx"
+		}
+		if hasMethod {
+			return "katana"
+		}
+		return "httpx"
+	}
+	return "generic"
+}
+
+// jsonConfidence computes confidence for a JSON importer based on probe shape.
+// want is the shape this importer claims (e.g. "httpx").
+func jsonConfidence(path string, peek []byte, want string) (float64, bool) {
+	shape := jsonProbeShape(peek)
+	if shape == "" {
+		return 0, false
+	}
+	if shape != want {
+		return 0, false
+	}
+	// Base confidence for correct shape
+	conf := 0.85
+	// Extension tie-break: .json adds 0.05, .ndjson too
+	extLower := strings.ToLower(filepath.Ext(path))
+	if extLower == ".json" || extLower == ".ndjson" || extLower == ".jsonl" {
+		conf += 0.05
+	}
+	if conf > 0.95 {
+		conf = 0.95
+	}
+	return conf, true
 }
 
 // extensionHint returns a confidence bump for extension tie-break.

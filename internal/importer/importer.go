@@ -108,7 +108,8 @@ func (e ImportEnv) now() time.Time {
 // through the single normalization point (asset builders) and deduplicates by
 // canonical Identity.String(). CIDRs are validated via netip.ParsePrefix and
 // deduplicated by canonical prefix string (no asset kind — they are stored as
-// strings). JS is stored via asset.NewJavaScript.
+// strings). JS is stored via asset.NewJavaScript. Findings are stored via
+// asset.NewFinding and deduped by Finding.Identity().
 //
 // The Sink also preserves provenance sidecar data without mutating asset
 // Identity — provenance is stored in the asset's Prov field plus the sidecar
@@ -116,12 +117,13 @@ func (e ImportEnv) now() time.Time {
 type Sink struct {
 	seen map[string]struct{}
 
-	Domains []asset.Domain
-	Hosts   []asset.Host
-	URLs    []asset.URL
-	IPs     []asset.IP
-	CIDRs   []string
-	JS      []asset.JavaScript
+	Domains  []asset.Domain
+	Hosts    []asset.Host
+	URLs     []asset.URL
+	IPs      []asset.IP
+	CIDRs    []string
+	JS       []asset.JavaScript
+	Findings []asset.Finding
 
 	// ProvenanceRecords preserves per-asset provenance sidecar: importer,
 	// original tool, filename, import time, original record (first 4 KiB), and

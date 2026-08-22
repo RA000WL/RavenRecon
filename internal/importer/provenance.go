@@ -26,6 +26,18 @@ func ProvenanceSourceForImporter(importerName string) string {
 		return "plain-ips"
 	case "plain-cidrs":
 		return "plain-cidrs"
+	case "json-httpx":
+		return "httpx"
+	case "json-dnsx":
+		return "dnsx"
+	case "json-naabu":
+		return "naabu"
+	case "json-katana":
+		return "katana"
+	case "json-nuclei":
+		return "nuclei"
+	case "json-generic":
+		return "json-generic"
 	default:
 		return importerName
 	}

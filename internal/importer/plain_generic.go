@@ -178,5 +178,5 @@ func bytesTrimSpace(b []byte) []byte {
 }
 
 func totalAssets(s *Sink) int {
-	return len(s.Domains) + len(s.Hosts) + len(s.URLs) + len(s.IPs) + len(s.JS) + len(s.CIDRs)
+	return len(s.Domains) + len(s.Hosts) + len(s.URLs) + len(s.IPs) + len(s.JS) + len(s.CIDRs) + len(s.Findings)
 }

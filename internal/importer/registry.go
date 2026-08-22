@@ -99,11 +99,19 @@ func (r *Registry) Detect(path string, peek []byte) []DetectMatch {
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		ai, aj := matches[i], matches[j]
-		// generic fallback last
-		isGenericI := ai.Importer.Name() == "plain-generic"
-		isGenericJ := aj.Importer.Name() == "plain-generic"
+		// generic fallback last (plain-generic and json-generic)
+		isGenericI := ai.Importer.Name() == "plain-generic" || ai.Importer.Name() == "json-generic"
+		isGenericJ := aj.Importer.Name() == "plain-generic" || aj.Importer.Name() == "json-generic"
 		if isGenericI != isGenericJ {
 			return isGenericJ // non-generic before generic
+		}
+		// json-generic is still before plain-generic when both generic
+		if isGenericI && isGenericJ && ai.Importer.Name() != aj.Importer.Name() {
+			// json-generic outranks plain-generic
+			if ai.Importer.Name() == "json-generic" {
+				return true
+			}
+			return false
 		}
 		if ai.Confidence != aj.Confidence {
 			return ai.Confidence > aj.Confidence
