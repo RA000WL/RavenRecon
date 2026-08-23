@@ -35,8 +35,12 @@ import (
 //
 // StageParams keys (all optional, unknown keys ignored):
 //
-//	paths                    newline- or comma-separated file and/or
-//	                         directory paths. Directories are walked
+//	paths                    newline-separated file and/or directory
+//	                         paths. ',' and '\n' are RESERVED separators:
+//	                         an individual path containing either is
+//	                         rejected with a structured error naming it
+//	                         (rename such files; pass paths newline-
+//	                         separated). Directories are walked
 //	                         recursively in deterministic (lexical) order;
 //	                         every entry must exist and be a regular file or
 //	                         a directory; path segments containing ".." are
@@ -706,23 +710,33 @@ func foldIngestOutcomes(in pipeline.StageInput, files []string, outcomes []inges
 // ---- params and path handling ----
 
 // ingestPathsParam reads the "paths" StageParams key: entries separated by
-// newlines (preferred — paths may contain commas) or commas when no newline
-// is present. Whitespace around entries is trimmed; empty entries dropped.
+// newlines. Whitespace around entries is trimmed; empty entries dropped.
 // Absent or empty yields nil (the stage completes vacuously).
+//
+// Separators are RESERVED inside individual paths (NEW-73 residual): an
+// entry still containing ',' or '\n' after splitting is rejected with a
+// structured error naming it. Silently accepting one would make the same
+// filename parse differently depending on the surrounding entries — and
+// the legacy comma fallback never actually split at all (strings.Split was
+// given the two-character separator "\n,", a literal-substring match, so a
+// comma-joined list surfaced as one mangled entry and a confusing stat
+// error). Commas are therefore reserved outright: operators pass paths
+// newline-separated and rename files that contain separator characters.
 func ingestPathsParam(params map[string]string) ([]string, error) {
 	v, ok := params["paths"]
 	if !ok || strings.TrimSpace(v) == "" {
 		return nil, nil
 	}
-	seps := "\n"
-	if !strings.Contains(v, "\n") {
-		seps = "\n,"
-	}
 	var out []string
-	for _, part := range strings.Split(v, seps) {
-		if p := strings.TrimSpace(part); p != "" {
-			out = append(out, p)
+	for _, part := range strings.Split(v, "\n") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
 		}
+		if strings.ContainsAny(p, ",\n") {
+			return nil, fmt.Errorf("invalid ingest path %q: contains a reserved separator character (',' or newline); separators join entries and cannot appear inside an individual path", p)
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }

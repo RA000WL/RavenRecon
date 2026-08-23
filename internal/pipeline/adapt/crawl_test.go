@@ -10,6 +10,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/crawl"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
+	"github.com/RA000WL/RavenRecon/internal/report"
 )
 
 // fakeCrawlSource is the hermetic crawl seam for tests.
@@ -228,7 +229,10 @@ func TestCrawlStageNoHostsShortCircuit(t *testing.T) {
 // (Result.FailedHosts = len(hosts), e.g. katana missing from PATH), the
 // stage must report incomplete with honest counters, never
 // completed=len(hosts). The signal is explicit engine data (NEW-85) — the
-// stage never infers failure from diagnostics presence.
+// stage never infers failure from diagnostics presence. NEW-91: a total
+// failure additionally carries a wrapped Err (joined with the engine's
+// Diagnostics), attached AND returned, so the runner can fold it into
+// RunReport.StageErrors.
 func TestCrawlStageAllHostsFailedReportsIncomplete(t *testing.T) {
 	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
 		return crawl.Result{
@@ -242,14 +246,26 @@ func TestCrawlStageAllHostsFailedReportsIncomplete(t *testing.T) {
 		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com"), mustHostCrawl(t, "api.example.com")},
 	}
 	res, err := st.Run(context.Background(), in)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if err == nil {
+		t.Fatal("Run error = nil, want the wrapped total-failure error returned for collection")
 	}
 	if res.Outcome != pipeline.OutcomeIncomplete {
 		t.Fatalf("Outcome = %q, want incomplete when every host's crawl failed", res.Outcome)
 	}
 	if res.ItemsProcessed != 0 || res.ItemsFailed != 2 {
 		t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 0/2", res.ItemsProcessed, res.ItemsFailed)
+	}
+	// NEW-91: a total failure must carry a structured error so the runner
+	// can fold it into RunReport.StageErrors — the report error summary may
+	// not stay total=0 beside an incomplete stages row.
+	if res.Err == nil {
+		t.Fatal("Err = nil, want a wrapped total-failure error")
+	}
+	if !strings.Contains(res.Err.Error(), "all 2 hosts failed") {
+		t.Fatalf("Err = %v, want it to name the whole-run abort (all 2 hosts failed)", res.Err)
+	}
+	if !strings.Contains(res.Err.Error(), "katana not found") {
+		t.Fatalf("Err = %v, want the engine's diagnostic detail joined in", res.Err)
 	}
 }
 
@@ -390,5 +406,114 @@ func TestCrawlStageCancelledKeepsJoinedErrorAndPartialURLs(t *testing.T) {
 	}
 	if len(res.Additions.URLs) != 1 || res.Additions.URLs[0].String() != "https://example.com/partial" {
 		t.Fatalf("Additions.URLs = %v, want the partially captured in-scope URL retained on the cancelled result", res.Additions.URLs)
+	}
+}
+
+// TestCrawlStageEngineErrorWithLiveContextFailsStage pins the other half of
+// NEW-91: an explicit engine error returned with a LIVE context was
+// previously dropped on the floor — the host accounting below ran off the
+// (zero) result and could even report completed. The stage must fail with
+// the wrapped engine error, both attached to the result and returned.
+func TestCrawlStageEngineErrorWithLiveContextFailsStage(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{}, errors.New("engine exploded before any host attempt")
+	}}
+	st := NewCrawlStage(src)
+	in := pipeline.StageInput{
+		Target: mustDomainCrawl(t, "example.com"),
+		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com")},
+	}
+	res, runErr := st.Run(context.Background(), in)
+	if runErr == nil {
+		t.Fatal("Run error = nil, want the wrapped engine error returned")
+	}
+	if !strings.Contains(runErr.Error(), "engine exploded before any host attempt") {
+		t.Fatalf("Run error = %v, want the engine detail retained", runErr)
+	}
+	if res.Outcome != pipeline.OutcomeFailed {
+		t.Fatalf("Outcome = %q, want failed when the engine returns an explicit error", res.Outcome)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "engine exploded") {
+		t.Fatalf("res.Err = %v, want the engine detail attached to the result too", res.Err)
+	}
+}
+
+// TestCrawlStageTotalFailureFoldsIntoRunStageErrors is the NEW-91 end-to-end
+// pin, mirroring TestReportStageFoldsStageErrorsIntoSummary: a whole-run
+// crawl abort (katana missing from PATH — FailedHosts = len(hosts), nil
+// engine error) must reach RunReport.StageErrors AND the rendered report's
+// error summary, instead of an error summary stuck at total=0 beside an
+// incomplete/failed stages row.
+func TestCrawlStageTotalFailureFoldsIntoRunStageErrors(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		// The engine's real missing-binary shape (NEW-85): explicit
+		// per-host failure signal plus a diagnostic, nil error.
+		return crawl.Result{
+			Diagnostics: []string{"katana not found: exec: \"katana\": executable file not found in $PATH"},
+			FailedHosts: len(hosts),
+		}, nil
+	}}
+	reg := report.NewRegistry()
+	var summary report.ErrorSummary
+	rep := captureReporter("crawl-summary-capture", func(m *report.Model) {
+		summary = m.Errors
+	})
+	if err := reg.Register(rep); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	seed := &t3dFakeStage{name: pipeline.StageDiscover, res: pipeline.StageResult{
+		Outcome: pipeline.OutcomeCompleted,
+		Additions: pipeline.StageAdditions{
+			Hosts: []asset.Host{mustHostCrawl(t, "www.example.com"), mustHostCrawl(t, "api.example.com")},
+		},
+	}}
+	cfg := pipeline.ScanConfig{
+		Target:    mustDomainCrawl(t, "example.com"),
+		Stages:    []pipeline.StageName{pipeline.StageDiscover, pipeline.StageCrawl, pipeline.StageReport},
+		OutputDir: t.TempDir(),
+	}
+	run, err := pipeline.Run(context.Background(), cfg, nil, fakeClock{}, []pipeline.Stage{
+		seed,
+		NewCrawlStage(src),
+		NewReportStage(reg),
+	})
+	if err != nil {
+		t.Fatalf("pipeline.Run: %v", err)
+	}
+	if len(run.Stages) != 3 {
+		t.Fatalf("stages = %d, want 3", len(run.Stages))
+	}
+	crawlRec := run.Stages[1]
+	if crawlRec.Name != pipeline.StageCrawl {
+		t.Fatalf("second stage = %q, want crawl", crawlRec.Name)
+	}
+	// The adapter reports incomplete at its own boundary; carrying an Err,
+	// the runner normalizes the record to failed — accepted (documented in
+	// the adapter): a whole-run abort IS a stage failure end to end.
+	if crawlRec.Outcome != pipeline.OutcomeFailed {
+		t.Fatalf("crawl record outcome = %q, want failed (incomplete + Err normalizes to failed)", crawlRec.Outcome)
+	}
+	if crawlRec.Err == nil || !strings.Contains(crawlRec.Err.Error(), "all 2 hosts failed") {
+		t.Fatalf("crawl record Err = %v, want a wrapped whole-run-abort error naming all 2 hosts", crawlRec.Err)
+	}
+	if len(run.StageErrors) != 1 || run.StageErrors[0].Name != pipeline.StageCrawl {
+		t.Fatalf("RunReport.StageErrors = %+v, want exactly the crawl failure", run.StageErrors)
+	}
+
+	if summary.Total == 0 {
+		t.Fatal("model error summary total = 0, want >= 1 (the crawl total failure must reach the operator-facing summary)")
+	}
+	found := false
+	for _, cat := range summary.Categories {
+		for _, s := range cat.Samples {
+			if s.Stage == string(pipeline.StageCrawl) &&
+				strings.Contains(s.Message, "all 2 hosts failed") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no summary sample names crawl with the whole-run abort; summary = %+v", summary)
 	}
 }

@@ -94,6 +94,74 @@ func TestWorkerSnapshotSorted(t *testing.T) {
 	}
 }
 
+// insertionSortWorkerRowsReference is the exact hand-rolled insertion sort
+// that snapshot used before the L-11 cleanup. It stays here as the reference
+// implementation the replacement's output is pinned against.
+func insertionSortWorkerRowsReference(rows []workerState) {
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && rows[j].idx < rows[j-1].idx; j-- {
+			rows[j], rows[j-1] = rows[j-1], rows[j]
+		}
+	}
+}
+
+// TestWorkerSnapshotMatchesInsertionReferenceOnScrambledFixture pins the
+// stdlib replacement to the old insertion sort's output order. The dashboard
+// is rebuilt for every round: Go randomizes map iteration order, so each
+// round feeds both algorithms a different input permutation of the same row
+// multiset and the pin doubles as a determinism check.
+func TestWorkerSnapshotMatchesInsertionReferenceOnScrambledFixture(t *testing.T) {
+	scrambled := []int{17, 3, 42, 0, 9, 31, 5, 27, 1, 63, 12, 44}
+	states := []event.WorkerState{
+		event.WorkerRunning, event.WorkerIdle, event.WorkerWaiting,
+		event.WorkerFailed, event.WorkerCompleted, event.WorkerCancelled,
+		event.WorkerRunning, event.WorkerIdle, event.WorkerWaiting,
+		event.WorkerIdle, event.WorkerCompleted, event.WorkerRunning,
+	}
+	for round := 0; round < 25; round++ {
+		d := newWorkerDashboard()
+		for k, idx := range scrambled {
+			d.started(idx)
+			switch states[k%len(states)] {
+			case event.WorkerRunning:
+				d.taskStarted(idx, uint64(k+1), testBase.Add(time.Duration(k)*time.Second))
+				d.taskRunning(idx, uint64(k+1))
+			case event.WorkerWaiting:
+				d.taskStarted(idx, uint64(k+1), testBase.Add(time.Duration(k)*time.Second))
+			case event.WorkerFailed:
+				d.taskStarted(idx, uint64(k+1), testBase.Add(time.Duration(k)*time.Second))
+				d.taskTerminal(idx, uint64(k+1), testBase.Add(time.Duration(k+1)*time.Second), true, "boom")
+			case event.WorkerCompleted:
+				d.taskStarted(idx, uint64(k+1), testBase.Add(time.Duration(k)*time.Second))
+				d.taskTerminal(idx, uint64(k+1), testBase.Add(time.Duration(k+1)*time.Second), false, "")
+			case event.WorkerCancelled:
+				d.stopped(idx, event.WorkerCancelled)
+			default: // WorkerIdle: leave the freshly started row untouched
+			}
+		}
+
+		// Reference: same rows in whatever permutation map iteration yields
+		// this round, ordered by the old algorithm.
+		want := make([]workerState, 0, len(d.workers))
+		for _, w := range d.workers {
+			want = append(want, *w)
+		}
+		insertionSortWorkerRowsReference(want)
+
+		got := d.snapshot()
+		if len(got) != len(want) {
+			t.Fatalf("round %d: length drift: got %d want %d", round, len(got), len(want))
+		}
+		for i := range got {
+			g, wr := got[i], want[i]
+			if g.idx != wr.idx || g.state != wr.state || g.jobID != wr.jobID ||
+				g.tasks != wr.tasks || g.lastError != wr.lastError || !g.taskStart.Equal(wr.taskStart) {
+				t.Fatalf("round %d: order drift at %d: got %+v want %+v", round, i, g, wr)
+			}
+		}
+	}
+}
+
 func TestFormatWorkerRow(t *testing.T) {
 	t0 := testBase
 	// Idle/completed rows show the task count, no job.

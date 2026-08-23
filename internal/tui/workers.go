@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/event"
@@ -157,13 +159,13 @@ func (d *WorkerDashboard) snapshot() []workerState {
 	for _, w := range d.workers {
 		out = append(out, *w)
 	}
-	// Insertion sort is fine: the table is bounded by the pool's
-	// concurrency (small in practice). Deterministic order is the contract.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].idx < out[j-1].idx; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
+	// Stable stdlib sort: rows ascending by worker index, equal indices
+	// keeping input order — the exact contract of the insertion sort this
+	// replaces (L-11), now O(n log n). snapshot runs on every render frame,
+	// and the table's hard bound (maxWorkers) must not be able to turn a
+	// frame into quadratic work. SortStableFunc is in-place (symMerge), so
+	// it adds no per-frame allocation beyond the rows slice itself.
+	slices.SortStableFunc(out, func(a, b workerState) int { return cmp.Compare(a.idx, b.idx) })
 	return out
 }
 

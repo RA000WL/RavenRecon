@@ -150,6 +150,21 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 		truncated = true
 	}
 
+	// NEW-91: an explicit engine error with a LIVE context was previously
+	// dropped on the floor here — the host accounting below ran off the
+	// (possibly zero) result and could even report completed while the
+	// failure went unrecorded. Fail the stage with the wrapped engine
+	// error instead; whatever URLs were captured still ride Additions
+	// (the runner merges additions regardless of outcome).
+	if err != nil {
+		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
+		return pipeline.StageResult{
+			Outcome:   pipeline.OutcomeFailed,
+			Err:       wrapped,
+			Additions: pipeline.StageAdditions{URLs: urls},
+		}, wrapped
+	}
+
 	// Host-failure accounting (crawl contract): the engine counts hosts
 	// whose katana invocation failed outright on Result.FailedHosts —
 	// including whole-run aborts like a missing binary (NEW-85: the engine
@@ -174,8 +189,35 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 		res.Outcome = pipeline.OutcomeIncomplete
 		res.ItemsProcessed = 0
 		res.ItemsFailed = failed
+		if failed == len(hosts) && len(hosts) > 0 {
+			// NEW-91: TOTAL failure (whole-run abort such as a missing
+			// binary). Attach a wrapped error — joined with the engine's
+			// Diagnostics when present — and return it, so the runner's
+			// collectStageErr folds it into RunReport.StageErrors and the
+			// report's error summary names crawl instead of staying
+			// total=0 beside a non-completed stages row. The runner
+			// normalizes an incomplete record carrying an Err to failed;
+			// that is accepted here: a whole-run abort IS a stage failure
+			// end to end, and the incomplete outcome above remains the
+			// fine-grained signal for direct Stage callers.
+			parts := make([]error, 0, len(result.Diagnostics)+1)
+			parts = append(parts, fmt.Errorf("crawl: all %d hosts failed", failed))
+			for _, d := range result.Diagnostics {
+				parts = append(parts, errors.New(d))
+			}
+			wrapped := fmt.Errorf("stage %s: %w", s.Name(), errors.Join(parts...))
+			res.Err = wrapped
+			return res, wrapped
+		}
+		// Partial zero-output failure (fewer than all hosts failed):
+		// stays a quiet incomplete. Rule (NEW-91 judgment call): Err rides
+		// ONLY total failures and explicit engine errors — per-host notes
+		// in Diagnostics describe individual hosts, not a stage-level
+		// fault, so ordinary mixed runs must not flood the operator-facing
+		// error summary.
 	case failed > 0:
 		// Some hosts crawled, some failed: partial with honest counters.
+		// Same rule as above: no Err for partial failures.
 		res.Outcome = pipeline.OutcomePartial
 		res.ItemsProcessed = len(hosts) - failed
 		res.ItemsFailed = failed

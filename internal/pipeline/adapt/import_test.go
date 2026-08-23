@@ -622,6 +622,82 @@ func TestIngestStagePathValidation(t *testing.T) {
 			t.Fatalf("res=%+v err = %v, want structured zero-expansion error naming %s", res, err, drop)
 		}
 	})
+
+	// NEW-73 residual: separators are reserved inside individual paths. A
+	// path containing ',' or '\n' must be REJECTED with a structured error
+	// naming it — never silently mis-parsed into fragments or mangled into
+	// a nonexistent joined blob.
+	t.Run("reserved separator rejected (comma filename)", func(t *testing.T) {
+		dir := t.TempDir()
+		ok := filepath.Join(dir, "ok.txt")
+		if err := os.WriteFile(ok, []byte("a.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write ok fixture: %v", err)
+		}
+		comma := filepath.Join(dir, "naughty,name.txt")
+		if err := os.WriteFile(comma, []byte("b.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write comma-named fixture: %v", err)
+		}
+		_, err := stage.Run(context.Background(), ingestInput(t, clk, nil,
+			strings.Join([]string{ok, comma}, "\n"), nil))
+		if err == nil {
+			t.Fatalf("err = nil, want a structured reserved-separator rejection naming %s (old behavior silently imported it)", comma)
+		}
+		if !strings.Contains(err.Error(), "reserved separator") {
+			t.Fatalf("err = %v, want the reserved-separator reason stated", err)
+		}
+		if !strings.Contains(err.Error(), comma) {
+			t.Fatalf("err = %v, want the offending path %s named", err, comma)
+		}
+	})
+
+	t.Run("reserved separator rejected (comma-joined list)", func(t *testing.T) {
+		dir := t.TempDir()
+		f1 := filepath.Join(dir, "one.txt")
+		f2 := filepath.Join(dir, "two.txt")
+		if err := os.WriteFile(f1, []byte("a.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write f1: %v", err)
+		}
+		if err := os.WriteFile(f2, []byte("b.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write f2: %v", err)
+		}
+		// The legacy comma-joined form never actually split (the old parse
+		// used strings.Split with the two-character separator "\n,", a
+		// literal-substring match): it surfaced as a confusing stat error
+		// over the whole joined blob. It now gets the honest structured
+		// rejection — commas are reserved, pass paths newline-separated.
+		_, err := stage.Run(context.Background(), ingestInput(t, clk, nil, f1+","+f2, nil))
+		if err == nil {
+			t.Fatalf("err = nil, want a structured reserved-separator rejection for %q", f1+","+f2)
+		}
+		if !strings.Contains(err.Error(), "reserved separator") {
+			t.Fatalf("err = %v, want the reserved-separator reason stated", err)
+		}
+	})
+
+	// Companion pin for the reserved-separator rule: legitimate multi-path
+	// input is unchanged — newline-joined entries still expand to every
+	// file.
+	t.Run("multi-path newline form unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		f1 := filepath.Join(dir, "one.txt")
+		f2 := filepath.Join(dir, "two.txt")
+		if err := os.WriteFile(f1, []byte("a.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write f1: %v", err)
+		}
+		if err := os.WriteFile(f2, []byte("b.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write f2: %v", err)
+		}
+		res, err := stage.Run(context.Background(), ingestInput(t, clk, nil, f1+"\n"+f2, nil))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Outcome != pipeline.OutcomeCompleted {
+			t.Fatalf("outcome = %q (%v)", res.Outcome, res.Err)
+		}
+		if res.ItemsProcessed != 2 {
+			t.Fatalf("ItemsProcessed = %d, want 2 files imported", res.ItemsProcessed)
+		}
+	})
 }
 
 // TestIngestStageDeduplicatesExpandedPaths pins the compaction pass: a file

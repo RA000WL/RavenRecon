@@ -2,6 +2,7 @@ package techintel
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -342,15 +343,15 @@ func sourcesMask(o Observation) string {
 	if o.Endpoint != nil {
 		mask = append(mask, 'e')
 	}
-	// The append order above is NOT sorted (h, b, c, t, d, e); the insertion
-	// sort below is the guarantee of the deterministic order ('b' < 'c' <
-	// 'd' < 'e' < 'h' < 't'), so equivalent observations always produce the
-	// same mask regardless of how the appends are ordered.
-	for i := 1; i < len(mask); i++ {
-		for j := i; j > 0 && mask[j] < mask[j-1]; j-- {
-			mask[j], mask[j-1] = mask[j-1], mask[j]
-		}
-	}
+	// The append order above is NOT sorted (h, b, c, t, d, e); the sort below
+	// is the guarantee of the deterministic order ('b' < 'c' < 'd' < 'e' <
+	// 'h' < 't'), so equivalent observations always produce the same mask
+	// regardless of how the appends are ordered. Each letter is appended at
+	// most once, so the keys are pairwise distinct and every correct sort —
+	// stable or not — yields byte-identical output to the insertion sort this
+	// replaces (L-11); slices.Sort on []byte is monomorphized and allocates
+	// nothing beyond the slice itself.
+	slices.Sort(mask)
 	return string(mask)
 }
 

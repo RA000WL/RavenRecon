@@ -7,6 +7,34 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-92 (LOW) — cli/ingest.go doc comment still describes the pre-NEW-73-residual paths separator contract (internal/cli)
+- Status: VERIFIED — orchestrator-fixed inline 2026-08-23 (one comment line): internal/cli/ingest.go buildIngestConfig doc now states newline is the ONLY separator and commas are reserved/rejected, matching the wave-c contract.
+- Reporter: wave-c agent 1
+- Owner: (unassigned)
+- Problem: internal/cli/ingest.go:276 says the ingest stage's params carry paths newline-joined as "the adapter's preferred separator — paths may contain commas". After the NEW-73 residual fix, internal/pipeline/adapt/import.go ingestPathsParam treats ',' (and '\n') as RESERVED inside individual paths and rejects any entry containing them with a structured error; newline is now the ONLY separator and comma-containing filenames are rejected outright. The stale comment tells operators commas are acceptable when they no longer are.
+- Fix: reword internal/cli/ingest.go:276 to state that paths are newline-joined and that ',' / '\n' are reserved inside individual paths (rejected by the adapter); optionally surface a CLI-side hint if an operator passes a comma-containing filename.
+- Verification: grep + read of both comments after edit.
+
+### NEW-74 (INFO) — Audit INFO/doc-skew wave B (see REVIEW-2026-08-23.md §3 INFO)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-23) — all claimed and residual items done across waves a/b; nothing further open under this entry.
+- Reporter: reviewer (full audit 2026-08-23)
+- Owner: docs
+- Problem: CLI usage lists ten stages vs twelve actual + "no active enumeration ever run" overclaim vs crawl/dnsx_brute; version.go stale migration comment; dns-vs-httpprobe all-timeout classification asymmetry; transport idle-conn hygiene; provenance ordinal drift; progress-event overcount; jsintel inline-script uncounted parse failures; adapt truncation metadata must be consumed at wiring time; priority FNV digest bound; TUI bidi passthrough; detect Context trust boundary; fixture_manifest in prod package.
+- Fix: doc corrections + noted follow-ups; details in report §3 INFO.
+- Verification: n/a (docs) / per-item notes.
+
+
+### NEW-73 (LOW) — Audit LOW/INFO wave A: correctness/hygiene (see REVIEW-2026-08-23.md §3 LOW 1–14)
+- Status: VERIFIED + CLOSED (orchestrator, 2026-08-23) — every subitem done across waves a/b/c. Wave c closed the last two residuals: ingest paths with reserved separators (, 
+) rejected with structured errors naming the path (also uncovered: legacy comma fallback was a literal-substring split bug that mangled comma-joined lists); insertion sorts outside dns.go converted with byte-exact equivalence pins (techintel sourcesMask exhaustive over all 64 subsets; tui worker snapshot stable-by-idx across 25 map permutations — removing a quadratic per-render-frame hazard). xml_stream site was misflagged (validity scan, not a sort) — skipped with evidence.
+- Ingest path-param lossiness residual — implemented 2026-08-23 by wave-c agent 1 (import.go adapter only), awaiting orchestrator verification: internal/pipeline/adapt/import.go ingestPathsParam now treats ',' and '\n' as RESERVED inside individual paths and rejects any entry containing either with a structured error naming the offending path ("invalid ingest path %q: contains a reserved separator character …"); params-key doc block updated. Discovery recorded at the site: the legacy comma fallback NEVER actually split — strings.Split was given the two-character separator "\n," (literal-substring match), so comma-joined lists surfaced as one mangled entry with a confusing stat error, while lone comma-paths accidentally survived intact; the fallback is replaced by the explicit rejection (newline is the only separator). Tests: TestIngestStagePathValidation/reserved_separator_rejected_(comma_filename) (red: old code silently imported an existing comma-named file passed alongside another path), reserved_separator_rejected_(comma-joined_list), multi-path_newline_form_unchanged.
+- Reporter: reviewer (full audit 2026-08-23)
+- Owner: (unassigned)
+- Problem: fourteen LOW items with file:line detail in the report — highlights: urlintel live-record TLS-diagnostic stored StatusFailed; NetResolver lazy-init race; outer-deadline discards captured tool stdout prefix; OverflowDropped under-count; configurable-cap decode churn loop; candidateAsset zero-asset swallow; report deadline→failed skew; Fingerprint[:8] panic guard; three divergent URL-filter copies (root cause of H-3); crawl cancellation drops engine error; O(n²) insertion sorts; ingest path param newline/comma lossiness; chaos apex-subdomain mangling; PDCP_API_KEY init()-scope leak in tests.
+- Fix: per-item fixes in the report.
+- Verification: per-item tests named in the report.
+
+
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). Set-Cookie values redacted at boundedHeaders choke point (names+attributes preserved for techintel fingerprints); decode-time compliance refusal self-heals pre-fix cached records; integration proof: report marshal contains no cookie secret; name-keyed fingerprint parity test green.
 - Reporter: reviewer

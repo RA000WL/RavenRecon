@@ -249,6 +249,64 @@ func TestSourcesMask(t *testing.T) {
 	}
 }
 
+// insertionSortMaskReference is the exact hand-rolled insertion sort that
+// sourcesMask used before the L-11 cleanup. It stays here as the reference
+// implementation the replacement's output is pinned against.
+func insertionSortMaskReference(mask []byte) {
+	for i := 1; i < len(mask); i++ {
+		for j := i; j > 0 && mask[j] < mask[j-1]; j-- {
+			mask[j], mask[j-1] = mask[j-1], mask[j]
+		}
+	}
+}
+
+// TestSourcesMaskMatchesInsertionReferenceOnAllSubsets proves the stdlib
+// sort orders exactly like the old insertion sort: every one of the 2^6
+// family-flag subsets is exercised (an exhaustive determinism pin, not a
+// sample), with the reference fed the same unsorted h,b,c,t,d,e append order
+// production uses.
+func TestSourcesMaskMatchesInsertionReferenceOnAllSubsets(t *testing.T) {
+	for subset := 0; subset < 1<<6; subset++ {
+		o := newObs(t, "https://ok.example/")
+		var raw []byte // production append order: h, b, c, t, d, e
+		if subset&1 != 0 {
+			o.Headers = []HeaderEntry{{Name: "X", Value: "y"}}
+			raw = append(raw, 'h')
+		}
+		if subset&2 != 0 {
+			o.Body = "x"
+			raw = append(raw, 'b')
+		}
+		if subset&4 != 0 {
+			o.Cookies = []CookieEntry{{Name: "c"}}
+			raw = append(raw, 'c')
+		}
+		if subset&8 != 0 {
+			o.TLS = &TLSInfo{}
+			raw = append(raw, 't')
+		}
+		if subset&16 != 0 {
+			o.DNS = &DNSInfo{}
+			raw = append(raw, 'd')
+		}
+		if subset&32 != 0 {
+			ep, err := asset.NewEndpoint("GET", o.URL.String(), asset.Provenance{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.Endpoint = &ep
+			raw = append(raw, 'e')
+		}
+
+		want := append([]byte(nil), raw...)
+		insertionSortMaskReference(want)
+		got := sourcesMask(o)
+		if got != string(want) {
+			t.Errorf("subset %#06b: sourcesMask = %q, insertion-sort reference = %q", subset, got, want)
+		}
+	}
+}
+
 func TestObservationIdentity(t *testing.T) {
 	o := newObs(t, "https://ok.example/")
 	if o.identity() != o.URL.Identity() {

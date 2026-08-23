@@ -273,7 +273,8 @@ func stageNames(names []pipeline.StageName) []string {
 // configuration: the stage list is ALWAYS [ingest + selected downstream]
 // (ingest first, by construction — the operator cannot reorder or remove
 // it), and the ingest stage's params carry the input paths newline-joined
-// (the adapter's preferred separator — paths may contain commas). Mirroring
+// (newline is the ONLY separator — commas are reserved inside paths and
+// rejected at expansion time; see expandIngestPaths). Mirroring
 // buildScanConfig, no new config.Config fields and no bounds overrides: the
 // runner resolves defaults.
 func buildIngestConfig(opts ingestOptions, target asset.Domain) (pipeline.ScanConfig, error) {
