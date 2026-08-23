@@ -40,9 +40,10 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Reporting framework | 2811-2995 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes |
 | Event bus | 2996-3138 | canonical event model + bounded non-blocking bus; observer-only |
 | Terminal observability (TUI) | 3141-3233 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
-| Configuration precedence | 3234-3247 | CLI flags → environment → config file → defaults |
-| Safety boundary | 3248-3260 | recon-only: what must never be added |
-| v0.3 boundary | 3261-3487 | implemented-vs-planned inventory of every subsystem |
+| Universal asset ingestion | 3235-3339 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
+| Configuration precedence | 3340-3353 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3354-3366 | recon-only: what must never be added |
+| v0.3 boundary | 3367-3610 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -3230,6 +3231,111 @@ codes or the summary. `--tui` and `--verbose` are mutually exclusive (one
 event sink per run), `--tui-compact` requires `--tui`, and controller
 construction errors return before the stages run, mirroring usage errors
 (`internal/cli`).
+
+## Universal asset ingestion
+
+`internal/importer` (roadmap v1.8) turns reconnaissance artifacts from any
+source into canonical Phase 2 assets through one adapter interface:
+`Importer{Name, Version, CanImport, Import}` over a sealed `Registry`
+(validated registration, deterministic Name-sorted `List`, `Detect`
+ordered by confidence desc / Name asc with the json-generic and
+plain-generic fallbacks always last). Import is passive ingestion only:
+imported findings are evidence to report and enrich, never re-executed.
+
+Layout: `importer.go` (interface, Sink, Bounds), `registry.go`,
+`detect.go` (waterfall + line-shape classifier), `reader.go` (peek,
+bounded streaming, progress), `plain_domains.go`/`plain_urls.go`/
+`plain_ips.go`/`plainjs.go`/`plain_generic.go` (7 plain-text importers),
+`json.go` (5 tool importers, generic fallback, bounded array framer),
+`xml.go`/`xml_stream.go` (Burp sitemap/issues + OWASP ZAP),
+`archive.go` (CDX lines + WARC records), `cache.go` (key parts +
+streamed content hash), `provenance.go` (original-tool labels),
+`adapt_helpers.go`. The full 18-importer set (16 specific + 2 generic
+fallbacks) is registered at a caller-side composition point —
+`pipeline/adapt.NewIngestStage()` in production; `doc.go` carries the
+registration checklist and per-roadmap-row dispositions (crawl tools'
+bare-URL outputs route through the plain/json families deliberately).
+
+Detection waterfall: each file's first `PeekSize` (32 KiB) bytes are
+buffered once, then classification runs content-first — gzip magic
+(peeks inflated in memory ≤32 KiB so content decides while extensions
+only bump confidence) → JSON probe (decode first value; classify
+url/host/ip/port/template-id key shapes; array vs NDJSON framing) → XML
+probe (root `<items>`/`<issues>` → Burp, `<OWASPZAPReport>` case-
+insensitive → ZAP, unknown roots → no claim) → archive content probes
+(CDX row shape over a ≥0.5 majority of ≤50 sampled lines; WARC
+first-line magic) → extension/MIME tie-break (+0.05) → line-shape
+classifier for the plain family (host/url/ip/cidr/js via netip +
+ParseURL). Known gap: gzipped bare-link lists are claimed by nobody at
+detection time today (TODO.md NEW-60); the streaming path itself is
+gzip-transparent once an importer is chosen.
+
+Streaming bounds (C-4): `bufio.Reader` 8 KiB with `ReadSlice` capped at
+`MaxLineBytes`+1 (32 KiB); oversized lines count as failed+truncated and
+drain in bounded chunks with per-chunk ctx checks; gzip decompression is
+transparent via `openStream` with total decompressed bytes capped at
+`MaxDecompressedBytes` (100 MiB, exact tally incl. inter-element bytes);
+the retained set caps at `MaxOutput` (100k records, tail-drop).
+Cancellation is checked per record; progress events flow through the
+Observer seam every 64 KiB or 10k records. Truncation is honest:
+`Truncated=true` plus the sticky flag `import_truncated` on the stats —
+never silently completed.
+
+Cache keys: `CacheKeyForFile` streams a SHA-256 content hash into
+Target `import:<hex>` under Operation `ingest.import`, with Config
+`{schema, importer_version, max_output, max_line_bytes,
+max_decompressed_bytes}` and Tool = importer name/version — every input
+that materially changes the result participates. The package exposes key
+parts only (it never imports `internal/cache`, layering §0.4); the stage
+composes cache-before-execute around `Import`. Truncated imports store
+`StatusIncomplete` so `Get` can never serve them as valid hits; failed
+invocations store nothing; oversized payloads skip `Put` best-effort.
+The cached payload embeds normalized identities+stats PLUS the retained
+assets and provenance records so warm runs are byte-equivalent to cold
+ones (locked-decision D4 amendment, TODO.md NEW-59 batch 5); every
+decoded record is re-canonicalized through the asset builders before
+serving, and tampered payloads self-heal (Delete + fresh execution).
+
+Provenance: every accepted record produces an immutable
+`ProvenanceRecord` (importer name, original tool via the label map in
+`provenance.go`, filename base only — paths are redacted from errors,
+import time, `OriginalRecord` = verbatim record head bounded to 4 KiB,
+confidence, bounded metadata) keyed by canonical identity, plus asset
+`Prov.Source = "import:<importer>"`. Duplicates keep the earliest-wins
+record; the same asset seen in two files keeps both records.
+
+Pipeline composition (`pipeline/adapt/import.go`): paths expand
+deterministically (lexical walk + sort, deduplicated), one bounded
+`runtime.Pool` serves the stage, and per file the peek-buffered Detect
+top match wins (ambiguity resolved by Detect ordering; no claim → the
+file fails structurally, never a silent skip) before cache-before-
+execute wraps `Import`. Outcomes fold per file and per stage into the
+house vocabulary (cancelled > all-failed > partial > completed;
+truncated imports surface Truncated with the sticky flag). Retained
+assets merge into Additions (boundary-filtered against the target
+domain) and Results; the provenance sidecar rides
+`StageResult.Provenance` and merges first-seen-per-identity across
+stages into `RunReport.Provenance`.
+
+Origin attribution (`internal/report`): provenance projects into
+`Context.Attribution` per identity — `{Importer, OriginalTool,
+Filename, ImportedAt, Confidence}` (the Line field exists but no CLI
+wiring populates it yet) — capped at 100k entries as a sorted-key prefix
+with an explicit `AttributionTruncated` flag, validated against the
+model's identities (unknown keys rejected). The model carries an origins
+census (`{"discovered":N,"imported":M}`); `OriginOf` is membership-based
+(imported else discovered). Enriched and Generated exist in the
+vocabulary only — no subsystem derives them yet. CSV hosts/urls/findings
+gain an origin column; Markdown/HTML render a Provenance section only
+when attribution exists. Absent attribution keeps legacy exports and
+digests byte-identical.
+
+CLI: `ravenrecon ingest [options] <target> <path> [<path>...]` runs the
+ingest stage followed by the standard downstream stages (default
+selection `[ingest] + AllStages() - discover`; `--stages` selects a
+downstream subset). There is deliberately no `--type` flag — format
+detection is content-first; flags must precede positionals when multiple
+paths are given.
 
 ## Configuration precedence
 

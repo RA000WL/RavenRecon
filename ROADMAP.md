@@ -54,7 +54,7 @@ Every phase must satisfy these before it is complete:
 | v1.5 | Real-world validation, URL hunting, discovery data quality | ✅ Complete | Quality gate b46a110; JS→URL 2d06b94; urllive 7fc7e4c; per-tool+health f44cecc; honest duration 08861f0; chaos 184796a; dnsx brute 0a19d67; katana crawl 1ab2e99; validated across 5 real-target field trials (NEW-19/36/38/39/40). Remainder: NEW-48 (OPT-P2-1 --dry-run/help docs). |
 | v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
 | v1.7 | Integration and acceptance testing | ✅ Complete | Closed 2026-08-23 — fixtures/goldens/bench-gate landed (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; NEW-56/57/58): `fixtures/<profile>/` hybrid manifests, per-stage goldens via `internal/golden` (`-update`), `testdata/bench/*.txt` + `cmd/benchgate` stdlib comparator (D4, no `benchstat`), CI bench-gate job, memory guards (C-4 drift + HeapInuse), D6 interaction suite across 12 stages; validated deterministic, `gofmt`/`vet`/`build`/`test`/`-race` green. |
-| v1.8 | Universal Asset Ingestion Framework | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-2`. |
+| v1.8 | Universal Asset Ingestion Framework | ✅ Complete | Closed 2026-08-23 — `internal/importer` (18 importers behind one interface, auto detection, bounded streaming, provenance sidecar, cache integration), pipeline ingest stage + report attribution, `ravenrecon ingest` CLI, benchmarks + memory guards (1ede060, 81785f2, 3e5ba4e, 5e806fe, 7fd312a, cf0e939). Deferred: Common Crawl remote ingestion; Enriched/Generated origin derivation; CIDR report channel. Optimizations: `OPT-P3-2`. |
 | v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-3` + `OPT-P1-2` isolation for third-party packs. |
 
 ---
@@ -412,7 +412,7 @@ Acceptance criteria:
 
 ## v1.8 — Universal Asset Ingestion Framework
 
-Status: planned
+Status: complete (closed 2026-08-23)
 
 Goal: consume reconnaissance artifacts from any source — RavenRecon itself or
 external tools — normalize them into the canonical asset graph, preserve
@@ -448,43 +448,111 @@ Design rules:
 
 Checklist:
 
-- [ ] `internal/importer` package: importer interface, registry, format
+- [x] `internal/importer` package: importer interface, registry, format
       detection, streaming readers, validation, normalization, progress events
-- [ ] Automatic format detection — extension, MIME, structure, content
-      signature; no `--type` flag (files/folders only)
-- [ ] Plain-text importers: domains, subdomains, urls, alive, js, ips, cidrs
-- [ ] JSON importers: httpx, dnsx, naabu, katana, nuclei
-- [ ] XML importers: Burp sitemap/issues, OWASP ZAP
-- [ ] Crawl-output importers: katana, hakrawler, gospider, waymore, gau
-- [ ] Archive sources: wayback (Common Crawl future)
-- [ ] Streaming parsers: bounded memory, incremental parsing, progress events,
-      cancellation, resume
-- [ ] Provenance preserved on every imported asset (importer, original tool,
+      (1ede060 core + registry + detection waterfall + bounded streaming;
+      archive content probes extended in 5e806fe)
+- [x] Automatic format detection — extension, MIME, structure, content
+      signature; no `--type` flag (files/folders only) (1ede060 waterfall,
+      confidence desc / Name asc with generic fallbacks last; gzip peeks
+      inflated ≤32 KiB for content-first detection in 5e806fe; `ingest`
+      CLI rejects any `--type` flag, cf0e939)
+- [x] Plain-text importers: domains, subdomains, urls, alive, js, ips, cidrs
+      (1ede060 — 7 importers via the asset builders only)
+- [x] JSON importers: httpx, dnsx, naabu, katana, nuclei (81785f2 — plus a
+      json-generic fallback; modern katana `-jsonl` nested
+      `request.endpoint` shape covered by 5e806fe's fix round)
+- [x] XML importers: Burp sitemap/issues, OWASP ZAP (3e5ba4e)
+- [x] Crawl-output importers: katana, hakrawler, gospider, waymore, gau
+      (5e806fe — disposition: no redundant adapters; these tools' documented
+      outputs are bare URL lists → plain family, or flat url-key JSON →
+      json family, and are claimed by existing importers; see
+      `internal/importer/doc.go` for the per-tool verification)
+- [x] Archive sources: wayback (Common Crawl future) (5e806fe — CDX lines +
+      WARC records, local files incl. `.gz`; Common Crawl remote ingestion
+      deliberately deferred)
+- [x] Streaming parsers: bounded memory, incremental parsing, progress events,
+      cancellation, resume (1ede060 line streaming with 32 KiB line cap +
+      drained bounded chunks + 100 MiB decompression cap; 81785f2 array
+      framer with exact decompressed-byte accounting; 3e5ba4e XML ring
+      window + sticky-decoder contract; resume = unchanged-file repeat
+      imports served by cache hits — a mid-file resume cursor is not built)
+- [x] Provenance preserved on every imported asset (importer, original tool,
       filename, import time, original record, confidence, metadata)
-- [ ] Deduplication reuses the existing identity/merge/provenance/relationship
-      logic — no duplicate systems
-- [ ] Cache integration: content hash + import config + schema version +
+      (1ede060 sidecar records + asset Prov.Source; projected into report
+      attribution by 7fd312a/cf0e939)
+- [x] Deduplication reuses the existing identity/merge/provenance/relationship
+      logic — no duplicate systems (1ede060 Sink dedups by canonical
+      Identity().String(); report-side first-seen-wins merge in 7fd312a)
+- [x] Cache integration: content hash + import config + schema version +
       importer version; repeat imports of unchanged files become cache hits
-- [ ] Imported assets flow through the standard pipeline
+      (1ede060 key parts via CacheKeyForFile; 7fd312a stage-level
+      cache-before-execute with self-healing decode and
+      StatusIncomplete-for-truncated storage)
+- [x] Imported assets flow through the standard pipeline
       (DNS → HTTP → Tech → JS → Secrets → Priority → Detection → Reporting)
-- [ ] `ravenrecon ingest` CLI: single files, multiple files, folders
-- [ ] Reporting distinguishes Discovered / Imported / Enriched / Generated with
-      source attribution
-- [ ] Tests: empty files, malformed input, duplicates, huge files, cancellation,
-      resume, cache, streaming, mixed imports
+      (7fd312a ingest stage feeds Additions/Results into the SAME stages;
+      production AllStages() = 12 untouched)
+- [x] `ravenrecon ingest` CLI: single files, multiple files, folders
+      (cf0e939 — flags before positionals, target normalization via
+      asset.NewDomain, default selection [ingest]+AllStages minus discover)
+- [x] Reporting distinguishes Discovered / Imported / Enriched / Generated with
+      source attribution (7fd312a Origin vocabulary + census + per-asset
+      Attribution entries, CSV/Markdown/HTML origin columns and provenance
+      sections, digest-stable; cf0e939 CLI wiring. Disposition: only
+      Discovered and Imported are derived today — Enriched/Generated have no
+      producing subsystem yet and are deferred rather than fabricated)
+- [x] Tests: empty files, malformed input, duplicates, huge files, cancellation,
+      resume, cache, streaming, mixed imports (across all six commits:
+      hermetic table suites per format, heap guards skipped under -race,
+      C-4 drift detectors, regression tests with RED proofs; T14 adds
+      benchmarks + committed baseline + CI bench-gate step)
 
 Acceptance criteria:
 
-- Every supported format imports without a `--type` hint.
-- Imported assets carry full provenance and deduplicate against existing
-  assets via the shared identity/merge logic.
-- Imports are streaming with bounded memory; a 1 GB input does not spike
-  memory.
-- Repeat imports of unchanged files are cache hits.
-- Imported data produces reports structurally identical to pipeline-discovered
-  data (provenance aside).
-- All gates pass (gofmt, vet, build, test, race); benchmarks recorded for
-  large imports.
+- [x] Every supported format imports without a `--type` hint. (16-importer
+      detection tables per format family in `internal/importer/*_test.go`;
+      generic fallbacks last; honest gap recorded in TODO.md NEW-60: an
+      UNCOMPRESSED-only caveat applies to gzipped bare-link lists at
+      detection time even though the streaming path is gzip-transparent)
+- [x] Imported assets carry full provenance and deduplicate against existing
+      assets via the shared identity/merge logic. (Sink identity dedup tests;
+      provenance sidecar verbatim OriginalRecord windows; report
+      attribution projection tests incl. boundary-filter honesty)
+- [x] Imports are streaming with bounded memory; a 1 GB input does not spike
+      memory. (Structural: never-whole-file streaming under MaxLineBytes
+      32 KiB / MaxDecompressedBytes 100 MiB / MaxOutput 100k caps — pinned by
+      `internal/importer/bounds_c4_test.go`. Empirical: HeapInuse guards over
+      10 MB streams measure ~0 retained delta (<8 MiB ceiling), 12 MiB single
+      array elements and multi-MiB XML padding stay capped; the 1 GB claim
+      rests on those structural caps plus the 10 MB empirical runs, not on a
+      recorded 1 GB lab pass)
+- [x] Repeat imports of unchanged files are cache hits. (counting-importer +
+      counting-cache proofs in `internal/pipeline/adapt/import_test.go` —
+      warm run executes the importer exactly once across two runs;
+      truncated imports stored StatusIncomplete are never served)
+- [x] Imported data produces reports structurally identical to pipeline-discovered
+      data (provenance aside). (TestOriginOfParity: same host discovered vs
+      imported → identical asset fields, differing only origin/attribution;
+      absent-attribution exports stay byte-identical to legacy goldens)
+- [x] All gates pass (gofmt, vet, build, test, race); benchmarks recorded for
+      large imports. (gates green at close-out; `testdata/bench/importer.txt`
+      baselines + CI bench-gate step landed with T14)
+
+Honest dispositions (recorded at close-out):
+
+- Crawl tools: katana/hakrawler/gospider/gau outputs route through the plain
+  and json families (verified against each tool's documented output formats);
+  waymore uncompressed link lists likewise — gzipped bare-link lists are
+  claimed by nobody at detection time today (NEW-60).
+- Common Crawl remote ingestion is deferred: archive sources cover local CDX/
+  WARC files only.
+- Enriched/Generated origins are vocabulary-complete but derivation-deferred:
+  no subsystem produces them today, so reports carry discovered/imported
+  counts only.
+- CIDR imports reach the provenance sidecar but have no Results channel in
+  the pipeline/report model yet (Results mirrors Context 1:1; neither has a
+  CIDR slot).
 
 ---
 

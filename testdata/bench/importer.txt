@@ -1,0 +1,56 @@
+goos: linux
+goarch: amd64
+pkg: github.com/RA000WL/RavenRecon/internal/importer
+cpu: AMD Ryzen 5 8645HS w/ Radeon 760M Graphics
+BenchmarkPlainURLs10K-12          	      81	  16371135 ns/op	21277264 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      80	  16326914 ns/op	21277254 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      80	  16417547 ns/op	21277188 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      72	  16079358 ns/op	21277180 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      68	  16203603 ns/op	21277193 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      74	  16556399 ns/op	21277182 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      79	  16508374 ns/op	21277173 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      68	  16675672 ns/op	21277199 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      66	  16261946 ns/op	21277200 B/op	  120129 allocs/op
+BenchmarkPlainURLs10K-12          	      70	  16588988 ns/op	21277204 B/op	  120129 allocs/op
+BenchmarkJSONHTTPX10K-12          	      40	  32400067 ns/op	26859837 B/op	  200022 allocs/op
+BenchmarkJSONHTTPX10K-12          	      34	  31777252 ns/op	26863468 B/op	  200028 allocs/op
+BenchmarkJSONHTTPX10K-12          	      34	  32278698 ns/op	26864718 B/op	  200031 allocs/op
+BenchmarkJSONHTTPX10K-12          	      37	  32496234 ns/op	26869871 B/op	  200038 allocs/op
+BenchmarkJSONHTTPX10K-12          	      33	  32596985 ns/op	26863139 B/op	  200028 allocs/op
+BenchmarkJSONHTTPX10K-12          	      37	  32426964 ns/op	26865426 B/op	  200031 allocs/op
+BenchmarkJSONHTTPX10K-12          	      37	  32111379 ns/op	26861025 B/op	  200025 allocs/op
+BenchmarkJSONHTTPX10K-12          	      34	  32602643 ns/op	26863716 B/op	  200029 allocs/op
+BenchmarkJSONHTTPX10K-12          	      32	  32705724 ns/op	26865250 B/op	  200031 allocs/op
+BenchmarkJSONHTTPX10K-12          	      38	  31656829 ns/op	26865884 B/op	  200032 allocs/op
+BenchmarkDetectFullRegistry-12    	      24	  45177763 ns/op	23876032 B/op	  359802 allocs/op
+BenchmarkDetectFullRegistry-12    	      27	  45656148 ns/op	23875880 B/op	  359802 allocs/op
+BenchmarkDetectFullRegistry-12    	      25	  46361285 ns/op	23876210 B/op	  359800 allocs/op
+BenchmarkDetectFullRegistry-12    	      25	  45044490 ns/op	23875109 B/op	  359797 allocs/op
+BenchmarkDetectFullRegistry-12    	      25	  44946890 ns/op	23875929 B/op	  359800 allocs/op
+BenchmarkDetectFullRegistry-12    	      26	  45722353 ns/op	23876466 B/op	  359804 allocs/op
+BenchmarkDetectFullRegistry-12    	      26	  45884385 ns/op	23875973 B/op	  359801 allocs/op
+BenchmarkDetectFullRegistry-12    	      28	  43983440 ns/op	23875815 B/op	  359803 allocs/op
+BenchmarkDetectFullRegistry-12    	      26	  44534244 ns/op	23875841 B/op	  359804 allocs/op
+BenchmarkDetectFullRegistry-12    	      27	  44591600 ns/op	23875564 B/op	  359800 allocs/op
+BenchmarkIngestCold-12            	    1665	    764879 ns/op	 1197477 B/op	    6127 allocs/op
+BenchmarkIngestCold-12            	    1598	    759497 ns/op	 1197753 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1550	    786663 ns/op	 1197675 B/op	    6127 allocs/op
+BenchmarkIngestCold-12            	    1520	    781752 ns/op	 1198869 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1508	    773929 ns/op	 1197803 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1495	    785790 ns/op	 1198904 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1677	    773058 ns/op	 1199542 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1560	    771046 ns/op	 1198557 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1501	    782912 ns/op	 1200510 B/op	    6128 allocs/op
+BenchmarkIngestCold-12            	    1528	    793830 ns/op	 1198876 B/op	    6128 allocs/op
+BenchmarkIngestHit-12             	    6397	    157927 ns/op	  182302 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    6423	    158873 ns/op	  182293 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    7297	    162517 ns/op	  182285 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    7292	    160101 ns/op	  182308 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    7371	    158096 ns/op	  182293 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    6170	    162551 ns/op	  182304 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    7543	    159422 ns/op	  182311 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    6756	    159214 ns/op	  182294 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    6430	    159792 ns/op	  182288 B/op	    1039 allocs/op
+BenchmarkIngestHit-12             	    7116	    163041 ns/op	  182305 B/op	    1039 allocs/op
+PASS
+ok  	github.com/RA000WL/RavenRecon/internal/importer	63.586s

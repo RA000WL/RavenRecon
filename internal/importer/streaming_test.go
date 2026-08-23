@@ -189,16 +189,14 @@ Loop:
 	}
 }
 
-// isRaceEnabled reports whether -race is active via runtime check hack.
-// We use presence of race detector by checking build tags? For simplicity, check env.
+// isRaceEnabled reports whether this test binary was built with -race, via
+// the build-tag pair (memguard_race_test.go / memguard_norace_test.go —
+// v1.7 pattern, locked decision D3 on TODO.md NEW-56). Heap-delta guards
+// are meaningless under the race detector's multi-fold heap inflation and
+// skip there; the previous stub here always returned false, leaving the
+// guards' documented "skip under race" contract dead code.
 func isRaceEnabled() bool {
-	// No direct stdlib way; rely on testing's race detection via flag
-	// We approximate: if the test binary was built with -race, runtime will have
-	// different behavior; but we can't detect directly without unsafe.
-	// Use a simple heuristic: check if we can detect via time?
-	// Simpler: skip if env var set (CI sets it). For now, never skip unless explicitly set.
-	// Instead, we use a build tag alternative: we check if GORACE env set.
-	return false
+	return raceEnabled
 }
 
 // TestResumeOffset placeholder — not implemented for Phase 1, but verify Import can be resumed via cache key.

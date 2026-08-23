@@ -31,3 +31,15 @@ workspace's machine); they are regression signals, not absolute numbers.
   separately (see TODO.md NEW-57). Re-include it once fixed;
   note it takes ≈1 min per iteration on this machine even when passing.
 
+## importer (v1.8 T14)
+
+- `importer.txt` covers all five benchmarks with no filter: the full
+  `-bench=.` set was stable across three recording sessions on this
+  machine (medians of B/op and allocs/op within <0.1% across sessions;
+  `cmd/benchgate` passes run↔run in both directions). Recorded
+  2026-08-23.
+- `BenchmarkIngestCold`/`BenchmarkIngestHit` include real fsync'd cache
+  writes/reads/deletes over a filesystem-backed cache, so their ns/op is
+  machine-noisy (±~5% here, more on shared CI runners). The gateable
+  metrics are allocation-shaped and deterministic for these workloads;
+  ns/op stays advisory-only per D4.

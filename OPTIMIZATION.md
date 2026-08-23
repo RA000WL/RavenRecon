@@ -383,7 +383,10 @@ hardening → operator experience → future platform work, each with evidence a
   `internal/secrentel` ingest cap), `techintel 128 technologies / 512 indicators per observation`
   (`MaxTechnologiesPerObservation`/`MaxIndicatorsPerObservation`, not HTML byte caps — the HTML
   caps are the jsintel 1 MiB above; see `internal/techintel/engine.go:83-84`), `secrentel 64 candidates/8 evidence`,
-  `priority` capped, `detect 4096 findings`, `report 100k/modelPerKind`. Lowering caps re-truncates;
+  `priority` capped, `detect 4096 findings`, `report 100k/modelPerKind`,
+  `importer line 32 KiB / decompressed gzip 100 MiB / 100k retained records`
+  (`importer.MaxLineBytes`/`MaxDecompressedBytes`/`MaxOutput`, pinned by `internal/importer/bounds_c4_test.go`;
+  all three enter cache keys). Lowering caps re-truncates;
   raising caps retains more but never invalidates keys (fixed constants by design).
 
 ### C-5 Security invariants to keep
@@ -459,7 +462,7 @@ hardening — per `AGENTS.md:5` scope policy.
 | OPT-P2-5 | Standalone CLIs | INFO | `AGENTS.md:2` | post-v1.6 | DEFERRED |
 | OPT-P2-6 | Dedup helpers | INFO | `dns/scope.go:15` `discovery/detect.go:215` | — | VERIFIED (4e31f8d + 321c55d, TODO.closed.md NEW-49/53) |
 | OPT-P3-1 | Fixtures/snapshots/bench | — | `ROADMAP.md:v1.7` | v1.7 | VERIFIED (53f2f46 + 2dcdc96 + 9370f3f + 14f61a9 + e043555, TODO.closed.md NEW-56) |
-| OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | PLANNED |
+| OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | VERIFIED (1ede060 + 81785f2 + 3e5ba4e + 5e806fe + 7fd312a + cf0e939 + T14 close-out, TODO.md NEW-59) |
 | OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` | v2.0 | PLANNED |
 | OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` | post-v1.4 | PLANNED |
 

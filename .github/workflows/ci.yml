@@ -101,3 +101,10 @@ jobs:
           # Regeneration must use the same filter so benchgate sees matching sets.
           go test -run '^$' -bench='Ingest(Cold|Hit)|Normalize|MergeParams' -benchmem -count=10 ./internal/urlintel > /tmp/new-urlintel.txt
           go run ./cmd/benchgate testdata/bench/urlintel.txt /tmp/new-urlintel.txt
+
+          echo "=== importer ==="
+          # README: importer.txt covers the full -bench=. set (v1.8 T14); no
+          # filter needed. IngestCold/Hit ns/op is fsync-noisy but advisory;
+          # the gate compares allocation medians only.
+          go test -run '^$' -bench=. -benchmem -count=10 ./internal/importer > /tmp/new-importer.txt
+          go run ./cmd/benchgate testdata/bench/importer.txt /tmp/new-importer.txt

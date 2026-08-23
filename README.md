@@ -4,7 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v1.7.0 — Integration and acceptance testing complete**
+**v1.8.0 — Universal Asset Ingestion complete**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -93,8 +93,17 @@ canonical event stream into a live terminal frame — progress, worker
 dashboard, throughput and ETA, resource sampling, an interesting-asset
 feed, and a grouped error feed — plus one deterministic final summary
 frame, with every dynamic string sanitized at the boundary and every
-structure bounded (see "Terminal observability (library)" below). None
-of the pipelines has a CLI command yet; the remaining active engines
+structure bounded (see "Terminal observability (library)" below). Universal
+asset ingestion (`internal/importer`, roadmap v1.8) makes the framework an
+analysis platform over other tools' output: 18 importer adapters behind one
+interface (plain text ×7, JSON ×5, XML ×2, archive CDX/WARC ×2, plus two
+generic fallbacks) auto-detect formats content-first — no `--type` flag —
+and stream every record through the single normalization point into the
+canonical asset graph with full provenance, dedup by identity, and
+content-hash caching; the `ravenrecon ingest` command runs files or folders
+through ingestion followed by the standard pipeline, and reports attribute
+each asset's origin (see "Universal asset ingestion" below). None of the
+other pipelines has a CLI command yet; the remaining active engines
 (crawling and secret verification) and the remaining v1.2 observability
 consumers (loggers and replays) are still later
 roadmap milestones.
@@ -705,6 +714,41 @@ a stderr warning only — it never changes the summary on stdout or the
 exit codes. `--tui` and `--verbose` are mutually exclusive (one event
 sink per run). See `ARCHITECTURE.md` ("Terminal observability").
 
+## Universal asset ingestion
+
+`internal/importer` (roadmap v1.8) consumes reconnaissance artifacts —
+`subdomains.txt`, `alive.txt`, `urls.txt`, httpx/dnsx/naabu/katana/nuclei
+JSONL, Burp sitemap/issues XML, OWASP ZAP XML, wayback CDX and WARC files,
+plain or gzipped — and normalizes every record into the canonical Phase 2
+asset graph through the single normalization point. Format detection is
+content-first (signature → structure → archive probes → extension → line
+shape over a 32 KiB peek): no `--type` flag exists, and generic fallbacks
+claim anything unrecognized rather than skipping silently. Imports stream
+with bounded memory (32 KiB lines, 100 MiB decompression cap, 100k-record
+retained set with honest truncation flags), deduplicate by canonical
+identity, and cache per file content hash plus import config — a repeat
+import of an unchanged file is a cache hit with zero parsing.
+
+Provenance is first-class: importer, original tool, filename, import time,
+verbatim record head (first 4 KiB), confidence, and bounded metadata travel
+with every asset into report attribution — CSV origin columns, Markdown/HTML
+provenance sections, and a discovered/imported origins census in the JSON
+model. Imported findings are evidence only and are never re-executed.
+Enriched/Generated origins are reserved vocabulary; Common Crawl remote
+ingestion is deferred (local archive files only).
+
+```bash
+go run ./cmd/ravenrecon ingest example.com urls.txt burp.xml exports/
+go run ./cmd/ravenrecon ingest --stages dns,httpprobe,report --output out/ example.com scan-data/
+```
+
+`ingest` accepts single files, multiple files, or folders (walked
+deterministically), runs the ingest stage followed by the standard pipeline
+(all stages except discovery by default), writes the same reports as a scan,
+and follows the scan exit-code contract. Flags precede positionals when
+multiple paths are given. See `ravenrecon ingest --help` and
+`ARCHITECTURE.md` ("Universal asset ingestion").
+
 ## Runtime engine
 
 A bounded, cancellable, rate-limited job execution engine lives in
@@ -773,6 +817,22 @@ observability frame on stderr — mutually exclusive with `--verbose`), and
 `--tui-compact` (condensed `--tui` frame; requires `--tui`). The default
 run carries no detection rules and no active enumeration is ever
 performed. See `ravenrecon scan --help` for the full contract.
+
+Ingest external artifacts through the pipeline:
+
+```bash
+go run ./cmd/ravenrecon ingest example.com urls.txt burp.xml exports/
+go run ./cmd/ravenrecon ingest --stages dns,httpprobe,report --output out/ example.com scan-data/
+```
+
+`ingest` takes a normalized target plus files or folders, auto-detects
+every format (no `--type` flag exists), streams them into the canonical
+asset graph with provenance and caching, then enriches through the selected
+stages (all except discovery by default) and writes reports like `scan`.
+Options mirror `scan`: `--stages <a,b>` (downstream only — `discover` and
+`ingest` are rejected), `--cache <dir>`, `--no-cache`, `--output <dir>`,
+`--verbose`, `--tui`, `--tui-compact`. Flags must come before the target
+and paths.
 
 Build:
 
