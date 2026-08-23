@@ -9,8 +9,10 @@
 // Design rules locked for Phase 1:
 //
 //   - Format detection waterfall: signature (<?xml/json.Valid/gzip magic) →
-//     structure probe (json.Decoder/xml.Decoder on peek) → MIME + extension
-//     tie-break → line-shape classifier for plain-text family. Peek = first
+//     structure probe (json.Decoder/xml.Decoder on peek) → archive content
+//     probes (WARC version marker / CDX line shape, gzip peeks inflated
+//     in-memory ≤32 KiB) → MIME + extension tie-break → line-shape
+//     classifier for plain-text family. Peek = first
 //     32 KiB via io.LimitReader, buffered once, then Seek(0,0). Registry
 //     returns ordered matches by confidence desc, Name asc; generic fallback
 //     last.
@@ -32,18 +34,53 @@
 // is deliberately no production compose point before that milestone, see
 // TestXMLRegistryDeterminism / newFullRegistry for the canonical set):
 //
-//	plain ×7   NewPlainDomainsImporter, NewPlainSubdomainsImporter,
-//	           NewPlainURLsImporter, NewPlainAliveImporter, NewPlainJSImporter,
-//	           NewPlainIPsImporter, NewPlainCIDRsImporter
-//	json ×5    NewJSONHttpxImporter, NewJSONDnsxImporter, NewJSONNaabuImporter,
-//	           NewJSONKatanaImporter, NewJSONNucleiImporter
-//	xml ×2     NewXMLBurpImporter (sitemap + issues shapes), NewXMLZapImporter
-//	fallbacks  NewJSONGenericImporter then NewPlainGenericImporter — always LAST
-//	           (registry sorts confidence desc, Name asc within a tier)
+//	plain ×7     NewPlainDomainsImporter, NewPlainSubdomainsImporter,
+//	             NewPlainURLsImporter, NewPlainAliveImporter,
+//	             NewPlainJSImporter, NewPlainIPsImporter, NewPlainCIDRsImporter
+//	json ×5      NewJSONHttpxImporter, NewJSONDnsxImporter,
+//	             NewJSONNaabuImporter, NewJSONKatanaImporter,
+//	             NewJSONNucleiImporter
+//	xml ×2       NewXMLBurpImporter (sitemap + issues shapes),
+//	             NewXMLZapImporter
+//	archive ×2   NewArchiveCDXImporter (wayback CDX lines, .cdx/.cdx.gz),
+//	             NewArchiveWARCImporter (WARC 0.x/1.x records, .warc/.warc.gz)
+//	fallbacks    NewJSONGenericImporter then NewPlainGenericImporter —
+//	             always LAST (registry sorts confidence desc, Name asc
+//	             within a tier)
 //
 // Do not wire a subset: Detect's generic-last fallback only behaves as tested
-// when this exact 14-specific-importer set (+2 generic fallbacks = 16 total)
+// when this exact 16-specific-importer set (+2 generic fallbacks = 18 total)
 // is registered.
+//
+// ROADMAP v1.8 row "Crawl-output importers: katana, hakrawler, gospider,
+// waymore, gau" — disposition (verified against each tool's documented output
+// formats; no redundant importers were added for one-URL-per-line output):
+//
+//   - katana text/stdout and -output files are bare crawled URLs, one per
+//     line → ingested by the plain URL family (content-shape detection claims
+//     them). katana -jsonl is claimed by json-katana in both shapes: flat
+//     {"url":...,"method":...} objects and modern exports nesting the
+//     endpoint under "request"."endpoint" (json-katana reads whichever
+//     field carries the URL).
+//   - hakrawler stdout is bare URLs → plain family. hakrawler -json emits
+//     flat {"url":...} NDJSON objects → classified through the existing JSON
+//     url-key shape and ingested as URLs by the JSON family.
+//   - gospider quiet mode (-q, "only show URL") and its per-category output
+//     files are bare URL lists → plain family. Decorated console lines
+//     ([robots]/[js] prefixes) fall through honestly as unparseable.
+//   - waymore URL mode (-mode U) writes deduplicated bare links
+//     (waymore.txt / -oU file), plain text without headers/footers → plain
+//     family. UNCOMPRESSED outputs only at detection time: plain-family
+//     probes decline gzipped peeks (plainConfidence, detect.go), so a
+//     waymore.txt.gz link list is claimed by nobody today even though the
+//     streaming path itself is gzip-capable (openStream/readLines) once an
+//     importer is chosen — open detection gap recorded in TODO.md (NEW-60).
+//   - gau prints bare URLs to stdout/--o file → plain family; gau --json
+//     emits flat url-key objects → JSON family.
+//   - Archive sources: archive-cdx and archive-warc above cover local
+//     wayback CDX exports and WARC files. Remote Common Crawl index
+//     ingestion is explicitly OUT OF SCOPE for this milestone — local files
+//     only; no network fetches happen in this package.
 //
 // This package imports only stdlib, internal/asset, and internal/event
 // (never internal/cache, internal/runtime, internal/pipeline, internal/report).

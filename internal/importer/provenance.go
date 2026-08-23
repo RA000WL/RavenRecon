@@ -42,6 +42,10 @@ func ProvenanceSourceForImporter(importerName string) string {
 		return "burpsuite"
 	case "xml-zap":
 		return "owaspzap"
+	case "archive-cdx":
+		return "wayback-cdx"
+	case "archive-warc":
+		return "warc"
 	default:
 		return importerName
 	}

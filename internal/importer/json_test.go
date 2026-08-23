@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/event"
 )
 
@@ -301,6 +302,100 @@ func TestJSONImportersTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRegressionMED_KatanaNestedJSONL pins end-to-end handling of modern
+// katana -jsonl exports, which nest the crawled endpoint under
+// "request"."endpoint" instead of a flat top-level url. Regression: such
+// files classified as "generic" shape, json-generic claimed them at 0.40,
+// and every record then failed "generic: no url/host/ip field" — silent
+// under-ingestion (ItemsProcessed:0, ItemsFailed:N).
+func TestRegressionMED_KatanaNestedJSONL(t *testing.T) {
+	const nested = `{"request":{"endpoint":"https://example.com/shell","method":"GET"},"response":{"status_code":200,"body":"<html>x</html>","duration":123}}`
+	const flat = `{"url":"https://example.com/flat","method":"POST"}`
+
+	ident := func(raw string) string {
+		t.Helper()
+		u, err := asset.ParseURL(raw, asset.Provenance{})
+		if err != nil {
+			t.Fatalf("ParseURL(%q): %v", raw, err)
+		}
+		return u.Identity().String()
+	}
+
+	t.Run("nested shape detected as json-katana against full registry", func(t *testing.T) {
+		p := writeArchiveTemp(t, "katana-modern.jsonl", nested+"\n"+nested+"\n")
+		peek, err := peekFile(p)
+		if err != nil {
+			t.Fatalf("peek: %v", err)
+		}
+		if got := mustTopName(t, p, string(peek)); got != "json-katana" {
+			t.Fatalf("top match %q want json-katana", got)
+		}
+	})
+
+	t.Run("nested and flat records both imported as URLs", func(t *testing.T) {
+		content := nested + "\n" + flat + "\n" +
+			`{"request":{"endpoint":"https://example.com/nested-two","method":"GET"}}` + "\n"
+		p := writeArchiveTemp(t, "katana-mixed.jsonl", content)
+		sink := NewSink()
+		env := ImportEnv{Clock: fixedClock(), Bounds: Bounds{MaxOutput: 1000}}
+		stats, err := NewJSONKatanaImporter().Import(context.Background(), env, p, sink)
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if stats.ItemsProcessed != 3 || stats.ItemsFailed != 0 {
+			t.Fatalf("stats processed=%d failed=%d want 3/0", stats.ItemsProcessed, stats.ItemsFailed)
+		}
+		if len(sink.URLs) != 3 {
+			t.Fatalf("urls=%d want 3", len(sink.URLs))
+		}
+		wantIDs := map[string]bool{
+			ident("https://example.com/shell"):      false,
+			ident("https://example.com/flat"):       false,
+			ident("https://example.com/nested-two"): false,
+		}
+		for _, u := range sink.URLs {
+			id := u.Identity().String()
+			if _, ok := wantIDs[id]; !ok {
+				t.Fatalf("unexpected URL identity %q (%s)", id, u.String())
+			}
+			wantIDs[id] = true
+		}
+		for id, seen := range wantIDs {
+			if !seen {
+				t.Fatalf("expected URL identity %q missing from sink", id)
+			}
+		}
+		// Nested records keep their verbatim line as provenance evidence.
+		found := false
+		for _, rec := range sink.ProvenanceRecords {
+			if strings.Contains(rec.OriginalRecord, `"request":{"endpoint"`) {
+				found = true
+				if rec.Importer != "json-katana" {
+					t.Fatalf("nested record provenance importer %q", rec.Importer)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("no nested-endpoint OriginalRecord retained")
+		}
+	})
+
+	t.Run("record without url or nested endpoint fails honestly", func(t *testing.T) {
+		p := writeArchiveTemp(t, "katana-empty.jsonl",
+			`{"request":{"method":"GET"},"response":{"status_code":500}}`+"\n")
+		sink := NewSink()
+		env := ImportEnv{Clock: fixedClock()}
+		stats, err := NewJSONKatanaImporter().Import(context.Background(), env, p, sink)
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if stats.ItemsProcessed != 0 || stats.ItemsFailed != 1 || len(sink.URLs) != 0 {
+			t.Fatalf("stats processed=%d failed=%d urls=%d want 0/1/0",
+				stats.ItemsProcessed, stats.ItemsFailed, len(sink.URLs))
+		}
+	})
 }
 
 func TestJSONImporterEmptyFile(t *testing.T) {

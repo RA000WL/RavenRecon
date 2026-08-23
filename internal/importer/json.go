@@ -401,7 +401,7 @@ type naabuRecord struct {
 type JSONKatanaImporter struct{ importerBase }
 
 func NewJSONKatanaImporter() *JSONKatanaImporter {
-	return &JSONKatanaImporter{importerBase{name: "json-katana", version: "1.0.0", tool: "katana"}}
+	return &JSONKatanaImporter{importerBase{name: "json-katana", version: "1.0.1", tool: "katana"}}
 }
 
 func (j *JSONKatanaImporter) CanImport(path string, peek []byte) (float64, bool) {
@@ -428,8 +428,13 @@ func (j *JSONKatanaImporter) Import(ctx context.Context, env ImportEnv, path str
 			return err
 		}
 		uStr := strings.TrimSpace(rec.URL)
+		if uStr == "" && rec.Request != nil {
+			// Modern katana -jsonl nests the crawled endpoint under
+			// "request"."endpoint"; the "response" sibling is deliberately
+			// not bound, keeping per-record decode memory bounded.
+			uStr = strings.TrimSpace(rec.Request.Endpoint)
+		}
 		if uStr == "" {
-			// Some katana variants use "request" with url inside?
 			return fmt.Errorf("katana missing url")
 		}
 		prov, srec := buildProvenance(env, j.Name(), filename, rawStr, now)
@@ -483,8 +488,17 @@ func (j *JSONKatanaImporter) Import(ctx context.Context, env ImportEnv, path str
 }
 
 type katanaRecord struct {
-	URL    string `json:"url"`
-	Method string `json:"method"`
+	URL     string         `json:"url"`
+	Method  string         `json:"method"`
+	Request *katanaRequest `json:"request"`
+}
+
+// katanaRequest mirrors the nested request object of modern katana -jsonl
+// output. Only Endpoint is consumed; unknown fields (and the whole
+// "response" object) are skipped by the struct decoder without retention.
+type katanaRequest struct {
+	Endpoint string `json:"endpoint"`
+	Method   string `json:"method"`
 }
 
 // JSONNucleiImporter consumes nuclei JSON and creates Findings.

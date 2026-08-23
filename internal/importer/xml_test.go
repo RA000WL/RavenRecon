@@ -55,6 +55,7 @@ func newFullRegistry(t *testing.T) *Registry {
 		NewJSONHttpxImporter(), NewJSONDnsxImporter(), NewJSONNaabuImporter(),
 		NewJSONKatanaImporter(), NewJSONNucleiImporter(), NewJSONGenericImporter(),
 		NewXMLBurpImporter(), NewXMLZapImporter(),
+		NewArchiveCDXImporter(), NewArchiveWARCImporter(),
 	} {
 		if err := r.Register(imp); err != nil {
 			t.Fatalf("Register(%s): %v", imp.Name(), err)

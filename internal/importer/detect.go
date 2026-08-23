@@ -25,6 +25,17 @@ import (
 // plain-generic's last-resort catch-all. Specific plain importers decline
 // any XML-looking peek (looksLikeXMLPeek) so tag-laden content is never
 // mis-ranked above an XML importer.
+//
+// Archive branch (ROADMAP v1.8 T8), probed after the json/xml structure
+// probes and before the line-shape classifier: archive-warc claims peeks
+// whose first non-empty (inner) line is a "WARC/<digit>" version marker;
+// archive-cdx claims peeks where ≥half of sampled lines carry the CDX shape
+// (SURT/timestamp/original-URL columns, see isCDXLine). Gzipped peeks are
+// inflated in memory up to PeekSize bytes and the inner content is probed,
+// so .warc.gz/.cdx.gz are detected by content while extensions only add a
+// confidence bump. Both probes decline XML/JSON signatures, and the CDX
+// majority requirement keeps one-URL-per-line crawl outputs (katana,
+// hakrawler, gospider, gau, waymore text mode) owned by the plain family.
 
 // looksLikeXMLPeek lives in xml_stream.go beside the rest of the XML
 // streaming machinery; it is the single definition of "peek looks like XML".
@@ -159,7 +170,39 @@ func classifyJSONObject(m map[string]json.RawMessage) string {
 		}
 		return "httpx"
 	}
+	// Modern katana -jsonl nests the crawled endpoint under
+	// "request"."endpoint" (with a sibling "response" object) instead of a
+	// flat top-level url; claiming it as katana keeps real exports out of
+	// json-generic's top-level-string-only field scan (silent under-
+	// ingestion regression). Checked last so flat shapes keep precedence.
+	if isKatanaNestedObject(m) {
+		return "katana"
+	}
 	return "generic"
+}
+
+// isKatanaNestedObject reports whether m carries modern katana -jsonl's
+// nested shape: a top-level "request" object whose "endpoint" is a non-empty
+// string. Only the bounded detection peek reaches this path, so the nested
+// decode is bounded by PeekSize.
+func isKatanaNestedObject(m map[string]json.RawMessage) bool {
+	raw, ok := m["request"]
+	if !ok || len(raw) == 0 {
+		return false
+	}
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return false
+	}
+	epRaw, ok := req["endpoint"]
+	if !ok || len(epRaw) == 0 {
+		return false
+	}
+	var endpoint string
+	if err := json.Unmarshal(epRaw, &endpoint); err != nil {
+		return false
+	}
+	return strings.TrimSpace(endpoint) != ""
 }
 
 // jsonConfidence computes confidence for a JSON importer based on probe shape.
