@@ -65,6 +65,13 @@ func TestClassifyContextFlags(t *testing.T) {
 		{"docs/setup.md", "", true},
 		{"spec/database.yml", "", true},
 		{"mock-server.js", "", true},
+		// NEW-78: whole-token matching — markers embedded inside larger
+		// words must NOT flag; genuine segment names still do.
+		{"", "/latest/app.js", false},
+		{"", "/js/demonstration.js", false},
+		{"", "/respectable/page", false},
+		{"test-fixture.js", "", true},
+		{"", "/assets/sandbox/init.js", true},
 	}
 	for _, tt := range cases {
 		flags := classifyContext(tt.filename, tt.path)

@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -267,7 +266,6 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
 			fmt.Errorf("stage %s: create pool: %w", s.Name(), err)
 	}
-	defer func() { _ = pool.Shutdown(context.Background()) }()
 
 	env := importer.ImportEnv{
 		Clock:  ingestEnvClock(in.Clock),
@@ -275,26 +273,41 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 	}
 
 	outcomes := make([]ingestFileOutcome, len(files))
-	var wg sync.WaitGroup
+	// Every slot starts as cancelled: a job the pool never executed (its
+	// context fired while the job sat queued — the forced-shutdown path
+	// drops queued work without running Func) keeps this honest
+	// placeholder instead of folding as the zero status (completed).
+	for i := range outcomes {
+		outcomes[i] = ingestFileOutcome{status: ingestCancelled}
+	}
 	for i, path := range files {
-		wg.Add(1)
 		idx := i
 		if _, err := pool.Submit(ctx, runtime.Job{Func: func(jobCtx context.Context) (any, error) {
-			defer wg.Done()
 			outcomes[idx] = s.importOne(jobCtx, env, in.Cache, path, bounds)
 			return nil, nil
 		}}); err != nil {
-			wg.Done()
 			// Submission refused (context cancelled or pool closing): this
 			// file and everything after it never ran — record them
 			// cancelled honestly and stop submitting.
+			cerr := ctx.Err()
+			if cerr == nil {
+				cerr = err
+			}
 			for j := i; j < len(files); j++ {
-				outcomes[j] = ingestFileOutcome{status: ingestCancelled, err: ctx.Err()}
+				outcomes[j] = ingestFileOutcome{status: ingestCancelled, err: cerr}
 			}
 			break
 		}
 	}
-	wg.Wait()
+	// Join point (H-2 / NEW-61): the pool itself, never a caller-side
+	// WaitGroup. A wg.Done inside the job closure deadlocks on
+	// cancellation: the forced-shutdown path drops queued jobs WITHOUT
+	// executing their Func, so their Done calls never fire and wg.Wait
+	// blocks forever before the deferred pool.Shutdown runs. Shutdown
+	// always waits for every worker to reach zero — draining cleanly when
+	// the stage context is live, forcing queued and running jobs down and
+	// STILL waiting to zero when it has already fired.
+	_ = pool.Shutdown(ctx)
 
 	res, execErr := foldIngestOutcomes(in, files, outcomes)
 	if res.Outcome == pipeline.OutcomeCancelled && ctx.Err() != nil {
@@ -814,13 +827,16 @@ func filterIngestDomains(declared asset.Domain, domains []asset.Domain) []asset.
 }
 
 // filterIngestURLs drops every URL whose canonical host is not representable
-// as an in-domain canonical asset.Host. IP-literal hosts fail asset.NewHost
-// and are dropped — mirroring the crawl adapter's filterURLs boundary.
+// as an in-domain canonical asset.Host. The port-bearing HostPort is stripped
+// through the package's ONE URL-host helper (urlHost, httpprobe.go — H-3 /
+// NEW-63: feeding the raw HostPort to asset.NewHost rejected every explicit
+// non-default port with a silent skip); IP-literal hosts are dropped — the
+// same boundary every adapter applies through filterURLs.
 func filterIngestURLs(declared asset.Domain, urls []asset.URL) []asset.URL {
 	out := make([]asset.URL, 0, len(urls))
 	for _, u := range urls {
-		h, err := asset.NewHost(u.HostPort, asset.Provenance{})
-		if err != nil {
+		h, ok := urlHost(u)
+		if !ok {
 			continue
 		}
 		if pipeline.InDomain(declared, h) {

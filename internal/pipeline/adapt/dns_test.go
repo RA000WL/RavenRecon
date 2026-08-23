@@ -1235,3 +1235,98 @@ func TestDNSBruteAboveCapTruncationFlag(t *testing.T) {
 		t.Fatalf("StickyFlags = %v, want %q set above the wordlist cap", res.StickyFlags, dnsBruteTruncatedFlag)
 	}
 }
+
+// --- NEW-71: brute abort/failure paths are never silent ---
+
+// TestDNSBruteFailedFlagOnResolveEngineError is the NEW-71 regression for
+// the engine-error abort path: dns.Resolve failing with a non-cancellation
+// error (fault-injected through an invalid worker-pool config) must surface
+// the dns_brute_failed sticky flag, never a bare empty result the caller
+// passes through as completed.
+func TestDNSBruteFailedFlagOnResolveEngineError(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	s := &dnsStage{resolver: newFakeResolver()}
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+	cfg := dns.Config{Concurrency: -1} // invalid: pool creation fails inside Resolve
+	bruteRes, _, wildcard := s.runBrute(context.Background(), in, cfg, pipeline.StageResult{})
+	if wildcard {
+		t.Fatal("wildcard = true, want false")
+	}
+	if !bruteRes.StickyFlags[dnsBruteFailedFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set when the brute resolve failed", bruteRes.StickyFlags, dnsBruteFailedFlag)
+	}
+	if len(bruteRes.Additions.Hosts) != 0 || len(bruteRes.Results.IPs) != 0 {
+		t.Fatalf("failed brute produced additions: %+v", bruteRes)
+	}
+}
+
+// cancelOnProbeResolver answers every query NODATA but cancels the stage
+// context on the first lookup (the wildcard probe): brute then reaches
+// candidate resolution with an already-fired context.
+type cancelOnProbeResolver struct{ cancel context.CancelFunc }
+
+func (r *cancelOnProbeResolver) Lookup(ctx context.Context, host string, rt dns.RecordType) ([]string, error) {
+	r.cancel()
+	return []string{}, nil
+}
+
+// TestDNSBruteCancelledDuringResolutionFlag is the NEW-71 regression for the
+// cancellation-abort path: the stage context firing during candidate
+// resolution must set dns_brute_skipped_cancelled (generalized beyond the
+// wildcard-probe skip) while the base outcome stays honest.
+func TestDNSBruteCancelledDuringResolutionFlag(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	in := dnsInput(target, nil)
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+	res, err := NewDNSStage(&cancelOnProbeResolver{cancel: cancel}).Run(ctx, in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if !res.StickyFlags[dnsBruteSkippedCancelledFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set when the resolve aborted on cancellation", res.StickyFlags, dnsBruteSkippedCancelledFlag)
+	}
+}
+
+// TestDNSBruteFailedFlagOnWildcardProbeEngineError is the NEW-71 regression
+// for the wildcard-probe engine-error abort path (runBrute's non-cancellation
+// IsWildcard failure): the wildcard state is UNKNOWN, so the brute must abort
+// and surface dns_brute_failed on the merged result while the base outcome
+// stays honest (no brute hosts, no wildcard flag). The fault is injected via
+// the fakeResolver seam on the exact probe host dns.IsWildcard queries; the
+// error is a typed ErrCancelled-kind query error carrying NO context
+// cancellation — the only surface IsWildcard re-raises instead of swallowing.
+func TestDNSBruteFailedFlagOnWildcardProbeEngineError(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	fake := newFakeResolver()
+	// Base corpus host resolves so the base run completes honestly.
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	probeHost := "ravenrecon-wildcard-check.example.com"
+	fake.setErr(probeHost, dns.TypeA, &dns.QueryError{
+		Kind: dns.ErrCancelled,
+		Host: probeHost,
+		Type: dns.TypeA,
+		Err:  errors.New("synthetic wildcard-probe engine failure"),
+	})
+
+	in := dnsInput(target, []asset.Host{mustHost(t, "www.example.com")})
+	in.Config = map[string]string{"dnsx_brute": "true", "dnsx_wordlist": "www"}
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if !res.StickyFlags[dnsBruteFailedFlag] {
+		t.Fatalf("StickyFlags = %v, want %q set when the wildcard probe failed with an engine error", res.StickyFlags, dnsBruteFailedFlag)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want the honest base outcome preserved on a failed brute abort", res.Outcome)
+	}
+	requireEqualStrings(t, "hosts after probe-failure abort", hostNames(res.Additions.Hosts), []string{"www.example.com"})
+	if seen := fake.seenHosts(); !seen[probeHost] {
+		t.Fatalf("wildcard probe host was never queried (fault injection missed): seen=%v", seen)
+	}
+}

@@ -1,6 +1,7 @@
 package httpprobe
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,7 +9,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -549,4 +552,167 @@ func (t *maxConcurrentTransport) RoundTrip(req *http.Request) (*http.Response, e
 
 func init() {
 	// Ensure deterministic clock for tests that use cache
+}
+
+// deepChainTLSState builds a fake tls.ConnectionState carrying n peer
+// certificates (independent self-signed leaves are enough: captureTLS only
+// inspects the leaf and counts the chain depth).
+func deepChainTLSState(t testing.TB, n int) *tls.ConnectionState {
+	t.Helper()
+	cs := tlsStateForTest(t, "example.com")
+	for len(cs.PeerCertificates) < n {
+		extra := tlsStateForTest(t, "example.com")
+		cs.PeerCertificates = append(cs.PeerCertificates, extra.PeerCertificates...)
+	}
+	return cs
+}
+
+// TestLiveProbeDeepChainTLSDiagnosticKeepsCompletedAndCached pins NEW-77:
+// a captureTLS diagnostic (chain deeper than the asset model cap) joined
+// into rec.Err must not flip a fully-observed response into a failed or
+// uncachable record. The first run stays completed (diagnostic in Err only,
+// no FailureReason stamped), and the second run is served as a cache hit —
+// hosts with deep chains are never re-probed forever.
+func TestLiveProbeDeepChainTLSDiagnosticKeepsCompletedAndCached(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(dir)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	domain := mustDomainProbe(t, "example.com")
+	u := mustURLProbe(t, "https://example.com/deep-chain")
+	tr := &urlTransport{byURL: map[string]cannedURLResponse{
+		"https://example.com/deep-chain": {
+			status:   200,
+			tlsState: deepChainTLSState(t, maxTLSMetadataChainDepth+1),
+		},
+	}}
+	cfg := Config{Concurrency: 1, QueueSize: 4, Cache: c, Transport: tr}
+	r1, err := ProbeURLs(context.Background(), domain, []asset.URL{u}, cfg)
+	if err != nil {
+		t.Fatalf("first ProbeURLs: %v", err)
+	}
+	rec1 := r1.Records[0]
+	if rec1.Cached {
+		t.Fatal("first run should not be cached")
+	}
+	if rec1.Status != 200 {
+		t.Fatalf("first run status = %d, want 200 (response fully observed)", rec1.Status)
+	}
+	if rec1.Err == nil || !strings.Contains(rec1.Err.Error(), "exceeds the asset model cap") {
+		t.Fatalf("first run err = %v, want the tls chain-depth diagnostic", rec1.Err)
+	}
+	if rec1.TLSMeta == nil || rec1.TLSMeta.Certificate.Fingerprint != "" {
+		t.Fatalf("first run TLS meta = %+v, want metadata kept but certificate asset suppressed", rec1.TLSMeta)
+	}
+	// The stored record must carry no failure reason: the response was
+	// observed, so ReasonOther must never be stamped.
+	key, err := liveKey(u, domain)
+	if err != nil {
+		t.Fatalf("liveKey: %v", err)
+	}
+	out := c.Get(context.Background(), key)
+	if !out.IsHit() || out.Record.Status != cache.StatusCompleted {
+		t.Fatalf("stored record = hit=%v status=%v, want a completed hit", out.IsHit(), out.Record.Status)
+	}
+	var stored storedLive
+	if jerr := json.Unmarshal(out.Record.Data, &stored); jerr != nil {
+		t.Fatalf("unmarshal stored: %v", jerr)
+	}
+	if stored.FailureReason != ReasonNone {
+		t.Fatalf("stored failure reason = %q, want none for an observed response", stored.FailureReason)
+	}
+	// Second run: served from cache without touching the transport.
+	tr2 := &urlTransport{byURL: map[string]cannedURLResponse{
+		"https://example.com/deep-chain": {err: errors.New("should not be called")},
+	}}
+	cfg2 := Config{Concurrency: 1, QueueSize: 4, Cache: c, Transport: tr2}
+	r2, err := ProbeURLs(context.Background(), domain, []asset.URL{u}, cfg2)
+	if err != nil {
+		t.Fatalf("second ProbeURLs: %v", err)
+	}
+	rec2 := r2.Records[0]
+	if !rec2.Cached || tr2.count() != 0 {
+		t.Fatalf("second run cached=%v requests=%d, want a zero-request cache hit", rec2.Cached, tr2.count())
+	}
+	if rec2.Status != 200 {
+		t.Fatalf("second run status = %d, want 200 served from cache", rec2.Status)
+	}
+}
+
+// TestLiveProbeRedirectFallbackSanitized pins the NEW-83 redaction item:
+// when the MaxHeaders cap drops the Location header from boundedHeaders,
+// the raw fallback goes through sanitizeLocation — control bytes and
+// userinfo never survive into RedirectLocation.
+func TestLiveProbeRedirectFallbackSanitized(t *testing.T) {
+	domain := mustDomainProbe(t, "example.com")
+	u := mustURLProbe(t, "http://example.com/redir-cap")
+	// More than MaxHeaders keys that all sort before "Location", so the cap
+	// drops Location from the retained headers and the raw fallback runs.
+	headers := make(map[string]string, MaxHeaders+2)
+	for i := range MaxHeaders + 2 {
+		headers["B-Test-"+pad3(i)] = "v"
+	}
+	hostile := "\x01http://user:pass@example.com/p\x7fath?q=1"
+	headers["Location"] = hostile
+	tr := &urlTransport{byURL: map[string]cannedURLResponse{
+		"http://example.com/redir-cap": {status: 302, headers: headers},
+	}}
+	cfg := Config{Concurrency: 1, QueueSize: 4, Transport: tr}
+	report, err := ProbeURLs(context.Background(), domain, []asset.URL{u}, cfg)
+	if err != nil {
+		t.Fatalf("ProbeURLs: %v", err)
+	}
+	rec := report.Records[0]
+	if !rec.RedirectObserved {
+		t.Fatal("RedirectObserved = false, want true")
+	}
+	if rec.RedirectLocation == "" {
+		t.Fatal("RedirectLocation empty, want the sanitized fallback target")
+	}
+	if strings.ContainsFunc(rec.RedirectLocation, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		t.Fatalf("RedirectLocation %q carries control bytes", rec.RedirectLocation)
+	}
+	if strings.Contains(rec.RedirectLocation, "user:pass") {
+		t.Fatalf("RedirectLocation %q carries credentials", rec.RedirectLocation)
+	}
+}
+
+// bodyOverrideTransport serves one canned response whose Body is supplied
+// per request (the urlTransport always answers with http.NoBody).
+type bodyOverrideTransport struct {
+	status int
+	body   io.ReadCloser
+}
+
+func (t *bodyOverrideTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.status,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       t.body,
+		Request:    req,
+	}, nil
+}
+
+// TestLiveProbeDrainsBodyBeforeClose pins the NEW-83 keep-alive item:
+// doLiveProbe drains up to maxRedirectDrainBytes of the terminal body
+// before closing it (like drainFollowedBody on the host path), so the
+// connection stays reusable; the body is always closed.
+func TestLiveProbeDrainsBodyBeforeClose(t *testing.T) {
+	domain := mustDomainProbe(t, "example.com")
+	u := mustURLProbe(t, "http://example.com/drain")
+	body := &drainTrackingBody{content: bytes.Repeat([]byte("x"), maxRedirectDrainBytes+4096)}
+	tr := &bodyOverrideTransport{status: 200, body: body}
+	cfg := Config{Concurrency: 1, QueueSize: 4, Transport: tr}
+	if _, err := ProbeURLs(context.Background(), domain, []asset.URL{u}, cfg); err != nil {
+		t.Fatalf("ProbeURLs: %v", err)
+	}
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	if !body.closed {
+		t.Fatal("terminal response body was not closed")
+	}
+	if body.read != maxRedirectDrainBytes {
+		t.Fatalf("drained %d bytes, want exactly %d (bounded drain)", body.read, maxRedirectDrainBytes)
+	}
 }

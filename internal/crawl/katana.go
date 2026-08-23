@@ -66,6 +66,14 @@ type Result struct {
 	Diagnostics []string
 	// Truncated reports that the retained set was cut at a cap.
 	Truncated bool
+	// FailedHosts counts hosts whose katana run failed outright: a runner
+	// error (including a per-tool timeout) or a non-zero exit without any
+	// usable output. Whole-run cancellation is not counted here — it is
+	// reported via the returned error. A non-zero count means the corpus is
+	// partial: such results are stored as cache.StatusIncomplete, never as
+	// StatusCompleted, so a broken run can never serve as a completed cache
+	// hit and the next run re-executes.
+	FailedHosts int
 }
 
 // Source adapts one active crawl corpus producer.
@@ -164,7 +172,7 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 	version := detectKatanaVersion(ctx, runner, katanaPath)
 	// Cache lookup: only when version known (Version=="" → no cache, like assetfinder).
 	if cfg.Cache != nil && version != "" {
-		key, kerr := crawlCacheKey(domain, hosts, cfg.Depth, version)
+		key, kerr := crawlCacheKey(domain, hosts, cfg, version)
 		if kerr == nil {
 			out := cfg.Cache.Get(ctx, key)
 			if out.IsHit() && out.Record != nil && out.Record.Status == cache.StatusCompleted {
@@ -197,11 +205,17 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 	var diagnostics []string
 	malformed := 0
 	truncated := false
+	failedHosts := 0
+	// hostErrs preserves the engine's per-host failure errors so a mid-run
+	// cancellation can return them joined with ctx.Err() instead of
+	// discarding the detail.
+	var hostErrs []error
 
 	// For determinism, process hosts in sorted order sequentially (bounded).
 	for _, h := range hosts {
 		if ctx.Err() != nil {
-			return Result{URLs: allCandidates, Diagnostics: diagnostics, Truncated: truncated}, ctx.Err()
+			return Result{URLs: allCandidates, Diagnostics: diagnostics, Truncated: truncated, FailedHosts: failedHosts},
+				errors.Join(append(hostErrs, ctx.Err())...)
 		}
 		// Build katana argv: separate args, never shell-joined.
 		targetURL := "https://" + h.Name
@@ -231,12 +245,16 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 			cancel()
 		}
 		if rerr != nil {
-			if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) || runCtx.Err() != nil {
-				// Cancellation is not a failure of the crawl; return what we have.
-				diagnostics = append(diagnostics, fmt.Sprintf("katana %s: %v", h.Name, rerr))
-				continue
-			}
 			diagnostics = append(diagnostics, fmt.Sprintf("katana %s: %v", h.Name, rerr))
+			if ctx.Err() == nil {
+				// Not a whole-run cancellation: this host genuinely failed
+				// (runner error or per-tool timeout).
+				failedHosts++
+			}
+			// Always preserve the engine's error so a mid-run cancellation
+			// returns it joined with the cancellation cause instead of
+			// discarding the detail.
+			hostErrs = append(hostErrs, fmt.Errorf("katana %s: %w", h.Name, rerr))
 			continue
 		}
 		// Parse JSONL output: 4 MiB bounded capture.
@@ -258,9 +276,12 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 			truncated = true
 			diagnostics = append(diagnostics, fmt.Sprintf("host %s stdout truncated", h.Name))
 		}
-		// Non-zero exit with usable output is partial but we keep it; without output it's ignored.
+		// Non-zero exit with usable output is partial but we keep it; without
+		// output the host counts as failed.
 		if res.ExitCode != 0 && len(parsed) == 0 && !res.StdoutTruncated {
 			diagnostics = append(diagnostics, fmt.Sprintf("katana %s exited %d", h.Name, res.ExitCode))
+			failedHosts++
+			hostErrs = append(hostErrs, fmt.Errorf("katana %s exited %d", h.Name, res.ExitCode))
 		}
 	}
 	if malformed > 0 {
@@ -274,18 +295,33 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 		truncated = true
 		diagnostics = append(diagnostics, fmt.Sprintf("total truncated at %d", MaxTotalURLs))
 	}
-	result := Result{URLs: allCandidates, Diagnostics: diagnostics, Truncated: truncated}
+	result := Result{URLs: allCandidates, Diagnostics: diagnostics, Truncated: truncated, FailedHosts: failedHosts}
 
-	// Cache store: only completed status. Truncated with flag is still completed (carve-out).
+	// A run interrupted by context cancellation is never reported as a clean
+	// success: return the engine's per-host failure errors joined with the
+	// cancellation cause so no detail is discarded (the partial corpus and
+	// diagnostics still travel on the Result).
+	if ctx.Err() != nil {
+		return result, errors.Join(append(hostErrs, ctx.Err())...)
+	}
+
+	// Cache store policy: a run with failed hosts is partial — store it as
+	// StatusIncomplete so it is never replayed as a completed hit (the cache
+	// serves only StatusCompleted records) and the next run re-executes.
+	// Truncated with the flag set is still completed (carve-out).
+	status := cache.StatusCompleted
+	if result.FailedHosts > 0 {
+		status = cache.StatusIncomplete
+	}
 	if cfg.Cache != nil && version != "" {
-		if key, kerr := crawlCacheKey(domain, hosts, cfg.Depth, version); kerr == nil {
+		if key, kerr := crawlCacheKey(domain, hosts, cfg, version); kerr == nil {
 			sc := storedCrawl{Domain: domain.Identity().String(), URLs: result.URLs, Truncated: result.Truncated, Diagnostics: result.Diagnostics}
 			if data, merr := json.Marshal(sc); merr == nil {
 				rec := cache.Record{
 					Operation: Operation,
 					Target:    domain.Identity().String(),
 					Tool:      cache.ToolInfo{Name: "katana", Version: version},
-					Status:    cache.StatusCompleted,
+					Status:    status,
 					Data:      data,
 				}
 				// Store with detached context if original cancelled (best-effort).
@@ -332,8 +368,12 @@ func detectKatanaVersion(ctx context.Context, runner discovery.Runner, katanaPat
 	return ""
 }
 
-// crawlCacheKey derives the cache key for a crawl operation.
-func crawlCacheKey(domain asset.Domain, hosts []asset.Host, depth int, version string) (cache.Key, error) {
+// crawlCacheKey derives the cache key for a crawl operation. cfg must be
+// effective (post-normalization): every value that shapes katana's retained
+// output participates in the key — depth, the per-tool timeout budget, and
+// the -c/-rl pacing flags (§11: keys cover every result-affecting input) —
+// alongside the host scope and tool version.
+func crawlCacheKey(domain asset.Domain, hosts []asset.Host, cfg Config, version string) (cache.Key, error) {
 	// scopeHash: hex sha256 of sorted host names joined by ",".
 	names := make([]string, len(hosts))
 	for i, h := range hosts {
@@ -346,8 +386,11 @@ func crawlCacheKey(domain asset.Domain, hosts []asset.Host, depth int, version s
 		Operation: Operation,
 		Target:    domain.Identity().String(),
 		Config: map[string]string{
-			"depth": fmt.Sprint(depth),
-			"scope": scopeHash,
+			"depth":       fmt.Sprint(cfg.Depth),
+			"scope":       scopeHash,
+			"timeout":     cfg.Timeout.String(),
+			"concurrency": fmt.Sprint(cfg.Concurrency),
+			"rate_limit":  fmt.Sprint(cfg.RateLimit),
 		},
 		Tool: cache.ToolInfo{Name: "katana", Version: version},
 	})

@@ -2,6 +2,7 @@ package adapt
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 )
 
@@ -398,5 +400,39 @@ func TestUrlliveStageCacheBeforePipelineMerge(t *testing.T) {
 	}
 	if !rep.Truncated || !rep.StickyFlags["live_records_truncated"] {
 		t.Fatalf("want live_records_truncated flag and Truncated, got %v %v", rep.Truncated, rep.StickyFlags)
+	}
+}
+
+// TestFoldUrlliveOutcomesTable is the M-9 / NEW-72 regression table: the
+// fold implements the unified mapping (adapt/doc.go) — cancelled >
+// failed-with-no-completions > all-completed > partial — so a mixed
+// success/failure report folds to PARTIAL, never completed.
+func TestFoldUrlliveOutcomesTable(t *testing.T) {
+	ok := httpprobe.LiveRecord{URL: mustURLUrllive(t, "http://example.com/ok"), Status: 200}
+	bad := httpprobe.LiveRecord{URL: mustURLUrllive(t, "http://example.com/bad"), Err: errors.New("connection refused")}
+	cancelled := httpprobe.LiveRecord{URL: mustURLUrllive(t, "http://example.com/cx"), Err: context.Canceled}
+	truncated := httpprobe.LiveRecord{URL: mustURLUrllive(t, "http://example.com/trunc"), Truncated: true}
+
+	cases := []struct {
+		name string
+		recs []httpprobe.LiveRecord
+		want pipeline.Outcome
+	}{
+		{"no records", nil, pipeline.OutcomeCompleted},
+		{"all success", []httpprobe.LiveRecord{ok}, pipeline.OutcomeCompleted},
+		{"all failed", []httpprobe.LiveRecord{bad}, pipeline.OutcomeFailed},
+		{"mixed success and failure", []httpprobe.LiveRecord{ok, bad}, pipeline.OutcomePartial},
+		{"cancelled only", []httpprobe.LiveRecord{cancelled}, pipeline.OutcomeCancelled},
+		{"cancelled beats failure", []httpprobe.LiveRecord{cancelled, bad}, pipeline.OutcomeCancelled},
+		{"truncated counts as completion", []httpprobe.LiveRecord{truncated}, pipeline.OutcomeCompleted},
+		{"truncated plus failure is partial", []httpprobe.LiveRecord{truncated, bad}, pipeline.OutcomePartial},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := foldUrlliveOutcomes(httpprobe.LiveReport{Records: tc.recs})
+			if got != tc.want {
+				t.Fatalf("foldUrlliveOutcomes = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

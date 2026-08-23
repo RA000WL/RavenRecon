@@ -171,11 +171,10 @@ func parseHTML(item Item, parser Parser, maxScripts int) (candidates []asset.URL
 	if len(body) > MaxHTMLBody {
 		body = body[:MaxHTMLBody]
 	}
-	lower := strings.ToLower(body)
 
 	pos := 0
 	for {
-		tagAt, isScript, ok := findNextTag(lower, pos)
+		tagAt, isScript, ok := findNextTag(body, pos)
 		if !ok {
 			break
 		}
@@ -186,8 +185,8 @@ func parseHTML(item Item, parser Parser, maxScripts int) (candidates []asset.URL
 		nameEnd := tagAt + nameLen
 		// A tag-name boundary: "<scriptx" is not a script tag. The char
 		// after the name must be whitespace, '/', '>', or end-of-body.
-		if nameEnd < len(lower) {
-			c := lower[nameEnd]
+		if nameEnd < len(body) {
+			c := body[nameEnd]
 			if !isSpace(c) && c != '/' && c != '>' {
 				pos = tagAt + 1
 				continue
@@ -220,11 +219,11 @@ func parseHTML(item Item, parser Parser, maxScripts int) (candidates []asset.URL
 			// Inline script without src: its body is not markup — advance
 			// past the closing </script> (or to the end when the block is
 			// unterminated) so script text is never tag-scanned.
-			closeAt := strings.Index(lower[tagEnd:], "</script")
+			closeAt := indexCloseScript(body, tagEnd)
 			var inline string
 			if closeAt >= 0 {
-				inline = body[tagEnd : tagEnd+closeAt]
-				pos = tagEnd + closeAt + len("</script")
+				inline = body[tagEnd:closeAt]
+				pos = closeAt + len("</script")
 			} else {
 				inline = body[tagEnd:]
 				pos = len(body)
@@ -233,21 +232,26 @@ func parseHTML(item Item, parser Parser, maxScripts int) (candidates []asset.URL
 			// the page URL (import specifier semantics: bare specifiers
 			// are dropped — they have no page-relative meaning — and
 			// unsupported schemes count malformed).
+			// A parse failure is counted (malformed), never silently
+			// dropped: the inline block was observed but could not be
+			// mined for imports.
 			parsed, perr := parser.Parse([]byte(inline))
-			if perr == nil {
-				for _, imp := range parsed.Imports {
-					if imp.Specifier == "" {
-						continue
-					}
-					u, resolved, bare := resolveImport(item.URL, imp.Specifier)
-					if !resolved {
-						if !bare {
-							malformed++
-						}
-						continue
-					}
-					candidates, dropped = addCandidate(candidates, u, maxScripts, dropped)
+			if perr != nil {
+				malformed++
+				continue
+			}
+			for _, imp := range parsed.Imports {
+				if imp.Specifier == "" {
+					continue
 				}
+				u, resolved, bare := resolveImport(item.URL, imp.Specifier)
+				if !resolved {
+					if !bare {
+						malformed++
+					}
+					continue
+				}
+				candidates, dropped = addCandidate(candidates, u, maxScripts, dropped)
 			}
 			continue
 		}
@@ -281,34 +285,73 @@ func parseHTML(item Item, parser Parser, maxScripts int) (candidates []asset.URL
 }
 
 // findNextTag locates the next "<script" or "<link" at or after pos,
-// returning the earlier one. A "<script" hit is reported as a script tag
-// only when the name is properly bounded (the char after "script" is
-// whitespace, '/', '>', or end-of-body): "<scriptx" is not a script tag and
-// is reported with isScript=false so the caller's boundary re-check skips
-// it. ok is false when neither prefix occurs.
-func findNextTag(lower string, pos int) (tagAt int, isScript bool, ok bool) {
-	si := strings.Index(lower[pos:], "<script")
-	li := strings.Index(lower[pos:], "<link")
-	switch {
-	case si < 0 && li < 0:
-		return 0, false, false
-	case si < 0:
-		return pos + li, false, true
-	case li < 0 || si < li:
-		at := pos + si
-		// Tag-name boundary: "script" must be followed by whitespace, '/',
-		// '>', or end-of-body — "<scriptx" is not a script tag.
-		nameEnd := at + len("<script")
-		if nameEnd < len(lower) {
-			c := lower[nameEnd]
-			if !isSpace(c) && c != '/' && c != '>' {
-				return at, false, true
-			}
+// returning the earlier one. Tag names match ASCII-case-insensitively
+// against the raw body — no lowercased copy is taken, so every offset
+// lives in ONE index space even for input whose case folding changes
+// byte lengths (e.g. U+0130). A "<script" hit is reported as a script
+// tag only when the name is properly bounded (the char after "script"
+// is whitespace, '/', '>', or end-of-body): "<scriptx" is not a script
+// tag and is reported with isScript=false so the caller's boundary
+// re-check skips it. ok is false when neither prefix occurs.
+func findNextTag(body string, pos int) (tagAt int, isScript bool, ok bool) {
+	for i := pos; i < len(body); i++ {
+		if body[i] != '<' {
+			continue
 		}
-		return at, true, true
-	default:
-		return pos + li, false, true
+		if hasTagName(body, i+1, "script") {
+			// Tag-name boundary: "script" must be followed by
+			// whitespace, '/', '>', or end-of-body — "<scriptx" is
+			// not a script tag.
+			return i, tagNameBoundary(body, i+len("<script")), true
+		}
+		if hasTagName(body, i+1, "link") {
+			return i, false, true
+		}
 	}
+	return 0, false, false
+}
+
+// hasTagName reports whether s[at:] begins with name, compared
+// ASCII-case-insensitively (identical to a strings.ToLower comparison
+// for all-ASCII input; non-ASCII bytes never fold). Out-of-range at is
+// false.
+func hasTagName(s string, at int, name string) bool {
+	if at < 0 || at+len(name) > len(s) {
+		return false
+	}
+	for k := range len(name) {
+		c := s[at+k]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != name[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// tagNameBoundary reports whether the byte at i ends a tag name:
+// whitespace, '/', '>' — or end-of-body.
+func tagNameBoundary(s string, i int) bool {
+	if i >= len(s) {
+		return true
+	}
+	c := s[i]
+	return isSpace(c) || c == '/' || c == '>'
+}
+
+// indexCloseScript returns the index of the next "</script" (matched
+// ASCII-case-insensitively against the raw body) at or after from, or
+// -1 when none remains. Like findNextTag it works in the body's single
+// index space.
+func indexCloseScript(body string, from int) int {
+	for i := from; i < len(body); i++ {
+		if body[i] == '<' && hasTagName(body, i+1, "/script") {
+			return i
+		}
+	}
+	return -1
 }
 
 // scanTagAttrs parses the attributes of the tag body starting at nameEnd

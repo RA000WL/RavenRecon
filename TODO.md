@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-61).
+  next free `NEW-n` (currently NEW-90).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -53,6 +53,17 @@ orchestrator; every agent may append or update its own entries.
 
 ## Open items
 
+> **2026-08-23 implementation wave:** NEW-61 through NEW-84 were implemented
+> by a builder batch (10 parallel fix agents + orchestrator integration).
+> Gates at close: gofmt clean, go vet clean, `go build ./...` OK,
+> `go test ./... -count=1` 28/28 packages pass, `go test -race` green on
+> runtime/cache/event/pipeline/adapt/tui/crawl, CLI smoke-tested live
+> (doctor; discover + scan against vulnbank.org incl. --tui header and exit
+> codes). Entries below flipped to IN PROGRESS — never self-closed; orchestrator
+> verified 2026-08-23 (4-cluster reviewer sweep + gap fixes): all 22 entries
+> VERIFIED and archived to TODO.closed.md. NEW-85..NEW-89 filed from findings
+> the sweep surfaced.
+
 ### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
 - Status: DEFERRED
 - Reporter: reviewer
@@ -88,21 +99,6 @@ orchestrator; every agent may append or update its own entries.
   fixed bounds are deliberate contracts.
 - Verification: n/a while deferred.
 
-### NEW-58 (LOW) — C-4 drift detectors missing for detect/report caps (internal/detect, internal/report)
-- Status: VERIFIED — implemented (builder session ses_fda40ee7cffeIG9invXq9imvcA)
-  and orchestrator-verified 2026-08-22: constants verified code↔doc before
-  pinning (detect.maxFindingsPerRun=4096, report.maxModelPerKind=100_000);
-  perturbation evidence shows each detector fails naming constant, actual,
-  expected, and doc source; gates green. Archived to TODO.closed.md.
-- Reporter: builder (v1.7 batch D, NEW-56)
-- Owner: builder
-- Problem: every other C-4-documented cap gained an in-package bounds_c4_test.go
-  drift detector in batch D; detect (maxFindingsPerRun=4096) and report
-  (maxModelPerKind=100000) did not because those packages were scope-restricted
-  mid-task. Their constants are unexported, so detectors must be in-package.
-- Fix: add bounds_c4_test.go to both packages pinning the documented values.
-- Verification: tests pass; constants drift would fail them.
-
 ### NEW-60 (INFO) — gzipped plain-text link lists claimed by nobody at detection time (internal/importer)
 - Status: OPEN
 - Reporter: reviewer T8 round (entry recorded by fix session ses_fd28d1daaffeOWE1tUkrhAgem8, 2026-08-23)
@@ -123,10 +119,51 @@ orchestrator; every agent may append or update its own entries.
   top match plain-urls; existing gzipped CDX/WARC content-detection and
   anti-steal cases stay green.
 
+
+### NEW-85 (MEDIUM) — crawl stage diagnostic-presence heuristic misclassifies linkless successes as failures (internal/pipeline/adapt)
+- Status: OPEN
+- Reporter: reviewer (v1.8-wave verification cluster A, 2026-08-23)
+- Owner: (unassigned)
+- Problem: adapt/crawl.go:150-158 — when FailedHosts==0 && len(URLs)==0 && !Truncated && len(Diagnostics)>0, the stage infers failed=len(hosts). A katana run that genuinely succeeded over a linkless site but emitted any benign diagnostic (e.g. "N malformed lines skipped") is reported incomplete with ItemsFailed=len(hosts) — counters lie even though the outcome errs conservative.
+- Fix: explicit engine signal instead of inference — engine sets FailedHosts=len(hosts) itself on its genuine failure early-returns (e.g. katana.go missing-binary path), adapter drops the diagnostics heuristic.
+- Verification: linkless-success-with-benign-diagnostic fixture → completed, ItemsFailed=0; genuine-failure fixtures still fail.
+
+### NEW-86 (LOW) — crawl exit-0 all-malformed output still stores completed-empty corpus (internal/crawl)
+- Status: OPEN
+- Reporter: reviewer (v1.8-wave verification cluster A, 2026-08-23)
+- Owner: (unassigned)
+- Problem: crawl/katana.go:280-320 — hosts exiting 0 but emitting only malformed JSONL increment neither FailedHosts nor Truncated; an all-such-hosts run stores StatusCompleted with an empty corpus that is served permanently (no TTL) — same poison-the-key class as NEW-62.
+- Fix: count unparseable-output-with-zero-parsed as host failure (or store incomplete when parsed==0 && malformed>0).
+- Verification: fake runner emitting garbage JSONL → no completed record stored; second Crawl re-executes.
+
+### NEW-87 (LOW) — urlintel storeURL drops urlKey build error (internal/urlintel)
+- Status: OPEN
+- Reporter: reviewer (v1.8-wave verification cluster D, 2026-08-23)
+- Owner: (unassigned)
+- Problem: record.go:403-405 — `key, err := urlKey(...)` err is silently overwritten by json.Marshal's err; a key-build failure would proceed toward Put("") surfacing a misleading "cache put" diagnostic instead of lookupURL's failed classification (asymmetry with lookupURL:326-333). Practically unreachable today (const operation, validated identity).
+- Fix: handle urlKey's error before Marshal, mirroring lookupURL.
+- Verification: fault-injection key-builder test asserting failed classification not cache-put diagnostic.
+
+### NEW-88 (LOW) — jsintel/adapt toolRunBudget is package-level mutable state (§7.2) (internal/jsintel/adapt)
+- Status: OPEN
+- Reporter: reviewer (v1.8-wave verification cluster B, 2026-08-23)
+- Owner: (unassigned)
+- Problem: adapt/run.go:38-41 — mutable package-level var used as test-only time seam for the NEW-68 timeout budget; production never writes it and tests are not parallel today, but it is global mutable state and a data-race trap if these paths ever run t.Parallel().
+- Fix: thread the budget through the unexported env (settable only from tests).
+- Verification: tests pass with seam removed from package scope.
+
+### NEW-89 (INFO wave) — doc/comment nits from v1.8-wave verification (multi-package)
+- Status: OPEN
+- Reporter: reviewer (verification clusters A-D, 2026-08-23)
+- Owner: docs
+- Problem: cli.go:52/:80 "No active enumeration, brute force, or intel modes are ever run" overclaims given crawl stage + opt-in dnsx_brute (also missing from NEW-74's lists); scanUsage promises "progress counters (completed/remaining/in-flight/eta)" though production emits only stage events (render zero/unknown); event.go AssetDiscovered.Path bound rationale breaks under percent-escaping (escaped path can triple bytes vs decoded cap derivation); discovery/cache.go:27 stale "both callers do" comment (one production caller); techintel truncateUTF8 comment misstates loop purpose (runs exactly when a multi-byte rune is cut); adapt/import_test.go dead `blocker.cancel` assignment; adapt/crawl_test.go garbled first comment line; tui/feed.go percentDecode duplicates asset/service.go encoder inverse (drift risk cosmetic-only — decode failure degrades to whole-identity digest).
+- Fix: comment/text corrections; consider one exported codec for candidate-label encoding in a future milestone.
+- Verification: n/a (docs) / trivial.
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this
-  workspace (all 22 packages pass). internal/discovery is slow (~75 s:
+  workspace (all packages pass). internal/discovery is slow (~75 s:
   bounded `waitForTrue` polling of 2-3 s per cache/subprocess test) but does
   NOT hang; the earlier "deterministic hang" warning referred to a parallel
   in-flight workspace and is resolved here.
@@ -136,3 +173,19 @@ orchestrator; every agent may append or update its own entries.
   (synthetic values only).
 - External tools are adapters behind interfaces; core pipelines never branch
   on tool names.
+
+### NEW-73 (LOW) — Audit LOW/INFO wave A: correctness/hygiene (see REVIEW-2026-08-23.md §3 LOW 1–14)
+- Status: IN PROGRESS — most items implemented 2026-08-23 (urlintel live-record TLS status, NetResolver race, outer-deadline stdout-prefix ingestion, crawl cancellation error preservation, chaos apex mangling, LookPath conflation, marshal-fail cache skip); deliberately NOT changed: L-4/L-5 secrentel OverflowDropped count precision, O(n²) insertion sorts, candidateAsset swallow, report deadline→failed skew, ingest path-param lossiness, PDCP init()-scope in adapt tests — remaining items stay OPEN within this entry.
+- Reporter: reviewer (full audit 2026-08-23)
+- Owner: (unassigned)
+- Problem: fourteen LOW items with file:line detail in the report — highlights: urlintel live-record TLS-diagnostic stored StatusFailed; NetResolver lazy-init race; outer-deadline discards captured tool stdout prefix; OverflowDropped under-count; configurable-cap decode churn loop; candidateAsset zero-asset swallow; report deadline→failed skew; Fingerprint[:8] panic guard; three divergent URL-filter copies (root cause of H-3); crawl cancellation drops engine error; O(n²) insertion sorts; ingest path param newline/comma lossiness; chaos apex-subdomain mangling; PDCP_API_KEY init()-scope leak in tests.
+- Fix: per-item fixes in the report.
+- Verification: per-item tests named in the report.
+
+### NEW-74 (INFO) — Audit INFO/doc-skew wave B (see REVIEW-2026-08-23.md §3 INFO)
+- Status: IN PROGRESS — CLI usage stage count + --tui claims corrected 2026-08-23; AGENTS.md §10 MaxWorkers snippet fixed; jsintel inline-script parse failures now counted. Remaining doc items (README/ARCHITECTURE drift, provenance ordinal, progress-event overcount, TUI bidi passthrough, detect Context trust boundary, fixture_manifest placement) stay OPEN with owner docs.
+- Reporter: reviewer (full audit 2026-08-23)
+- Owner: docs
+- Problem: CLI usage lists ten stages vs twelve actual + "no active enumeration ever run" overclaim vs crawl/dnsx_brute; version.go stale migration comment; dns-vs-httpprobe all-timeout classification asymmetry; transport idle-conn hygiene; provenance ordinal drift; progress-event overcount; jsintel inline-script uncounted parse failures; adapt truncation metadata must be consumed at wiring time; priority FNV digest bound; TUI bidi passthrough; detect Context trust boundary; fixture_manifest in prod package.
+- Fix: doc corrections + noted follow-ups; details in report §3 INFO.
+- Verification: n/a (docs) / per-item notes.

@@ -7,6 +7,175 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-61 (HIGH, §0.7) — Ingest stage deadlocks forever on cancellation (internal/pipeline/adapt)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: Shutdown-join + pre-initialised cancelled slots; TestIngestStageCancelWithQueuedFilesReturnsPromptly (watchdog) fails at HEAD by deadlock
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md H-2)
+- Owner: (unassigned)
+- Problem: ingestStage.Run joins via sync.WaitGroup whose Done lives only inside job closures (import.go:283); cancelled runs drop queued jobs without executing Func (runtime/pool.go:403–424), so wg.Wait() at import.go:297 blocks forever before the deferred pool.Shutdown. Reproduced empirically; Ctrl-C during `ravenrecon ingest` hangs.
+- Fix: join via pool.Shutdown(budgetedCtx) then fold, treating still-zero outcomes[i] as cancelled.
+- Verification: regression test cancelling mid-run with more files than concurrency; pipeline.Run must return promptly with honest cancelled outcomes.
+
+### NEW-62 (HIGH, §0.6) — Crawl caches all-failed run as completed-empty corpus (internal/crawl)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: FailedHosts tracking, store downgraded StatusIncomplete; TestKatanaAllFailStoresIncompleteAndReexecutes fails at HEAD
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md H-1)
+- Owner: (unassigned)
+- Problem: KatanaSource.Crawl folds every host failure into Diagnostics (katana.go:233–241,262–264) and stores unconditionally as cache.StatusCompleted (katana.go:280–301) — a broken run poisons the key permanently (cache serves only completed; no TTL).
+- Fix: track per-host failures; skip store or store StatusIncomplete/StatusFailed when ≥1 host failed; hermetic fake-runner regression tests.
+- Verification: all-fail run writes no completed record; second Crawl re-executes.
+
+### NEW-63 (HIGH) — filterIngestURLs silently drops imported URLs with explicit non-default ports (internal/pipeline/adapt)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: shared urlHost port-strip at single fold choke point (+L-9 filter consolidation); unit table + whole-stage e2e retain :8443
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md H-3)
+- Owner: (unassigned)
+- Problem: import.go:819–831 feeds u.HostPort (retains :8080/:8443) to asset.NewHost whose validateHostname rejects ':' → silent skip, outcome stays completed; non-standard-port attack surface vanishes from every importer family, stably across cache replays.
+- Fix: strip port via the correct sibling helper (httpprobe.go urlHost) before the InDomain check; consolidate L-9's three filter copies.
+- Verification: table test over httpx/Burp/CDX/plain imports containing :8443 URLs asserting retention.
+
+### NEW-64 (MEDIUM, §0.6) — secrentel Overflow flag false-negative after Phase-2 dedup shrink (internal/secrentel)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: overflowCandidates set at both cap sites; TestOverflowFlagSurvivesDedupShrink fails at HEAD both assertions
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-1)
+- Owner: (unassigned)
+- Problem: engine.go:376 derives Overflow post-hoc from list length; cap trips increment only counts (scan.go:159–163,232–235) and Phase-2 dedup (scan.go:263–283) can shrink below cap → truncated set stored/replayed/reported as complete without the mandatory flag. Reproduced empirically (63<64 kept, 1 dropped, flag FALSE). Dead field overflowCandidates (scan.go:51).
+- Fix: set out.overflowCandidates where either cap trips; entry.Overflow = overflowCandidates || counts.OverflowDropped > 0.
+- Verification: in-package test with cross-family duplicates at cap pinning flag=true.
+
+### NEW-65 (MEDIUM, §11) — urlintel cache keys omit detected tool version (internal/urlintel)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster D: ToolInfo in urlKey, unknown version never cached; TestIngestCacheToolVersionSeparation + TestIngestUnknownToolVersionNeverCached fail at HEAD
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-2)
+- Owner: (unassigned)
+- Problem: urlKey (record.go:44–53) hashes adapter name only; Run detects versions then discards them (adapt/source.go:405–465). Tool upgrade serves stale pre-upgrade payloads until TTL; contradicts discovery's versioned-key convention (discovery/cache.go:30–37).
+- Fix: include cache.ToolInfo{Name, Version}; unknown version ⇒ never cached (mirror discovery).
+- Verification: version-change re-execution test mirroring discovery's TestRunCacheVersionChangeReexecutes.
+
+### NEW-66 (MEDIUM, §11) — Crawl cache key omits Timeout/Concurrency/RateLimit (internal/crawl)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: key carries timeout/concurrency/rate_limit from effectiveConfig; per-field mutation test fails at HEAD
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-3)
+- Owner: (unassigned)
+- Problem: crawlCacheKey (katana.go:336–354) carries only depth+scope while output materially depends on cfg.Timeout (-timeout wrap :224–228), -rl/-c (:215–216); short-budget runs poison long-budget configs.
+- Fix: add the three normalized values to the Config map.
+- Verification: two configs differing only in timeout produce different keys.
+
+### NEW-67 (MEDIUM, §11) — Discovery cache keys omit QualityConfig though the gate shapes stored records (internal/discovery)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C: normalized gate config in key + policy doc; TestCacheKeyIncludesNormalizedQualityConfig
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-4)
+- Owner: (unassigned)
+- Problem: records persist the producing run's post-gate retained set (pipeline.go:404–459) but cacheKey (cache.go:30–37) excludes gate config; raising MaxPerSource after an over_cap store keeps serving the smaller capped set until TTL.
+- Fix: include normalized QualityConfig in the key Config map, or document replay-over-recompute as deliberate policy with the explicitness of the unknown-version policy.
+- Verification: key-difference test across gate configs; or doc update pinned by comment.
+
+### NEW-68 (MEDIUM, §8 parity) — jsintel/adapt Run lacks adapter-level execution timeout (internal/jsintel/adapt)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: toolRunBudget WithTimeout before runner handoff; real wedged subprocess killed at budget — pre-fix probe showed NO deadline reached runner
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-5)
+- Owner: (unassigned)
+- Problem: subjs/linkfinder/SecretFinder are active fetchers; only detection is bounded (tool.go:348). No default per-tool deadline exists; tests use context.Background(); pool permits Timeout=0. Sibling urlintel/adapt enforces DefaultToolTimeout=2m (source.go:143,559). Latent until orchestration wires it.
+- Fix: mirror urlintel/adapt — per-tool default timeout wrapped in Run before the runner handoff.
+- Verification: test that a hanging fake executable is killed at the default budget.
+
+### NEW-69 (MEDIUM, §0.6 asymmetry) — priority AttackPaths silently caps path count with no truncation signal (internal/priority)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: ([]AttackPath, bool) mirroring Correlate; consumed as priorityPathsTruncated sticky; TestAttackPathsBounds asserts both sides
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-6)
+- Owner: (unassigned)
+- Problem: attackpath.go:153–156 cuts to maxPathsPerRun silently; correlate.go:189–193 returns (groups, truncated) for the identical cut class. Callers cannot distinguish "exactly 32" from ">32 cut".
+- Fix: mirror Correlate's shape (([]AttackPath, bool) or result struct), update doc, extend TestAttackPathsBounds.
+- Verification: bounds test asserts the signal.
+
+### NEW-70 (MEDIUM, latent §15) — TUI renders full secret_candidate identities (value embedded) once producers exist (internal/tui)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: redactedSecretCandidateLabel (digest projection = secrentel redactedCandidateID); rendered-frame leak sweep fails at HEAD (verbatim secret rendered)
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-7)
+- Owner: (unassigned)
+- Problem: feed.go:178–180 uses raw p.Identity as display label; Identity embeds percent-encoded candidate VALUE (asset/secret_candidate.go:232–237); rendered verbatim (render.go:207–216). Dormant (no producer emits these events yet — verified) but the secrentel→bus wiring milestone activates a live terminal/scrollback secret leak; violates the redactedCandidateID discipline (secrentel/record.go:143–153).
+- Fix: type+digest display label before any producer lands; keep full identity only in-memory dedupe key; regression-test rendered labels contain no value substring.
+- Verification: synthetic high-confidence event renders redacted label.
+
+### NEW-71 (MEDIUM) — Opt-in DNS brute failure paths report bare completed with no marker (internal/pipeline/adapt)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A + completion check: markers on all three abort paths; wildcard-probe fault-injection test present and passing (TestDNSBruteFailedFlagOnWildcardProbeEngineError)
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-8)
+- Owner: (unassigned)
+- Problem: runBrute abort/failure paths (dns.go:629–636) and swallowed wildcard-probe error (:580–582) produce empty results the propagation heuristic passes through — enabled brute silently absent, no sticky flag/counter; contradicts NEW-47 precedent.
+- Fix: return markers from runBrute on every abort/failure path; OR into baseRes.StickyFlags.
+- Verification: fault-injection tests per path assert flags.
+
+### NEW-72 (MEDIUM) — urllive fold omits partial bucket; mixed success/failure reports completed (internal/pipeline/adapt)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: explicit partial bucket in fold switch; 8-row table test incl. mixed→partial fails at HEAD
+- Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md M-9)
+- Owner: (unassigned)
+- Problem: foldUrlliveOutcomes (urllive.go:212–240) has no partial row; deviates from the unified mapping table in adapt/doc.go; unpinned by tests.
+- Fix: track allCompleted; return partial on failed/incomplete mix; table test.
+- Verification: mixed-outcome table test pins partial.
+
+### NEW-75 (HIGH) — parseHTML index desync between ToLower copy and raw body → remote slice panic (internal/jsintel)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: single-string raw-body case-insensitive scan, all pos updates ≤ len(body); TestParseHTMLCaseFoldNoSecondIndexSpace PANICS at HEAD (slice bounds [41:40]) — the reported DoS shape
+- Reporter: reviewer (full-repo review 2026-08-23)
+- Owner: (unassigned)
+- Problem: discover.go:174 builds `lower := strings.ToLower(body)` but tag offsets computed in `lower` space index raw `body` (:196,:223-227). ToLower can shrink byte length (U+0130→'i', 2→1 bytes); an unterminated inline `<script>` sets `pos = len(body)` (:230) which can exceed len(lower), so the next `findNextTag(lower, pos)` evaluates `lower[pos:]` (:289) → slice-bounds panic in the engine's unrecovered reader loop (remote DoS from one hostile page). Absent the panic, offsets corrupt → wrong/missed candidates.
+- Fix: scan and slice ONE string (everything from `lower`, or case-insensitive matching on `body`); at minimum clamp pos at :230, but unify mixed-space slicing regardless.
+- Verification: regression test with U+0130 + unterminated `<script>`; engine survives, offsets correct.
+
+### NEW-76 (MEDIUM) — Crawl cache key omits Timeout/Concurrency/RateLimit (internal/crawl)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. duplicate of NEW-66 — same fix, same verdict
+- Reporter: reviewer (full-repo review 2026-08-23)
+- Owner: (unassigned)
+- Problem: crawlCacheKey (katana.go:336-354) keys only depth+scope+tool version; retained URL set also depends on per-tool timeout budget and rate/concurrency (crawl_timeout/crawl_rate_limit/crawl_concurrency StageParams) → warm run under different bounds served results it never computed (§11 shape).
+- Fix: add effective timeout/rate-limit/concurrency to the key Config.
+- Verification: two runs differing only in rate limit produce distinct keys.
+
+### NEW-77 (MEDIUM) — TLS-capture diagnostic flips successful live probe's cache record to failed, forcing permanent re-probes (internal/httpprobe/urls.go live path)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C/D: liveStatusToCache Status!=0→completed before error checks; TestLiveProbeDeepChainTLSDiagnosticKeepsCompletedAndCached (run2 IsHit, transport not called)
+- Owner: (unassigned)
+- Problem: doLiveProbe joins captureTLS diagnostics (tls.go:216-222 chain-depth cap) into rec.Err even when the HTTP response was fully observed (urls.go:322-334); liveStatusToCache (urls.go:565-597) has no typed branch for plain diagnostics → StatusFailed stored, never a hit, every https host with >8-cert chains re-probed every run; FailureReason=ReasonOther on a completed observation. Host-probe path stores the same class as completed.
+- Fix: classify from transport outcome — StatusCompleted whenever rec.Status != 0, error-type checks only when rec.Status == 0; or move captureTLS diagnostics to a field that never feeds liveStatusToCache/FailureReason.
+- Verification: fake deep-chain TLS peer → record cached completed, served as hit second run.
+
+### NEW-78 (MEDIUM) — FP context markers match inside unrelated words, capping real secrets at Low and dropping them from queue (internal/secrentel)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster B: ASCII-letter tokenizer + EqualFold whole-segment compare; /latest/app.js & /respectable/ NOT flagged at HEAD (flagged), fixtures still flagged
+- Owner: (unassigned)
+- Problem: fpContextMarkers (falsepositive.go:47-52) are bare case-insensitive substrings over filename+"/"+urlPath (:116-131): "latest" contains "test", "respect"/"inspection" contain "spec", "demonstration" contains "demo". Flagged candidates are capped at Low AND permanently excluded from the offline verification queue (report.go:504-510 skips len(FPFlags)>0).
+- Fix: tokenize subject on non-alphanumeric bytes (/ _ - . digits); compare whole segments exactly.
+- Verification: /latest/app.js not flagged; test-fixture.js still flagged.
+
+### NEW-79 (MEDIUM) — HTML-extracted corpus values have count caps but no per-value byte caps (~300x transient memory amplification) (internal/techintel)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C: capHTMLValue/truncateUTF8 across all HTML extraction sites + truncated propagation; TestScanHTMLValueByteCaps
+- Owner: (unassigned)
+- Problem: scanHTML (analyze.go:430-530) caps counts only (128 scripts/css, 256 attrs, 32 sourceMaps); parseTag copies attr values verbatim → hostile 1 MiB page of `<div a="<junk>">` retains ~256 x ~1 MiB entries, duplicated by full ToLower copies (:277-285); sourceMappingURL tokens run to end-of-body x32 ≈ 300 MiB transient per observation x concurrency. Persistence bounded (NewEvidence truncates 256 B); exposure is analysis-time memory. Headers already use per-value caps (64 KiB).
+- Fix: truncate each extracted value to a fixed cap (e.g. 4 KiB) in scanHTML/parseTag; set htmlExtract.truncated when the cap bites.
+- Verification: hostile-page test shows bounded peak retention; truncation flag set.
+
+### NEW-80 (MEDIUM) — validatePayload leaves most event payload string fields unbounded despite hostile-event contract (internal/event)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C + completion: FindingCreated.Identity and RecommendationCreated.Identity bounds added with test rows (:241,:248); all listed fields bounded
+- Owner: (unassigned)
+- Problem: event.go:10-13/92-94 promise Validate re-checks every field; only message-type fields are length-checked (event_test.go:201-216 pins only those). AssetDiscovered.Identity/Kind/Method/Path, CacheAccess.Key/State, RelationshipCreated.From/To/Kind, EvidenceCreated.*, FindingCreated.*, RecommendationCreated.Text/Level, RequestObserved.*, RuleExecuted.RuleID, Progress.Phase, PhaseTransition.Phase, Shutdown.Reason are unbounded — multi-MB Identity passes Validate and fans out to subscribers/TUI.
+- Fix: apply existing per-field length caps to every payload string field in Validate.
+- Verification: oversized payload fields fail Validate.
+
+### NEW-81 (MEDIUM) — ParseURL no size bound; path/query enter identity unbounded (internal/asset)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C: raw-input size cap before url.Parse; TestParseURLRawInputBound
+- Owner: (unassigned)
+- Problem: sibling types bound identity sizes via embedded names (parameter.go:32-34, technology.go:103-105, evidence.go:91-93, finding.go:11-13); url.go does not — Path (:208)/Query (:212) flow from arbitrarily large raw input into Identity().Value and derived cache keys.
+- Fix: reject raw inputs over a fixed cap (e.g. 4-8 KiB) in ParseURL before url.Parse.
+- Verification: oversize input returns error, not a giant identity.
+
+### NEW-82 (MEDIUM) — --tui advertises worker/throughput/interesting sections and target header production can never render (internal/cli)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster D: RunMetadata published before controller start in scan+ingest (25-event wiring tests assert Target/OutputDir first event); usage text honest
+- Owner: (unassigned)
+- Problem: scanUsage promises stage lifecycle, progress, worker dashboard, throughput, interesting assets, errors (ingest.go:81-82 inherits claim). Production publishes only the runner's 24 stage events: StageInput has no Observer seam (pipeline/stage.go), no runtime.NewPool site sets Observer, nothing emits KindRunMetadata → header renders "ravenrecon — untitled run" (render.go:110-114), dynamic sections never appear.
+- Fix: publish event.RunMetadata (Target/OutputDir) from runScan/runIngest before starting the controller; amend usage text for sections requiring a not-yet-existing stage observer seam.
+- Verification: manual scan --tui shows target header; usage matches reality.
+
+### NEW-83 (LOW wave) — Full-repo review LOW items A (2026-08-23, reviewer session ox-alpha)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster C+D + orchestrator completion: all implemented subitems verified FIXED with named regressions; the two claimed-but-missing subitems closed this session — crawl adapter now errors.Join(ctx.Err(), engineErr)+retains partial URLs (TestCrawlStageCancelledKeepsJoinedErrorAndPartialURLs) and importer cancelled-handle no longer counts phantom failed (TestReadLinesCancelledHandleRecordNotCountedFailed, fix completed by orchestrator after builder session lost to ECONNRESET mid-dispatch); deliberately-deferred items remain listed in the archived entry
+- Owner: (unassigned)
+- Problem: verified LOWs with evidence — discovery/pipeline.go:450-457 Put proceeds after marshal failure persisting completed record with empty Data (dns storeType handles correctly); discovery detect.go:161-165 + chaos.go:48-53 + source.go:67-70 conflate permission-denied LookPath errors as StatusMissing instead of broken/WARN; cli scan.go:244-248 `scan --stages ingest` accepted then fails inside pipeline.Run contradicting scan's own help; cli ingest.go:156-170 bare `help` after an option becomes target instead of usage; cli cli.go:139-143 doctor/version silently swallow extra args while other commands reject them; crawl adapter drops katana Diagnostics so missing-binary reports completed with ItemsProcessed=len(hosts) (katana.go:180-183, adapt/crawl.go:146-160); importer reader.go:323-330 cancelled plain imports overcount ItemsFailed by one phantom record; httpprobe urls.go:309-320 RedirectLocation fallback bypasses sanitizeLocation when header-cap truncation drops Location (>128 headers); httpprobe urls.go:341-349 body closed undrained defeating keep-alive contrary to adjacent comment (mirror drainFollowedBody); asset endpoint.go:36-43 validateMethod no length bound into Identity; asset relationship.go:103-113 Kind unbounded into ID(); config config.go:103-104 TUIConfig accepts +Inf InterestingRate disabling rate cap; cache cache.go:285/410-412 crash-leftover entry-*.tmp files never reclaimed by any sweep except Clear; secrentel scan.go:176-183 + techintel observation.go:196-212 Trail-extension/truncation cuts split multi-byte runes → non-UTF-8 values mutate through JSON cache round-trip (cross-run identity drift); jsintel parse.go:590-592,664-666 decodeEscape diverges from scanner on CRLF continuations (spurious CRLF / dropped \r).
+- Fix: per-item; details preserved in session transcript.
+- Verification: targeted tests per item.
+
+### NEW-84 (INFO wave) — Full-repo review INFO/doc-skew items B (2026-08-23, reviewer session ox-alpha)
+- Status: VERIFIED — orchestrator-verified 2026-08-23. cluster D/C: UserAgent composes version.Version; golden fallback capped 4 KiB/side; dns submitCause nil guard; AGENTS §10 snippet Concurrency; CLI twelve-stage usage — all with named tests or doc-verified
+- Owner: docs
+- Problem: AGENTS.md §10 canonical snippet names runtime.Config{MaxWorkers} but actual field is Concurrency (pool.go:54) — snippet does not compile; config.go:175 Default() UserAgent hardcodes "1.4.0" duplicating internal/version.Version; asset technology.go:184-193 strings.Fields converts NBSP to space although doc claims non-ASCII rejected; golden diff.go:29-34 oversized-diff fallback returns oldText+newText unbounded though Diff documents byte-capped output; dns run.go:207-209 fmt.Errorf("%w", ctx.Err()) renders %!w(<nil>) if Submit fails while ctx live.
+- Fix: doc/comment corrections + one-line guards.
+- Verification: n/a (docs) / trivial.
+
+
 ### NEW-59 (HIGH) — v1.8 Universal Asset Ingestion Framework (ROADMAP v1.8)
 - Status: VERIFIED — milestone complete (closed by orchestrator 2026-08-23; commits 1ede060, 81785f2, 3e5ba4e, 5e806fe, 7fd312a, cf0e939, 1794fcd; every batch reviewer-verified) — implementation COMPLETE through T14 close-out
   (2026-08-23; batches 1-7 below). Remaining steps are orchestrator-only:

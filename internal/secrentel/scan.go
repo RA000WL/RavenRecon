@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
@@ -48,7 +49,7 @@ type scanOutcome struct {
 	evidence           []asset.Evidence
 	edges              []asset.Relationship
 	counts             scanCounts
-	overflowCandidates bool
+	overflowCandidates bool // a cap tripped (M-1): survives Phase-2 dedup shrink
 	signalsScanned     int
 }
 
@@ -160,6 +161,7 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 		for i, m := range matches {
 			if i >= limits.maxMatchesPerPattern {
 				out.counts.OverflowDropped += len(matches) - i
+				out.overflowCandidates = true
 				break
 			}
 			if m[0] < 0 || m[1] < m[0] {
@@ -174,11 +176,18 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 				start, end = gs, ge
 			}
 			if p.Trail > 0 && p.Group == 0 {
-				if end+p.Trail <= len(content) {
-					end = end + p.Trail
-				} else {
-					end = len(content)
+				limit := end + p.Trail
+				if limit > len(content) {
+					limit = len(content)
 				}
+				// Back up to a UTF-8 rune boundary so the Trail extension
+				// never splits a multi-byte rune (NEW-83): values must stay
+				// valid UTF-8 and survive JSON round-trips unchanged (same
+				// approach as the asset-layer truncateEvidence helpers).
+				for limit > start && limit < len(content) && !utf8.RuneStart(content[limit]) {
+					limit--
+				}
+				end = limit
 			}
 			value := string(content[start:end])
 
@@ -231,6 +240,7 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 			}
 			if len(out.candidates) >= limits.maxCandidates {
 				out.counts.OverflowDropped++
+				out.overflowCandidates = true
 				continue
 			}
 			candIndex[k] = len(out.candidates)

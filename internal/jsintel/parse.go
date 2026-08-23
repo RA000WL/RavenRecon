@@ -588,12 +588,15 @@ func decodeEscape(raw string, i int, b *strings.Builder) int {
 		b.WriteByte('\n')
 		return i + 2
 	case 'r':
-		if i+2 < len(raw) && raw[i+2] == '\n' {
-			return i + 3 // \r\n line continuation: removed
-		}
+		b.WriteByte('\r')
 		return i + 2
 	case '\n':
 		return i + 2 // line continuation: removed
+	case '\r':
+		if i+2 < len(raw) && raw[i+2] == '\n' {
+			return i + 3 // \r\n line continuation: removed
+		}
+		return i + 2 // lone CR line continuation: removed
 	case 't':
 		b.WriteByte('\t')
 		return i + 2

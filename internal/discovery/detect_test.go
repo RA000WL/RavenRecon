@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,7 +105,7 @@ func TestDetectVersionedFailureIsWarnNotMissing(t *testing.T) {
 
 func TestDetectVersionedMissing(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["subfinder"] = errors.New("not found in PATH")
+	l.errs["subfinder"] = exec.ErrNotFound
 	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){})
 	d := detectVersioned(context.Background(), detectEnv(t, "subfinder", r, l), "-version")
 	if d.Status != StatusMissing {
@@ -184,7 +188,7 @@ func TestDetectCapabilityEmptyOutputIsWarn(t *testing.T) {
 
 func TestDetectCapabilityMissing(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["assetfinder"] = errors.New("not found in PATH")
+	l.errs["assetfinder"] = exec.ErrNotFound
 	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){})
 	d := detectCapability(context.Background(), detectEnv(t, "assetfinder", r, l), "-h")
 	if d.Status != StatusMissing {
@@ -201,6 +205,40 @@ func TestDetectionLabel(t *testing.T) {
 	for s, want := range cases {
 		if got := s.Label(); got != want {
 			t.Errorf("Label(%s) = %q, want %q", s, got, want)
+		}
+	}
+}
+
+// A lookup failure that does NOT mean "absent" — e.g. a PATH entry without
+// execute permission — must degrade to a WARN carrying the underlying cause,
+// never the MISSING that would make doctor and pipeline report an installed
+// tool as not installed (broken-vs-missing distinction).
+func TestDetectLookupPermissionDeniedIsWarnNotMissing(t *testing.T) {
+	l := newFakeLookup()
+	l.errs["subfinder"] = os.ErrPermission
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){})
+	d := detectVersioned(context.Background(), detectEnv(t, "subfinder", r, l), "-version")
+	if d.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn for permission-denied lookup (%+v)", d.Status, d)
+	}
+	if !strings.Contains(d.Reason, "permission denied") {
+		t.Fatalf("reason = %q, want the underlying cause", d.Reason)
+	}
+	if d.Exists {
+		t.Fatal("Exists must stay false when the lookup itself failed")
+	}
+}
+
+// The not-exist family is the one lookup outcome that means not-installed:
+// exec.ErrNotFound (LookPath's sentinel) and fs.ErrNotExist both stay MISSING.
+func TestDetectLookupNotExistFamilyIsMissing(t *testing.T) {
+	for _, lookErr := range []error{exec.ErrNotFound, fs.ErrNotExist} {
+		l := newFakeLookup()
+		l.errs["subfinder"] = lookErr
+		r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){})
+		d := detectVersioned(context.Background(), detectEnv(t, "subfinder", r, l), "-version")
+		if d.Status != StatusMissing {
+			t.Fatalf("%v: status = %s, want missing", lookErr, d.Status)
 		}
 	}
 }

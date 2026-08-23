@@ -90,9 +90,9 @@ func TestTUIValidateRejectsUnknownColorMode(t *testing.T) {
 	}
 }
 
-func TestTUIValidateRejectsNegativeOrNaNInterestingRate(t *testing.T) {
+func TestTUIValidateRejectsNegativeNaNOrInfiniteInterestingRate(t *testing.T) {
 	cfg := DefaultTUI()
-	for _, r := range []float64{-1, -0.5, math.NaN()} {
+	for _, r := range []float64{-1, -0.5, math.NaN(), math.Inf(1), math.Inf(-1)} {
 		cfg.InterestingRate = r
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("interesting rate %v must be rejected", r)

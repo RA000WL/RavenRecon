@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +36,9 @@ func TestInterestingClassification(t *testing.T) {
 		{"endpoint plain path", asset("endpoint", "e6", "GET", "/login", 0), false, "", "", ""},
 		{"endpoint unknown method", asset("endpoint", "e7", "POST", "/api/v1", 0), false, "", "", ""},
 		{"source map", asset("source_map", "m1", "", "/app.js.map", 0), true, "asset|source_map|m1", "m1", "source map exposed"},
-		{"secret high confidence", asset("secret_candidate", "s1", "", "", 0.8), true, "asset|secret_candidate|s1", "s1", "high-confidence secret"},
+		// The label is the redacted type+digest form — the raw identity
+		// (which embeds the percent-encoded value) never reaches display.
+		{"secret high confidence", asset("secret_candidate", "s1", "", "", 0.8), true, "asset|secret_candidate|s1", redactedSecretCandidateLabel("s1"), "high-confidence secret"},
 		{"secret below threshold", asset("secret_candidate", "s2", "", "", 0.79), false, "", "", ""},
 		{"technology", asset("technology", "t1", "", "", 0), true, "asset|technology|t1", "t1", "technology detected"},
 		{"host not interesting", asset("host", "h1", "", "", 0), false, "", "", ""},
@@ -318,5 +322,92 @@ func TestTruncateLabel(t *testing.T) {
 	want := strings.Repeat("a", maxFeedLabelBytes-len(labelMarker)) + labelMarker
 	if got != want || len(got) > maxFeedLabelBytes {
 		t.Fatalf("torn rune must be trimmed before the marker within the bound, got %q (len %d)", got, len(got))
+	}
+}
+
+// percentEncodeTest mirrors asset/service.go's percentEncode (every byte
+// outside [a-zA-Z0-9] becomes %XX, uppercase hex) so tests can build the
+// canonical secret_candidate identity shape without importing internal/asset.
+func percentEncodeTest(s string) string {
+	const hexDigit = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := range s {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hexDigit[c>>4])
+		b.WriteByte(hexDigit[c&0x0f])
+	}
+	return b.String()
+}
+
+// TestSecretCandidateLabelRedaction is the M-7 regression test: a
+// secret_candidate identity embeds the percent-encoded candidate VALUE, so
+// the display label must be the redacted type+digest form and the rendered
+// frame must never contain any substring of the candidate value.
+func TestSecretCandidateLabelRedaction(t *testing.T) {
+	value := "eyJhbGciOiJIUzI1NiJ9.SflKxwRJSMeKKF2QT4fWPmeJw-secretvalue"
+	source := "javascript:https://cdn.example.com/app.js"
+	identity := "secret_candidate:jwt/" + percentEncodeTest(value) + "/" + percentEncodeTest(source)
+
+	label := redactedSecretCandidateLabel(identity)
+
+	// Exact shape: type + "/" + first four SHA-256 bytes of the RAW value,
+	// mirroring secrentel/record.go redactedCandidateID.
+	sum := sha256.Sum256([]byte(value))
+	want := "jwt/" + hex.EncodeToString(sum[:4])
+	if label != want {
+		t.Fatalf("label = %q, want %q", label, want)
+	}
+
+	// No substring of the candidate value may survive anywhere in the
+	// label. Check every rune-anchored substring up to 8 bytes plus the
+	// whole value: any leak path fails here.
+	for _, sub := range []string{value, value[:16], value[20:36], "SflKxw", "secretvalue", percentEncodeTest(value)[:24]} {
+		if strings.Contains(label, sub) {
+			t.Fatalf("label %q leaks value substring %q", label, sub)
+		}
+	}
+
+	// The rendered frame must be clean too: admit the event through a full
+	// State (feed → snapshot → interestingSection) and scan the output.
+	st := NewState(highRate)
+	st.Apply(ev(event.KindAssetDiscovered, 10, event.AssetDiscovered{
+		Identity: identity, Kind: "secret_candidate", Confidence: 0.9,
+	}))
+	frame := Render(st, testBase.Add(time.Second), Options{})
+	if !strings.Contains(frame, want) {
+		t.Fatalf("frame must show the redacted label %q, got:\n%s", want, frame)
+	}
+	for _, sub := range []string{value, "SflKxw", "secretvalue"} {
+		if strings.Contains(frame, sub) {
+			t.Fatalf("rendered frame leaks value substring %q:\n%s", sub, frame)
+		}
+	}
+}
+
+// TestSecretCandidateLabelMalformedIdentity pins the hostile-input
+// degradation: identities that do not parse into the canonical three-part
+// shape never render verbatim either.
+func TestSecretCandidateLabelMalformedIdentity(t *testing.T) {
+	for _, identity := range []string{
+		"",
+		"s1",
+		"secret_candidate:",
+		"secret_candidate:noslash",
+		"secret_candidate:one/two",
+		"secret_candidate:a%ZZb/c/d", // malformed escape in the value
+		"secret_candidate:a%2/c/d",   // truncated escape in the value
+	} {
+		label := redactedSecretCandidateLabel(identity)
+		if strings.Contains(label, identity) && identity != "" && len(identity) < 8 {
+			t.Fatalf("identity %q leaked into label %q", identity, label)
+		}
+		if !strings.HasPrefix(label, "secret_candidate/") && !strings.Contains(label, "/") {
+			t.Fatalf("label %q for identity %q is not a redacted type/digest form", label, identity)
+		}
 	}
 }

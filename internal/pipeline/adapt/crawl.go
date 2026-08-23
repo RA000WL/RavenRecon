@@ -2,14 +2,12 @@ package adapt
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
-	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/crawl"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 )
@@ -58,7 +56,7 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 		// Derive hosts from URLs corpus if present (e.g., when httpprobe was skipped).
 		seen := make(map[string]struct{})
 		for _, u := range in.URLs {
-			h, ok := urlHostCrawl(u)
+			h, ok := urlHost(u)
 			if !ok {
 				continue
 			}
@@ -121,25 +119,29 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 	}
 
 	result, err := s.src.Crawl(ctx, in.Target, hosts, cfg)
-	if err != nil {
-		if ctx.Err() != nil {
-			joined := fmt.Errorf("stage %s: %w", s.Name(), ctx.Err())
-			return pipeline.StageResult{Outcome: pipeline.OutcomeCancelled, Err: joined}, joined
-		}
-		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
-		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped}, wrapped
+	if err != nil && ctx.Err() != nil {
+		// The run was cancelled mid-crawl: the outcome carries cancellation,
+		// but nothing is lost — the engine's error is joined alongside
+		// ctx.Err() (mirroring httpprobe) so its shutdown detail survives,
+		// and any partially captured URLs are filtered into Additions (the
+		// runner merges additions regardless of outcome).
+		wrapped := fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), err))
+		return pipeline.StageResult{
+			Outcome:   pipeline.OutcomeCancelled,
+			Err:       wrapped,
+			Additions: pipeline.StageAdditions{URLs: filterURLs(in.Target, result.URLs)},
+		}, wrapped
 	}
 	if ctx.Err() != nil {
 		wrapped := fmt.Errorf("stage %s: %w", s.Name(), ctx.Err())
 		return pipeline.StageResult{
 			Outcome:   pipeline.OutcomeCancelled,
 			Err:       wrapped,
-			Additions: pipeline.StageAdditions{URLs: filterURLsCrawl(in.Target, result.URLs)},
+			Additions: pipeline.StageAdditions{URLs: filterURLs(in.Target, result.URLs)},
 		}, wrapped
 	}
 
-	// Output: Additions.URLs = deduplicated, in-domain filtered, sorted, capped.
-	urls := filterURLsCrawl(in.Target, result.URLs)
+	urls := filterURLs(in.Target, result.URLs)
 	// Deduplicate against incoming corpus is handled by runner's mergeCorpus,
 	// but we also cap here deterministically.
 	truncated := result.Truncated
@@ -147,17 +149,45 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 		urls = urls[:crawl.MaxTotalURLs]
 		truncated = true
 	}
+
+	// Host-failure accounting (crawl contract): the engine counts hosts
+	// whose katana invocation failed outright on Result.FailedHosts. A
+	// total failure must never report completed=len(hosts).
+	failed := result.FailedHosts
+	if failed > len(hosts) {
+		failed = len(hosts)
+	}
+	if failed == 0 && len(result.URLs) == 0 && !result.Truncated &&
+		len(result.Diagnostics) > 0 {
+		// The engine aborted before any per-host attempt (e.g. katana
+		// absent from PATH): every requested host failed.
+		failed = len(hosts)
+	}
+
 	res := pipeline.StageResult{
-		Outcome:        pipeline.OutcomeCompleted,
-		ItemsProcessed: len(hosts),
-		ItemsFailed:    0,
-		Additions:      pipeline.StageAdditions{URLs: urls},
+		Additions: pipeline.StageAdditions{URLs: urls},
+	}
+	switch {
+	case failed > 0 && len(result.URLs) == 0:
+		// Nothing was crawled at all — the stage never produced its
+		// output. Honest incomplete (the outcome vocabulary's never-ran
+		// bucket), never a silent completed.
+		res.Outcome = pipeline.OutcomeIncomplete
+		res.ItemsProcessed = 0
+		res.ItemsFailed = failed
+	case failed > 0:
+		// Some hosts crawled, some failed: partial with honest counters.
+		res.Outcome = pipeline.OutcomePartial
+		res.ItemsProcessed = len(hosts) - failed
+		res.ItemsFailed = failed
+	default:
+		res.Outcome = pipeline.OutcomeCompleted
+		res.ItemsProcessed = len(hosts)
 	}
 	if truncated {
 		res.Truncated = true
 		res.StickyFlags = map[string]bool{crawlTruncatedFlag: true}
 	}
-	// Also propagate any diagnostics as? Not needed.
 
 	return res, nil
 }
@@ -260,38 +290,4 @@ func crawlRateLimitParam(params map[string]string) (int, error) {
 		return n, nil
 	}
 	return crawl.DefaultRateLimit, nil
-}
-
-// filterURLsCrawl drops every URL whose canonical host is out-of-domain, an IP
-// literal, or not representable as a canonical asset.Host. Mirrors
-// httpprobe.go filterURLs.
-func filterURLsCrawl(declared asset.Domain, urls []asset.URL) []asset.URL {
-	out := make([]asset.URL, 0, len(urls))
-	for _, u := range urls {
-		h, ok := urlHostCrawl(u)
-		if !ok {
-			continue
-		}
-		if pipeline.InDomain(declared, h) {
-			out = append(out, u)
-		}
-	}
-	return out
-}
-
-func urlHostCrawl(u asset.URL) (asset.Host, bool) {
-	hp := u.HostPort
-	if host, _, err := net.SplitHostPort(hp); err == nil {
-		hp = host
-	}
-	hp = strings.TrimPrefix(hp, "[")
-	hp = strings.TrimSuffix(hp, "]")
-	if _, err := netip.ParseAddr(hp); err == nil {
-		return asset.Host{}, false
-	}
-	h, err := asset.NewHost(hp, asset.Provenance{})
-	if err != nil {
-		return asset.Host{}, false
-	}
-	return h, true
 }

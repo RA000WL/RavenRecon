@@ -346,3 +346,22 @@ func TestNewJavaScript(t *testing.T) {
 		t.Error("NewJavaScript(not-a-url) expected error")
 	}
 }
+
+// TestNewEndpointMethodLengthBound pins NEW-83: endpoint methods are bounded
+// (maxMethodBytes = 16). Standard verbs and the jsintel/urlintel endpoint
+// classes are far below the bound; the boundary must be accepted.
+func TestNewEndpointMethodLengthBound(t *testing.T) {
+	p := NewProvenance("manual")
+
+	if _, err := NewEndpoint(strings.Repeat("A", maxMethodBytes), "https://example.com", p); err != nil {
+		t.Fatalf("method exactly at the %d-byte bound must be accepted: %v", maxMethodBytes, err)
+	}
+	if _, err := NewEndpoint(strings.Repeat("A", maxMethodBytes+1), "https://example.com", p); err == nil {
+		t.Errorf("method over the %d-byte bound must be rejected", maxMethodBytes)
+	}
+	for _, m := range []string{"GET", "POST", "PUT", "DELETE", "CONNECT", "WS", "SSE", "GQL"} {
+		if _, err := NewEndpoint(m, "https://example.com", p); err != nil {
+			t.Errorf("standard method %q must be accepted: %v", m, err)
+		}
+	}
+}

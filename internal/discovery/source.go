@@ -66,6 +66,9 @@ func runAndParse(ctx context.Context, e toolEnv, name string, args []string) (Di
 	e = e.sanitized()
 	path, err := e.lookup(e.binOrName())
 	if err != nil {
+		if !lookupMissing(err) {
+			return DiscoverResult{}, fmt.Errorf("%s: resolve executable %s: %w", name, e.binOrName(), err)
+		}
 		return DiscoverResult{}, fmt.Errorf("%s: %w (%s)", name, ErrExecutableNotFound, e.binOrName())
 	}
 	res, err := e.runner.Run(ctx, Cmd{Path: path, Args: args}, e.limits)

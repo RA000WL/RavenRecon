@@ -99,13 +99,28 @@ type Relationship struct {
 	To Identity `json:"to"`
 }
 
-// NewRelationship validates and builds a Relationship.
+// maxRelationshipKindBytes bounds a RelationshipKind label. The fixed
+// vocabulary's longest value is "secret_candidate_to_evidence" (29 bytes);
+// 64 leaves headroom for future vocabulary entries.
+const maxRelationshipKindBytes = 64
+
+// NewRelationship validates and builds a Relationship. The kind must be a
+// bounded printable-ASCII label, like the other identity-bearing labels of
+// this package, so edge kinds stay safe to embed in cache keys and IDs.
 func NewRelationship(from Identity, kind RelationshipKind, to Identity) (Relationship, error) {
 	if from.IsZero() {
 		return Relationship{}, fmt.Errorf("relationship source must not be zero")
 	}
 	if strings.TrimSpace(string(kind)) == "" {
 		return Relationship{}, fmt.Errorf("relationship kind must not be empty")
+	}
+	if len(kind) > maxRelationshipKindBytes {
+		return Relationship{}, fmt.Errorf("relationship kind %q is longer than %d bytes", string(kind), maxRelationshipKindBytes)
+	}
+	for i := 0; i < len(kind); i++ {
+		if c := kind[i]; c < 0x20 || c > 0x7e {
+			return Relationship{}, fmt.Errorf("relationship kind %q contains a non-printable character", string(kind))
+		}
 	}
 	if to.IsZero() {
 		return Relationship{}, fmt.Errorf("relationship destination must not be zero")

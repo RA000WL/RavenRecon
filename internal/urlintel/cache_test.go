@@ -104,29 +104,35 @@ func TestIngestRunErrDiagnosticsBounded(t *testing.T) {
 
 // TestURLKeyComposition pins the Phase 3 key derivation: the key contains
 // the operation, the canonical URL identity (never raw input), the adapter,
-// and the result-relevant ParseParameters flag — and nothing else. Two
-// logically identical observations produce identical keys.
+// the detected tool version (cache.ToolInfo), and the result-relevant
+// ParseParameters flag — and nothing else. Two logically identical
+// observations produce identical keys; a different tool version never
+// shares one (a tool upgrade changes emitted data, AGENTS §11).
 func TestURLKeyComposition(t *testing.T) {
 	u := mustURL(t, "http://example.com/p?a=1")
 
-	k1, err := urlKey(u, "adapter-a", true)
+	k1, err := urlKey(u, "adapter-a", "v1.0.0", true)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}
-	k2, err := urlKey(u, "adapter-b", true)
+	k2, err := urlKey(u, "adapter-b", "v1.0.0", true)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}
-	k3, err := urlKey(u, "adapter-a", false)
+	k3, err := urlKey(u, "adapter-a", "v1.0.0", false)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}
-	k4, err := urlKey(u, "adapter-a", true)
+	k4, err := urlKey(u, "adapter-a", "v1.0.0", true)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}
-	if k1 == k2 || k1 == k3 {
-		t.Fatalf("keys must differ across adapters and flags: %q %q %q", k1, k2, k3)
+	k5v2, err := urlKey(u, "adapter-a", "v2.0.0", true)
+	if err != nil {
+		t.Fatalf("urlKey: %v", err)
+	}
+	if k1 == k2 || k1 == k3 || k1 == k5v2 {
+		t.Fatalf("keys must differ across adapters, flags, and versions: %q %q %q %q", k1, k2, k3, k5v2)
 	}
 	if k1 != k4 {
 		t.Fatalf("identical observations must produce identical keys: %q vs %q", k1, k4)
@@ -135,7 +141,7 @@ func TestURLKeyComposition(t *testing.T) {
 	// The key is derived from the canonical identity, so a differently
 	// spelled raw line for the same canonical URL yields the same key.
 	raw := mustURL(t, "HTTP://example.com:80/p?a=1")
-	k5, err := urlKey(raw, "adapter-a", true)
+	k5, err := urlKey(raw, "adapter-a", "v1.0.0", true)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}
@@ -143,7 +149,8 @@ func TestURLKeyComposition(t *testing.T) {
 		t.Fatalf("canonical-equivalent observations must share a key: %q vs %q", k1, k5)
 	}
 
-	// The key payload carries the operation, target, and configuration.
+	// The key payload carries the operation, target, configuration, and
+	// tool identity.
 	k, err := cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    u.Identity().String(),
@@ -151,6 +158,7 @@ func TestURLKeyComposition(t *testing.T) {
 			"adapter":          "adapter-a",
 			"parse_parameters": "true",
 		},
+		Tool: cache.ToolInfo{Name: "adapter-a", Version: "v1.0.0"},
 	})
 	if err != nil {
 		t.Fatalf("cache.NewKey: %v", err)
@@ -286,6 +294,69 @@ func TestIngestCacheParseParametersFlag(t *testing.T) {
 	}
 	if len(rep3.Entries[0].Parameters) != 2 {
 		t.Fatalf("parameters = %d, want 2 from the cached record", len(rep3.Entries[0].Parameters))
+	}
+}
+
+// TestIngestCacheToolVersionSeparation pins that the detected tool version
+// is part of the key: a record written under v1 is never served to a v2 run
+// (a tool upgrade changes emitted data, AGENTS §11), and the v1 record
+// stays servable for v1 runs.
+func TestIngestCacheToolVersionSeparation(t *testing.T) {
+	clk := newFakeClock(fixedTime)
+	line := []string{"http://example.com/p?q=1"}
+
+	cfgV1 := testConfig()
+	cfgV1.Clock = clk
+	cfgV1.ToolVersion = "v1.0.0"
+	cfgV1.Cache = openTestCache(t, clk, 0)
+	cfgV1.Metrics = &Metrics{}
+	runIngest(t, cfgV1, line)
+
+	// Same URL, same adapter, different tool version: fresh extraction.
+	cfgV2 := testConfig()
+	cfgV2.Clock = newFakeClock(fixedTime)
+	cfgV2.ToolVersion = "v2.0.0"
+	cfgV2.Cache = cfgV1.Cache
+	cfgV2.Metrics = &Metrics{}
+	runIngest(t, cfgV2, line)
+	if snap := cfgV2.Metrics.Snapshot(); snap.Extracted != 1 || snap.Stored != 1 {
+		t.Fatalf("v2 metrics = %+v, want a fresh extraction and store under the v2 key", snap)
+	}
+
+	// The v1 record is untouched: a v1 re-run is a pure cache hit.
+	cfgV1.Metrics = &Metrics{}
+	runIngest(t, cfgV1, line)
+	if snap := cfgV1.Metrics.Snapshot(); snap.Extracted != 0 || snap.Stored != 0 || snap.Reads != 1 {
+		t.Fatalf("v1 re-run metrics = %+v, want a pure cache hit", snap)
+	}
+}
+
+// TestIngestUnknownToolVersionNeverCached pins the unknown-version policy
+// (mirrors internal/discovery): an observation whose ToolVersion is unknown
+// ("") never reads and never writes cache records — it executes fresh on
+// every run — because a ""-version identity could not be distinguished from
+// any other unknown version.
+func TestIngestUnknownToolVersionNeverCached(t *testing.T) {
+	clk := newFakeClock(fixedTime)
+	line := []string{"http://example.com/p?q=1"}
+	cfg := testConfig()
+	cfg.Clock = clk
+	cfg.ToolVersion = ""
+	cfg.Cache = openTestCache(t, clk, 0)
+
+	for run := 1; run <= 2; run++ {
+		cfg.Metrics = &Metrics{}
+		rep := runIngest(t, cfg, line)
+		snap := cfg.Metrics.Snapshot()
+		if snap.Reads != 0 || snap.Stored != 0 {
+			t.Fatalf("run %d metrics = %+v, want zero cache reads and stores for an unknown version", run, snap)
+		}
+		if snap.Extracted != 1 {
+			t.Fatalf("run %d extracted = %d, want a fresh extraction every run", run, snap.Extracted)
+		}
+		if rep.Entries[0].Cached {
+			t.Fatalf("run %d entry Cached = true, want false", run)
+		}
 	}
 }
 
@@ -455,7 +526,7 @@ func TestIngestCacheSelfHealing(t *testing.T) {
 	runIngest(t, cfg, line) // write a valid record
 
 	u := mustURL(t, "http://example.com/p?q=1")
-	key, err := urlKey(u, cfg.Adapter, cfg.ParseParameters)
+	key, err := urlKey(u, cfg.Adapter, cfg.ToolVersion, cfg.ParseParameters)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}

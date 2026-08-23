@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
@@ -558,7 +559,10 @@ func TestDiscoveryStageSkippedSources(t *testing.T) {
 	// and claiming completed would hide that it never ran.
 	t.Run("all sources skipped", func(t *testing.T) {
 		lookup := func(name string) (string, error) {
-			return "", errors.New("not found: " + name)
+			// The real exec.LookPath surface for an absent binary is the
+			// fs.ErrNotExist family (NEW-83): only that classifies MISSING;
+			// any other lookup error is a broken tool (WARN).
+			return "", fmt.Errorf("%w: %s", exec.ErrNotFound, name)
 		}
 		runner := newFakeRunner(standardScript())
 		stage := NewDiscoveryStage(runner, lookup)
@@ -578,7 +582,7 @@ func TestDiscoveryStageSkippedSources(t *testing.T) {
 	t.Run("one skipped among completed", func(t *testing.T) {
 		lookup := func(name string) (string, error) {
 			if name == "amass" {
-				return "", errors.New("not found: amass")
+				return "", fmt.Errorf("%w: amass", exec.ErrNotFound)
 			}
 			return name, nil
 		}

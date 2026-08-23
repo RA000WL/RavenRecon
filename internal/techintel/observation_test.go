@@ -1,10 +1,12 @@
 package techintel
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
@@ -114,27 +116,33 @@ func TestPrepareObservationBounds(t *testing.T) {
 
 // TestPrepareObservationRejectsOversizedCanonicalURL is the M1 regression
 // test: a caller-composed observation whose canonical URL exceeds
-// maxCanonicalURLLen (32 KiB) is REJECTED as malformed at ingest — counted,
-// never analyzed — and the check runs BEFORE any re-parse, so an oversized
+// maxCanonicalURLLen (8 KiB, exactly asset.ParseURL's constructor cap) is
+// REJECTED as malformed at ingest — counted, never analyzed. The
+// defense-in-depth re-check runs BEFORE any re-parse, so an oversized
 // canonical URL never reaches the parser. The boundary is pinned exactly: a
 // canonical string of exactly maxCanonicalURLLen bytes passes ingest, one
 // byte more is malformed.
 func TestPrepareObservationRejectsOversizedCanonicalURL(t *testing.T) {
 	now := fixedTime.Add(time.Minute)
+	prefix := "https://ok.example/"
 
-	// A canonical URL with a 40 KiB path: asset.ParseURL accepts it (the URL
-	// model itself has no size cap), but the ingest boundary must not.
-	raw := "https://ok.example/" + strings.Repeat("a", 40<<10)
-	u, err := asset.ParseURL(raw, asset.Provenance{})
-	if err != nil {
-		t.Fatalf("ParseURL(40 KiB path): %v", err)
+	// Constructor layer (authoritative): asset.ParseURL owns the bound on
+	// RAW input and rejects anything beyond the shared 8 KiB cap outright.
+	overRaw := prefix + strings.Repeat("a", maxCanonicalURLLen-len(prefix)+1)
+	if _, err := asset.ParseURL(overRaw, asset.Provenance{}); err == nil {
+		t.Fatal("asset.ParseURL must reject raw input beyond the shared 8 KiB cap")
 	}
+
+	// Ingest layer: a hand-built struct that skipped the constructor still
+	// cannot enter analysis — the canonical-length re-check fires before any
+	// parser work.
+	u := asset.URL{Scheme: "https", HostPort: "ok.example", Path: "/" + strings.Repeat("a", 40<<10)}
 	if n := len(u.String()); n <= maxCanonicalURLLen {
 		t.Fatalf("fixture canonical URL = %d bytes, need > %d", n, maxCanonicalURLLen)
 	}
 
 	o := Observation{URL: u, Source: "test", ObservedAt: now}
-	_, _, err = prepareObservation(o, now)
+	_, _, err := prepareObservation(o, now)
 	if err == nil {
 		t.Fatal("an observation with an oversized canonical URL must be rejected")
 	}
@@ -147,9 +155,7 @@ func TestPrepareObservationRejectsOversizedCanonicalURL(t *testing.T) {
 	}
 
 	// Boundary: a canonical string of EXACTLY maxCanonicalURLLen bytes
-	// passes ingest (the rejection is strictly > cap); one byte more is
-	// malformed.
-	prefix := "https://ok.example/"
+	// passes ingest (the rejection is strictly > cap).
 	atCap := prefix + strings.Repeat("b", maxCanonicalURLLen-len(prefix))
 	uAt, err := asset.ParseURL(atCap, asset.Provenance{})
 	if err != nil {
@@ -162,11 +168,14 @@ func TestPrepareObservationRejectsOversizedCanonicalURL(t *testing.T) {
 		t.Errorf("a canonical URL of exactly the cap must pass ingest: %v", err)
 	}
 
+	// One byte more is malformed. The raw form is refused by the
+	// constructor; a hand-built struct with that canonical string is refused
+	// by the ingest re-check.
 	overCap := prefix + strings.Repeat("b", maxCanonicalURLLen-len(prefix)+1)
-	uOver, err := asset.ParseURL(overCap, asset.Provenance{})
-	if err != nil {
-		t.Fatal(err)
+	if _, err := asset.ParseURL(overCap, asset.Provenance{}); err == nil {
+		t.Error("asset.ParseURL must reject raw input one byte over the shared cap")
 	}
+	uOver := asset.URL{Scheme: "https", HostPort: "ok.example", Path: "/" + strings.Repeat("b", maxCanonicalURLLen-len(prefix)+1)}
 	if _, _, err := prepareObservation(Observation{URL: uOver, Source: "test", ObservedAt: now}, now); err == nil {
 		t.Error("a canonical URL one byte over the cap must be rejected")
 	}
@@ -252,5 +261,56 @@ func TestObservationIdentity(t *testing.T) {
 	o.Endpoint = &ep
 	if o.identity() != ep.Identity() {
 		t.Error("endpoint-keyed observation identity must be the endpoint identity")
+	}
+}
+
+// NEW-83: ingest byte cuts are rune-safe — truncated body, header, and
+// cookie values stay valid UTF-8 and survive a JSON round-trip unchanged.
+func TestPrepareObservationTruncationRuneSafe(t *testing.T) {
+	now := fixedTime.Add(time.Minute)
+
+	o := newObs(t, "https://ok.example/")
+	// Each oversized value ends in multi-byte runes so a raw cut at the cap
+	// would tear one.
+	o.Body = strings.Repeat("a", maxObservationBody-1) + strings.Repeat("é", 8)
+	o.Headers = []HeaderEntry{{Name: "X-Long", Value: strings.Repeat("b", maxHeaderValueBytes-1) + strings.Repeat("é", 8)}}
+	o.Cookies = []CookieEntry{
+		{Name: strings.Repeat("n", maxCookieNameBytes-1) + "éé", Value: strings.Repeat("v", maxCookieValueBytes-1) + "éé"},
+	}
+	prepared, truncated, err := prepareObservation(o, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Error("truncation not flagged")
+	}
+
+	check := func(kind string, got string) {
+		t.Helper()
+		if !utf8.ValidString(got) {
+			t.Errorf("%s is not valid UTF-8 after truncation", kind)
+		}
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("%s marshal: %v", kind, err)
+		}
+		var back string
+		if err := json.Unmarshal(data, &back); err != nil || back != got {
+			t.Errorf("%s JSON round-trip mismatch", kind)
+		}
+	}
+	check("body", prepared.Body)
+	if len(prepared.Body) > maxObservationBody {
+		t.Errorf("body = %d bytes, want ≤ %d", len(prepared.Body), maxObservationBody)
+	}
+	for i, h := range prepared.Headers {
+		check(fmt.Sprintf("header[%d]", i), h.Value)
+		if len(h.Value) > maxHeaderValueBytes {
+			t.Errorf("header[%d] = %d bytes, want ≤ %d", i, len(h.Value), maxHeaderValueBytes)
+		}
+	}
+	for i, c := range prepared.Cookies {
+		check(fmt.Sprintf("cookie[%d] name", i), c.Name)
+		check(fmt.Sprintf("cookie[%d] value", i), c.Value)
 	}
 }

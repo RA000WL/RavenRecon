@@ -44,13 +44,22 @@ const dnsBruteTruncatedFlag = "dns_brute_truncated"
 const dnsBruteResolversIgnoredFlag = "dns_brute_resolvers_ignored"
 
 // dnsBruteSkippedCancelledFlag is the sticky flag set when the stage context
-// fired during the wildcard probe, aborting the opt-in brute before any
-// candidate was generated or resolved (NEW-47). The stage outcome stays the
+// fired during the opt-in brute — during the wildcard probe, aborting brute
+// before any candidate was generated (NEW-47), or during candidate
+// resolution, aborting it mid-run (NEW-71). The stage outcome stays the
 // base run's — exactly as for the wildcard abort — because the base
 // resolution itself is honest and complete; the flag is the marker that the
 // retained set lacks brute hosts because brute never ran, never silence
 // (AGENTS §0.6).
 const dnsBruteSkippedCancelledFlag = "dns_brute_skipped_cancelled"
+
+// dnsBruteFailedFlag is the sticky flag set when the opt-in brute aborted on
+// an engine failure (NEW-71): a wildcard probe that failed with a
+// non-cancellation error — leaving the wildcard state unknown, so brute
+// output would be untrustworthy — or a candidate resolution that returned an
+// engine error. The stage outcome stays the base run's; without the flag an
+// operator-enabled brute would be silently absent from a bare completed.
+const dnsBruteFailedFlag = "dns_brute_failed"
 
 // dnsStage adapts internal/dns (dns.Resolve) into a pipeline.Stage.
 //
@@ -578,7 +587,11 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 		if isContextError(err) {
 			return pipeline.StageResult{StickyFlags: map[string]bool{dnsBruteSkippedCancelledFlag: true}}, false, false
 		}
-		wildcard = false
+		// Non-cancellation probe failure (NEW-71): the wildcard state is
+		// UNKNOWN, so proceeding could emit wildcard-inflated hosts as
+		// discoveries. Abort the brute and surface the failure via
+		// dns_brute_failed instead of silently swallowing the error.
+		return pipeline.StageResult{StickyFlags: map[string]bool{dnsBruteFailedFlag: true}}, false, false
 	}
 	if wildcard {
 		return pipeline.StageResult{}, false, true
@@ -629,10 +642,14 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 	rep, err := dns.Resolve(bruteCtx, in.Target, filtered, cfg)
 	if err != nil {
 		if isContextError(err) {
-			return pipeline.StageResult{}, candidateTruncated, false
+			// NEW-71: the stage context fired during candidate resolution —
+			// an operator-enabled brute aborted mid-run must never pass
+			// through as a bare completed with no marker.
+			return pipeline.StageResult{StickyFlags: map[string]bool{dnsBruteSkippedCancelledFlag: true}}, candidateTruncated, false
 		}
-		// Engine error on brute: treat as failed brute with no additions.
-		return pipeline.StageResult{}, candidateTruncated, false
+		// Engine error on brute (NEW-71): failed brute with no additions,
+		// surfaced via dns_brute_failed — never a silent empty result.
+		return pipeline.StageResult{StickyFlags: map[string]bool{dnsBruteFailedFlag: true}}, candidateTruncated, false
 	}
 	// Inspect the raw resolve report for cancellation/timeout. When
 	// BruteTimeout fires mid-resolution dns.Resolve returns nil error but

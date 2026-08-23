@@ -24,7 +24,7 @@
 // indicator kind, so it never enters a cache key. Body, header-value,
 // cookie-, and TLS/DNS-list truncation happen at ingest with the
 // observation's Truncated flag set (the result is honest); malformed input
-// (a broken URL, a canonical URL longer than 32 KiB, an inconsistent
+// (a broken URL, a canonical URL longer than 8 KiB, an inconsistent
 // endpoint, more than 128 header entries) is counted, never analyzed, and
 // never panics.
 //
@@ -180,7 +180,7 @@
 //
 // # Bounds
 //
-// Per-observation: canonical URL 32 KiB (malformed beyond), body 1 MiB
+// Per-observation: canonical URL 8 KiB (malformed beyond), body 1 MiB
 // (truncated), 128 header entries (malformed beyond), 256 cookies (analyzer
 // cap), 128/512 technology/indicator caps (config with defaults), bounded
 // HTML candidates, evidence values capped by asset.NewEvidence. Per-run:

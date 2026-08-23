@@ -42,16 +42,18 @@ const (
 	// observed cookie set is incomplete).
 	maxObservationCookies = 256
 
-	// maxCanonicalURLLen is the ingest-boundary cap on the observation
-	// URL's CANONICAL string, mirroring urlintel's raw-line cap
-	// (maxRawURLLen, 32 KiB): the URL identity feeds cache keys, evidence
-	// source identities, and report entries, so a caller-composed
-	// observation whose canonical URL exceeds this is REJECTED as malformed
-	// at ingest (counted, never analyzed). It is a fixed constant,
-	// deliberately NOT configuration, and never enters cache keys; the
-	// check runs before any re-parse, so a hostile oversized URL never
-	// reaches the parser.
-	maxCanonicalURLLen = 32 << 10 // 32 KiB
+	// maxCanonicalURLLen is the ingest-boundary re-check cap on the
+	// observation URL's CANONICAL string: 8 KiB, exactly asset.ParseURL's
+	// maxRawURLBytes — the bounds belong at the single normalization point
+	// (the constructor), and this defense-in-depth re-check keeps a
+	// caller-composed struct that skipped the constructor from entering
+	// analysis (it fires BEFORE the re-parse, so an oversized canonical URL
+	// never reaches the parser). The URL identity feeds cache keys, evidence
+	// source identities, and report entries; an observation whose canonical
+	// URL exceeds this is REJECTED as malformed at ingest (counted, never
+	// analyzed). It is a fixed constant, deliberately NOT configuration, and
+	// never enters cache keys.
+	maxCanonicalURLLen = 8 << 10 // 8 KiB — asset.ParseURL's maxRawURLBytes
 
 	// maxTLSEntries bounds the TLSInfo ALPN and DNSNames lists and
 	// maxCNAMEChain bounds the DNSInfo CNAME chain. Longer lists are
@@ -184,7 +186,7 @@ func (o Observation) identity() asset.Identity {
 //
 //   - the URL does not re-parse to its own canonical identity (zero, broken,
 //     or hand-built non-canonical structs);
-//   - the URL's canonical string exceeds maxCanonicalURLLen (32 KiB);
+//   - the URL's canonical string exceeds maxCanonicalURLLen (8 KiB);
 //   - an attached endpoint does not re-validate, or its URL identity differs
 //     from the observation URL's;
 //   - more than maxObservationHeaders header entries.
@@ -211,14 +213,14 @@ func prepareObservation(o Observation, now time.Time) (Observation, bool, error)
 	// Body bound: truncate, never reject — the analysis result stays honest
 	// via the Truncated flag.
 	if len(out.Body) > maxObservationBody {
-		out.Body = out.Body[:maxObservationBody]
+		out.Body = truncateUTF8(out.Body, maxObservationBody)
 		truncated = true
 	}
 
 	// Header value bound: truncate (the retained line is what gets matched).
 	for i := range out.Headers {
 		if len(out.Headers[i].Value) > maxHeaderValueBytes {
-			out.Headers[i].Value = out.Headers[i].Value[:maxHeaderValueBytes]
+			out.Headers[i].Value = truncateUTF8(out.Headers[i].Value, maxHeaderValueBytes)
 			truncated = true
 		}
 	}
@@ -226,11 +228,11 @@ func prepareObservation(o Observation, now time.Time) (Observation, bool, error)
 	// Cookie name/value bounds: truncate.
 	for i := range out.Cookies {
 		if len(out.Cookies[i].Name) > maxCookieNameBytes {
-			out.Cookies[i].Name = out.Cookies[i].Name[:maxCookieNameBytes]
+			out.Cookies[i].Name = truncateUTF8(out.Cookies[i].Name, maxCookieNameBytes)
 			truncated = true
 		}
 		if len(out.Cookies[i].Value) > maxCookieValueBytes {
-			out.Cookies[i].Value = out.Cookies[i].Value[:maxCookieValueBytes]
+			out.Cookies[i].Value = truncateUTF8(out.Cookies[i].Value, maxCookieValueBytes)
 			truncated = true
 		}
 	}

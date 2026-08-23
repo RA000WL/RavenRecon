@@ -33,15 +33,22 @@ const maxSourceBytes = 128
 //
 // The key contains every input that materially changes the result: the
 // operation ("url.ingest"), the canonical Phase 2 URL identity (raw input
-// never reaches a key), the adapter identity (the same URL observed by
-// different sources is a different observation — this is the user's
-// per-adapter key spec), and the result-relevant ParseParameters flag
-// (parameter extraction changes the stored payload). Nothing else:
-// timings, timeouts, concurrency, and rate limits never enter a key, and
-// the fixed caps (maxRawURLLen, maxParametersPerURL) are constants, so a
-// completed entry written under the current caps stays valid under any
-// future caps that only retain more.
-func urlKey(u asset.URL, adapter string, parseParams bool) (cache.Key, error) {
+// never reaches a key), the adapter identity plus the detected tool version
+// as the key's ToolInfo (the same URL observed by different sources — or by
+// a different version of the same source — is a different observation; a
+// tool upgrade changes emitted data, AGENTS §11), and the result-relevant
+// ParseParameters flag (parameter extraction changes the stored payload).
+// Nothing else: timings, timeouts, concurrency, and rate limits never enter
+// a key, and the fixed caps (maxRawURLLen, maxParametersPerURL) are
+// constants, so a completed entry written under the current caps stays
+// valid under any future caps that only retain more.
+//
+// Callers must invoke urlKey only for known-version observations: by policy
+// (see lookupURL/storeURL) an unknown version makes the observation
+// NON-CACHEABLE, and it must never be keyed, read, or written under a
+// ""-version identity, which could not be distinguished from any other
+// unknown version (mirrors internal/discovery/cache.go).
+func urlKey(u asset.URL, adapter, version string, parseParams bool) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    u.Identity().String(),
@@ -49,6 +56,7 @@ func urlKey(u asset.URL, adapter string, parseParams bool) (cache.Key, error) {
 			"adapter":          adapter,
 			"parse_parameters": strconv.FormatBool(parseParams),
 		},
+		Tool: cache.ToolInfo{Name: adapter, Version: version},
 	})
 }
 
@@ -307,8 +315,14 @@ func storedToEntry(s storedURL, u asset.URL) URLEntry {
 // empty Status to fall through to execution (miss, expired, incomplete, or
 // discarded unusable records), or already classified failed when the key
 // cannot be built.
+//
+// An observation whose tool version is unknown is non-cacheable by policy
+// (see urlKey): it never reads a record and always falls through.
 func lookupURL(ctx context.Context, u asset.URL, e *env) URLEntry {
-	key, err := urlKey(u, e.adapter, e.parseParams)
+	if e.cache == nil || e.toolVersion == "" {
+		return URLEntry{URL: u}
+	}
+	key, err := urlKey(u, e.adapter, e.toolVersion, e.parseParams)
 	if err != nil {
 		return URLEntry{
 			URL:    u,
@@ -374,17 +388,19 @@ func (e *env) recordCacheDiagnostic(u asset.URL, what string, err error) {
 // record is written). A cancelled run still persists its terminal completed
 // records using a detached, bounded context so the write cannot wedge
 // shutdown (Phase 4 convention).
+//
+// An observation whose tool version is unknown is non-cacheable by policy
+// (see urlKey): it never writes a record.
 func storeURL(ctx context.Context, u asset.URL, entry URLEntry, e *env) URLEntry {
 	if entry.Status != StatusCompleted {
 		// Failed / cancelled observations are never cached: a later run
 		// must re-work them, and no partial state exists to resume.
 		return entry
 	}
-	key, err := urlKey(u, e.adapter, e.parseParams)
-	if err != nil {
-		entry.Err = errors.Join(entry.Err, fmt.Errorf("urlintel: %s: build cache key: %w", u.String(), err))
+	if e.cache == nil || e.toolVersion == "" {
 		return entry
 	}
+	key, err := urlKey(u, e.adapter, e.toolVersion, e.parseParams)
 	st := entryToStored(entry, e.adapter)
 	data, err := json.Marshal(st)
 	if err != nil {

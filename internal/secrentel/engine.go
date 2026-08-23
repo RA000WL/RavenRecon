@@ -373,7 +373,7 @@ func processDocument(ctx context.Context, sd scannedDocument, e *env) ReportEntr
 		Relationships: outcome.edges,
 		Counts:        outcome.counts,
 		Truncated:     sd.truncated,
-		Overflow:      len(outcome.candidates) >= e.limits.maxCandidates,
+		Overflow:      outcome.overflowCandidates || outcome.counts.OverflowDropped > 0,
 		FirstSeen:     sd.observedAt,
 		LastSeen:      sd.observedAt,
 		Sources:       []string{sd.source},

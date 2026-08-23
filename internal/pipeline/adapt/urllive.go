@@ -203,12 +203,15 @@ func buildUrlliveResult(report httpprobe.LiveReport, outcome pipeline.Outcome, e
 }
 
 // foldUrlliveOutcomes reduces the engine's per-URL outcomes to one stage
-// outcome. Mapping: cancelled > failed > completed (spec simplified). Any
-// record whose Err is context.Canceled (run cancellation) folds to
-// cancelled; any other Err (timeout, refused, dns, etc.) folds to failed
-// when no completed record exists; otherwise completed. Truncated records
-// are considered completed for outcome purposes — the flag, not the
-// outcome, marks the set incomplete (AGENTS §0.6 carve-out).
+// outcome using the unified mapping table (adapt/doc.go): cancelled >
+// failed&&none-completed > all-completed > partial. Any record whose Err is
+// a context error (run cancellation) folds to cancelled; any other Err
+// (timeout, refused, dns, etc.) folds to failed only when NO completed
+// record exists — a mixed success/failure report is PARTIAL (M-9 / NEW-72:
+// the old fold collapsed mixed reports into completed). All-completed
+// reports are completed; anything else is partial. Truncated records are
+// considered completed for outcome purposes — the flag, not the outcome,
+// marks the set incomplete (AGENTS §0.6 carve-out).
 func foldUrlliveOutcomes(report httpprobe.LiveReport) pipeline.Outcome {
 	if len(report.Records) == 0 {
 		return pipeline.OutcomeCompleted
@@ -234,8 +237,10 @@ func foldUrlliveOutcomes(report httpprobe.LiveReport) pipeline.Outcome {
 		return pipeline.OutcomeCancelled
 	case anyFailed && !anyCompleted:
 		return pipeline.OutcomeFailed
-	default:
+	case !anyFailed:
 		return pipeline.OutcomeCompleted
+	default:
+		return pipeline.OutcomePartial
 	}
 }
 

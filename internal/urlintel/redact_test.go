@@ -40,7 +40,7 @@ func TestIngestUserinfoRedactedAtConstruction(t *testing.T) {
 	// (b) The cache record payload contains no userinfo: a raw scan of the
 	// stored bytes (any smuggled field would show up) plus the typed check.
 	u := mustURL(t, canonical)
-	key, err := urlKey(u, cfg.Adapter, cfg.ParseParameters)
+	key, err := urlKey(u, cfg.Adapter, cfg.ToolVersion, cfg.ParseParameters)
 	if err != nil {
 		t.Fatalf("urlKey: %v", err)
 	}

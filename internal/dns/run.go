@@ -205,7 +205,7 @@ func Resolve(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg C
 			// behind this one was never submitted and keeps its initialized
 			// cancelled status with the cause attached.
 			for j := i + 1; j < len(hosts); j++ {
-				results[j].Err = fmt.Errorf("dns: not submitted: %w", ctx.Err())
+				results[j].Err = fmt.Errorf("dns: not submitted: %w", submitCause(ctx.Err(), err))
 			}
 			break
 		}
@@ -223,6 +223,18 @@ func Resolve(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg C
 		return report, fmt.Errorf("dns: pool shutdown: %w", shutdownErr)
 	}
 	return report, nil
+}
+
+// submitCause selects the error reported for hosts that were never
+// submitted: the run-context error when the context is already done (the
+// usual cancellation shape), otherwise the Submit error itself. Submit can
+// fail while the context is still live (ErrPoolClosed), and formatting a
+// nil context error must never render "%!w(<nil>)".
+func submitCause(ctxErr, submitErr error) error {
+	if ctxErr != nil {
+		return ctxErr
+	}
+	return submitErr
 }
 
 // shutdownContext derives the bounded drain context for pool shutdown,

@@ -92,16 +92,20 @@ type AttackPath struct {
 //	        contributing member's step is the path's final evidence
 //	        attachment.
 //
-// Bounds: at most maxStepsPerPath steps per path (Truncated reports the
-// cut) and maxPathsPerRun paths per run, kept highest group score first
-// (ties by root identity asc) — both total orders, so identical group
-// input produces bit-for-bit identical output. Groups without contributing
-// members produce no path; empty input produces no paths; nothing panics.
+// Bounds: at most maxStepsPerPath steps per path (AttackPath.Truncated
+// reports the cut) and maxPathsPerRun paths per run, kept highest group
+// score first (ties by root identity asc) — both total orders, so identical
+// group input produces bit-for-bit identical output. The boolean second
+// return reports the run-level path cut (paths beyond maxPathsPerRun were
+// dropped after ranking), mirroring Correlate's shape: callers get an
+// explicit truncation signal instead of a silently capped set. Groups
+// without contributing members produce no path; empty input produces no
+// paths and false; nothing panics.
 //
 // Reminder of scope (see AttackPath): these are recon hypotheses for a
 // researcher's reading order — never exploitation chains, never
 // vulnerability claims, never tested statements.
-func AttackPaths(groups []Group) []AttackPath {
+func AttackPaths(groups []Group) ([]AttackPath, bool) {
 	var paths []AttackPath
 	for _, g := range groups {
 		contributing := contributingMembers(g.Members)
@@ -150,10 +154,11 @@ func AttackPaths(groups []Group) []AttackPath {
 		}
 		return paths[i].Root.String() < paths[j].Root.String()
 	})
-	if len(paths) > maxPathsPerRun {
+	truncated := len(paths) > maxPathsPerRun
+	if truncated {
 		paths = paths[:maxPathsPerRun]
 	}
-	return paths
+	return paths, truncated
 }
 
 // contributingMembers returns the members carrying at least one factor,

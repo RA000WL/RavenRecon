@@ -325,6 +325,14 @@ func readLines(ctx context.Context, env ImportEnv, path string, handle func(line
 				if errors.Is(err, errOutputTruncated) {
 					truncated = true
 				}
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// A record whose handler bailed on cancellation was never
+				// processed — it is neither completed nor failed. The run is
+				// aborting: surface the cause instead of counting a phantom
+				// failure (cancellation is never reported as a record
+				// failure, mirroring the runtime pool's terminal
+				// classification).
+				return processed, failed, truncated, err
 			} else {
 				failed++
 			}

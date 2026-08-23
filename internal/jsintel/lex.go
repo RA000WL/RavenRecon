@@ -631,6 +631,12 @@ func (lx *lexer) scanRegexBody(i int) (int, bool) {
 		switch {
 		case c == '\\':
 			j += 2
+			// The escape target may itself be a line terminator (a
+			// malformed regex, but reachable): the skip must still
+			// advance the line count or every later token shifts up.
+			if k := j - 1; k < len(lx.src) && (lx.src[k] == '\n' || lx.src[k] == '\r') {
+				lx.line++
+			}
 		case c == '[':
 			inClass = true
 			j++

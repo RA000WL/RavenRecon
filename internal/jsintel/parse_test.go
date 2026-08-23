@@ -894,3 +894,29 @@ func TestParseAdversarialImportWindow(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestDecodeStringEscapeTable pins decodeString's escape semantics against
+// the scanner's (lex.go scanString): \r is a REAL escape writing a
+// carriage return, while backslash + an actual CR (with or without a
+// following LF) is a line continuation that emits nothing — the CRLF pair
+// is removed as one unit, never re-emitted as a spurious CRLF.
+func TestDecodeStringEscapeTable(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"escaped r writes carriage return", "a\\rb", "a\rb"},
+		{"escaped n writes newline", "a\\nb", "a\nb"},
+		{"backslash CRLF continuation removed", "a\\\r\nb", "ab"},
+		{"backslash lone CR continuation removed", "a\\\rb", "ab"},
+		{"backslash LF continuation removed", "a\\\nb", "ab"},
+		{"bare CRLF preserved verbatim", "a\r\nb", "a\r\nb"},
+		{"unknown escape keeps char after backslash", "a\\qb", "aqb"},
+	}
+	for _, tc := range cases {
+		if got := decodeString(tc.raw); got != tc.want {
+			t.Errorf("%s: decodeString(%q) = %q, want %q", tc.name, tc.raw, got, tc.want)
+		}
+	}
+}

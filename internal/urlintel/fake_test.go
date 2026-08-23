@@ -102,6 +102,7 @@ func testConfig() Config {
 	cfg.Burst = 0
 	cfg.Adapter = "test-adapter"
 	cfg.ParseParameters = true
+	cfg.ToolVersion = "v1.0.0" // known version: cacheable by policy
 	cfg.Clock = newFakeClock(fixedTime)
 	return cfg
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -852,4 +853,117 @@ func provenanceRows(res pipeline.StageResult) []string {
 		out = append(out, fmt.Sprintf("%s|%s|%s|%s|%d", r.Identity, r.Importer, r.Filename, r.ImportTime.Format(time.RFC3339Nano), int(r.Confidence*100)))
 	}
 	return out
+}
+
+// --- NEW-63 / H-3: imported URLs with explicit non-default ports ---
+
+// TestFilterIngestURLsRetainsNonDefaultPort is the H-3 regression: the
+// canonical HostPort retains explicit ports ("api.example.com:8443"), and
+// asset.NewHost rejects ':' — the pre-fix filter silently dropped EVERY
+// port-bearing URL. The filter must strip the port through the shared
+// urlHost helper before the domain check.
+func TestFilterIngestURLsRetainsNonDefaultPort(t *testing.T) {
+	target := inTarget(t)
+	urls := []asset.URL{
+		mustURL(t, "http://api.example.com:8443/"),
+		mustURL(t, "http://www.example.com/"),
+		mustURL(t, "http://evil.com/out"),
+		mustURL(t, "http://93.184.216.34/x"), // IP literal: never in-domain
+	}
+	got := filterIngestURLs(target, urls)
+	if len(got) != 2 {
+		t.Fatalf("filterIngestURLs kept %d URLs, want 2 (ported + plain in-domain)", len(got))
+	}
+	if got[0].Identity().String() != urls[0].Identity().String() ||
+		got[1].Identity().String() != urls[1].Identity().String() {
+		t.Fatalf("kept = %v/%v, want the two in-domain URLs in input order",
+			got[0].Identity(), got[1].Identity())
+	}
+}
+
+// TestIngestStageRetainsPortedURLsEndToEnd drives the whole ingest stage
+// over a plain-URLs file carrying an explicit :8443 URL: the ported URL
+// must reach Additions.URLs, not vanish into a silent skip.
+func TestIngestStageRetainsPortedURLsEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "urls.txt")
+	content := strings.Join([]string{
+		"http://api.example.com:8443/",
+		"http://www.example.com/",
+		"http://evil.com/out",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	clk := fixedClock{now: fixedTime}
+
+	res, err := NewIngestStage().Run(context.Background(),
+		ingestInput(t, clk, nil, path, nil))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var got []string
+	for _, u := range res.Additions.URLs {
+		got = append(got, u.Identity().String())
+	}
+	want := []string{"url:http://api.example.com:8443/", "url:http://www.example.com/"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Additions.URLs = %v, want %v", got, want)
+	}
+}
+
+// --- NEW-61 / H-2: cancellation with queued files never deadlocks ---
+
+// TestIngestStageCancelWithQueuedFilesReturnsPromptly is the H-2 regression:
+// concurrency 1 over four files means three jobs sit queued while the first
+// blocks. Cancelling mid-run drops those queued jobs WITHOUT executing their
+// Func (the pool's forced-shutdown path) — the old caller-side WaitGroup's
+// Done lived only inside the closures, so wg.Wait blocked forever before the
+// deferred Shutdown could run. Run must return promptly and fold every
+// never-executed file as cancelled.
+func TestIngestStageCancelWithQueuedFilesReturnsPromptly(t *testing.T) {
+	dir := t.TempDir()
+	var paths []string
+	for i := 0; i < 4; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("domains%d.txt", i))
+		if err := os.WriteFile(p, []byte("a.example.com\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		paths = append(paths, p)
+	}
+	clk := fixedClock{now: fixedTime}
+
+	reg := importer.NewRegistry()
+	blocker := &blockingImporter{imp: importer.NewPlainDomainsImporter()}
+	if err := reg.Register(blocker); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	reg.Seal()
+	stage := &ingestStage{registry: reg}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocker.cancel = cancel
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	in := ingestInput(t, clk, nil, strings.Join(paths, "\n"), nil)
+	in.Bounds.MaxConcurrency = 1
+
+	done := make(chan struct{})
+	var res pipeline.StageResult
+	go func() {
+		res, _ = stage.Run(ctx, in)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stage.Run did not return after cancellation — join point deadlocks on queued jobs")
+	}
+	if res.Outcome != pipeline.OutcomeCancelled {
+		t.Fatalf("Outcome = %q, want cancelled", res.Outcome)
+	}
 }

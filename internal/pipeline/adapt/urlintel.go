@@ -277,6 +277,15 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 		Clock: in.Clock,
 	}
 
+	// The detected tool version enters the engine's cache keys together with
+	// the adapter name (cache.ToolInfo): a tool upgrade changes emitted data,
+	// so a record written by another version is never served (AGENTS §11).
+	// Detection runs once per stage run, through the same runner/lookPath
+	// seams as execution. An UNKNOWN version ("") makes this run
+	// NON-CACHEABLE by policy (mirrors internal/discovery): such observations
+	// execute fresh and never read or write records.
+	cfg.ToolVersion = detectToolVersion(ctx, s.runner, s.lookPath, tool)
+
 	// One shared accumulator merges every domain's observations at emit time:
 	// one report entry per distinct canonical URL across the whole stage,
 	// deterministically sorted — the engine's documented multi-run merge
@@ -365,6 +374,45 @@ const (
 	domainFailed
 	domainCancelled
 )
+
+// detectToolVersion detects the selected tool's version through the same
+// seams the execution uses, mirroring urlintel/adapt's detection contract:
+// a version-probed tool runs its probe through the runner (bounded by
+// DefaultDetectTimeout), and the tolerant version pattern reads stdout
+// first, then stderr. A probe that fails to execute, garbles, times out, or
+// prints no recognizable version yields "" — in urlintel/adapt's terms at
+// worst a WARN; here simply an unknown version, which makes the run
+// non-cacheable by policy (never a hard failure). An existence-probed tool
+// (waybackurls) has no probe at all and yields "".
+func detectToolVersion(ctx context.Context, runner discovery.Runner, lookPath func(string) (string, error), tool urladapt.Tool) string {
+	if tool.ProbeKind != urladapt.ProbeVersion || len(tool.ProbeArgs) == 0 {
+		return ""
+	}
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	if runner == nil {
+		runner = discovery.ExecRunner{}
+	}
+	bin := tool.Bin
+	if bin == "" {
+		bin = tool.Name
+	}
+	path, err := lookPath(bin)
+	if err != nil {
+		return ""
+	}
+	pctx, cancel := context.WithTimeout(ctx, urladapt.DefaultDetectTimeout)
+	defer cancel()
+	res, err := runner.Run(pctx, discovery.Cmd{Path: path, Args: tool.ProbeArgs}, discovery.Limits{MaxOutput: discovery.DefaultMaxOutput})
+	if err != nil {
+		return ""
+	}
+	if v := discovery.ExtractVersion(res.Stdout); v != "" {
+		return v
+	}
+	return discovery.ExtractVersion(res.Stderr)
+}
 
 // runDomain constructs the selected tool's LineSource for one domain and
 // ingests it into the shared accumulator. It returns a domain status and,

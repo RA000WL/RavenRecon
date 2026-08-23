@@ -122,9 +122,14 @@ func (stateErrorCache) Delete(ctx context.Context, key cache.Key) error { return
 func (stateErrorCache) Clear(ctx context.Context) error                 { return nil }
 
 // gauLines scripts the gau invocation for one domain to emit the given raw
-// lines.
+// lines, plus the -version detection probe: a known detected version is
+// required for the observations to be cacheable at all (urlintel/adapt keys
+// per tool version; an unknown version is non-cacheable by policy).
 func gauLines(domain string, lines ...string) map[string]func(discovery.Cmd) (discovery.RunResult, error) {
 	return map[string]func(discovery.Cmd) (discovery.RunResult, error){
+		"gau -version": func(discovery.Cmd) (discovery.RunResult, error) {
+			return discovery.RunResult{Stdout: []byte("gau 2.1.1\n")}, nil
+		},
 		"gau " + domain: func(discovery.Cmd) (discovery.RunResult, error) {
 			return discovery.RunResult{Stdout: []byte(strings.Join(lines, "\n") + "\n")}, nil
 		},
@@ -777,8 +782,9 @@ func TestURLIntelStageDeduplicatesDeclaredDomains(t *testing.T) {
 	if res.Outcome != pipeline.OutcomeCompleted {
 		t.Fatalf("Outcome = %q, want %q", res.Outcome, pipeline.OutcomeCompleted)
 	}
-	// "gau example.com" ran once: the duplicate in.Domains entry was deduped.
-	if got := len(runner.calls); got != 1 {
-		t.Fatalf("runner invocations = %d, want 1 (target deduped against Domains)", got)
+	// "gau example.com" ran once (the duplicate in.Domains entry was
+	// deduped), plus the single -version detection probe: 2 invocations.
+	if got := len(runner.calls); got != 2 {
+		t.Fatalf("runner invocations = %d, want 2 (probe + one execution; target deduped against Domains)", got)
 	}
 }

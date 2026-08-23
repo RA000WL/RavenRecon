@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -276,7 +278,7 @@ func TestChaosNonZeroExitWithPartialOutput(t *testing.T) {
 
 func TestChaosExecutableMissing(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["chaos"] = errors.New("not found in PATH")
+	l.errs["chaos"] = exec.ErrNotFound
 	c := chaos{env: chaosEnv(newFakeRunner(t, nil), l)}
 	c.env.name = "chaos"
 	_, err := c.Discover(context.Background(), mustDomain(t, "example.com"))
@@ -304,7 +306,7 @@ func TestChaosCancellation(t *testing.T) {
 
 func TestChaosDetectMissingBinary(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["chaos"] = errors.New("not found in PATH")
+	l.errs["chaos"] = exec.ErrNotFound
 	r := newFakeRunner(t, nil)
 	t.Setenv("PDCP_API_KEY", "testkey")
 	c := chaos{env: chaosEnv(r, l)}
@@ -606,4 +608,66 @@ func TestChaosCacheHit(t *testing.T) {
 		t.Fatalf("cached hosts = %v, want [a.example.com]", names(rep2.Results[0].Hosts))
 	}
 	// Issue: unknown version (no PDCP key) would not be cached – but here version is known so cache hit
+}
+
+// Permission-denied lookup degrades to WARN carrying the cause, never
+// MISSING (broken-vs-missing distinction shared with the versioned
+// detectors).
+func TestChaosDetectLookupPermissionDeniedIsWarn(t *testing.T) {
+	l := newFakeLookup()
+	l.errs["chaos"] = os.ErrPermission
+	c := chaos{env: chaosEnv(newFakeRunner(t, nil), l)}
+	c.env.name = "chaos"
+	d := c.Detect(context.Background())
+	if d.Status != StatusWarn {
+		t.Fatalf("status = %s, want warn for permission-denied lookup (%+v)", d.Status, d)
+	}
+	if !strings.Contains(d.Reason, "permission denied") {
+		t.Fatalf("reason = %q, want the underlying cause", d.Reason)
+	}
+}
+
+// A non-not-exist lookup failure during execution fails the source with the
+// underlying cause; ErrExecutableNotFound is reserved for genuinely absent
+// binaries.
+func TestChaosDiscoverLookupPermissionDeniedNotNotFound(t *testing.T) {
+	l := newFakeLookup()
+	l.errs["chaos"] = os.ErrPermission
+	c := chaos{env: chaosEnv(newFakeRunner(t, nil), l)}
+	c.env.name = "chaos"
+	_, err := c.Discover(context.Background(), mustDomain(t, "example.com"))
+	if err == nil || errors.Is(err, ErrExecutableNotFound) {
+		t.Fatalf("want a failure that is not ErrExecutableNotFound, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("err = %v, want the underlying cause", err)
+	}
+}
+
+// v0.5 subdomain lists may contain the queried domain itself. The apex must
+// be kept as-is — appending the domain would fabricate the bogus host
+// "example.com.example.com" downstream.
+func TestChaosParseSubdomainsApexKeptAsIs(t *testing.T) {
+	t.Setenv("PDCP_API_KEY", "testkey")
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
+		"chaos -d example.com -silent -json": func(Cmd) (RunResult, error) {
+			return RunResult{Stdout: []byte(`{"domain":"example.com","subdomains":["www","example.com"]}` + "\n")}, nil
+		},
+	})
+	c := chaos{env: chaosEnv(r, newFakeLookup())}
+	c.env.name = "chaos"
+	res, err := c.Discover(context.Background(), mustDomain(t, "example.com"))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	got := names(res.Hosts)
+	want := []string{"example.com", "www.example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("hosts = %v, want %v", got, want)
+	}
+	for _, h := range res.Hosts {
+		if strings.Contains(h.Name, "example.com.example.com") {
+			t.Fatalf("apex was doubled into bogus host %q", h.Name)
+		}
+	}
 }

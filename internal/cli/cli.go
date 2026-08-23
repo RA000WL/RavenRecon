@@ -45,9 +45,10 @@ Examples:
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
   amass enum -passive -d <domain>.
-The scan command runs discover → dns → httpprobe → urlintel → techintel →
-jsintel → secrentel → priority → detect → report and writes the report
-into an output directory (default ravenrecon-report).
+The scan command runs discover → dns → httpprobe → urlintel → crawl →
+techintel → jsintel → secrentel → urllive → priority → detect → report
+(twelve stages) and writes the report into an output directory
+(default ravenrecon-report).
 No active enumeration, brute force, or intel modes are ever run.
 
 RavenRecon is intended for authorized security testing and
@@ -137,9 +138,17 @@ func Run(ctx context.Context, args []string) error {
 		return printUsage(os.Stdout)
 
 	case "version":
+		// Like every other command, unexpected arguments are a usage
+		// error — never silently ignored.
+		if len(args) > 1 {
+			return fmt.Errorf("version: unexpected argument(s) %q (usage: ravenrecon version)", args[1])
+		}
 		return printVersion(os.Stdout)
 
 	case "doctor":
+		if len(args) > 1 {
+			return fmt.Errorf("doctor: unexpected argument(s) %q (usage: ravenrecon doctor)", args[1])
+		}
 		return runDoctor(ctx, os.Stdout)
 
 	case "discover":
@@ -182,7 +191,8 @@ type discoverOptions struct {
 
 // parseDiscoverArgs parses "discover" arguments: exactly one target domain,
 // followed by options. Options must come after the domain (the domain is
-// positional); -h/--help anywhere prints discover usage via errDiscoverHelp.
+// positional); -h/--help anywhere, and a bare "help" as the first
+// post-option word, print discover usage via errDiscoverHelp.
 func parseDiscoverArgs(args []string) (discoverOptions, error) {
 	if len(args) == 0 {
 		return discoverOptions{}, fmt.Errorf("discover: missing domain argument (usage: ravenrecon discover <domain> [options])")
@@ -203,6 +213,12 @@ func parseDiscoverArgs(args []string) (discoverOptions, error) {
 		return discoverOptions{}, fmt.Errorf("discover: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
+		// A bare "help" following the options is a help request per the
+		// contract above — never a domain that would fail normalization
+		// with a confusing invalid-target error.
+		if rest[0] == "help" {
+			return discoverOptions{}, errDiscoverHelp
+		}
 		return discoverOptions{}, fmt.Errorf("discover: unexpected argument(s) %q (usage: ravenrecon discover <domain> [options])", rest[0])
 	}
 

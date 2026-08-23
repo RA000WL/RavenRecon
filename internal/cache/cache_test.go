@@ -592,13 +592,22 @@ func TestTempLeftoverIgnored(t *testing.T) {
 	if o := c.Get(context.Background(), key); !o.IsHit() {
 		t.Fatalf("expected hit unaffected by leftover temp, got %s", o.State)
 	}
-	// InvalidateIncompatible ignores non-.json files.
+	// InvalidateIncompatible reclaims the crash residue: the temp file is
+	// removed (race-free under the instance mutex), the .json entry is
+	// untouched, and temporary files are not counted as removed entries.
 	removed, err := c.InvalidateIncompatible(context.Background())
 	if err != nil {
 		t.Fatalf("InvalidateIncompatible: %v", err)
 	}
 	if removed != 0 {
-		t.Fatalf("invalidator must not count leftover temp files, removed %d", removed)
+		t.Fatalf("invalidator must not count reclaimed temp files as entries, removed %d", removed)
+	}
+	tmp := filepath.Join(filepath.Dir(path), "entry-12345.tmp")
+	if _, serr := os.Stat(tmp); !os.IsNotExist(serr) {
+		t.Fatalf("leftover temp file survived InvalidateIncompatible (err %v)", serr)
+	}
+	if o := c.Get(context.Background(), key); !o.IsHit() {
+		t.Fatalf("the .json entry must survive the temp reclaim, got %s", o.State)
 	}
 	// Clear removes leftover temp files too: after Clear the whole entries
 	// tree is gone, so there can be no leftover temp files anywhere.

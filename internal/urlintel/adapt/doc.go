@@ -55,11 +55,15 @@
 // # Adapter identity and cache keys
 //
 // The orchestration passes the tool NAME as the engine's adapter identity
-// (urlintel.Config.Adapter), which enters per-(URL, adapter) cache keys and
-// the provenance of every asset. The same URL observed by two tools is two
-// cache records; the engine's accumulator merges them into one report entry
-// with unioned sources. Callers must pass the same tool name across runs —
-// the engine's key contract.
+// (urlintel.Config.Adapter) and the DETECTED tool version as
+// (urlintel.Config.ToolVersion); both enter per-(URL, adapter, version)
+// cache keys, and the name enters the provenance of every asset. The same
+// URL observed by two tools — or by two versions of one tool — is stored as
+// distinct records; the engine's accumulator merges them into one report
+// entry with unioned sources. A tool whose version cannot be detected is
+// non-cacheable by policy (mirrors internal/discovery): its observations
+// execute fresh on every run. Callers must pass the same tool name across
+// runs — the engine's key contract.
 //
 // # Orchestration
 //

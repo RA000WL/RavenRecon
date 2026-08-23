@@ -15,7 +15,7 @@ func Diff(oldText, newText string) string {
 
 	const maxCells = 4_000_000
 	if len(oldLines)*len(newLines) > maxCells {
-		return "old:\n" + oldText + "new:\n" + newText
+		return cappedFallback(oldText, newText)
 	}
 
 	lcs := make([][]int, len(oldLines)+1)
@@ -116,4 +116,30 @@ func splitLines(s string) []string {
 		lines = lines[:n-1]
 	}
 	return lines
+}
+
+// cappedFallback renders the oversized-input path: the LCS would exceed its
+// cell cap, so Diff falls back to a labeled dump of both documents. The dump
+// is byte-capped like every other Diff output path — each side gets half of
+// the same 8 KiB budget the LCS renderer enforces, so the fallback can never
+// be the one unbounded return.
+func cappedFallback(oldText, newText string) string {
+	const fallbackCap = 8 << 10
+	var b strings.Builder
+	b.WriteString("old:\n")
+	writeCapped(&b, oldText, fallbackCap/2)
+	b.WriteString("new:\n")
+	writeCapped(&b, newText, fallbackCap/2)
+	return b.String()
+}
+
+// writeCapped appends s to b, truncating at limit bytes with the same
+// truncation marker the LCS path emits.
+func writeCapped(b *strings.Builder, s string, limit int) {
+	if len(s) <= limit {
+		b.WriteString(s)
+		return
+	}
+	b.WriteString(s[:limit])
+	b.WriteString("\n… (diff truncated)\n")
 }

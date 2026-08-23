@@ -4,9 +4,11 @@ package adapt
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/discovery"
 )
@@ -101,4 +103,46 @@ func TestRunScriptToolWithRealWrapper(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	requireLines(t, drainItems(t, src), "/api/v1/users")
+}
+
+// TestRunRealExecutableKilledAtBudget: the M-5 acceptance case end to end.
+// A real hanging executable (a wedged SecretFinder stand-in) is run through
+// the PRODUCTION seams (nil runner = ExecRunner, nil lookup = exec.LookPath)
+// under a context with NO deadline; the adapter's own execution budget must
+// kill it, and Run must classify the result as deadline-exceeded. The
+// budget value itself is compressed for the test (toolRunBudget, restored
+// on defer); TestRunDefaultBudgetConstant pins the production default at 2m
+// and TestRunDefaultBudgetInstalledForUndeadlinedCaller proves an
+// undealined caller receives exactly that budget.
+func TestRunRealExecutableKilledAtBudget(t *testing.T) {
+	toolRunBudget = 500 * time.Millisecond
+	defer func() { toolRunBudget = DefaultToolTimeout }()
+
+	dir := t.TempDir()
+	sf := filepath.Join(dir, "SecretFinder.py")
+	script := "#!/bin/sh\n" +
+		"# Wedged tool: ignores its argv and never exits.\n" +
+		"while :; do sleep 1; done\n"
+	if err := os.WriteFile(sf, []byte(script), 0o755); err != nil {
+		t.Fatalf("write SecretFinder.py stand-in: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	start := time.Now()
+	src, err := Run(context.Background(), nil, Tools["secretfinder"], "https://example.com/", nil)
+	el := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run err = %v, want wrap context.DeadlineExceeded", err)
+	}
+	if src != nil {
+		t.Fatal("Run returned a source for a timed-out execution, want nil")
+	}
+	// The kill happened AT the budget: not appreciably early (the tool
+	// really did hang) and not unbounded.
+	if el < 250*time.Millisecond {
+		t.Fatalf("Run returned after %s; the tool was killed before the budget elapsed", el)
+	}
+	if el > 30*time.Second {
+		t.Fatalf("Run returned after %s; the budget did not bound the hang", el)
+	}
 }

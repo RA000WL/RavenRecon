@@ -3,6 +3,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -17,24 +18,43 @@ import (
 // result-relevant configuration, and the tool identity (name plus detected
 // version), because a tool version change can change results.
 //
-// The only result-relevant configuration today is the passive mode. Adding
-// other invocation modes (or any option that changes the results' meaning)
-// MUST extend this map; timings, rate limits, and other non-semantic settings
-// must never enter the key.
+// The normalized quality gate configuration is part of the Config map:
+// stored records persist the producing run's post-gate retained set and its
+// recorded issues, so MaxPerSource, DivergenceRatio, and DivergenceMinCount
+// materially change what a replay serves. Raising the cap after a capped
+// store must miss and re-execute. AbortOnFlag is deliberately excluded: it
+// changes only whether flagged runs fail, never the record content.
+//
+// Timings, rate limits, and other non-semantic settings must never enter
+// the key.
+//
+// qc MUST be pre-normalized via NormalizeQualityConfig (both callers do).
 //
 // Callers must invoke cacheKey only for known-version tools: by policy (see
 // runSource) an unknown version (det.Version == "") makes the tool
 // NON-CACHEABLE, and it must never be keyed, read, or written under a
 // ""-version identity, which could not be distinguished from any other
 // unknown version.
-func cacheKey(target asset.Domain, src Source, det Detection) (cache.Key, error) {
+func cacheKey(target asset.Domain, src Source, det Detection, qc QualityConfig) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    target.Identity().String(),
-		Config:    map[string]string{"mode": "passive"},
-		Tool:      cache.ToolInfo{Name: src.Name(), Version: det.Version},
+		Config: map[string]string{
+			"mode":                         "passive",
+			"quality_max_per_source":       strconv.Itoa(qc.MaxPerSource),
+			"quality_divergence_ratio":     strconv.FormatFloat(qc.DivergenceRatio, 'g', -1, 64),
+			"quality_divergence_min_count": strconv.Itoa(qc.DivergenceMinCount),
+		},
+		Tool: cache.ToolInfo{Name: src.Name(), Version: det.Version},
 	})
 }
+
+// encodeResult marshals a storedResult into a cache record payload. It is a
+// package-level variable solely as a hermetic test seam: production always
+// uses json.Marshal, which cannot fail on this struct — the failure path
+// exists so an encoding bug degrades to a skipped store instead of a
+// Data-less completed record.
+var encodeResult = json.Marshal
 
 // storedResult is the structured Data payload stored in cache records. It is
 // never terminal output; it is the normalized, deduplicated result model.

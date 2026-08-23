@@ -488,3 +488,31 @@ func TestRunDiscoverCancelledMidRun(t *testing.T) {
 		t.Fatalf("the cancelled outcome must be reported:\n%s", out)
 	}
 }
+
+// TestParseDiscoverArgsHelpAfterOption is the NEW-83 regression test: a
+// bare "help" following an option is a help request per the contract
+// comment — never a domain that would fail normalization with a confusing
+// invalid-target error.
+func TestParseDiscoverArgsHelpAfterOption(t *testing.T) {
+	opts, err := parseDiscoverArgs([]string{"--no-cache", "help"})
+	if err != errDiscoverHelp {
+		t.Fatalf("bare help after an option must return errDiscoverHelp, got %v", err)
+	}
+	if opts.domain != "" {
+		t.Fatalf("help request must not produce options, got %+v", opts)
+	}
+}
+
+// TestRunVersionDoctorRejectExtraArgs is the NEW-83 regression test:
+// doctor and version reject leftover arguments like every other command —
+// never silently ignore them.
+func TestRunVersionDoctorRejectExtraArgs(t *testing.T) {
+	err := Run(context.Background(), []string{"version", "--bogus"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("version --bogus must be a usage error, got %v", err)
+	}
+	err = Run(context.Background(), []string{"doctor", "extra"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("doctor extra must be a usage error, got %v", err)
+	}
+}

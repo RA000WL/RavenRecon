@@ -79,8 +79,10 @@ Options:
                           stage_finished) to stderr as the run progresses.
                           Mutually exclusive with --tui.
   --tui                   Render a live observability frame on stderr while
-                          the run progresses (same frame as scan).
-                          Mutually exclusive with --verbose.
+                          the run progresses (the same frame as scan:
+                          phase, stage lifecycle, progress counters,
+                          warnings/errors, target and output directory,
+                          final summary). Mutually exclusive with --verbose.
   --tui-compact           Condense the --tui frame. Requires --tui.
 
 Scope: imports are filtered against the declared target — hosts and URLs
@@ -155,7 +157,8 @@ type ingestOptions struct {
 // inputs, and Go's flag package stops parsing at the first positional — so
 // options must come BEFORE the target: everything after the target is an
 // input path (documented in ingestUsage). -h/--help/help anywhere before
-// the positionals prints ingest usage via errIngestHelp. Validation of flag
+// the positionals, and a bare "help" as the first post-option word, print
+// ingest usage via errIngestHelp. Validation of flag
 // VALUES happens here; the target is validated and normalized through
 // asset.NewDomain (the single normalization point) by runIngest, and the
 // paths are validated by the ingest stage itself (the single validation
@@ -188,6 +191,12 @@ func parseIngestArgs(args []string) (ingestOptions, error) {
 	positional := fs.Args()
 	if len(positional) == 0 {
 		return ingestOptions{}, fmt.Errorf("ingest: missing target argument (usage: ravenrecon ingest [options] <target> <path> [<path>...])")
+	}
+	// A bare "help" following the options is a help request per the
+	// contract above — never a target domain that would fail
+	// normalization with a confusing invalid-target error.
+	if positional[0] == "help" {
+		return ingestOptions{}, errIngestHelp
 	}
 	if len(positional) == 1 {
 		return ingestOptions{}, fmt.Errorf("ingest: missing input path argument after %q (usage: ravenrecon ingest [options] <target> <path> [<path>...])", positional[0])
@@ -401,6 +410,12 @@ func runIngest(ctx context.Context, w io.Writer, args []string, stages func(pipe
 			bus.Close()
 			return fmt.Errorf("ingest: --tui: subscribe: %w", err)
 		}
+		// Run-level metadata FIRST, before the controller starts
+		// consuming (NEW-82) — identical to runScan.
+		bus.Publish(event.Event{
+			Kind:    event.KindRunMetadata,
+			Payload: event.RunMetadata{Target: target.String(), OutputDir: cfg.OutputDir},
+		})
 		ctl, err := tuiNew(config.TUIConfig{
 			Enabled: true,
 			Compact: opts.tuiCompact,

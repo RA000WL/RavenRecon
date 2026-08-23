@@ -218,10 +218,107 @@ func TestValidateRejectsPayloadFieldRules(t *testing.T) {
 		{"progress negative total", New(KindProgress, at, Progress{Completed: 0, Total: -1})},
 		{"phase_transition empty", New(KindPhaseTransition, at, PhaseTransition{Phase: ""})},
 		{"shutdown bad reason", New(KindShutdown, at, Shutdown{Reason: "abrupt"})},
+
+		// NEW-80 regression: every payload string field is length-bounded.
+		// Each case sits one byte over its documented bound; the boundary
+		// acceptance side is pinned by TestValidateAcceptsPayloadBounds.
+		{"stage_started oversized name", New(KindStageStarted, at, StageStarted{Name: strings.Repeat("s", maxStageNameBytes+1)})},
+		{"stage_finished oversized name", New(KindStageFinished, at, StageFinished{Name: strings.Repeat("s", maxStageNameBytes+1), Outcome: "completed"})},
+		{"task_completed oversized category", New(KindTaskCompleted, at, TaskCompleted{TaskTerminal: TaskTerminal{Category: strings.Repeat("c", maxLabelBytes+1)}})},
+		{"task_failed oversized category", New(KindTaskFailed, at, TaskFailed{TaskTerminal: TaskTerminal{Category: strings.Repeat("c", maxLabelBytes+1)}})},
+		{"cache oversized key", New(KindCacheHit, at, CacheAccess{Key: strings.Repeat("a", maxCacheKeyBytes+1), State: "hit", Hit: true})},
+		{"cache oversized state", New(KindCacheHit, at, CacheAccess{Key: strings.Repeat("a", 64), State: strings.Repeat("s", maxCacheStateBytes+1), Hit: true})},
+		{"asset oversized identity", New(KindAssetDiscovered, at, AssetDiscovered{Identity: "host:" + strings.Repeat("h", maxIdentityStringBytes), Kind: "host"})},
+		{"asset oversized kind", New(KindAssetDiscovered, at, AssetDiscovered{Identity: "host:x", Kind: strings.Repeat("k", maxKindLabelBytes+1)})},
+		{"asset oversized method", New(KindAssetDiscovered, at, AssetDiscovered{Identity: "endpoint:x", Kind: "endpoint", Method: strings.Repeat("M", maxMethodBytes+1)})},
+		{"asset oversized path", New(KindAssetDiscovered, at, AssetDiscovered{Identity: "url:https://example.com", Kind: "url", Path: "/" + strings.Repeat("p", maxPayloadPathBytes)})},
+		{"relationship oversized from", New(KindRelationshipCreated, at, RelationshipCreated{From: "host:" + strings.Repeat("h", maxIdentityStringBytes), To: "ip:192.0.2.1", Kind: "host_to_ip"})},
+		{"relationship oversized to", New(KindRelationshipCreated, at, RelationshipCreated{From: "host:example.com", To: "ip:" + strings.Repeat("1", maxIdentityStringBytes), Kind: "host_to_ip"})},
+		{"relationship oversized kind", New(KindRelationshipCreated, at, RelationshipCreated{From: "host:a", To: "ip:192.0.2.1", Kind: strings.Repeat("k", maxKindLabelBytes+1)})},
+		{"evidence oversized identity", New(KindEvidenceCreated, at, EvidenceCreated{Identity: "evidence:" + strings.Repeat("e", maxIdentityStringBytes), Source: "host:a", Method: "header"})},
+		{"evidence oversized source", New(KindEvidenceCreated, at, EvidenceCreated{Identity: "evidence:e", Source: "host:" + strings.Repeat("h", maxIdentityStringBytes), Method: "header"})},
+		{"evidence oversized method", New(KindEvidenceCreated, at, EvidenceCreated{Identity: "evidence:e", Source: "host:a", Method: strings.Repeat("m", maxMethodBytes+1)})},
+		{"finding oversized identity", New(KindFindingCreated, at, FindingCreated{Identity: "finding:r@" + strings.Repeat("s", maxIdentityStringBytes), RuleID: "r", Subject: "s"})},
+		{"finding oversized rule ID", New(KindFindingCreated, at, FindingCreated{Identity: "finding:r@s", RuleID: strings.Repeat("r", maxRuleIDBytes+1), Subject: "s"})},
+		{"finding oversized subject", New(KindFindingCreated, at, FindingCreated{Identity: "finding:r@s", RuleID: "r", Subject: "url:https://" + strings.Repeat("h", maxIdentityStringBytes)})},
+		{"finding oversized priority", New(KindFindingCreated, at, FindingCreated{Identity: "finding:r@s", RuleID: "r", Subject: "s", Priority: strings.Repeat("p", maxFindingLabelBytes+1)})},
+		{"finding oversized category", New(KindFindingCreated, at, FindingCreated{Identity: "finding:r@s", RuleID: "r", Subject: "s", Category: strings.Repeat("c", maxFindingLabelBytes+1)})},
+		{"recommendation oversized text", New(KindRecommendationCreated, at, RecommendationCreated{Identity: "host:a", Text: strings.Repeat("t", maxRecommendationTextBytes+1), Level: "high"})},
+		{"recommendation oversized level", New(KindRecommendationCreated, at, RecommendationCreated{Identity: "host:a", Text: "investigate", Level: strings.Repeat("l", maxKindLabelBytes+1)})},
+		{"recommendation oversized identity", New(KindRecommendationCreated, at, RecommendationCreated{Identity: "host:" + strings.Repeat("h", maxIdentityStringBytes), Text: "investigate", Level: "high"})},
+		{"request_observed oversized identity", New(KindRequestObserved, at, RequestObserved{Identity: "url:https://" + strings.Repeat("h", maxIdentityStringBytes)})},
+		{"request_observed oversized method", New(KindRequestObserved, at, RequestObserved{Identity: "url:https://example.com", Method: strings.Repeat("G", maxMethodBytes+1)})},
+		{"rule_executed oversized rule ID", New(KindRuleExecuted, at, RuleExecuted{RuleID: strings.Repeat("r", maxRuleIDBytes+1), Executions: 1})},
+		{"warning oversized category", New(KindWarning, at, Warning{Category: strings.Repeat("c", maxLabelBytes+1), Message: "warn"})},
+		{"error oversized category", New(KindError, at, Error{Category: strings.Repeat("c", maxLabelBytes+1), Message: "err"})},
+		{"progress oversized phase", New(KindProgress, at, Progress{Phase: strings.Repeat("p", maxStageNameBytes+1), Completed: 1})},
+		{"phase_transition oversized phase", New(KindPhaseTransition, at, PhaseTransition{Phase: strings.Repeat("p", maxStageNameBytes+1)})},
+		{"shutdown oversized reason", New(KindShutdown, at, Shutdown{Reason: strings.Repeat("f", maxKindLabelBytes+1)})},
+		{"run_metadata oversized target", New(KindRunMetadata, at, RunMetadata{Target: strings.Repeat("t", maxMetadataBytes+1)})},
+		{"run_metadata oversized output dir", New(KindRunMetadata, at, RunMetadata{OutputDir: strings.Repeat("d", maxMetadataBytes+1)})},
 	}
 	for _, tc := range cases {
 		if err := tc.ev.Validate(); err == nil {
 			t.Fatalf("%s: Validate succeeded, want error", tc.name)
+		}
+	}
+}
+
+// TestValidateAcceptsPayloadBounds pins the acceptance side of the NEW-80
+// payload string-field bounds: every field at exactly its documented bound
+// validates, so legitimate producers are never rejected.
+func TestValidateAcceptsPayloadBounds(t *testing.T) {
+	at := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name string
+		ev   Event
+	}{
+		{"stage_started bound name", New(KindStageStarted, at, StageStarted{Name: strings.Repeat("s", maxStageNameBytes)})},
+		{"stage_finished bound fields", New(KindStageFinished, at, StageFinished{Name: strings.Repeat("s", maxStageNameBytes), Outcome: "failed", Err: strings.Repeat("e", maxMessageBytes)})},
+		{"task_completed bound category", New(KindTaskCompleted, at, TaskCompleted{TaskTerminal: TaskTerminal{Category: strings.Repeat("c", maxLabelBytes)}})},
+		{"cache bound fields", New(KindCacheHit, at, CacheAccess{Key: strings.Repeat("a", maxCacheKeyBytes), State: strings.Repeat("s", maxCacheStateBytes), Hit: true})},
+		{"asset bound fields", New(KindAssetDiscovered, at, AssetDiscovered{
+			Identity: "endpoint:" + strings.Repeat("h", maxIdentityStringBytes-9),
+			Kind:     strings.Repeat("k", maxKindLabelBytes),
+			Method:   strings.Repeat("G", maxMethodBytes),
+			Path:     "/" + strings.Repeat("p", maxPayloadPathBytes-1),
+		})},
+		{"relationship bound fields", New(KindRelationshipCreated, at, RelationshipCreated{
+			From: "host:" + strings.Repeat("h", maxIdentityStringBytes-5),
+			To:   "ip:" + strings.Repeat("1", maxIdentityStringBytes-3),
+			Kind: strings.Repeat("k", maxKindLabelBytes),
+		})},
+		{"evidence bound fields", New(KindEvidenceCreated, at, EvidenceCreated{
+			Identity: "evidence:" + strings.Repeat("e", maxIdentityStringBytes-9),
+			Source:   "host:" + strings.Repeat("h", maxIdentityStringBytes-5),
+			Method:   strings.Repeat("m", maxMethodBytes),
+		})},
+		{"finding bound fields", New(KindFindingCreated, at, FindingCreated{
+			Identity: "finding:r@" + strings.Repeat("s", maxIdentityStringBytes-10),
+			RuleID:   strings.Repeat("r", maxRuleIDBytes),
+			Subject:  "url:" + strings.Repeat("h", maxIdentityStringBytes-4),
+			Priority: strings.Repeat("p", maxFindingLabelBytes),
+			Category: strings.Repeat("c", maxFindingLabelBytes),
+		})},
+		{"recommendation bound fields", New(KindRecommendationCreated, at, RecommendationCreated{
+			Identity: "url:" + strings.Repeat("h", maxIdentityStringBytes-4),
+			Text:     strings.Repeat("t", maxRecommendationTextBytes),
+			Level:    strings.Repeat("l", maxKindLabelBytes),
+		})},
+		{"request_observed bound fields", New(KindRequestObserved, at, RequestObserved{
+			Identity: "url:" + strings.Repeat("h", maxIdentityStringBytes-4),
+			Method:   strings.Repeat("G", maxMethodBytes),
+		})},
+		{"rule_executed bound rule ID", New(KindRuleExecuted, at, RuleExecuted{RuleID: strings.Repeat("r", maxRuleIDBytes), Executions: 1})},
+		{"warning bound fields", New(KindWarning, at, Warning{Category: strings.Repeat("c", maxLabelBytes), Message: strings.Repeat("m", maxMessageBytes)})},
+		{"error bound fields", New(KindError, at, Error{Category: strings.Repeat("c", maxLabelBytes), Message: strings.Repeat("m", maxMessageBytes)})},
+		{"progress bound phase", New(KindProgress, at, Progress{Phase: strings.Repeat("p", maxStageNameBytes), Completed: 1, Total: 1, TotalKnown: true})},
+		{"phase_transition bound phase", New(KindPhaseTransition, at, PhaseTransition{Phase: strings.Repeat("p", maxStageNameBytes)})},
+		{"run_metadata bound fields", New(KindRunMetadata, at, RunMetadata{Target: strings.Repeat("t", maxMetadataBytes), OutputDir: strings.Repeat("d", maxMetadataBytes)})},
+	}
+	for _, tc := range cases {
+		if err := tc.ev.Validate(); err != nil {
+			t.Errorf("%s: Validate rejected a bound-sized payload: %v", tc.name, err)
 		}
 	}
 }

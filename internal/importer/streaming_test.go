@@ -126,6 +126,45 @@ func TestCancellation(t *testing.T) {
 	}
 }
 
+// TestReadLinesCancelledHandleRecordNotCountedFailed is the NEW-83
+// regression: a cancellation surfaced by the record handler mid-stream is
+// not a failed record. The handle below cancels the run between record 1
+// and record 2, so record 2's per-record checkCtx returns before any
+// processing; without the distinct classification that unprocessed line
+// was counted as a phantom ItemsFailed=1.
+func TestReadLinesCancelledHandleRecordNotCountedFailed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cancel-midstream.txt")
+	content := "a.example.com\nb.example.com\nc.example.com\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	env := ImportEnv{Clock: fixedClock()}
+	calls := 0
+	processed, failed, truncated, err := readLines(ctx, env, path, func(line, raw string) error {
+		calls++
+		if calls == 2 {
+			cancel() // fire exactly between record 1 and record 2
+		}
+		return checkCtx(ctx)
+	})
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want 1 (only the record handled before cancellation)", processed)
+	}
+	if failed != 0 {
+		t.Fatalf("failed = %d, want 0: the line cancelled-before-processing is not a failed record", failed)
+	}
+	if truncated {
+		t.Fatal("truncated = true, want false for a clean cancellation")
+	}
+}
+
 func TestProgressEmission(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "progress.txt")

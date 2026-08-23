@@ -362,6 +362,36 @@ func TestRunTimedOut(t *testing.T) {
 	}
 }
 
+// TestRunOuterDeadlineStillIngestsCapturedPrefix: the OUTER per-job deadline
+// killing the tool mid-capture must not discard the captured stdout — the
+// bounded prefix is ingested under a detached, bounded context (mirroring
+// the per-tool-timeout partial handling), so the slot classifies timed-out
+// AND the lines it already produced reach the run report (L-3).
+func TestRunOuterDeadlineStillIngestsCapturedPrefix(t *testing.T) {
+	runner := newFakeRunner(runStep{out: []byte("gau 2.1.1\n")},
+		runStep{block: true, out: []byte(urlA + "\n" + urlB + "\n")})
+	cfg := testConfig([]Tool{Gau()}, []asset.Host{mustHost(t, "example.com")})
+	cfg.Runner = runner
+	cfg.LookPath = newFakeLookup().asFunc()
+	cfg.Timeout = 200 * time.Millisecond // outer per-job deadline fires mid-execution
+	cfg.Metrics = &urlintel.Metrics{}
+
+	rep := runOnce(t, cfg)
+	r := rep.Results[0]
+	if r.Status != ResultTimedOut {
+		t.Fatalf("result = %+v, want timed-out", r)
+	}
+	if r.Lines != 2 {
+		t.Fatalf("lines = %d, want 2 (the captured prefix must be ingested)", r.Lines)
+	}
+	if findEntry(t, rep.Report, urlA).URL.Identity().String() == "" {
+		t.Fatalf("entry %s missing from the report: the captured prefix was discarded", urlA)
+	}
+	if rep.Metrics.Lines != 2 || rep.Metrics.Extracted != 2 {
+		t.Fatalf("metrics = %+v, want both prefix lines ingested and extracted", rep.Metrics)
+	}
+}
+
 // TestRunCancelledBeforeStart: an already-cancelled context is refused up
 // front.
 func TestRunCancelledBeforeStart(t *testing.T) {
@@ -482,21 +512,24 @@ func TestRunCacheSecondRunZeroWork(t *testing.T) {
 		}
 		return c
 	}
-	cfg := testConfig([]Tool{Gau()}, []asset.Host{mustHost(t, "example.com")})
-	cfg.Runner = newFakeRunner(runStep{out: []byte("gau 2.1.1\n")}, runStep{out: urlLines()})
-	cfg.LookPath = newFakeLookup().asFunc()
-
-	// First run: extract and store.
-	cfg.Cache = open(t)
-	cfg.Metrics = &urlintel.Metrics{}
-	rep1 := runOnce(t, cfg)
-	if rep1.Metrics.Extracted != 2 || rep1.Metrics.Stored != 2 {
-		t.Fatalf("run 1 metrics = %+v, want 2 extracted / 2 stored", rep1.Metrics)
+	// Each run gets its own scripted runner so BOTH detections see the
+	// version probe (the known-version policy requires it: an unknown
+	// version is non-cacheable); only the cache is shared.
+	newCfg := func(c *cache.FS, m *urlintel.Metrics) Config {
+		cfg := testConfig([]Tool{Gau()}, []asset.Host{mustHost(t, "example.com")})
+		cfg.Runner = newFakeRunner(runStep{out: []byte("gau 2.1.1\n")}, runStep{out: urlLines()})
+		cfg.LookPath = newFakeLookup().asFunc()
+		cfg.Cache = c
+		cfg.Metrics = m
+		return cfg
 	}
 
+	// First run: extract and store.
+	shared := open(t)
+	rep1 := runOnce(t, newCfg(shared, &urlintel.Metrics{}))
+
 	// Second run against the SAME cache: every URL is a hit, zero work.
-	cfg.Metrics = &urlintel.Metrics{}
-	rep2 := runOnce(t, cfg)
+	rep2 := runOnce(t, newCfg(shared, &urlintel.Metrics{}))
 	if rep2.Metrics.Extracted != 0 || rep2.Metrics.Stored != 0 {
 		t.Fatalf("run 2 metrics = %+v, want 0 extracted / 0 stored", rep2.Metrics)
 	}

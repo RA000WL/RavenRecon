@@ -439,3 +439,25 @@ func TestLexAdversarial(t *testing.T) {
 		}
 	}
 }
+
+// TestLexRegexEscapedLineTerminatorCountsLine pins the scanRegexBody line
+// accounting: a backslash escape whose target is a raw line terminator is
+// skipped in one jump, but the terminator must still advance lx.line —
+// otherwise every token after the regex reports a line too low.
+func TestLexRegexEscapedLineTerminatorCountsLine(t *testing.T) {
+	src := "var re = /a\\\nb/;\nvar x = 1;\n"
+	toks, truncated, _ := lex(t, src)
+	if truncated {
+		t.Fatal("truncated = true, want false")
+	}
+	srcBytes := []byte(src)
+	for _, tk := range toks {
+		if tk.kind == tokIdent && tk.text(srcBytes) == "x" {
+			if tk.line != 3 {
+				t.Fatalf("ident x at line %d, want 3 (the escaped LF inside the regex body must count)", tk.line)
+			}
+			return
+		}
+	}
+	t.Fatal("ident x not found in token stream")
+}

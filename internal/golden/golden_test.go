@@ -42,6 +42,33 @@ func TestDiffCollapsesLongRuns(t *testing.T) {
 	}
 }
 
+// TestDiffOversizedFallbackCapped pins that the oversized-input fallback
+// (LCS cell-cap exceeded) is byte-capped like the LCS path: it returns a
+// labeled dump of both documents, each truncated at half the output budget,
+// never the unbounded texts.
+func TestDiffOversizedFallbackCapped(t *testing.T) {
+	var oldB, newB strings.Builder
+	for range 3000 {
+		oldB.WriteString("same\n")
+	}
+	for range 2500 { // 3000*2500 lines ≫ the 4M-cell LCS cap
+		newB.WriteString("changed\n")
+	}
+	got := Diff(oldB.String(), newB.String())
+	if !strings.HasPrefix(got, "old:\n") || !strings.Contains(got, "\nnew:\n") {
+		t.Fatalf("fallback = %q, want the old:/new: labeled dump", got)
+	}
+	if !strings.Contains(got, "(diff truncated)") {
+		t.Fatalf("fallback = %q, want a truncation marker", got)
+	}
+	// Both halves capped at fallbackCap/2 plus labels and markers: the
+	// result stays far below the combined raw input size (~44 KiB).
+	const fallbackCap = 8 << 10
+	if len(got) > fallbackCap+128 {
+		t.Fatalf("fallback is %d bytes, want within the %d-byte output budget", len(got), fallbackCap)
+	}
+}
+
 func TestWriteAtomicAndByteStable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "x.golden")

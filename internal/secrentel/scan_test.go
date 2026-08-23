@@ -1,9 +1,11 @@
 package secrentel
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
@@ -746,4 +748,49 @@ func TestScanDedupEntropyWinner(t *testing.T) {
 			t.Errorf("tie-break winner requires entropy → factor must be present; got %+v winner should be %q", c.confidence.Factors, pB.ID)
 		}
 	})
+}
+
+// NEW-83: a Trail extension that lands inside a multi-byte rune backs up to
+// the nearest UTF-8 rune boundary, so values stay valid UTF-8 and survive
+// JSON round-trips unchanged.
+func TestScanTrailCutIsRuneSafe(t *testing.T) {
+	pat := patterns.Pattern{
+		ID:       "test.trail.rune",
+		Type:     asset.SecretTypePrivateKey,
+		Family:   patterns.FamilyStructured,
+		Regex:    `BEGIN_SEC`,
+		Anchors:  []string{"begin_sec"},
+		Strength: 0.6,
+		Trail:    9,
+	}
+	db, err := patterns.CompileForTest([]patterns.Pattern{pat})
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	sd, err := prepareDocument(Document{Kind: KindJS, Content: []byte("BEGIN_SEC" + strings.Repeat("é", 100))}, fixedTime(0))
+	if err != nil {
+		t.Fatalf("prepareDocument: %v", err)
+	}
+
+	out := scanDocument(sd, db, defaultScanLimits())
+	if len(out.candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1; counts %+v", len(out.candidates), out.counts)
+	}
+	v := out.candidates[0].value
+	// Match ends at byte 9; trail limit is byte 18 — the second byte of an
+	// "é" — so the cut must back up to byte 17 (4 full runes).
+	if want := "BEGIN_SEC" + strings.Repeat("é", 4); v != want {
+		t.Errorf("value = %q (%d bytes), want %q", v, len(v), want)
+	}
+	if !utf8.ValidString(v) {
+		t.Error("trail-cut value is not valid UTF-8")
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back string
+	if err := json.Unmarshal(data, &back); err != nil || back != v {
+		t.Error("trail-cut value changed across a JSON round-trip")
+	}
 }

@@ -3,11 +3,17 @@ package crawl
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
 )
 
@@ -355,7 +361,247 @@ func TestKatanaDetectArgShape(t *testing.T) {
 			foundDepth = true
 		}
 	}
+
 	if !foundDepth {
 		t.Errorf("args %v missing -d 2", seenArgs)
+	}
+}
+
+// recordingCache is a hermetic in-memory Cache mirroring production lookup
+// semantics: Get serves only StatusCompleted records as hits.
+type recordingCache struct {
+	mu   sync.Mutex
+	recs map[cache.Key]cache.Record
+	gets int
+}
+
+func newRecordingCache() *recordingCache {
+	return &recordingCache{recs: make(map[cache.Key]cache.Record)}
+}
+
+func (c *recordingCache) Get(_ context.Context, key cache.Key) cache.Outcome {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gets++
+	rec, ok := c.recs[key]
+	if !ok || rec.Status != cache.StatusCompleted {
+		return cache.Outcome{State: cache.StateMiss}
+	}
+	r := rec
+	return cache.Outcome{State: cache.StateHit, Record: &r}
+}
+
+func (c *recordingCache) Put(_ context.Context, key cache.Key, rec cache.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recs[key] = rec
+	return nil
+}
+
+func (c *recordingCache) Delete(_ context.Context, key cache.Key) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.recs, key)
+	return nil
+}
+
+func (c *recordingCache) Clear(context.Context) error { return nil }
+
+func (c *recordingCache) snapshot() (map[cache.Key]cache.Record, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[cache.Key]cache.Record, len(c.recs))
+	for k, v := range c.recs {
+		out[k] = v
+	}
+	return out, c.gets
+}
+
+// TestCrawlCacheKeyCoversTimeoutConcurrencyRateLimit pins §11 coverage:
+// two effective configs differing only in one result-shaping bound must
+// produce different keys (audit M-3/NEW-76/NEW-66).
+func TestCrawlCacheKeyCoversTimeoutConcurrencyRateLimit(t *testing.T) {
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "www.example.com")}
+	base := effectiveConfig(Config{Depth: 2})
+	k0, err := crawlCacheKey(domain, hosts, base, "v1")
+	if err != nil {
+		t.Fatalf("crawlCacheKey base: %v", err)
+	}
+	cases := map[string]func(*Config){
+		"rate_limit":  func(c *Config) { c.RateLimit++ },
+		"timeout":     func(c *Config) { c.Timeout += time.Second },
+		"concurrency": func(c *Config) { c.Concurrency++ },
+		"depth":       func(c *Config) { c.Depth++ },
+	}
+	for name, mutate := range cases {
+		cfg := base
+		mutate(&cfg)
+		k1, err := crawlCacheKey(domain, hosts, cfg, "v1")
+		if err != nil {
+			t.Fatalf("crawlCacheKey %s: %v", name, err)
+		}
+		if k1 == k0 {
+			t.Errorf("key unchanged after mutating %s: keys must differ", name)
+		}
+	}
+	// Normalization stability: the same effective config yields the same key.
+	k2, err := crawlCacheKey(domain, hosts, effectiveConfig(Config{Depth: 2}), "v1")
+	if err != nil {
+		t.Fatalf("crawlCacheKey repeat: %v", err)
+	}
+	if k2 != k0 {
+		t.Errorf("same effective config produced different keys")
+	}
+}
+
+// katanaScript builds a fake runner script that answers the version probe
+// and dispatches crawl invocations to fn.
+func katanaScript(version string, fn func(cmd discovery.Cmd) (discovery.RunResult, error)) map[string]func(discovery.Cmd) (discovery.RunResult, error) {
+	return map[string]func(discovery.Cmd) (discovery.RunResult, error){
+		"katana": func(cmd discovery.Cmd) (discovery.RunResult, error) {
+			if len(cmd.Args) > 0 && cmd.Args[0] == "-version" {
+				return discovery.RunResult{Stdout: []byte(version + "\n")}, nil
+			}
+			if fn == nil {
+				return discovery.RunResult{}, nil
+			}
+			return fn(cmd)
+		},
+	}
+}
+
+// goodOutput is one valid JSONL endpoint record for example.com.
+func goodOutput(endpoint string) []byte {
+	b, _ := json.Marshal(katanaRecord{Endpoint: endpoint})
+	return append(b, '\n')
+}
+
+// TestKatanaAllFailStoresIncompleteAndReexecutes pins NEW-62/H-1: a run in
+// which every host invocation fails stores no completed record; the next run
+// with the same cache re-executes instead of replaying a poisoned hit.
+func TestKatanaAllFailStoresIncompleteAndReexecutes(t *testing.T) {
+	var mu sync.Mutex
+	crawlCalls := 0
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		mu.Lock()
+		crawlCalls++
+		mu.Unlock()
+		return discovery.RunResult{}, fmt.Errorf("dial tcp: connection refused")
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	cfg := Config{Depth: 2, Cache: mem}
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "a.example.com"), mustHost(t, "b.example.com")}
+
+	res1, err := src.Crawl(context.Background(), domain, hosts, cfg)
+	if err != nil {
+		t.Fatalf("first Crawl: %v", err)
+	}
+	if res1.FailedHosts != 2 {
+		t.Fatalf("FailedHosts = %d, want 2", res1.FailedHosts)
+	}
+	if len(res1.URLs) != 0 {
+		t.Fatalf("URLs = %d, want 0 from all-fail run", len(res1.URLs))
+	}
+	recs, _ := mem.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("stored %d records, want 1", len(recs))
+	}
+	for key, rec := range recs {
+		if rec.Status == cache.StatusCompleted {
+			t.Fatalf("all-fail run stored a completed record under %s", key)
+		}
+		if rec.Status != cache.StatusIncomplete {
+			t.Fatalf("stored status = %q, want incomplete", rec.Status)
+		}
+	}
+
+	// Second run with the same cache must re-execute every host.
+	res2, err := src.Crawl(context.Background(), domain, hosts, cfg)
+	if err != nil {
+		t.Fatalf("second Crawl: %v", err)
+	}
+	if res2.FailedHosts != 2 {
+		t.Fatalf("second run FailedHosts = %d, want 2", res2.FailedHosts)
+	}
+	mu.Lock()
+	got := crawlCalls
+	mu.Unlock()
+	if got != 4 {
+		t.Fatalf("runner crawl calls = %d, want 4 (2 per run: re-executed, not replayed)", got)
+	}
+}
+
+// TestKatanaPartialFailureStoresIncomplete pins the mixed case: URLs from
+// healthy hosts are retained but the partial corpus never stores completed.
+func TestKatanaPartialFailureStoresIncomplete(t *testing.T) {
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		for i, a := range cmd.Args {
+			if a == "-u" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "https://bad.example.com" {
+				return discovery.RunResult{}, fmt.Errorf("killed by signal")
+			}
+		}
+		return discovery.RunResult{Stdout: goodOutput("https://example.com/ok")}, nil
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "good.example.com"), mustHost(t, "bad.example.com")}
+	res, err := src.Crawl(context.Background(), domain, hosts, Config{Depth: 2, Cache: mem})
+	if err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if res.FailedHosts != 1 {
+		t.Fatalf("FailedHosts = %d, want 1", res.FailedHosts)
+	}
+	if len(res.URLs) != 1 || res.URLs[0].String() != "https://example.com/ok" {
+		t.Fatalf("URLs = %v, want the healthy host's endpoint kept", res.URLs)
+	}
+	recs, _ := mem.snapshot()
+	for _, rec := range recs {
+		if rec.Status != cache.StatusIncomplete {
+			t.Fatalf("partial-run status = %q, want incomplete", rec.Status)
+		}
+	}
+}
+
+// TestKatanaCancellationPreservesEngineError pins the LOW wave item: when ctx
+// cancels mid-run the engine's per-host error detail survives both on the
+// returned error and in Diagnostics, and nothing is stored as completed.
+func TestKatanaCancellationPreservesEngineErrorAndDiagnostics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		cancel()
+		return discovery.RunResult{}, fmt.Errorf("engine exploded: %w", context.Canceled)
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "www.example.com"), mustHost(t, "alt.example.com")}
+	res, err := src.Crawl(ctx, domain, hosts, Config{Depth: 2, Cache: mem})
+	if err == nil {
+		t.Fatal("cancelled run returned nil error, want cancellation surfaced")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if !strings.Contains(err.Error(), "engine exploded") {
+		t.Fatalf("err = %v, want engine detail preserved via join", err)
+	}
+	found := false
+	for _, d := range res.Diagnostics {
+		if strings.Contains(d, "engine exploded") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Diagnostics = %v, want engine error detail preserved", res.Diagnostics)
+	}
+	recs, _ := mem.snapshot()
+	if len(recs) != 0 {
+		t.Fatalf("cancelled run stored %d records, want none", len(recs))
 	}
 }

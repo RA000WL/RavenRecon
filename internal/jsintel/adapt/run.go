@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/discovery"
 	"github.com/RA000WL/RavenRecon/internal/jsintel"
@@ -26,6 +27,20 @@ import (
 // engine's Malformed accounting.
 const maxRawLineBytes = 32 << 10 // 32 KiB
 
+// DefaultToolTimeout is the built-in default per-tool execution budget,
+// mirroring urlintel/adapt (REVIEW-2026-08-23 M-5): subjs/linkfinder/
+// SecretFinder are active fetchers whose Python pair has no internal HTTP
+// timeout, so the adapter itself must bound every run even when the caller
+// passes a context without a deadline. The budget encloses the runner
+// handoff only. The caller's own deadline always wins when earlier —
+// context.WithTimeout keeps whichever deadline elapses first.
+const DefaultToolTimeout = 2 * time.Minute
+
+// toolRunBudget is the budget Run actually installs. It exists ONLY so
+// tests can compress time (shrink it, restore with defer); production code
+// never writes it, so the effective default is always DefaultToolTimeout.
+var toolRunBudget = DefaultToolTimeout
+
 // Run executes tool t against target (a declared URL such as
 // "https://example.com/") and returns a jsintel.Source yielding one
 // Item{Kind: ItemLine, Line: <raw stdout line>} per output line of the
@@ -34,9 +49,11 @@ const maxRawLineBytes = 32 << 10 // 32 KiB
 // arguments as separate argv values — never a shell, never concatenation —
 // bounded per-stream capture (Limits.MaxOutput, default 4 MiB), and
 // process-group kill on cancellation (unix). The runner enforces the
-// context/timeout/output limits: the caller's context deadline is the
-// execution deadline (the python tools have no HTTP timeout of their own —
-// SecretFinder in particular must be bounded by the caller's deadline).
+// context/timeout/output limits. The execution deadline is the EARLIER of
+// the caller's context deadline and the adapter's own DefaultToolTimeout
+// budget (2m) — a caller context without a deadline is still bounded (the
+// python tools have no HTTP timeout of their own; SecretFinder in
+// particular must never run unbounded).
 //
 // The returned source is non-nil whenever the process executed and exited —
 // its bounded stdout capture is valid regardless of the exit code — and nil
@@ -45,8 +62,10 @@ const maxRawLineBytes = 32 << 10 // 32 KiB
 // remains streamable, so callers that keep partial output stream it and
 // classify the slot themselves (partial vs failed), mirroring the
 // urlintel/adapt classification. Cancelled and timed-out executions are
-// classified per the house contract: the returned error wraps ctx.Err() for
-// the caller to distinguish via errors.Is.
+// classified per the house contract: the returned error wraps the governing
+// context error (context.Canceled, or context.DeadlineExceeded whether it
+// came from the caller or from DefaultToolTimeout) for the caller to
+// distinguish via errors.Is.
 //
 // Executable resolution (the wrapper model): the command's Path is the
 // per-run override-map value when present (keys "subjs", "linkfinder.py",
@@ -128,11 +147,20 @@ func Run(ctx context.Context, r *discovery.Runner, t Tool, target string, overri
 		}
 	}
 
-	rres, rerr := e.runner.Run(ctx, discovery.Cmd{Path: path, Args: t.buildArgv(target, tmp)}, e.limits)
+	// The per-tool default budget: WithTimeout keeps whichever deadline is
+	// earlier — the caller's when it set one within 2m, else this budget.
+	runCtx, cancel := context.WithTimeout(ctx, toolRunBudget)
+	defer cancel()
+
+	rres, rerr := e.runner.Run(runCtx, discovery.Cmd{Path: path, Args: t.buildArgv(target, tmp)}, e.limits)
 	if rerr != nil {
 		// The process never ran to completion. Context classification
 		// takes priority: cancellation and deadline-elapse are never tool
-		// failures.
+		// failures. The adapter's own budget firing while the caller's
+		// context is still alive classifies identically (deadline exceeded).
+		if runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return nil, fmt.Errorf("adapt: %s %s: %w", t.Name, target, runCtx.Err())
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("adapt: %s %s: %w", t.Name, target, ctxErr)
 		}

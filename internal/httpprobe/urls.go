@@ -308,14 +308,15 @@ func doLiveProbe(ctx context.Context, target asset.URL, domain asset.Domain, e e
 	rec.Headers = hdrMap
 	if isRedirectCode(statusCode) && resp.Header.Get("Location") != "" {
 		rec.RedirectObserved = true
-		// Location header already redacted in boundedHeaders, but also ensure
-		// userinfo stripped for direct observation.
+		// Location is already redacted when it survived boundedHeaders, but
+		// the header cap can drop it; the raw fallback goes through
+		// sanitizeLocation so control bytes and userinfo never survive into
+		// an observation.
 		loc := resp.Header.Get("Location")
-		// boundedHeaders redacts Location values; use the redacted form from hdrMap
 		if vals := hdrMap["Location"]; len(vals) > 0 && vals[0] != "" {
 			rec.RedirectLocation = vals[0]
 		} else {
-			rec.RedirectLocation = stripLocationUserinfo(loc)
+			rec.RedirectLocation = sanitizeLocation(loc)
 		}
 	}
 	// TLS metadata capture for https probes that completed a handshake.
@@ -342,10 +343,10 @@ func doLiveProbe(ctx context.Context, target asset.URL, domain asset.Domain, e e
 			rec.ErrMsg = rec.Err.Error()
 		}
 	}
-	// Body handling: MaxBody 0 — drain and close without retention.
-	// Ensure body is closed to reuse connections (even though keep-alives
-	// are disabled in tests, production transport may keep them).
-	_ = resp.Body.Close()
+	// Body handling: MaxBody 0 — drain and close without retention,
+	// mirroring the host path's drainFollowedBody: draining up to 4 KiB
+	// before Close keeps the connection reusable for keep-alive reuse.
+	drainFollowedBody(resp.Body)
 	return rec
 }
 
@@ -520,11 +521,13 @@ func storeLive(ctx context.Context, target asset.URL, domain asset.Domain, rec L
 		Truncated:        rec.Truncated,
 		ErrMsg:           rec.ErrMsg,
 	}
-	// FailureReason is derived for validation purposes: map Err to reason.
-	if rec.Err != nil {
-		// Use classifyProbeError to derive reason if possible.
+	// FailureReason is the typed cause of a probe that never received an
+	// HTTP response (StatusCode 0). A probe that observed a response is
+	// completed regardless of any joined non-fatal diagnostics (e.g. the
+	// tls chain-depth cap): its diagnostics stay in ErrMsg and no reason
+	// is stamped.
+	if rec.Err != nil && rec.Status == 0 {
 		_, fr := classifyProbeError(ctx, rec.Err)
-		// For truncated, reason is none; for others, use derived.
 		if rec.Truncated {
 			st.FailureReason = ReasonNone
 		} else {
@@ -565,6 +568,13 @@ func storeLive(ctx context.Context, target asset.URL, domain asset.Domain, rec L
 func liveStatusToCache(rec LiveRecord) cache.Status {
 	if rec.Truncated {
 		return cache.StatusIncomplete
+	}
+	// A response was fully observed: the probe is completed regardless of
+	// any joined non-fatal diagnostics (e.g. the tls chain-depth cap, which
+	// suppresses only the certificate asset). The typed checks below apply
+	// to transport outcomes — probes that never saw a response.
+	if rec.Status != 0 {
+		return cache.StatusCompleted
 	}
 	if rec.Err != nil {
 		if errors.Is(rec.Err, context.Canceled) {

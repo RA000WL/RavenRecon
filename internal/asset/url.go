@@ -61,11 +61,22 @@ type URL struct {
 	Prov Provenance `json:"provenance,omitempty"`
 }
 
+// maxRawURLBytes bounds the raw input ParseURL accepts, mirroring the
+// identity-bounding discipline of the sibling types (parameter.go's name
+// bound, evidence.go's indicator bound): without it, an unbounded Path or
+// RawQuery would flow into Identity().Value and every downstream consumer
+// of that identity. 8 KiB is far above any legitimate observed request
+// target while keeping canonical identities bounded.
+const maxRawURLBytes = 8 * 1024
+
 // ParseURL parses and canonicalizes raw into a URL asset.
 func ParseURL(raw string, p Provenance) (URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return URL{}, fmt.Errorf("URL must not be empty")
+	}
+	if len(raw) > maxRawURLBytes {
+		return URL{}, fmt.Errorf("URL exceeds %d bytes (got %d)", maxRawURLBytes, len(raw))
 	}
 	u, err := url.Parse(raw)
 	if err != nil {

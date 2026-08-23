@@ -37,7 +37,7 @@ func pathFixture(t *testing.T) []Group {
 // it was derived from.
 func TestAttackPathsEvidenceContract(t *testing.T) {
 	groups := pathFixture(t)
-	paths := AttackPaths(groups)
+	paths, _ := AttackPaths(groups)
 	if len(paths) != 1 {
 		t.Fatalf("paths = %d, want 1", len(paths))
 	}
@@ -128,7 +128,10 @@ func TestAttackPathsBounds(t *testing.T) {
 		}))
 	}
 	groups, _ := Correlate(members)
-	paths := AttackPaths(groups)
+	paths, truncated := AttackPaths(groups)
+	if truncated {
+		t.Error("truncated = true, want false (one path is below the run cap)")
+	}
 	if len(paths) != 1 {
 		t.Fatalf("paths = %d, want 1", len(paths))
 	}
@@ -150,9 +153,12 @@ func TestAttackPathsBounds(t *testing.T) {
 		})
 		manyGroups = append(manyGroups, groups...)
 	}
-	capped := AttackPaths(manyGroups)
+	capped, truncated := AttackPaths(manyGroups)
 	if len(capped) != maxPathsPerRun {
 		t.Errorf("paths = %d, want the cap %d", len(capped), maxPathsPerRun)
+	}
+	if !truncated {
+		t.Error("truncated = true expected: paths beyond maxPathsPerRun were dropped")
 	}
 	for i := 1; i < len(capped); i++ {
 		if capped[i-1].Score < capped[i].Score {
@@ -175,25 +181,28 @@ func TestAttackPathsSkipsFactorlessGroups(t *testing.T) {
 	if len(quiet) != 1 {
 		t.Fatalf("groups = %d", len(quiet))
 	}
-	if paths := AttackPaths(quiet); len(paths) != 0 {
+	if paths, _ := AttackPaths(quiet); len(paths) != 0 {
 		t.Errorf("factorless group must yield no path, got %d", len(paths))
 	}
-	if paths := AttackPaths(nil); paths != nil {
-		t.Errorf("nil groups must yield no paths, got %v", paths)
+	if paths, truncated := AttackPaths(nil); paths != nil || truncated {
+		t.Errorf("nil groups must yield no paths and false, got %v %v", paths, truncated)
 	}
 }
 
 // TestAttackPathsDeterministic pins bit-for-bit determinism.
 func TestAttackPathsDeterministic(t *testing.T) {
-	a, err := json.Marshal(AttackPaths(pathFixture(t)))
+	a, b := pathFixture(t), pathFixture(t)
+	pa, _ := AttackPaths(a)
+	pb, _ := AttackPaths(b)
+	ab, err := json.Marshal(pa)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := json.Marshal(AttackPaths(pathFixture(t)))
+	bb, err := json.Marshal(pb)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(a) != string(b) {
+	if string(ab) != string(bb) {
 		t.Error("identical group inputs must produce identical path output bytes")
 	}
 }

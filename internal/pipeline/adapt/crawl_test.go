@@ -2,7 +2,9 @@ package adapt
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -216,5 +218,147 @@ func TestCrawlStageNoHostsShortCircuit(t *testing.T) {
 	}
 	if res.Outcome != pipeline.OutcomeCompleted {
 		t.Errorf("Outcome = %q, want completed", res.Outcome)
+	}
+}
+
+// --- crawl-adapter honesty: failed hosts are never completed=len(hosts) ---
+
+// TestCrawlStageAllHostsFailedReportsIncomplete pins the honesty contract:
+// a crawl engine result with ZERO URLs, non-empty diagnostics, and no
+// truncation marker means every host's katana invocation failed (e.g.
+// katana missing from PATH). The stage must report incomplete with honest
+// counters, never completed=len(hosts).
+func TestCrawlStageAllHostsFailedReportsIncomplete(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{Diagnostics: []string{"katana not found: exec: \"katana\": executable file not found in $PATH"}}, nil
+	}}
+	st := NewCrawlStage(src)
+	in := pipeline.StageInput{
+		Target: mustDomainCrawl(t, "example.com"),
+		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com"), mustHostCrawl(t, "api.example.com")},
+	}
+	res, err := st.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeIncomplete {
+		t.Fatalf("Outcome = %q, want incomplete when every host's crawl failed", res.Outcome)
+	}
+	if res.ItemsProcessed != 0 || res.ItemsFailed != 2 {
+		t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 0/2", res.ItemsProcessed, res.ItemsFailed)
+	}
+}
+
+// TestCrawlStageFailedHostsReportsPartial pins the FailedHosts contract's
+// mixed case: some hosts crawled (URLs exist), some failed outright — the
+// stage reports partial with honest counters.
+func TestCrawlStageFailedHostsReportsPartial(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{
+			URLs:        []asset.URL{mustURLCrawl(t, "https://example.com/a")},
+			FailedHosts: 1,
+		}, nil
+	}}
+	st := NewCrawlStage(src)
+	in := pipeline.StageInput{
+		Target: mustDomainCrawl(t, "example.com"),
+		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com"), mustHostCrawl(t, "api.example.com")},
+	}
+	res, err := st.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomePartial {
+		t.Fatalf("Outcome = %q, want partial when a host failed but URLs were crawled", res.Outcome)
+	}
+	if res.ItemsProcessed != 1 || res.ItemsFailed != 1 {
+		t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 1/1", res.ItemsProcessed, res.ItemsFailed)
+	}
+}
+
+// TestCrawlStageLegitimateEmptyAndDiagnosticsStayCompleted guards the
+// heuristic's other side: a genuinely linkless host (zero URLs, zero
+// diagnostics) stays completed, and diagnostics beside real URLs do not
+// downgrade the outcome.
+func TestCrawlStageLegitimateEmptyAndDiagnosticsStayCompleted(t *testing.T) {
+	t.Run("legitimately empty crawl", func(t *testing.T) {
+		src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+			return crawl.Result{}, nil
+		}}
+		st := NewCrawlStage(src)
+		in := pipeline.StageInput{
+			Target: mustDomainCrawl(t, "example.com"),
+			Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com")},
+		}
+		res, err := st.Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Outcome != pipeline.OutcomeCompleted || res.ItemsProcessed != 1 {
+			t.Fatalf("Outcome/ItemsProcessed = %q/%d, want completed/1 for an empty-but-successful crawl", res.Outcome, res.ItemsProcessed)
+		}
+	})
+	t.Run("diagnostics beside URLs keep completed", func(t *testing.T) {
+		src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+			return crawl.Result{
+				URLs:        []asset.URL{mustURLCrawl(t, "https://example.com/a")},
+				Diagnostics: []string{"host api.example.com exited 1"},
+			}, nil
+		}}
+		st := NewCrawlStage(src)
+		in := pipeline.StageInput{
+			Target: mustDomainCrawl(t, "example.com"),
+			Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com")},
+		}
+		res, err := st.Run(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Outcome != pipeline.OutcomeCompleted {
+			t.Fatalf("Outcome = %q, want completed when URLs were produced", res.Outcome)
+		}
+		if res.ItemsProcessed != 1 || res.ItemsFailed != 0 {
+			t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 1/0", res.ItemsProcessed, res.ItemsFailed)
+		}
+	})
+}
+
+// TestCrawlStageCancelledKeepsJoinedErrorAndPartialURLs is the NEW-73
+// regression: when the engine returns BOTH partial URLs and an error while
+// the stage context is cancelled, the adapter must not collapse to a bare
+// ctx.Err() — the joined engine detail stays attached to the cancelled
+// result AND the in-scope captured URLs are retained as additions (the
+// runner merges additions regardless of outcome, so a mid-crawl
+// cancellation never silently discards what was already crawled).
+func TestCrawlStageCancelledKeepsJoinedErrorAndPartialURLs(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		urls := []asset.URL{mustURLCrawl(t, "https://example.com/partial")}
+		return crawl.Result{URLs: urls},
+			errors.Join(context.Canceled, errors.New("katana host scan aborted"))
+	}}
+	st := NewCrawlStage(src)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the stage context is already fired when Run begins
+	in := pipeline.StageInput{
+		Target: mustDomainCrawl(t, "example.com"),
+		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com")},
+		Bounds: pipeline.StageConfig{MaxOutput: 100000},
+		Clock:  fixedClock{now: fixedTime},
+	}
+	res, runErr := st.Run(ctx, in)
+	if res.Outcome != pipeline.OutcomeCancelled {
+		t.Fatalf("Outcome = %q, want cancelled", res.Outcome)
+	}
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Fatalf("Err = %v, want a wrapped context.Canceled", res.Err)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "katana host scan aborted") {
+		t.Fatalf("Err = %v, want the engine's joined detail retained alongside the cancellation", res.Err)
+	}
+	if runErr == nil || !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run error = %v, want the joined cancellation error returned", runErr)
+	}
+	if len(res.Additions.URLs) != 1 || res.Additions.URLs[0].String() != "https://example.com/partial" {
+		t.Fatalf("Additions.URLs = %v, want the partially captured in-scope URL retained on the cancelled result", res.Additions.URLs)
 	}
 }

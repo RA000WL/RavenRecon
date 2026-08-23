@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -124,7 +126,7 @@ func TestSubfinderEmptySuccess(t *testing.T) {
 
 func TestSubfinderExecutableMissing(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["subfinder"] = errors.New("not found in PATH")
+	l.errs["subfinder"] = exec.ErrNotFound
 	s := subfinder{env: adapterEnv(newFakeRunner(t, nil), l)}
 	s.env.name = "subfinder"
 	_, err := s.Discover(context.Background(), mustDomain(t, "example.com"))
@@ -264,5 +266,21 @@ func TestAmassStderrOnlySuccess(t *testing.T) {
 	}
 	if len(dres.Hosts) != 0 {
 		t.Fatalf("stderr-only output must yield no hosts, got %v", names(dres.Hosts))
+	}
+}
+
+// A non-not-exist lookup failure fails with the underlying cause;
+// ErrExecutableNotFound stays reserved for genuinely absent binaries.
+func TestSubfinderLookupPermissionDeniedNotNotFound(t *testing.T) {
+	l := newFakeLookup()
+	l.errs["subfinder"] = os.ErrPermission
+	s := subfinder{env: adapterEnv(newFakeRunner(t, nil), l)}
+	s.env.name = "subfinder"
+	_, err := s.Discover(context.Background(), mustDomain(t, "example.com"))
+	if err == nil || errors.Is(err, ErrExecutableNotFound) {
+		t.Fatalf("want a failure that is not ErrExecutableNotFound, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("err = %v, want the underlying cause", err)
 	}
 }

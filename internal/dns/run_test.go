@@ -719,3 +719,20 @@ func TestResolveAllHostsMergesProvenance(t *testing.T) {
 		}
 	}
 }
+
+// Submit can fail while the run context is still live (e.g. ErrPoolClosed
+// during an abort). The never-submitted hosts must then carry the submit
+// error itself — formatting a nil context error would render "%!w(<nil>)".
+func TestSubmitCauseFallsBackToSubmitErrorWhenContextLive(t *testing.T) {
+	submitErr := errors.New("runtime: pool is closed")
+	if got := submitCause(nil, submitErr); got != submitErr {
+		t.Fatalf("submitCause(nil, %v) = %v, want the submit error", submitErr, got)
+	}
+	if got, want := fmt.Sprintf("dns: not submitted: %s", submitCause(nil, submitErr)),
+		"dns: not submitted: runtime: pool is closed"; got != want {
+		t.Fatalf("rendered message = %q, want %q", got, want)
+	}
+	if got := submitCause(context.Canceled, submitErr); got != context.Canceled {
+		t.Fatalf("submitCase(canceled, _) = %v, want the context error", got)
+	}
+}

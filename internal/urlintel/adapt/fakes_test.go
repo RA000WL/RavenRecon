@@ -116,7 +116,9 @@ func (f *fakeRunner) Run(ctx context.Context, cmd discovery.Cmd, limits discover
 	}
 	if step.block {
 		<-ctx.Done()
-		return discovery.RunResult{}, ctx.Err()
+		// The captured stdout (if any) is what the real bounded capture
+		// would hold when the process is killed mid-stream.
+		return discovery.RunResult{Stdout: step.out}, ctx.Err()
 	}
 	if step.runErr != nil {
 		return discovery.RunResult{}, step.runErr

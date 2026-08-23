@@ -63,12 +63,17 @@ Options (after the target):
                           stage_finished) to stderr as the run progresses.
                           Mutually exclusive with --tui.
   --tui                   Render a live observability frame on stderr while
-                          the run progresses: stage lifecycle, progress,
-                          worker dashboard, throughput, interesting assets,
-                          errors, and one deterministic final summary
-                          frame. Mutually exclusive with --verbose.
-  --tui-compact           Condense the --tui frame (no per-worker or
-                          resource sections). Requires --tui.
+                          the run progresses: phase and stage lifecycle,
+                          progress counters (completed/remaining/in-flight/
+                          elapsed/eta), warnings/errors, the declared target
+                          and output directory, and one deterministic final
+                          summary frame. Worker, throughput, and
+                          interesting-asset sections appear only when their
+                          event streams are published; production runs emit
+                          none today, so those sections stay empty.
+                          Mutually exclusive with --verbose.
+  --tui-compact           Condense the --tui frame (drops the resource
+                          section). Requires --tui.
 
 Timeouts: each external discovery tool runs under a per-tool execution
 deadline — the configuration key Discovery.Timeout (internal/config; zero
@@ -169,7 +174,8 @@ type scanOptions struct {
 
 // parseScanArgs parses "scan" arguments: exactly one target domain,
 // followed by options. Options must come after the target (the target is
-// positional); -h/--help anywhere prints scan usage via errScanHelp.
+// positional); -h/--help anywhere, and a bare "help" as the first
+// post-option word, print scan usage via errScanHelp.
 // Validation happens here for flag values (stage names against the fixed
 // vocabulary, durations, concurrency); the target itself is validated and
 // normalized through asset.NewDomain — the single normalization point —
@@ -204,9 +210,13 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		return scanOptions{}, fmt.Errorf("scan: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
+		// A bare "help" following the options is a help request per the
+		// contract above — never a stray positional.
+		if rest[0] == "help" {
+			return scanOptions{}, errScanHelp
+		}
 		return scanOptions{}, fmt.Errorf("scan: unexpected argument(s) %q (usage: ravenrecon scan <target> [options])", rest[0])
 	}
-
 	opts := scanOptions{
 		target:     args[0],
 		noCache:    *noCache,
@@ -241,6 +251,9 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, fmt.Errorf("scan: --stages: empty stage list")
 		}
 		for _, n := range names {
+			if n == string(pipeline.StageIngest) {
+				return scanOptions{}, fmt.Errorf("scan: --stages: %q is not part of scan's pipeline — it is the ingest command's import stage (known stages: %s)", n, stageVocabularyCLI)
+			}
 			name := pipeline.StageName(n)
 			if !pipeline.ValidStage(name) {
 				return scanOptions{}, fmt.Errorf("scan: --stages: unknown stage %q (known stages: %s)", n, stageVocabularyCLI)
@@ -587,6 +600,14 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 			bus.Close() // the bus is owned here; no goroutine was started
 			return fmt.Errorf("scan: --tui: subscribe: %w", err)
 		}
+		// Run-level metadata FIRST, before the controller starts
+		// consuming (NEW-82): the header shows the declared target and
+		// the summary knows the output directory from the first frame.
+		// Only the CLI knows these values; the pipeline never emits them.
+		bus.Publish(event.Event{
+			Kind:    event.KindRunMetadata,
+			Payload: event.RunMetadata{Target: target.String(), OutputDir: cfg.OutputDir},
+		})
 		// Enabled + Compact come from the flags; Color is resolved from
 		// os.Stderr (a character device renders color, pipes/redirects do
 		// not). Every other field stays zero and the library normalizes it

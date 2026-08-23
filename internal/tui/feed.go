@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -177,7 +180,13 @@ func interesting(ev event.Event) (key, label, detail string, ok bool) {
 			return "asset|" + p.Kind + "|" + p.Identity, p.Identity, "source map exposed", true
 		case "secret_candidate":
 			if p.Confidence >= 0.8 {
-				return "asset|" + p.Kind + "|" + p.Identity, p.Identity, "high-confidence secret", true
+				// The identity embeds the percent-encoded candidate VALUE
+				// (asset/secret_candidate.go Identity) — rendering it would
+				// leak the secret into the terminal and its scrollback
+				// (REVIEW-2026-08-23 M-7, mirroring secrentel/record.go's
+				// redactedCandidateID discipline). The full identity stays
+				// ONLY in the in-memory dedupe key.
+				return "asset|" + p.Kind + "|" + p.Identity, redactedSecretCandidateLabel(p.Identity), "high-confidence secret", true
 			}
 		case "technology":
 			return "asset|" + p.Kind + "|" + p.Identity, p.Identity, "technology detected", true
@@ -192,6 +201,88 @@ func interesting(ev event.Event) (key, label, detail string, ok bool) {
 		}
 	}
 	return "", "", "", false
+}
+
+// redactedSecretCandidateLabel derives the display-only label for one
+// secret_candidate asset identity: the candidate type plus a short SHA-256
+// prefix of its value (the first four digest bytes, eight hex characters) —
+// the redactedCandidateID discipline from secrentel/record.go. The canonical
+// identity embeds the percent-encoded candidate VALUE, so it must never be
+// rendered: a live frame lands in terminal scrollback and transcripts,
+// which are neither of the full-identity carve-outs. The value component is
+// percent-decoded first (asset/service.go percentEncode is injective), so
+// the label matches what the secrentel engine itself prints for the same
+// candidate.
+//
+// An identity that does not parse into the canonical
+// "secret_candidate:<type>/<encoded value>/<encoded source>" shape (a
+// hostile or foreign event) still never renders verbatim: it degrades to
+// a digest of the whole identity string. Every path returns at most
+// "secret_candidate/" + type + "/" + 8 hex characters of entropy.
+func redactedSecretCandidateLabel(identity string) string {
+	const kindPrefix = "secret_candidate:"
+	rest, ok := strings.CutPrefix(identity, kindPrefix)
+	if !ok {
+		return "secret_candidate/" + shortDigest(identity)
+	}
+	// percentEncode escapes every byte outside [a-zA-Z0-9], so "/" can
+	// never occur inside a component: exactly three parts, or malformed.
+	parts := strings.Split(rest, "/")
+	if len(parts) != 3 || parts[0] == "" {
+		return "secret_candidate/" + shortDigest(identity)
+	}
+	value, err := percentDecode(parts[1])
+	if err != nil {
+		return "secret_candidate/" + parts[0] + "/" + shortDigest(identity)
+	}
+	return parts[0] + "/" + shortDigest(value)
+}
+
+// shortDigest returns the first four SHA-256 bytes as eight lowercase hex
+// characters — the same projection secrentel uses for diagnostic-safe IDs.
+func shortDigest(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:4])
+}
+
+// percentDecode reverses asset/service.go's percentEncode (%XX with two
+// uppercase hex digits). It reports an error on any malformed escape so a
+// truncated or hostile component degrades to the whole-identity digest
+// instead of silently hashing the wrong bytes.
+func percentDecode(s string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '%' {
+			b.WriteByte(c)
+			continue
+		}
+		if i+2 >= len(s) {
+			return "", fmt.Errorf("percentDecode: truncated escape in %q", s)
+		}
+		hi, ok1 := unhex(s[i+1])
+		lo, ok2 := unhex(s[i+2])
+		if !ok1 || !ok2 {
+			return "", fmt.Errorf("percentDecode: invalid escape %q in %q", s[i:i+3], s)
+		}
+		b.WriteByte(hi<<4 | lo)
+		i += 2
+	}
+	return b.String(), nil
+}
+
+// unhex maps one hex digit to its value; ok is false for anything else.
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	}
+	return 0, false
 }
 
 // adminSegments is the display-only admin-ish path table (a small subset of

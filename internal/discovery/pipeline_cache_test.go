@@ -28,7 +28,7 @@ func openTestCache(t *testing.T, opts ...cache.Option) *cache.FS {
 func keyFor(t *testing.T, target asset.Domain, srcName, version string) cache.Key {
 	t.Helper()
 	src := registry[srcName](toolEnv{name: srcName})
-	k, err := cacheKey(target, src, Detection{Version: version})
+	k, err := cacheKey(target, src, Detection{Version: version}, NormalizeQualityConfig(QualityConfig{}))
 	if err != nil {
 		t.Fatalf("cacheKey: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestRunCacheKeyDiffersPerToolAndVersion(t *testing.T) {
 func TestRunCacheKeyIncludesMode(t *testing.T) {
 	target := mustDomain(t, "example.com")
 	src := registry["subfinder"](toolEnv{name: "subfinder"})
-	k1, err := cacheKey(target, src, Detection{Version: "v2.6.3"})
+	k1, err := cacheKey(target, src, Detection{Version: "v2.6.3"}, NormalizeQualityConfig(QualityConfig{}))
 	if err != nil {
 		t.Fatalf("cacheKey: %v", err)
 	}
@@ -784,5 +784,71 @@ func TestRunCacheUnknownVersionToKnownVersionReexecutes(t *testing.T) {
 	}
 	if execCalls != execs+1 {
 		t.Fatalf("run 3 must not re-execute: executions %d", execCalls)
+	}
+}
+
+// M-4: stored records persist the producing run's post-gate retained set
+// and its recorded issues, so the normalized gate configuration is part of
+// the key. Raising MaxPerSource after an over_cap store must miss and
+// re-execute, never serve the smaller capped set until TTL.
+func TestCacheKeyIncludesNormalizedQualityConfig(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	src := registry["subfinder"](toolEnv{name: "subfinder"})
+	key := func(qc QualityConfig) cache.Key {
+		t.Helper()
+		k, err := cacheKey(target, src, Detection{Version: "v2.6.3"}, NormalizeQualityConfig(qc))
+		if err != nil {
+			t.Fatalf("cacheKey: %v", err)
+		}
+		return k
+	}
+	base := key(QualityConfig{})
+	if base != key(DefaultQualityConfig()) {
+		t.Fatal("an empty config must normalize to the same key as the explicit default config")
+	}
+	for _, qc := range []QualityConfig{
+		{MaxPerSource: 10},
+		{DivergenceRatio: 5},
+		{DivergenceMinCount: 7},
+	} {
+		if key(qc) == base {
+			t.Fatalf("quality config %+v must change the cache key", qc)
+		}
+	}
+}
+
+// An encode failure must skip the Put entirely: persisting a Data-less
+// record under StatusCompleted would be guaranteed churn (the cache serves
+// only completed entries) plus a misleading terminal status — the same
+// shape dns.storeType already avoids.
+func TestRunMarshalFailureSkipsCachePut(t *testing.T) {
+	r := newFakeRunner(t, fullScript())
+	cfg := testConfig(r, newFakeLookup())
+	c := openTestCache(t)
+	cfg.Cache = c
+	target := mustDomain(t, "example.com")
+
+	orig := encodeResult
+	encodeResult = func(any) ([]byte, error) { return nil, errors.New("encode exploded") }
+	defer func() { encodeResult = orig }()
+
+	rep := mustRun(t, target, cfg)
+	for _, res := range rep.Results {
+		if res.Version == "" {
+			continue // unknown-version sources are never cached, never stored
+		}
+		if res.Err == nil || !strings.Contains(res.Err.Error(), "encode result") {
+			t.Fatalf("source %s (version %q): want joined encode error, got err=%v", res.Source, res.Version, res.Err)
+		}
+	}
+	// No record may exist under any storeable (versioned) source's key.
+	for _, res := range rep.Results {
+		if res.Version == "" {
+			continue
+		}
+		out := c.Get(context.Background(), keyFor(t, target, res.Source, res.Version))
+		if out.IsHit() || out.State != cache.StateMiss {
+			t.Fatalf("%s must leave no record after encode failure, got state %s", res.Source, out.State)
+		}
 	}
 }

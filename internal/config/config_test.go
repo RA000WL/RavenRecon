@@ -3,6 +3,8 @@ package config
 import (
 	"testing"
 	"time"
+
+	"github.com/RA000WL/RavenRecon/internal/version"
 )
 
 func TestDefault(t *testing.T) {
@@ -22,6 +24,11 @@ func TestDefault(t *testing.T) {
 
 	if cfg.UserAgent == "" {
 		t.Fatal("expected non-empty user agent")
+	}
+	// The default UserAgent must be composed from the single version
+	// constant, never a duplicated literal that can drift.
+	if want := "RavenRecon/" + version.Version; cfg.UserAgent != want {
+		t.Fatalf("default user agent = %q, want %q", cfg.UserAgent, want)
 	}
 
 	if cfg.Timeout != 120*time.Second {

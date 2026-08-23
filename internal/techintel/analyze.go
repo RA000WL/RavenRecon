@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/techintel/fingerprints"
@@ -21,7 +22,45 @@ const (
 	maxHTMLAttributes = 256
 	maxHTMLSourceMaps = 32
 	maxHTMLGenerators = 16
+
+	// maxHTMLValueBytes bounds ONE extracted HTML value (attribute name,
+	// attribute value, script src, stylesheet href, meta name/content,
+	// generator content, sourceMappingURL token). Values beyond the cap are
+	// truncated to a rune-safe prefix at extraction time and Truncated is
+	// set (NEW-79): retention is bounded by count-cap × value-cap.
+	maxHTMLValueBytes = 4 << 10 // 4 KiB
 )
+
+// truncateUTF8 cuts s to at most limit bytes at a UTF-8 rune boundary so
+// stored values stay valid UTF-8 and survive JSON round-trips unchanged
+// (NEW-83; same approach as the asset-layer truncateEvidence helpers).
+// Values within the limit are returned unchanged.
+func truncateUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	prefix := s[:limit]
+	// Trim an incomplete trailing UTF-8 sequence. For valid UTF-8 input this
+	// loop does not run.
+	for len(prefix) > 0 {
+		r, size := utf8.DecodeLastRuneInString(prefix)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix
+}
+
+// capHTMLValue truncates one extracted HTML value to maxHTMLValueBytes,
+// reporting whether the cap bit (the caller ORs it into
+// htmlExtract.truncated).
+func capHTMLValue(v string) (string, bool) {
+	if len(v) <= maxHTMLValueBytes {
+		return v, false
+	}
+	return truncateUTF8(v, maxHTMLValueBytes), true
+}
 
 // cookie flag labels for evidence-only session-flag records. The values
 // follow the canonical "kind:name" indicator-key form so a consumer can
@@ -441,6 +480,11 @@ func scanHTML(body string) htmlExtract {
 			out.truncated = true
 			return
 		}
+		name, nameCapped := capHTMLValue(name)
+		value, valueCapped := capHTMLValue(value)
+		if nameCapped || valueCapped {
+			out.truncated = true
+		}
 		out.attrs = append(out.attrs, attrEntry{name: name, value: value})
 	}
 
@@ -460,6 +504,10 @@ func scanHTML(body string) htmlExtract {
 		switch name {
 		case "script":
 			if src := attrValue(attrs, "src"); src != "" {
+				src, capped := capHTMLValue(src)
+				if capped {
+					out.truncated = true
+				}
 				if len(out.scripts) < maxHTMLScripts {
 					out.scripts = append(out.scripts, src)
 				} else {
@@ -470,6 +518,10 @@ func scanHTML(body string) htmlExtract {
 			rel := strings.ToLower(attrValue(attrs, "rel"))
 			if strings.Contains(rel, "stylesheet") {
 				if href := attrValue(attrs, "href"); href != "" {
+					href, capped := capHTMLValue(href)
+					if capped {
+						out.truncated = true
+					}
 					if len(out.css) < maxHTMLCSS {
 						out.css = append(out.css, href)
 					} else {
@@ -480,18 +532,27 @@ func scanHTML(body string) htmlExtract {
 		case "meta":
 			nameAttr := attrValue(attrs, "name")
 			if nameAttr != "" {
+				isGenerator := strings.EqualFold(nameAttr, "generator")
+				content := attrValue(attrs, "content")
+				nameAttr, nameCapped := capHTMLValue(nameAttr)
+				content, contentCapped := capHTMLValue(content)
+				if nameCapped || contentCapped {
+					out.truncated = true
+				}
 				if len(out.metas) < maxHTMLMetas {
-					out.metas = append(out.metas, metaEntry{name: nameAttr, content: attrValue(attrs, "content")})
+					out.metas = append(out.metas, metaEntry{name: nameAttr, content: content})
 				} else {
 					out.truncated = true
 				}
-				if strings.EqualFold(nameAttr, "generator") {
-					if gen := attrValue(attrs, "content"); gen != "" {
-						if len(out.generators) < maxHTMLGenerators {
-							out.generators = append(out.generators, gen)
-						} else {
-							out.truncated = true
-						}
+				if isGenerator && content != "" {
+					gen, capped := capHTMLValue(content)
+					if capped {
+						out.truncated = true
+					}
+					if len(out.generators) < maxHTMLGenerators {
+						out.generators = append(out.generators, gen)
+					} else {
+						out.truncated = true
 					}
 				}
 			}
@@ -518,8 +579,13 @@ func scanHTML(body string) htmlExtract {
 			end++
 		}
 		if end > pos {
+			tok := body[pos:end]
+			tok, capped := capHTMLValue(tok)
+			if capped {
+				out.truncated = true
+			}
 			if len(out.sourcemaps) < maxHTMLSourceMaps {
-				out.sourcemaps = append(out.sourcemaps, body[pos:end])
+				out.sourcemaps = append(out.sourcemaps, tok)
 			} else {
 				out.truncated = true
 			}

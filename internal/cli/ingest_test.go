@@ -501,17 +501,33 @@ func TestRunIngestTUIWiring(t *testing.T) {
 		t.Fatal("the TUI seam must receive the subscriber")
 	}
 	assertTUIReturned(t, fake)
-	// 12 selected stages × started+finished = 24 events, sequences intact.
-	if len(snap.events) != 24 {
-		t.Fatalf("controller consumed %d events, want 24", len(snap.events))
+	// NEW-82: a RunMetadata event (declared target + output directory)
+	// precedes the runner's events, then 12 selected stages ×
+	// started+finished = 24 stage events, sequences intact.
+	if len(snap.events) != 25 {
+		t.Fatalf("controller consumed %d events, want 25 (RunMetadata + 24 stage events)", len(snap.events))
 	}
-	for i, ev := range snap.events {
+	first := snap.events[0]
+	if first.Kind != event.KindRunMetadata {
+		t.Fatalf("first event kind = %s, want %s (RunMetadata must be published before the controller starts)", first.Kind, event.KindRunMetadata)
+	}
+	meta, ok := first.Payload.(event.RunMetadata)
+	if !ok {
+		t.Fatalf("first payload = %T, want event.RunMetadata", first.Payload)
+	}
+	if meta.Target != "example.com" {
+		t.Fatalf("RunMetadata.Target = %q, want the declared target", meta.Target)
+	}
+	if meta.OutputDir != dir {
+		t.Fatalf("RunMetadata.OutputDir = %q, want the effective --output directory %q", meta.OutputDir, dir)
+	}
+	for i, ev := range snap.events[1:] {
 		wantKind := eventKindAt(i)
 		if ev.Kind != wantKind {
-			t.Fatalf("event %d kind = %s, want %s", i, ev.Kind, wantKind)
+			t.Fatalf("stage event %d kind = %s, want %s", i, ev.Kind, wantKind)
 		}
-		if want := uint64(i + 1); ev.Sequence != want {
-			t.Fatalf("event %d sequence = %d, want %d", i, ev.Sequence, want)
+		if want := uint64(i + 2); ev.Sequence != want {
+			t.Fatalf("stage event %d sequence = %d, want %d", i, ev.Sequence, want)
 		}
 	}
 	if buf.String() != plain.String() {
@@ -702,5 +718,20 @@ func TestRunIngestSmokeE2E(t *testing.T) {
 	}
 	if !attributedAPI {
 		t.Fatalf("no attribution key covers api.example.com: %v", doc.Attribution)
+	}
+}
+
+// TestParseIngestArgsHelpAfterOption is the NEW-83 regression test: a bare
+// "help" following an option becomes the target positional (Go's flag
+// package stops at the first non-flag argument), which previously produced
+// a confusing invalid-target error. Per the contract comment it is a help
+// request.
+func TestParseIngestArgsHelpAfterOption(t *testing.T) {
+	opts, err := parseIngestArgs([]string{"--tui", "help"})
+	if err != errIngestHelp {
+		t.Fatalf("bare help after an option must return errIngestHelp, got %v", err)
+	}
+	if opts.target != "" {
+		t.Fatalf("help request must not produce options, got %+v", opts)
 	}
 }

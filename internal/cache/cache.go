@@ -388,6 +388,15 @@ func (c *FS) Clear(ctx context.Context) error {
 // It returns the number of entries removed. This is an explicit maintenance
 // operation; it walks the entry tree once and is also useful for pruning
 // records left by an older schema whose keys are no longer reachable.
+//
+// The walk also reclaims crash residue: entry-*.tmp temporary files that an
+// interrupted Put (os.CreateTemp at the write site) left behind. This is
+// race-free against in-flight writes because Put holds the same instance
+// mutex from CreateTemp through rename-or-remove, so no temporary file
+// removed here can belong to a concurrent Put of this instance; entries are
+// always named <digest>.json, so the temp pattern can never match one — no
+// .json entry is ever reclaimed by this sweep. Temporary files are not
+// counted in the returned number: it counts removed entries only.
 func (c *FS) InvalidateIncompatible(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("cache invalidate: %w", err)
@@ -407,11 +416,20 @@ func (c *FS) InvalidateIncompatible(ctx context.Context) (int, error) {
 		if d.IsDir() {
 			return nil
 		}
-		if !strings.HasSuffix(d.Name(), ".json") {
-			return nil // ignore leftover temporary files
-		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, "entry-") && strings.HasSuffix(name, ".tmp") {
+			// Crash residue from an interrupted Put: reclaim it (see the
+			// doc comment). Never counted as an entry.
+			if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("cache invalidate: remove %s: %w", path, rerr)
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".json") {
+			return nil // ignore any other non-entry file
 		}
 		switch c.readEntry(path).state {
 		case entryOversized, entryCorrupt, entrySchema:

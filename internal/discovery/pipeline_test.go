@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -166,7 +167,7 @@ func TestRunProvenanceMergeEarliestWins(t *testing.T) {
 // tools: skip with a clear warning, never a crash, never a failed run.
 func TestRunMissingSourceSkipped(t *testing.T) {
 	l := newFakeLookup()
-	l.errs["amass"] = errors.New("not found in PATH")
+	l.errs["amass"] = exec.ErrNotFound
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, l)
 	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
@@ -199,7 +200,7 @@ func TestRunMissingSourceSkipped(t *testing.T) {
 func TestRunAllSourcesMissing(t *testing.T) {
 	l := newFakeLookup()
 	for _, n := range builtInNames() {
-		l.errs[n] = errors.New("not found in PATH")
+		l.errs[n] = exec.ErrNotFound
 	}
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, l)

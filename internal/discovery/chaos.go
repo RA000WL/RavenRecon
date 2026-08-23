@@ -47,6 +47,11 @@ func (c chaos) Detect(ctx context.Context) Detection {
 	defer cancel()
 	path, err := e.lookup(e.binOrName())
 	if err != nil {
+		if !lookupMissing(err) {
+			d.Status = StatusWarn
+			d.Reason = fmt.Sprintf("executable %q lookup failed: %v", e.binOrName(), err)
+			return d
+		}
 		d.Status = StatusMissing
 		d.Reason = fmt.Sprintf("executable %q not found", e.binOrName())
 		return d
@@ -100,6 +105,9 @@ func (c chaos) Discover(ctx context.Context, target asset.Domain) (DiscoverResul
 	e := c.env.sanitized()
 	path, err := e.lookup(e.binOrName())
 	if err != nil {
+		if !lookupMissing(err) {
+			return DiscoverResult{}, fmt.Errorf("%s: resolve executable %s: %w", c.Name(), e.binOrName(), err)
+		}
 		return DiscoverResult{}, fmt.Errorf("%s: %w (%s)", c.Name(), ErrExecutableNotFound, e.binOrName())
 	}
 	res, err := e.runner.Run(ctx, Cmd{Path: path, Args: []string{"-d", target.Name, "-silent", "-json"}}, e.limits)
@@ -165,6 +173,11 @@ func parseChaosLines(stdout []byte, domain string, prov asset.Provenance) ([]ass
 							continue
 						}
 						switch {
+						case strings.EqualFold(sub, domain):
+							// v0.5 datasets may list the queried domain itself;
+							// appending the domain would fabricate the bogus host
+							// "domain.domain". Keep the apex as-is.
+							add(sub)
 						case strings.HasSuffix(sub, "."+domain):
 							add(sub)
 						default:

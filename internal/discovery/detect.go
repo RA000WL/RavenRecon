@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"strings"
 	"time"
@@ -153,6 +154,18 @@ func detectCapability(ctx context.Context, e toolEnv, flag string) Detection {
 	return detectExec(ctx, e, []string{flag}, modeCapability)
 }
 
+// lookupMissing reports whether a LookupFunc error means the executable
+// does not exist (a genuine MISSING): exec.LookPath signals both
+// exec.ErrNotFound and fs.ErrNotExist for an absent binary. Any other
+// lookup failure (permission denied on a PATH entry, malformed PATH, ...)
+// leaves existence unresolved and MUST degrade to a WARN carrying the
+// underlying cause — mirroring the execution stage's broken-vs-missing
+// distinction (ExecRunner.Run maps only exec.ErrNotFound/fs.ErrNotExist to
+// ErrExecutableNotFound).
+func lookupMissing(err error) bool {
+	return errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist)
+}
+
 func detectExec(ctx context.Context, e toolEnv, args []string, mode detectMode) Detection {
 	e = e.sanitized()
 	d := Detection{Source: e.name}
@@ -160,6 +173,11 @@ func detectExec(ctx context.Context, e toolEnv, args []string, mode detectMode) 
 	defer cancel()
 	path, err := e.lookup(e.binOrName())
 	if err != nil {
+		if !lookupMissing(err) {
+			d.Status = StatusWarn
+			d.Reason = fmt.Sprintf("executable %q lookup failed: %v", e.binOrName(), err)
+			return d
+		}
 		d.Status = StatusMissing
 		d.Reason = fmt.Sprintf("executable %q not found", e.binOrName())
 		return d

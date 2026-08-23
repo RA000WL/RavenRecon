@@ -1,11 +1,21 @@
 package jsintel
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
+
+// errParser is a Parser stub whose Parse always fails: it makes the
+// inline-script parse-failure path deterministically reachable (a real
+// parser can only fail there on input far beyond MaxHTMLBody).
+type errParser struct{}
+
+func (errParser) Parse([]byte) (Parsed, error) {
+	return Parsed{}, errors.New("synthetic parse failure")
+}
 
 func TestParseLineForms(t *testing.T) {
 	base := mustURL(t, "http://example.com/page/index.html")
@@ -433,4 +443,63 @@ func candStrings(cands []asset.URL) []string {
 		out = append(out, c.String())
 	}
 	return out
+}
+
+// TestParseHTMLCaseFoldNoSecondIndexSpace pins NEW-75: tag scanning runs
+// in ONE index space on the raw body. U+0130 ("İ") case-folds to a single
+// byte under strings.ToLower, so the removed shadow string was SHORTER
+// than body; an unterminated inline <script> then advanced pos to
+// len(body) > len(lower) and lower[pos:] panicked inside findNextTag.
+// The page must parse without panicking and still yield the inline
+// import.
+func TestParseHTMLCaseFoldNoSecondIndexSpace(t *testing.T) {
+	page := mustURL(t, "http://example.com/page/index.html")
+	body := "<title>\u0130</title><script>import \"./a.js\";"
+	item := Item{Kind: ItemHTML, URL: page, Body: body}
+	cands, malformed, dropped := parseHTML(item, NewParser(), 128)
+	if len(cands) != 1 || cands[0].String() != "http://example.com/page/a.js" {
+		t.Fatalf("candidates = %v, want [http://example.com/page/a.js]", candStrings(cands))
+	}
+	if malformed != 0 || dropped != 0 {
+		t.Errorf("malformed = %d, dropped = %d, want zeros", malformed, dropped)
+	}
+}
+
+// TestParseHTMLFoldedTagNames pins that uppercase tag names keep matching
+// after the lowercased shadow string was removed: ASCII-case-insensitive
+// matching against the raw body must behave exactly like the old ToLower
+// comparison for all-ASCII input.
+func TestParseHTMLFoldedTagNames(t *testing.T) {
+	page := mustURL(t, "http://example.com/page/index.html")
+	item := Item{Kind: ItemHTML, URL: page,
+		Body: `<SCRIPT SRC="/u.js"></SCRIPT><script>import "./b.js"</SCRIPT><script src="/c.js"></script>`}
+	cands, _, _ := parseHTML(item, NewParser(), 128)
+	want := []string{"http://example.com/u.js", "http://example.com/page/b.js", "http://example.com/c.js"}
+	got := candStrings(cands)
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidate[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+// TestParseHTMLInlineParseFailureCounted pins the review INFO fix: an
+// inline block whose parse fails is counted malformed, never silently
+// dropped. The stub parser makes the failure deterministic (a real
+// parser only fails there beyond the hard input limit, which MaxHTMLBody
+// truncation can never reach).
+func TestParseHTMLInlineParseFailureCounted(t *testing.T) {
+	page := mustURL(t, "http://example.com/page/index.html")
+	item := Item{Kind: ItemHTML, URL: page,
+		Body: `<script>import "./a.js";</script>`}
+	cands, malformed, _ := parseHTML(item, errParser{}, 128)
+	if len(cands) != 0 {
+		t.Errorf("candidates = %v, want none", candStrings(cands))
+	}
+	if malformed != 1 {
+		t.Errorf("malformed = %d, want 1 (the failed inline parse must be counted)", malformed)
+	}
 }

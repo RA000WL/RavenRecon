@@ -111,6 +111,16 @@ type Config struct {
 	// non-empty and at most 128 bytes (the Phase 2 source bound).
 	Adapter string
 
+	// ToolVersion is the detected version of the tool whose lines are
+	// being ingested (empty when it could not be determined). It enters
+	// the cache key together with the adapter name (cache.ToolInfo): a
+	// tool upgrade changes emitted data, so a record written by another
+	// version is never served (AGENTS §11). An UNKNOWN version makes the
+	// observation NON-CACHEABLE, mirroring internal/discovery's policy:
+	// "" cannot be distinguished from any other unknown version, so such
+	// runs never read or write cache records and execute fresh every time.
+	ToolVersion string
+
 	// ParseParameters enables query-parameter extraction. It is
 	// result-relevant and therefore enters the cache key: records written
 	// with extraction enabled are never served to a run that disabled it.
@@ -288,6 +298,7 @@ const maxRunDiagnostics = 32
 type env struct {
 	cache       cache.Cache
 	adapter     string
+	toolVersion string
 	parseParams bool
 	clock       runtime.Clock
 	metrics     *Metrics
@@ -393,6 +404,7 @@ func IngestInto(ctx context.Context, cfg Config, src LineSource, acc *Accumulato
 	e := &env{
 		cache:       cfg.Cache,
 		adapter:     cfg.Adapter,
+		toolVersion: cfg.ToolVersion,
 		parseParams: cfg.ParseParameters,
 		clock:       cfg.Clock,
 		metrics:     cfg.Metrics,

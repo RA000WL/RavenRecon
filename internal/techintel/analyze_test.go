@@ -1,6 +1,7 @@
 package techintel
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -866,4 +867,67 @@ func TestAnalyzeIndicatorsCap(t *testing.T) {
 	if out.evidence[0].Indicator != "header:x-a: 1" || out.evidence[1].Indicator != "header:x-b: 2" {
 		t.Errorf("retained evidence = %v", out.evidence)
 	}
+}
+
+// NEW-79: every extracted HTML value is byte-capped (retention is bounded by
+// count-cap × value-cap) and a cap bite sets truncated. Cuts are rune-safe
+// (NEW-83): retained values stay valid UTF-8 and survive JSON round-trips
+// unchanged.
+func TestScanHTMLValueByteCaps(t *testing.T) {
+	// Multi-byte runes throughout: a raw 4 KiB byte cut would tear a rune.
+	big := strings.Repeat("é", maxHTMLValueBytes) // 2 bytes/rune → 8 KiB
+	page := `<html><head>` +
+		`<script src="/js/` + big + `.js"></script>` +
+		`<link rel="stylesheet" href="/css/` + big + `">` +
+		`<meta name="description" content="` + big + `">` +
+		`</head><body><div data-x="` + big + `"></div></body></html>`
+	out := scanHTML(page)
+	if !out.truncated {
+		t.Error("value-cap bites must set truncated")
+	}
+
+	checkValues := func(kind string, vals []string) {
+		t.Helper()
+		if len(vals) == 0 {
+			t.Fatalf("%s: no values extracted", kind)
+		}
+		for i, v := range vals {
+			if len(v) > maxHTMLValueBytes {
+				t.Errorf("%s[%d] = %d bytes, want ≤ %d", kind, i, len(v), maxHTMLValueBytes)
+			}
+			if !utf8.ValidString(v) {
+				t.Errorf("%s[%d] is not valid UTF-8 after truncation", kind, i)
+			}
+			data, err := json.Marshal(v)
+			if err != nil {
+				t.Fatalf("%s[%d] marshal: %v", kind, i, err)
+			}
+			var back string
+			if err := json.Unmarshal(data, &back); err != nil || back != v {
+				t.Errorf("%s[%d] JSON round-trip mismatch", kind, i)
+			}
+		}
+	}
+	checkValues("scripts", out.scripts)
+	checkValues("css", out.css)
+	var metaNames, metaContents []string
+	for _, m := range out.metas {
+		metaNames = append(metaNames, m.name)
+		metaContents = append(metaContents, m.content)
+	}
+	checkValues("meta names", metaNames)
+	checkValues("meta contents", metaContents)
+
+	var attrValues []string
+	for _, a := range out.attrs {
+		attrValues = append(attrValues, a.value)
+	}
+	checkValues("attr values", attrValues)
+
+	// sourceMappingURL tokens are capped the same way.
+	sm := scanHTML("//# sourceMappingURL=" + big)
+	if !sm.truncated {
+		t.Error("sourcemap value-cap bite must set truncated")
+	}
+	checkValues("sourcemaps", sm.sourcemaps)
 }

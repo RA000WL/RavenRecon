@@ -2,7 +2,6 @@ package discovery
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -447,11 +446,17 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 				Truncated:     res.Truncated,
 				QualityIssues: res.QualityIssues,
 			}
-			if b, merr := json.Marshal(sr); merr == nil {
-				rec.Data = b
-			} else {
+			b, merr := encodeResult(sr)
+			if merr != nil {
 				res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: encode result: %w", res.Source, merr))
+				// Never persist a record whose payload failed to encode:
+				// a Data-less completed record is guaranteed churn (the
+				// cache serves only completed entries) plus a misleading
+				// terminal status. Skip the store; the joined error keeps
+				// the run honest. Mirrors dns.storeType.
+				continue
 			}
+			rec.Data = b
 			if perr := cfg.Cache.Put(storeCtx, keys[i], rec); perr != nil {
 				res.Err = errors.Join(res.Err, fmt.Errorf("discovery: %s: cache put: %w", res.Source, perr))
 			}
@@ -524,7 +529,7 @@ func runSource(ctx context.Context, target asset.Domain, src Source, det Detecti
 		// Unknown-version runs therefore bypass the cache entirely: no key,
 		// no Get, no Put, and every run executes fresh. Versioned tools cache
 		// on the detected version; a version change misses and re-executes.
-		k, err := cacheKey(target, src, det)
+		k, err := cacheKey(target, src, det, NormalizeQualityConfig(cfg.Quality))
 		if err != nil {
 			res.Status = OutFailed
 			res.Err = fmt.Errorf("discovery: %s: build cache key: %w", src.Name(), err)

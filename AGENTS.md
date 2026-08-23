@@ -145,7 +145,7 @@ Tool detection must be tool-specific — never assume `-version`, `-v`, or `--ve
 ## 10. Concurrency — canonical pattern
 **Never** create an unbounded goroutine per target, host, URL, endpoint, or result. Every worker system needs all four properties:
 ```go
-pool := runtime.NewPool(ctx, runtime.Config{MaxWorkers: n}) // explicit maximum concurrency
+pool := runtime.NewPool(ctx, runtime.Config{Concurrency: n}) // explicit maximum concurrency
 // ctx cancellation propagates to all workers; pool.Shutdown() drains cleanly
 ```
 Plus leak/race coverage (§13). Rate limiting centralized where practical.

@@ -18,6 +18,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/config"
+	"github.com/RA000WL/RavenRecon/internal/crawl"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
 	"github.com/RA000WL/RavenRecon/internal/dns"
 	"github.com/RA000WL/RavenRecon/internal/event"
@@ -984,9 +985,10 @@ func TestResolveTUIColor(t *testing.T) {
 
 // TestRunScanTUIWiring pins the full --tui wiring end to end: the bus is
 // the run's single event sink (ScanConfig.Observer non-nil on the seam
-// capture), all 24 stage events (12 stages × started+finished) reach the
-// controller's subscriber in order with bus-assigned sequences, the seam
-// receives Enabled/Compact from the flags and os.Stderr as the writer,
+// capture), a RunMetadata event precedes all 24 stage events (12 stages ×
+// started+finished), everything reaches the controller's subscriber in
+// order with bus-assigned sequences, the seam receives Enabled/Compact
+// from the flags and os.Stderr as the writer,
 // Controller.Run returns before runScan returns, and the summary is
 // byte-identical to the no-flag run.
 func TestRunScanTUIWiring(t *testing.T) {
@@ -1029,19 +1031,35 @@ func TestRunScanTUIWiring(t *testing.T) {
 			if snap.cfg.Compact != tc.wantCompact {
 				t.Fatalf("seam config Compact = %v, want %v", snap.cfg.Compact, tc.wantCompact)
 			}
-			if len(snap.events) != 24 {
-				t.Fatalf("controller consumed %d events, want 24 (12 stages × started+finished)", len(snap.events))
+			// RunMetadata is published before the controller starts
+			// consuming (NEW-82), then the runner's 24 stage events.
+			if len(snap.events) != 25 {
+				t.Fatalf("controller consumed %d events, want 25 (RunMetadata + 12 stages × started+finished)", len(snap.events))
 			}
-			for i, ev := range snap.events {
+			first := snap.events[0]
+			if first.Kind != event.KindRunMetadata {
+				t.Fatalf("first event kind = %s, want %s (RunMetadata must be published before the controller starts)", first.Kind, event.KindRunMetadata)
+			}
+			meta, ok := first.Payload.(event.RunMetadata)
+			if !ok {
+				t.Fatalf("first payload = %T, want event.RunMetadata", first.Payload)
+			}
+			if meta.Target != "example.com" {
+				t.Fatalf("RunMetadata.Target = %q, want the declared target", meta.Target)
+			}
+			if meta.OutputDir != dir {
+				t.Fatalf("RunMetadata.OutputDir = %q, want the effective --output directory %q", meta.OutputDir, dir)
+			}
+			for i, ev := range snap.events[1:] {
 				wantKind := event.KindStageStarted
 				if i%2 == 1 {
 					wantKind = event.KindStageFinished
 				}
 				if ev.Kind != wantKind {
-					t.Fatalf("event %d kind = %s, want %s (started/finished alternating)", i, ev.Kind, wantKind)
+					t.Fatalf("stage event %d kind = %s, want %s (started/finished alternating)", i, ev.Kind, wantKind)
 				}
-				if want := uint64(i + 1); ev.Sequence != want {
-					t.Fatalf("event %d sequence = %d, want %d (bus-assigned, no drops)", i, ev.Sequence, want)
+				if want := uint64(i + 2); ev.Sequence != want {
+					t.Fatalf("stage event %d sequence = %d, want %d (bus-assigned, no drops)", i, ev.Sequence, want)
 				}
 			}
 			assertTUIReturned(t, fake)
@@ -1395,6 +1413,15 @@ var smokeScript = map[string]smokeScriptEntry{
 	"chaos -d example.com -silent -json": {stdout: "{\"domain\":\"www.example.com\"}\n"},
 	"gau -version":                       {stdout: "v1.11.0\n"},
 	"gau example.com":                    {},
+	// Full production crawl invocation for the single in-scope host
+	// (katana.go buildCmd; -c 4 = the scan runner's default per-stage
+	// concurrency override). One in-scope JSONL endpoint keeps the crawl
+	// stage's happy path genuinely exercised (H-1 honesty contract: an
+	// unscripted/failing katana run now folds the stage to incomplete, so
+	// the smoke fixture must script a healthy crawl).
+	"katana -u https://www.example.com -d 3 -jc -ps -xhr -aff=false -fs fqdn -kf all -rl 150 -c 4 -timeout 5 -retries 1 -jsonl -o - -silent": {
+		stdout: "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"endpoint\":\"https://www.example.com/about\",\"source\":\"js\",\"tag\":\"a\"}\n",
+	},
 }
 
 // smokeRunner is a scripted discovery.Runner (thread-safe: the discovery
@@ -1481,9 +1508,13 @@ var _ http.RoundTripper = (*smokeTransport)(nil)
 // smokeScanStages builds the production-shaped twelve-stage seam for the
 // hermetic smoke tests: the same twelve adapters newScanStages constructs,
 // with ONLY the exec- and network-capable seams substituted (a scripted
-// discovery.Runner and fake LookupFunc for discover + urlintel, a fake
-// dns.Resolver, and a canned http.RoundTripper for httpprobe AND jsintel —
-// see TODO NEW-16) and every non-exec stage at its production nil seam.
+// discovery.Runner and fake LookupFunc for discover + urlintel + crawl, a
+// fake dns.Resolver, and a canned http.RoundTripper for httpprobe AND
+// jsintel — see TODO NEW-16) and every non-exec stage at its production nil
+// seam. The crawl stage shares the scripted runner/fake lookup so katana is
+// resolved and executed hermetically: without it, the H-1 honesty contract
+// folds a missing tool into an incomplete crawl, making this test
+// host-dependent.
 // cfgSink, when non-nil, captures the ScanConfig the runner-wiring passed
 // to the seam.
 func smokeScanStages(runner *smokeRunner, tr *smokeTransport, cfgSink *pipeline.ScanConfig) func(pipeline.ScanConfig) []pipeline.Stage {
@@ -1496,7 +1527,7 @@ func smokeScanStages(runner *smokeRunner, tr *smokeTransport, cfgSink *pipeline.
 			adapt.NewDNSStage(&smokeResolver{}),
 			adapt.NewHTTPProbeStage(tr),
 			adapt.NewURLIntelStage(runner, smokeLookup),
-			adapt.NewCrawlStage(nil),
+			adapt.NewCrawlStage(crawl.NewKatanaSource(runner, smokeLookup)),
 			adapt.NewTechIntelStage(nil),
 			adapt.NewJSIntelStage(tr),
 			adapt.NewSecretIntelStage(nil),
@@ -1655,5 +1686,36 @@ func TestRunScanUnknownSourcePassThrough(t *testing.T) {
 				t.Fatalf("summary must name the unknown-source failure:\n%s", out)
 			}
 		})
+	}
+}
+
+// TestParseScanArgsRejectsIngestStage is the NEW-83 regression test:
+// pipeline.ValidStage accepts "ingest" (it is the ingest command's import
+// stage), so without this guard `scan --stages ingest` parsed cleanly and
+// failed later inside the runner with a confusing internal error. The CLI
+// must reject it at parse time, naming scan's twelve-stage vocabulary.
+func TestParseScanArgsRejectsIngestStage(t *testing.T) {
+	for _, arg := range []string{"ingest", "dns,ingest", "ingest,dns"} {
+		_, err := parseScanArgs([]string{"example.com", "--stages", arg})
+		if err == nil {
+			t.Fatalf("--stages %q must be rejected at parse time", arg)
+		}
+		if !strings.Contains(err.Error(), "ingest") || !strings.Contains(err.Error(), "discover") {
+			t.Fatalf("--stages %q error must name the offending stage and the scan vocabulary, got %v", arg, err)
+		}
+	}
+}
+
+// TestParseScanArgsHelpAfterOption is the NEW-83 regression test: a bare
+// "help" following an option is a help request per the contract comment —
+// never a stray positional that yields a confusing unexpected-argument
+// error.
+func TestParseScanArgsHelpAfterOption(t *testing.T) {
+	opts, err := parseScanArgs([]string{"example.com", "--tui", "help"})
+	if err != errScanHelp {
+		t.Fatalf("bare help after an option must return errScanHelp, got %v", err)
+	}
+	if opts.target != "" {
+		t.Fatalf("help request must not produce options, got %+v", opts)
 	}
 }

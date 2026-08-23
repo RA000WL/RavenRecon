@@ -3,6 +3,7 @@ package asset
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // TechnologyCategory classifies a Technology asset into one of the 21
@@ -182,6 +183,16 @@ func WithVersion(t Technology, version string) (Technology, error) {
 // rejected; the canonical form is ASCII-only so identity values stay safe to
 // embed in cache keys and paths.
 func canonicalTechnologyName(name string) (string, error) {
+	// The documented contract rejects non-ASCII bytes in the INPUT. Check
+	// the raw bytes first: folding below (ToLower, strings.Fields) treats
+	// every Unicode whitespace — NBSP included — as a space run and would
+	// otherwise silently launder it into an ASCII space, smuggling a
+	// non-ASCII byte past this contract.
+	for i := 0; i < len(name); i++ {
+		if name[i] >= utf8.RuneSelf {
+			return "", fmt.Errorf("technology name %q contains a non-ASCII character", name)
+		}
+	}
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.Join(strings.Fields(name), " ")
 	if name == "" {

@@ -54,9 +54,15 @@
 // # Cache key composition
 //
 // Operation "url.ingest"; target = canonical URL identity; configuration =
-// adapter identity + the result-relevant ParseParameters flag. The adapter
-// identity is part of the key (the user's spec): the same URL observed by
-// two adapters is stored as two distinct records. Timings, timeouts,
+// adapter identity + the detected tool version (cache.ToolInfo) + the
+// result-relevant ParseParameters flag. The adapter identity is part of the
+// key (the user's spec): the same URL observed by two adapters is stored as
+// two distinct records — and the same URL observed by a DIFFERENT VERSION of
+// one adapter is a different record too, because a tool upgrade changes
+// emitted data. An observation whose tool version could not be determined
+// ("") is NON-CACHEABLE by policy, mirroring internal/discovery: "" cannot
+// be distinguished from any other unknown version, so such runs never read
+// or write records and execute fresh every time. Timings, timeouts,
 // concurrency, and rate limits never enter a key, and the fixed caps are
 // constants so records stay valid under any future caps that retain more.
 //
@@ -169,9 +175,11 @@
 //   - Value-less query keys ("?flag") are skipped: the Phase 2 Parameter
 //     model requires a non-empty observed value.
 //   - Raw lines over 32 KiB are rejected as malformed (not truncated).
-//   - Cache keys include the adapter, so an observation with an
-//     undetectable-or-missing adapter identity is never guessed: callers
-//     must pass the same adapter name for the same tool across runs.
+//   - Cache keys include the adapter and the detected tool version, so an
+//     observation with an undetectable-or-missing adapter identity is never
+//     guessed: callers must pass the same adapter name for the same tool
+//     across runs. An unknown tool version ("") is non-cacheable by policy:
+//     such observations never read or write records.
 //   - Lines not read when the run is cancelled are not represented (the
 //     source stream was never drained).
 //   - Cache hits replay the stored record's FirstSeen/LastSeen: a zero-work

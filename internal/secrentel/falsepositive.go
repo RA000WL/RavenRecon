@@ -44,8 +44,12 @@ var fpValueMarkers = []string{
 // connection strings from being suppressed.
 var fpExampleMarkers = []string{"EXAMPLE"}
 
-// fpContextMarkers are case-insensitive substrings of a filename or URL path
-// that mark documentation/test/sample context.
+// fpContextMarkers mark documentation/test/sample context. Matching is
+// WHOLE-TOKEN: the filename/URL-path subject is tokenized on non-letter
+// bytes ('/', '_', '-', '.', digits, punctuation) and each marker must equal
+// an entire token, case-insensitively (NEW-78). Substring matching flagged
+// "latest" (contains "test") and "respect" (contains "spec"); whole tokens
+// keep those clean while genuine segment names still flag.
 var fpContextMarkers = []string{
 	"test", "spec", "example", "sample", "demo", "docs", "mock", "fixture",
 	"tutorial", "changelog", "readme", "sandbox", "staging",
@@ -117,13 +121,27 @@ func looksHumanWord(value string) bool {
 
 // classifyContext returns the false-positive context flags of a document:
 // matched markers in the filename or URL path. Flags cap confidence at Low
-// (fpContextCap) but never suppress the candidate.
+// (fpContextCap) but never suppress the candidate. A marker matches only a
+// whole letter-token of "filename/urlPath", case-insensitively (NEW-78).
 func classifyContext(filename, urlPath string) []string {
 	var flags []string
+	matched := make([]bool, len(fpContextMarkers))
 	subject := filename + "/" + urlPath
-	for _, m := range fpContextMarkers {
-		if containsFold(subject, m) {
-			flags = append(flags, "context-marker:"+m)
+	for i := 0; i < len(subject); {
+		if !isASCIILetter(subject[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(subject) && isASCIILetter(subject[i]) {
+			i++
+		}
+		token := subject[start:i]
+		for j, m := range fpContextMarkers {
+			if !matched[j] && strings.EqualFold(token, m) {
+				matched[j] = true
+				flags = append(flags, "context-marker:"+m)
+			}
 		}
 	}
 	// Bounded: at most 3 flags retained (the subject is bounded anyway, but
@@ -132,4 +150,11 @@ func classifyContext(filename, urlPath string) []string {
 		flags = flags[:3]
 	}
 	return flags
+}
+
+// isASCIILetter reports whether b is an ASCII letter. Letters form the
+// tokens of the context-marker subject; every other byte — separators like
+// '/' '_' '-' '.', digits, and punctuation — delimits a token.
+func isASCIILetter(b byte) bool {
+	return 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z'
 }

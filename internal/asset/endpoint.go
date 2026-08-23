@@ -33,7 +33,17 @@ func NewEndpoint(method, rawURL string, p Provenance) (Endpoint, error) {
 	return Endpoint{Method: m, URL: u, Prov: p}, nil
 }
 
+// maxMethodBytes bounds the canonical HTTP method. Standard methods are at
+// most 7 bytes ("CONNECT"); the endpoint classes jsintel/urlintel emit
+// ("GET", "WS", "SSE", "GQL") are shorter still. 16 bytes leaves generous
+// headroom for WebDAV-style verbs while keeping method strings out of
+// identities unbounded.
+const maxMethodBytes = 16
+
 func validateMethod(m string) error {
+	if len(m) > maxMethodBytes {
+		return fmt.Errorf("method %q is longer than %d bytes", m, maxMethodBytes)
+	}
 	for i := 0; i < len(m); i++ {
 		c := m[i]
 		if !(c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {

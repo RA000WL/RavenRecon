@@ -13,6 +13,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
 
 // fakeClock is the deterministic runtime.Clock seam.
@@ -643,5 +644,62 @@ func TestMergeEntriesPreserveScanCounts(t *testing.T) {
 		if merged.Status != StatusCompleted {
 			t.Errorf("merged status = %s, want completed", merged.Status)
 		}
+	}
+}
+
+// M-1: the Overflow flag must survive Phase-2 dedup shrink. With cap 2 the
+// structured candidate and its contextual duplicate both admit, a third
+// value trips the admission cap (overflow recorded), then dedup removes the
+// duplicate — leaving len(candidates) < cap. The post-hoc length check read
+// false; the flag now comes from the cap-trip record.
+func TestOverflowFlagSurvivesDedupShrink(t *testing.T) {
+	pats := []patterns.Pattern{
+		{
+			ID:       "a-test-ovf-structured",
+			Type:     asset.SecretTypeAWS,
+			Family:   patterns.FamilyStructured,
+			Regex:    `SECRETVAL[0-9]+`,
+			Anchors:  []string{"secretval"},
+			Strength: 0.7,
+		},
+		{
+			ID:       "b-test-ovf-contextual",
+			Type:     asset.SecretTypeGeneric,
+			Family:   patterns.FamilyContextual,
+			Regex:    `val[:=]\s*["']?([A-Za-z0-9]+)`,
+			Anchors:  []string{"val"},
+			Group:    1,
+			Strength: 0.5,
+		},
+	}
+	db, err := patterns.CompileForTest(pats)
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	sd, err := prepareDocument(Document{
+		Kind:    KindJS,
+		Content: []byte(`val: SECRETVAL0123456789 val: OTHERVAL9876543210`),
+	}, fixedTime(0))
+	if err != nil {
+		t.Fatalf("prepareDocument: %v", err)
+	}
+
+	lim := defaultScanLimits()
+	lim.maxCandidates = 2
+	out := scanDocument(sd, db, lim)
+	if !out.overflowCandidates {
+		t.Error("overflowCandidates = false, want true (admission cap tripped)")
+	}
+	if out.counts.OverflowDropped == 0 {
+		t.Error("OverflowDropped = 0, want > 0")
+	}
+	if len(out.candidates) >= lim.maxCandidates {
+		t.Fatalf("dedup did not shrink below the cap (%d kept), scenario broken", len(out.candidates))
+	}
+
+	e := &env{db: db, clock: newFakeClock(), limits: lim, metrics: &Metrics{}}
+	entry := processDocument(context.Background(), sd, e)
+	if !entry.Overflow {
+		t.Error("entry.Overflow = false although a cap tripped and dedup shrank below the cap")
 	}
 }

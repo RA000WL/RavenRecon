@@ -134,6 +134,8 @@ type Resolver interface {
 // documentation). LookupCNAME returns the host itself when it has no CNAME
 // record; the pipeline treats a target identical to the queried host as "no
 // CNAME observation".
+// The zero value holds no resolver and must not be used directly: construct
+// instances with NewNetResolver.
 type NetResolver struct {
 	r *net.Resolver
 }
@@ -145,9 +147,6 @@ func NewNetResolver() *NetResolver {
 
 // Lookup implements Resolver.
 func (n *NetResolver) Lookup(ctx context.Context, host string, rt RecordType) ([]string, error) {
-	if n.r == nil {
-		n.r = &net.Resolver{PreferGo: true}
-	}
 	switch rt {
 	case TypeA:
 		addrs, err := n.r.LookupNetIP(ctx, "ip4", host)

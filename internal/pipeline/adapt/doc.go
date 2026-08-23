@@ -71,9 +71,11 @@
 //	partial): cancelled if any host/source was cancelled; else failed if any
 //	failed and none completed; else completed if every host/source completed;
 //	else partial. This is the pipeline runner's own foldOutcome shape
-//	(run.go) with the incomplete bucket reserved for discovery's OutSkipped
-//	and the runner's truncation downgrade — the adapters themselves never
-//	emit incomplete.
+//
+// (run.go) with the incomplete bucket reserved for discovery's OutSkipped,
+// the runner's truncation downgrade, and the crawl adapter's total-failure
+// case (every requested host failed and zero URLs were crawled — the stage
+// never produced its output; FailedHosts accounting in crawl.go).
 //
 // Sticky-flag naming convention: a truncation flag is <engine>_<what>_
 // truncated — dns_answers_truncated (dns.go), probe_truncated (httpprobe.go),
@@ -91,8 +93,11 @@
 // param is acknowledged but NOT honored; raised whenever ANY value was
 // supplied — including a comma-only one that parses to zero entries,
 // NEW-45), dns_brute_skipped_cancelled (the stage context fired during the
-// wildcard probe so the opt-in brute never ran; NEW-47 — the skip is marked,
-// never silently completed).
+// opt-in brute — wildcard probe or candidate resolution — so it never ran or
+// aborted mid-run; NEW-47 / NEW-71 — the skip is marked, never silently
+// completed), and dns_brute_failed (the opt-in brute aborted on an engine
+// failure — a non-cancellation wildcard-probe error leaving the wildcard
+// state unknown, or a candidate-resolution engine error; NEW-71).
 //
 // Asset-level truncation markers (OPT-P1-4). Two asset models carry their
 // own sticky drop markers, and the adapters that return those assets OR the

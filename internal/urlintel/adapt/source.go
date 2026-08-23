@@ -26,6 +26,12 @@ const shutdownGrace = 15 * time.Second
 // is disabled (0). Mirrors the Phase 4 convention.
 const shutdownForceBudget = 30 * time.Second
 
+// deadContextIngestBudget bounds the detached ingest granted to a captured
+// stdout prefix when the OUTER context (run deadline or cancellation)
+// killed the tool mid-capture: the work already paid for must reach the
+// report, but the grant must stay bounded so it cannot wedge run shutdown.
+const deadContextIngestBudget = 15 * time.Second
+
 // Config configures one historical-URL adapter run.
 //
 // Zero values are normalized where documented (Tools, MaxOutputSize,
@@ -478,7 +484,7 @@ submitLoop:
 						}
 					}
 				}()
-				res, d := runOne(jctx, cfg, e, t, target, acc)
+				res, d := runOne(jctx, cfg, e, t, target, acc, det.Version)
 				results[i] = res
 				if d != nil {
 					diagMu.Lock()
@@ -530,14 +536,16 @@ submitLoop:
 
 // runOne is one (tool, target) job body: it executes the tool through the
 // hardened runner with the typed argv, streams the bounded stdout capture
-// through the engine's per-(URL, adapter) ingest, and classifies the slot.
+// through the engine's per-(URL, adapter) ingest (keyed by the DETECTED
+// tool version — an unknown version makes the observation non-cacheable),
+// and classifies the slot.
 //
 // The returned error is nil unless the INGEST surfaced non-fatal diagnostics
 // (for example cache read/write warnings) that are not accounted for by the
 // slot's classification; Run joins those at run level. Cancellation,
 // deadline-elapse, and tool failures never reach that return — they are
 // classified into the ToolResult.
-func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, acc *urlintel.Accumulator) (ToolResult, error) {
+func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, acc *urlintel.Accumulator, version string) (ToolResult, error) {
 	e = e.sanitized() // nil seams mean production defaults (lookup, runner, limits)
 	res := ToolResult{Tool: t.Name, Target: target}
 
@@ -561,37 +569,51 @@ func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, a
 	}
 	rres, err := e.runner.Run(runCtx, discovery.Cmd{Path: path, Args: t.Args(target)}, e.limits)
 	isPerToolTimeout := false
+	var outerErr error
 	if err != nil {
 		if runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 			isPerToolTimeout = true
 		} else {
-			// The process never ran to completion. Context classification
-			// takes priority: cancellation and deadline-elapse are never tool
-			// failures.
+			// Context classification takes priority: cancellation and
+			// deadline-elapse are never tool failures.
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return classifyContextSlot(res, ctxErr)
-			}
-			if errors.Is(err, discovery.ErrExecutableNotFound) {
+				// The OUTER context (run deadline or run cancellation)
+				// killed the tool mid-capture: the bounded stdout captured
+				// so far is still valid and must reach the report, so fall
+				// through to ingest below instead of discarding it.
+				outerErr = ctxErr
+			} else if errors.Is(err, discovery.ErrExecutableNotFound) {
 				res.Status = ResultFailed
 				res.Err = fmt.Errorf("adapt: %s %s: %w (%s)", t.Name, target.Name, discovery.ErrExecutableNotFound, bin)
 				return res, nil
+			} else {
+				res.Status = ResultFailed
+				res.Err = fmt.Errorf("adapt: %s %s could not be executed: %w", t.Name, target.Name, err)
+				return res, nil
 			}
-			res.Status = ResultFailed
-			res.Err = fmt.Errorf("adapt: %s %s could not be executed: %w", t.Name, target.Name, err)
-			return res, nil
 		}
 	}
 
-	// The process executed and exited; its bounded stdout capture is valid
-	// regardless of the exit code. On a per-tool timeout the captured prefix
-	// is still valid — ingest it and report partial. Stream it through the
-	// engine (raw lines exist only at the ingest boundary), then classify.
+	// The process executed — or was killed mid-capture; its bounded stdout
+	// capture is valid regardless of the exit code. On a per-tool timeout OR
+	// an outer-deadline/cancellation kill the captured prefix is ingested so
+	// the work already paid for is represented in the report. A dead outer
+	// context would refuse the ingest immediately (IngestInto honors ctx),
+	// so an outer-kill prefix is ingested under a detached, bounded context
+	// (the Phase 4 convention, mirroring storeURL's detached write).
 	src := newToolSource(rres.Stdout)
-	ierr := urlintel.IngestInto(ctx, urlintel.Config{
+	ingestCtx := ctx
+	if outerErr != nil {
+		var icancel context.CancelFunc
+		ingestCtx, icancel = context.WithTimeout(context.Background(), deadContextIngestBudget)
+		defer icancel()
+	}
+	ierr := urlintel.IngestInto(ingestCtx, urlintel.Config{
 		Concurrency:     cfg.IngestWorkers,
 		QueueSize:       cfg.QueueSize,
 		Timeout:         cfg.Timeout,
 		Adapter:         t.Name,
+		ToolVersion:     version,
 		ParseParameters: cfg.ParseParameters,
 		Cache:           cfg.Cache,
 		Clock:           cfg.Clock,
@@ -599,6 +621,9 @@ func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, a
 	}, src, acc)
 	res.Lines = src.lineCount()
 
+	if outerErr != nil {
+		return classifyContextSlot(res, outerErr)
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		// Run teardown mid-ingest (outer deadline or run cancellation): the
 		// consumed lines are already represented in the report.

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/RA000WL/RavenRecon/internal/version"
 )
 
 // Config contains global RavenRecon runtime configuration.
@@ -86,7 +88,8 @@ func DefaultTUI() TUIConfig {
 // Validate checks the TUI configuration contract: the refresh interval must
 // be positive, the event history must be bounded within [1, 4096], the color
 // mode must be one of the canonical values, and the interesting-feed rate
-// must not be negative or NaN. It returns an error describing the first
+// must not be negative, NaN, or infinite (an infinite rate would disable
+// the feed's rate cap entirely). It returns an error describing the first
 // violation; a nil error means the configuration is usable.
 func (c TUIConfig) Validate() error {
 	if c.RefreshInterval <= 0 {
@@ -100,8 +103,8 @@ func (c TUIConfig) Validate() error {
 	default:
 		return &tuiConfigError{field: "Color", problem: fmt.Sprintf("must be \"auto\", \"on\", or \"off\", got %q", c.Color)}
 	}
-	if math.IsNaN(c.InterestingRate) || c.InterestingRate < 0 {
-		return &tuiConfigError{field: "InterestingRate", problem: fmt.Sprintf("must not be negative or NaN, got %v", c.InterestingRate)}
+	if math.IsNaN(c.InterestingRate) || math.IsInf(c.InterestingRate, 0) || c.InterestingRate < 0 {
+		return &tuiConfigError{field: "InterestingRate", problem: fmt.Sprintf("must not be negative, NaN, or infinite, got %v", c.InterestingRate)}
 	}
 	return nil
 }
@@ -172,7 +175,7 @@ func Default() Config {
 		// (discover exposes only --sources and --no-cache).
 		Timeout:   120 * time.Second,
 		Rate:      5,
-		UserAgent: "RavenRecon/1.4.0",
+		UserAgent: "RavenRecon/" + version.Version,
 		Cache: CacheConfig{
 			Enabled: false,
 			Dir:     "",

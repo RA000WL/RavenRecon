@@ -422,3 +422,123 @@ func TestRunCompletedEmpty(t *testing.T) {
 		t.Fatalf("items = %v, want none", got)
 	}
 }
+
+// hangingRunner is a discovery.Runner standing in for a wedged executable:
+// Run blocks until the context is done, then reports the context error. It
+// records the deadline observed on the context so tests can pin exactly
+// which budget the adapter installed.
+type hangingRunner struct {
+	// noBlocking makes Run return success immediately instead of wedging;
+	// used when a test only wants to observe the installed deadline.
+	noBlocking bool
+
+	hasDeadline bool
+	deadline    time.Time
+}
+
+// Run implements discovery.Runner.
+func (h *hangingRunner) Run(ctx context.Context, _ discovery.Cmd, _ discovery.Limits) (discovery.RunResult, error) {
+	h.deadline, h.hasDeadline = ctx.Deadline()
+	if h.noBlocking {
+		return discovery.RunResult{}, nil
+	}
+	<-ctx.Done()
+	return discovery.RunResult{}, ctx.Err()
+}
+
+// TestRunDefaultBudgetKillsHangingTool: a caller context WITHOUT a deadline
+// (context.Background — what every existing test passed) must still be
+// bounded. A hanging tool is killed by the adapter's own budget, the error
+// wraps context.DeadlineExceeded per the house contract, and Run returns
+// nil source. The budget is compressed to 80ms for the test; a companion
+// test pins the production value at 2m and the subprocess suite exercises
+// the real ExecRunner kill. REVIEW-2026-08-23 M-5.
+func TestRunDefaultBudgetKillsHangingTool(t *testing.T) {
+	toolRunBudget = 80 * time.Millisecond
+	defer func() { toolRunBudget = DefaultToolTimeout }()
+
+	h := &hangingRunner{}
+	r := discovery.Runner(h)
+	start := time.Now()
+	src, err := Run(context.Background(), &r, Tools["secretfinder"], testTarget, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run err = %v, want wrap context.DeadlineExceeded", err)
+	}
+	if src != nil {
+		t.Fatal("Run returned a source for a timed-out execution, want nil")
+	}
+	if el := time.Since(start); el > 30*time.Second {
+		t.Fatalf("Run returned after %s; the budget did not bound the hang", el)
+	}
+	if !h.hasDeadline {
+		t.Fatal("the runner saw no context deadline; the adapter installed no budget")
+	}
+	if want := start.Add(80 * time.Millisecond); h.deadline.After(want.Add(5 * time.Second)) {
+		t.Fatalf("installed deadline = %s after start, want ~%s (the budget)", h.deadline.Sub(start), want.Sub(start))
+	}
+}
+
+// TestRunDefaultBudgetInstalledForUndeadlinedCaller: with no shrink and a
+// runner that returns immediately, the deadline observed by the runner is
+// start+DefaultToolTimeout — proving the 2m budget is what a caller without
+// a deadline gets in production.
+func TestRunDefaultBudgetInstalledForUndeadlinedCaller(t *testing.T) {
+	h := &hangingRunner{noBlocking: true}
+	start := time.Now()
+	if _, err := runWith(h, Tools["secretfinder"], testTarget, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !h.hasDeadline {
+		t.Fatal("runner saw no deadline")
+	}
+	lo, hi := start.Add(DefaultToolTimeout-time.Minute), start.Add(DefaultToolTimeout+time.Minute)
+	if h.deadline.Before(lo) || h.deadline.After(hi) {
+		t.Fatalf("installed deadline = %s after start, want ~%s", h.deadline.Sub(start), DefaultToolTimeout)
+	}
+}
+
+// TestRunDefaultBudgetConstant pins the budget to the urlintel/adapt parity
+// value (2m) so a silent change cannot drift from the sibling adapter.
+func TestRunDefaultBudgetConstant(t *testing.T) {
+	if DefaultToolTimeout != 2*time.Minute {
+		t.Fatalf("DefaultToolTimeout = %s, want 2m", DefaultToolTimeout)
+	}
+}
+
+// TestRunCallerDeadlineWinsOverDefaultBudget: when the caller's context
+// carries an earlier deadline, THAT one governs — WithTimeout keeps the
+// earliest deadline and the classification is unchanged.
+func TestRunCallerDeadlineWinsOverDefaultBudget(t *testing.T) {
+	h := &hangingRunner{}
+	r := discovery.Runner(h)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := Run(ctx, &r, Tools["secretfinder"], testTarget, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run err = %v, want wrap context.DeadlineExceeded", err)
+	}
+	if !h.hasDeadline {
+		t.Fatal("runner saw no deadline")
+	}
+	if want := start.Add(50 * time.Millisecond); h.deadline.After(want.Add(5 * time.Second)) {
+		t.Fatalf("governing deadline = %s after start, want ~%s (caller's)", h.deadline.Sub(start), want.Sub(start))
+	}
+}
+
+// TestRunCallerCancellationBeatsBudgetFiring: outer cancellation is still
+// classified as cancelled even though the derived run context also carries
+// the default budget.
+func TestRunCallerCancellationBeatsBudgetFiring(t *testing.T) {
+	h := &hangingRunner{}
+	r := discovery.Runner(h)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	_, err := Run(ctx, &r, Tools["secretfinder"], testTarget, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run err = %v, want wrap context.Canceled", err)
+	}
+}

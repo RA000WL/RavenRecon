@@ -264,3 +264,36 @@ func TestIdentityConcurrentReads(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestParseURLRawInputBound pins NEW-81: ParseURL rejects raw inputs over
+// maxRawURLBytes (8 KiB) before parsing, so Path and Query — and therefore
+// Identity().Value — can never be unbounded. The boundary itself must be
+// accepted so no legitimate observation is rejected.
+func TestParseURLRawInputBound(t *testing.T) {
+	p := NewProvenance("manual")
+
+	// One byte over the bound is rejected cleanly.
+	over := "https://example.com/" + strings.Repeat("a", maxRawURLBytes)
+	if _, err := ParseURL(over, p); err == nil {
+		t.Fatal("ParseURL accepted an oversized raw input, want error")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("oversize error %q does not name the bound", err)
+	}
+
+	// Exactly at the bound is accepted.
+	at := "https://example.com/" + strings.Repeat("a", maxRawURLBytes-20)
+	u, err := ParseURL(at, p)
+	if err != nil {
+		t.Fatalf("ParseURL at the %d-byte bound: %v", maxRawURLBytes, err)
+	}
+	if len(u.Identity().Value) > maxRawURLBytes+len("url:") {
+		t.Errorf("identity value = %d bytes, unexpectedly above the raw-input bound", len(u.Identity().Value))
+	}
+
+	// Surrounding whitespace does not smuggle an oversized input past the
+	// cap (the length check runs after TrimSpace).
+	padded := "  " + at + "\n"
+	if _, err := ParseURL(padded, p); err != nil {
+		t.Fatalf("ParseURL of a padded boundary-sized URL: %v", err)
+	}
+}
