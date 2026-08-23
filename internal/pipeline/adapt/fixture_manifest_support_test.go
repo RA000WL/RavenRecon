@@ -1,18 +1,27 @@
 package adapt
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
 // fixtureManifest is the JSON manifest format for the v1.7 acceptance
 // fixture profiles (NEW-56 D1: hybrid weighted static fixtures). One
 // manifest per profile directory under fixtures/<profile>/manifest.json;
 // JS bodies may be separate .js files referenced by "file" and served
 // through the loopback server exactly as the T4 harness does.
 //
-// This file is deliberately NON-test code: parsing and validating the
-// manifest format is pure data handling with no test doubles involved, so
-// it compiles into the production package without changing production
-// behavior (the materialization of a manifest into the hermetic T4 seams —
+// This file is TEST-SUPPORT code (review finding: parsing and validating
+// an acceptance-fixture manifest has no production caller, so it compiles
+// only with the package's tests instead of riding in the production
+// package). The materialization of a manifest into the hermetic T4 seams —
 // fake runners, fake resolver, canned transports — lives in the package's
 // acceptance test-support file, because the seam types themselves are
-// test-file-local).
+// test-file-local.
 //
 // Manifest schema (all keys required unless marked optional; unknown keys
 // are rejected at decode time so typos fail loudly):
@@ -36,14 +45,6 @@ package adapt
 //	stage_params optional map[stageName]map[string]string — pipeline
 //	             StageParams passed through ScanConfig (e.g. the discovery
 //	             quality-gate keys)
-import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-)
 
 // manifestName is the manifest file every profile directory must contain.
 const manifestName = "manifest.json"

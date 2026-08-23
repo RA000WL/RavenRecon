@@ -18,7 +18,7 @@ priority → detect → report into one deterministic, cancellable run (twelve s
 included), exposed as the `ravenrecon scan <domain>` command (v1.3) with live terminal
 observability (`scan --tui`, v1.4) driven by the run's canonical events. v1.7 closes the acceptance
 framework: `fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/` manifests (`fixtures/<profile>/manifest.json`
-+ `internal/pipeline/adapt/fixture_manifest.go`) materialized through the existing T4 seams (fixed clock, fresh
++ `internal/pipeline/adapt/fixture_manifest_support_test.go`) materialized through the existing T4 seams (fixed clock, fresh
 temp-dir cache, loopback JS; see `fixtures/README.md`), per-stage goldens (`internal/pipeline/adapt/testdata/acceptance_{clean,messy,hostile}/`
 normalized `RunReport` + 12 stage-named goldens + markdown via shared `internal/golden` with `go test -update`
 regeneration — failing subtest IS the stage name; determinism 3×/5×, hermetic `PATH=/nonexistent`; see `internal/golden/README.md`),
@@ -480,7 +480,11 @@ rule can never be mutated through a caller-held alias. The dependency
 graph is validated before every run: missing references and cycles are
 rejected at startup with the smallest offending rule named.
 
-Context and findings: detectors receive a fixed, immutable Context — the
+Context and findings: detectors receive a shared Context that is immutable
+by convention, not by enforcement — the engine hands every rule of a run
+the same `*detect.Context` and a rule must not mutate it or any state it
+references (a mutating rule is a data race by definition; the engine
+documents this trust boundary, it does not police it) — carrying the
 normalized corpus domains (assets, relationships, evidence, technologies,
 secret candidates, JavaScript, endpoints), a bounded configuration map, a
 bounded Logger, the cancellation context, and the injected Clock — and
@@ -684,7 +688,11 @@ resolves `"auto"` from its own terminal detection, and the library never
 probes the terminal, never enters raw mode, and never reads keys. Every
 dynamic string is sanitized at the controller boundary before it can
 reach a frame (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8 are
-stripped; the renderer adds only its own fixed color codes), and every
+stripped; the renderer adds only its own fixed color codes). One honest
+limit: Unicode format controls such as bidirectional overrides
+(U+202A–U+202E, U+2066–U+2069) are valid non-C1 codepoints and are NOT
+stripped, so visually confusing text remains possible in terminals that
+honor them — they cannot move the cursor or change terminal state. Every
 structure is bounded (subscriber buffer, history ring, throughput sample
 rings, a 64-item interesting feed, a 32-group error feed, 200-byte
 lines, 64 KiB frames) with drop counters exposed on the components that
@@ -815,8 +823,17 @@ incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources
 `--verbose` (one line per stage event on stderr), `--tui` (live
 observability frame on stderr — mutually exclusive with `--verbose`), and
 `--tui-compact` (condensed `--tui` frame; requires `--tui`). The default
-run carries no detection rules and no active enumeration is ever
-performed. See `ravenrecon scan --help` for the full contract.
+run carries no detection rules and no exploitation, credential attacks,
+or vulnerability verification exists (discovery is passive; crawling is
+same-site link exploration of already-discovered live hosts; DNS brute
+force exists solely behind the dns stage's opt-in `dnsx_brute`
+parameter, off by default). See `ravenrecon scan --help` for the full
+contract. Argument order differs between the two commands: `scan` takes
+the target BEFORE any flags (`ravenrecon scan <target> [options]` — a
+flag after the target is rejected as an unexpected argument), while
+`ingest` takes flags FIRST (`ravenrecon ingest [options] <target>
+<paths>`); both orders are deliberate, but the asymmetry means options
+are not interchangeable between them.
 
 Ingest external artifacts through the pipeline:
 

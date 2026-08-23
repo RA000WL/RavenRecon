@@ -7,6 +7,110 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-3 (INFO) — Set-Cookie retained verbatim in boundedHeaders (internal/httpprobe)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). Set-Cookie values redacted at boundedHeaders choke point (names+attributes preserved for techintel fingerprints); decode-time compliance refusal self-heals pre-fix cached records; integration proof: report marshal contains no cookie secret; name-keyed fingerprint parity test green.
+- Reporter: reviewer
+- Owner: (none)
+- Problem: boundedHeaders retains Set-Cookie verbatim; session cookies could
+  be stored in probe records. Pre-existing behavior, outside the audit
+  scope — documented here only, per AGENTS.md §5.
+- Fix (if ever scoped): redact Set-Cookie values like Location userinfo;
+  requires a scoped milestone decision first.
+- Verification: n/a while deferred.
+
+### NEW-14 (INFO) — priority stage parameter-name derivation diverges from urlintel's extraction (internal/pipeline/adapt)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). queryParamNames skips value-less keys (?flag and ?flag=), caps at 64 with priority_params_truncated sticky + Truncated — pathological URLs score completed, never fail; alignment with urlintel verified at extract.go.
+- Reporter: reviewer (T2d round, INFO-2)
+- Owner: (none)
+- Problem: the priority adapter derives Signal.ParameterNames from the URL
+  asset's canonical query (internal/pipeline/adapt/priority.go:371-389,
+  queryParamNames) while urlintel's own extraction
+  (internal/urlintel/extract.go:103-140, extractParams) differs on the same
+  URL: (a) queryParamNames includes value-less keys (`?flag` → name
+  `flag`) that urlintel deliberately skips; (b) a URL with >64 parameters
+  fails the priority engine's signal validation (internal/priority/
+  score.go:644-646 → per-asset failed), whereas urlintel caps at 256 with
+  an explicit Overflow flag. Both outcomes are honest (no §0.6 violation —
+  nothing is silently completed) and the derivation is deterministic on the
+  canonical query, but a pathological URL surfaces as a FAILED priority
+  asset with no truncation signal, and parameter-name semantics differ
+  between the two consumers.
+- Fix (if ever scoped): align queryParamNames with urlintel's extraction
+  semantics (skip value-less keys) and decide the >64-parameter path
+  (either a parameter cap with an explicit truncation signal or acceptance
+  of longer lists) — requires a scoped milestone decision; the engines'
+  fixed bounds are deliberate contracts.
+- Verification: n/a while deferred.
+
+### NEW-60 (INFO) — gzipped plain-text link lists claimed by nobody at detection time (internal/importer)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). plainConfidence inflates gzipped peeks once bounded (≤32 KiB via inflatePeek); corrupt gzip declines; JSON/XML guards re-checked post-inflation; confidence parity with uncompressed equivalents; anti-steal cases green.
+- Reporter: reviewer T8 round (entry recorded by fix session ses_fd28d1daaffeOWE1tUkrhAgem8, 2026-08-23)
+- Owner: (unassigned)
+- Problem: plainConfidence declines any gzipped peek before the line-shape
+  classifier (detect.go:363), and no other family claims a gzip of bare URLs
+  (archive probes require WARC magic or CDX row shape) — so e.g. a
+  waymore.txt.gz bare-link export streams fine once an importer is chosen
+  (openStream/readLines are gzip-transparent) but Detect returns no claim at
+  all for it. doc.go's waymore bullet previously overstated this as
+  gzip-capable coverage; it is now qualified to uncompressed outputs.
+- Fix option: mirror the archive branch's bounded inflatePeek (≤PeekSize,
+  archive.go inflatePeek) inside plainConfidence (or as a pre-step in
+  Detect): if isGzipped(peek), inflate once in memory and run the same
+  XML/JSON-decline guards + lineShapeHistogram over the inflated bytes;
+  corrupt gzip must keep declining honestly.
+- Verification: registry table case with a gzipped one-URL-per-line list →
+  top match plain-urls; existing gzipped CDX/WARC content-detection and
+  anti-steal cases stay green.
+
+### NEW-85 (MEDIUM) — crawl stage diagnostic-presence heuristic misclassifies linkless successes as failures (internal/pipeline/adapt)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). heuristic deleted; engine sets FailedHosts=len(hosts) on genuine abort paths; linkless-success-with-benign-diagnostic fixture now completed/0-failed (red at HEAD).
+- Reporter: reviewer (v1.8-wave verification cluster A, 2026-08-23)
+- Owner: (unassigned)
+- Problem: adapt/crawl.go:150-158 — when FailedHosts==0 && len(URLs)==0 && !Truncated && len(Diagnostics)>0, the stage infers failed=len(hosts). A katana run that genuinely succeeded over a linkless site but emitted any benign diagnostic (e.g. "N malformed lines skipped") is reported incomplete with ItemsFailed=len(hosts) — counters lie even though the outcome errs conservative.
+- Fix: explicit engine signal instead of inference — engine sets FailedHosts=len(hosts) itself on its genuine failure early-returns (e.g. katana.go missing-binary path), adapter drops the diagnostics heuristic.
+- Verification: linkless-success-with-benign-diagnostic fixture → completed, ItemsFailed=0; genuine-failure fixtures still fail.
+
+### NEW-86 (LOW) — crawl exit-0 all-malformed output still stores completed-empty corpus (internal/crawl)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). zero-usable-endpoints-with-malformed-lines counts as host failure; completed-empty store now requires zero errors/malformed across all hosts; all-malformed fixture stores incomplete + re-executes (red at HEAD).
+- Reporter: reviewer (v1.8-wave verification cluster A, 2026-08-23)
+- Owner: (unassigned)
+- Problem: crawl/katana.go:280-320 — hosts exiting 0 but emitting only malformed JSONL increment neither FailedHosts nor Truncated; an all-such-hosts run stores StatusCompleted with an empty corpus that is served permanently (no TTL) — same poison-the-key class as NEW-62.
+- Fix: count unparseable-output-with-zero-parsed as host failure (or store incomplete when parsed==0 && malformed>0).
+- Verification: fake runner emitting garbage JSONL → no completed record stored; second Crawl re-executes.
+
+### NEW-87 (LOW) — urlintel storeURL drops urlKey build error (internal/urlintel)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). storeURL split into storeKeyFailed/storeURLByKey; key-build failure classified like lookupURL, never reaches Marshal/Put; direct-branch unit tests.
+- Reporter: reviewer (v1.8-wave verification cluster D, 2026-08-23)
+- Owner: (unassigned)
+- Problem: record.go:403-405 — `key, err := urlKey(...)` err is silently overwritten by json.Marshal's err; a key-build failure would proceed toward Put("") surfacing a misleading "cache put" diagnostic instead of lookupURL's failed classification (asymmetry with lookupURL:326-333). Practically unreachable today (const operation, validated identity).
+- Fix: handle urlKey's error before Marshal, mirroring lookupURL.
+- Verification: fault-injection key-builder test asserting failed classification not cache-put diagnostic.
+
+### NEW-88 (LOW) — jsintel/adapt toolRunBudget is package-level mutable state (§7.2) (internal/jsintel/adapt)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). toolRunBudget package var deleted; budget threaded via unexported env (zero→DefaultToolTimeout); grep proves no global remains; all timeout tests unchanged semantics.
+- Reporter: reviewer (v1.8-wave verification cluster B, 2026-08-23)
+- Owner: (unassigned)
+- Problem: adapt/run.go:38-41 — mutable package-level var used as test-only time seam for the NEW-68 timeout budget; production never writes it and tests are not parallel today, but it is global mutable state and a data-race trap if these paths ever run t.Parallel().
+- Fix: thread the budget through the unexported env (settable only from tests).
+- Verification: tests pass with seam removed from package scope.
+
+### NEW-89 (INFO wave) — doc/comment nits from v1.8-wave verification (multi-package)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). cli overclaim rewritten honestly (incl. a third instance found inside scanUsage itself); --tui counter phrasing qualified; event Path comment corrected to escaped-path reality; discovery cache comments fixed; README scan-vs-ingest argument order documented; truncateUTF8 + dead blocker.cancel + garbled comment fixed by orchestrator; percentDecode codec consolidation deferred as future-milestone note.
+- Reporter: reviewer (verification clusters A-D, 2026-08-23)
+- Owner: docs
+- Problem: cli.go:52/:80 "No active enumeration, brute force, or intel modes are ever run" overclaims given crawl stage + opt-in dnsx_brute (also missing from NEW-74's lists); scanUsage promises "progress counters (completed/remaining/in-flight/eta)" though production emits only stage events (render zero/unknown); event.go AssetDiscovered.Path bound rationale breaks under percent-escaping (escaped path can triple bytes vs decoded cap derivation); discovery/cache.go:27 stale "both callers do" comment (one production caller); techintel truncateUTF8 comment misstates loop purpose (runs exactly when a multi-byte rune is cut); adapt/import_test.go dead `blocker.cancel` assignment; adapt/crawl_test.go garbled first comment line; tui/feed.go percentDecode duplicates asset/service.go encoder inverse (drift risk cosmetic-only — decode failure degrades to whole-identity digest).
+- Fix: comment/text corrections; consider one exported codec for candidate-label encoding in a future milestone.
+- Verification: n/a (docs) / trivial.
+
+### NEW-90 (MEDIUM) — stage-level structured failures absent from report error summary (internal/pipeline)
+- Status: VERIFIED — cleanup wave b, orchestrator-verified 2026-08-23 (merge-level reviewer APPROVE). StageErrors folded: runner collects non-nil StageResult.Err into RunReport.StageErrors (omitempty keeps passing runs byte-stable) → NewStageErrorRecord → error summary; failing-fake-stage test asserts summary ≥1 naming the stage; v1.7 goldens byte-green.
+- Reporter: orchestrator (vulnbank.org field test, 2026-08-23)
+- Owner: builder
+- Problem: crawl stage reported failed=1 / outcome incomplete but RunReport errors summary showed total=0 — StageResult.Err never reaches the operator-facing error summary; a failed stage is visible only in the stages table.
+- Fix: fold non-nil StageResult.Err into the run error summary (deduped by stage, bounded by existing caps), or document the stages-table-as-single-source explicitly; prefer folding with tests.
+- Verification: hermetic run with a failing fake stage → errors summary counts ≥1 naming the stage; v1.7 goldens unchanged for passing runs.
+
+
 ### NEW-61 (HIGH, §0.7) — Ingest stage deadlocks forever on cancellation (internal/pipeline/adapt)
 - Status: VERIFIED — orchestrator-verified 2026-08-23. cluster A: Shutdown-join + pre-initialised cancelled slots; TestIngestStageCancelWithQueuedFilesReturnsPromptly (watchdog) fails at HEAD by deadlock
 - Reporter: reviewer (full audit 2026-08-23, REVIEW-2026-08-23.md H-2)

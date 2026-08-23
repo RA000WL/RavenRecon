@@ -23,12 +23,19 @@ import (
 // recorded issues, so MaxPerSource, DivergenceRatio, and DivergenceMinCount
 // materially change what a replay serves. Raising the cap after a capped
 // store must miss and re-execute. AbortOnFlag is deliberately excluded: it
-// changes only whether flagged runs fail, never the record content.
+// changes only whether flagged runs fail, never the record content. The
+// exclusion does not let a warm replay dodge the abort policy either:
+// replayed records carry their recorded QualityIssues verbatim (sticky),
+// and the run-level gate at the pipeline join point re-checks AbortOnFlag
+// over the aggregated fresh AND replayed issues, so a flagged record
+// replayed under AbortOnFlag still fails the run.
 //
 // Timings, rate limits, and other non-semantic settings must never enter
 // the key.
 //
-// qc MUST be pre-normalized via NormalizeQualityConfig (both callers do).
+// qc MUST be pre-normalized via NormalizeQualityConfig before this call.
+// There is exactly one production caller today (runSource in pipeline.go),
+// which normalizes; every test caller must do the same.
 //
 // Callers must invoke cacheKey only for known-version tools: by policy (see
 // runSource) an unknown version (det.Version == "") makes the tool

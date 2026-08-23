@@ -67,12 +67,15 @@ type Result struct {
 	// Truncated reports that the retained set was cut at a cap.
 	Truncated bool
 	// FailedHosts counts hosts whose katana run failed outright: a runner
-	// error (including a per-tool timeout) or a non-zero exit without any
-	// usable output. Whole-run cancellation is not counted here — it is
-	// reported via the returned error. A non-zero count means the corpus is
-	// partial: such results are stored as cache.StatusIncomplete, never as
-	// StatusCompleted, so a broken run can never serve as a completed cache
-	// hit and the next run re-executes.
+	// error (including a per-tool timeout), a non-zero exit without any
+	// usable output, or an invocation that produced zero usable endpoints
+	// while emitting malformed/unparseable lines (a broken output channel).
+	// Whole-run cancellation is not counted here — it is reported via the
+	// returned error. A whole-run abort before any per-host attempt (e.g.
+	// a missing binary) counts every requested host. A non-zero count
+	// means the corpus is partial: such results are stored as
+	// cache.StatusIncomplete, never as StatusCompleted, so a broken run can
+	// never serve as a completed cache hit and the next run re-executes.
 	FailedHosts int
 }
 
@@ -165,8 +168,14 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 	// Binary existence check: like Chaos, missing binary is StatusMissing, not error.
 	katanaPath, err := lookPath("katana")
 	if err != nil {
-		// Missing binary: return empty result with diagnostic, not error.
-		return Result{Diagnostics: []string{"katana not found: " + err.Error()}}, nil
+		// Missing binary: return an empty result with an explicit whole-run
+		// failure signal, not an error. FailedHosts carries the abort
+		// itself (NEW-85) so consumers never have to infer failure from
+		// diagnostics presence.
+		return Result{
+			Diagnostics: []string{"katana not found: " + err.Error()},
+			FailedHosts: len(hosts),
+		}, nil
 	}
 	// Version detection for cache key (like discovery: version probe).
 	version := detectKatanaVersion(ctx, runner, katanaPath)
@@ -282,6 +291,20 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 			diagnostics = append(diagnostics, fmt.Sprintf("katana %s exited %d", h.Name, res.ExitCode))
 			failedHosts++
 			hostErrs = append(hostErrs, fmt.Errorf("katana %s exited %d", h.Name, res.ExitCode))
+			continue
+		}
+		// Exit-clean (or truncated stdout) with nothing usable among the
+		// emitted lines — every line was malformed/unparseable: the host's
+		// output channel is broken, the same failure class as a non-zero
+		// exit without usable output (NEW-86). Counting it here keeps a
+		// completed-empty cache store reachable only when every host truly
+		// produced zero output AND zero errors/malformed lines.
+		if m > 0 && len(parsed) == 0 {
+			diagnostics = append(diagnostics,
+				fmt.Sprintf("katana %s produced no usable endpoints (%d malformed line(s))", h.Name, m))
+			failedHosts++
+			hostErrs = append(hostErrs,
+				fmt.Errorf("katana %s produced no usable endpoints (%d malformed line(s))", h.Name, m))
 		}
 	}
 	if malformed > 0 {
@@ -309,6 +332,13 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 	// StatusIncomplete so it is never replayed as a completed hit (the cache
 	// serves only StatusCompleted records) and the next run re-executes.
 	// Truncated with the flag set is still completed (carve-out).
+	//
+	// FailedHosts classes: runner error; non-zero exit without usable
+	// output; zero usable endpoints with malformed lines (NEW-86); and
+	// whole-run aborts such as a missing binary (NEW-85). Consequently a
+	// StatusCompleted record with an empty corpus is only ever written when
+	// EVERY host ran cleanly — zero errors, zero unusable exits, zero
+	// malformed lines: katana genuinely found nothing in scope.
 	status := cache.StatusCompleted
 	if result.FailedHosts > 0 {
 		status = cache.StatusIncomplete

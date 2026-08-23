@@ -33,13 +33,11 @@ const maxRawLineBytes = 32 << 10 // 32 KiB
 // timeout, so the adapter itself must bound every run even when the caller
 // passes a context without a deadline. The budget encloses the runner
 // handoff only. The caller's own deadline always wins when earlier —
-// context.WithTimeout keeps whichever deadline elapses first.
+// context.WithTimeout keeps whichever deadline elapses first. The budget
+// Run actually installs is carried per-run on the unexported env (zero
+// value means this default); there is deliberately no package-level
+// mutable override for it (§7.2).
 const DefaultToolTimeout = 2 * time.Minute
-
-// toolRunBudget is the budget Run actually installs. It exists ONLY so
-// tests can compress time (shrink it, restore with defer); production code
-// never writes it, so the effective default is always DefaultToolTimeout.
-var toolRunBudget = DefaultToolTimeout
 
 // Run executes tool t against target (a declared URL such as
 // "https://example.com/") and returns a jsintel.Source yielding one
@@ -94,7 +92,7 @@ var toolRunBudget = DefaultToolTimeout
 //	secretfinder: Path "SecretFinder.py" (or override), argv exactly
 //	             ["-i", <target>, "-o", "cli"]. -H is never passed (broken
 //	             in the tool: crashes with an AttributeError).
-func Run(ctx context.Context, r *discovery.Runner, t Tool, target string, overrides map[string]string) (src jsintel.Source, err error) {
+func Run(ctx context.Context, r *discovery.Runner, t Tool, target string, overrides map[string]string) (jsintel.Source, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("adapt: context must not be nil")
 	}
@@ -111,7 +109,14 @@ func Run(ctx context.Context, r *discovery.Runner, t Tool, target string, overri
 		return nil, fmt.Errorf("adapt: %s: target must be a single line (no CR/LF)", t.Name)
 	}
 	e := env{runner: runnerOf(r), overrides: overrides}.sanitized()
+	return e.runTool(ctx, t, target)
+}
 
+// runTool executes the validated tool against the validated target under the
+// sanitized environment. It is the seam-carrying body of Run: tests inject a
+// compressed budget (and fake seams) by building the env explicitly instead
+// of mutating any package-level state.
+func (e env) runTool(ctx context.Context, t Tool, target string) (src jsintel.Source, err error) {
 	// Panic containment: a panicking runner (hostile seam) must fail the
 	// call with a structured error, never crash the process.
 	defer func() {
@@ -149,7 +154,7 @@ func Run(ctx context.Context, r *discovery.Runner, t Tool, target string, overri
 
 	// The per-tool default budget: WithTimeout keeps whichever deadline is
 	// earlier — the caller's when it set one within 2m, else this budget.
-	runCtx, cancel := context.WithTimeout(ctx, toolRunBudget)
+	runCtx, cancel := context.WithTimeout(ctx, e.budget)
 	defer cancel()
 
 	rres, rerr := e.runner.Run(runCtx, discovery.Cmd{Path: path, Args: t.buildArgv(target, tmp)}, e.limits)

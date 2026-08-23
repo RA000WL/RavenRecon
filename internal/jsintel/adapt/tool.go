@@ -212,16 +212,21 @@ func (t Tool) targetFile() bool {
 const DefaultDetectTimeout = 5 * time.Second
 
 // env is the execution environment for one run or detection: the hardened
-// runner, the capture limits, the detection budget, and the per-name
-// overrides. Zero values mean production defaults. There is deliberately no
-// lookup seam here: command resolution is the runner's job, never the
-// adapter's (detection's existence check takes its own optional lookup
-// seam, mirroring urlintel/adapt).
+// runner, the capture limits, the detection budget, the per-run execution
+// budget, and the per-name overrides. Zero values mean production defaults.
+// There is deliberately no lookup seam here: command resolution is the
+// runner's job, never the adapter's (detection's existence check takes its
+// own optional lookup seam, mirroring urlintel/adapt).
 type env struct {
 	runner        discovery.Runner
 	limits        discovery.Limits
 	detectTimeout time.Duration
-	overrides     map[string]string
+	// budget is the per-tool execution budget Run installs (zero means
+	// DefaultToolTimeout). It lives here — not on a package variable — so
+	// tests compress time by constructing their own env, never by mutating
+	// shared state (§7.2).
+	budget    time.Duration
+	overrides map[string]string
 }
 
 // sanitized returns e with production defaults applied.
@@ -231,6 +236,9 @@ func (e env) sanitized() env {
 	}
 	if e.detectTimeout <= 0 {
 		e.detectTimeout = DefaultDetectTimeout
+	}
+	if e.budget <= 0 {
+		e.budget = DefaultToolTimeout
 	}
 	if e.limits.MaxOutput <= 0 {
 		e.limits.MaxOutput = discovery.DefaultMaxOutput

@@ -83,6 +83,10 @@ type fixtureHarness struct {
 // materializing a silent approximation.
 func newFixtureHarness(t *testing.T, m fixtureManifest) *fixtureHarness {
 	t.Helper()
+	// Fixture manifests script all four discovery sources including chaos:
+	// pin its API key for this test (L-14 — hermetic, auto-restored; no
+	// package init leak).
+	t.Setenv("PDCP_API_KEY", "testkey")
 	h := &fixtureHarness{m: m}
 
 	// Discovery: detections + runs merged into ONE fakeRunner script keyed

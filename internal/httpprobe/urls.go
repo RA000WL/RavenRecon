@@ -406,6 +406,12 @@ func decodeStoredLive(raw json.RawMessage, target asset.URL, domain asset.Domain
 		if len(h.Values) == 0 {
 			return s, fmt.Errorf("stored live header %q has no values", h.Key)
 		}
+		// Credential self-heal for Set-Cookie, mirroring the redirect
+		// location check below: pre-redaction cached records could carry
+		// verbatim session-cookie values; refuse and recompute them.
+		if h.Key == setCookieHeader && !storedSetCookieValuesRedacted(h.Values) {
+			return s, fmt.Errorf("stored live header %q retains unredacted cookie values", h.Key)
+		}
 	}
 	if len(s.Headers) > MaxHeaders {
 		return s, fmt.Errorf("stored live retains %d headers (cap %d)", len(s.Headers), MaxHeaders)

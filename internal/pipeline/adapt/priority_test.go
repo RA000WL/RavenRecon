@@ -537,3 +537,65 @@ func TestPriorityStageCorrelationCutFlag(t *testing.T) {
 		t.Errorf("StickyFlags = %v, want %s set", res.StickyFlags, priorityGroupsTruncated)
 	}
 }
+
+func TestQueryParamNamesSkipsValuelessKeys(t *testing.T) {
+	// NEW-14 alignment: "?flag" and "?flag=" carry no observed value, so
+	// they yield no name — the same rule urlintel's extractParams applies.
+	names, truncated := queryParamNames("a=1&flag&b=2&empty=&c=3")
+	if got, want := strings.Join(names, ","), "a,b,c"; got != want {
+		t.Errorf("names = %q, want %q", got, want)
+	}
+	if truncated {
+		t.Error("truncated = true, want false (well under the bound)")
+	}
+
+	names, truncated = queryParamNames("")
+	if names != nil || truncated {
+		t.Errorf("empty query = %v/%v, want nil/false", names, truncated)
+	}
+}
+
+func TestPriorityStageParamOverflowTruncatesNotFails(t *testing.T) {
+	// NEW-14: a URL with 70 parameters must NOT fail engine validation —
+	// the derivation retains the first 64 canonical (sorted) names and the
+	// stage reports Truncated + priority_params_truncated; the asset still
+	// scores (completed).
+	interesting, risk := priorityCatalogs(t)
+	domains := []asset.Domain{mustDomain(t, "example.com")}
+	var q []string
+	for i := 0; i < 70; i++ {
+		q = append(q, fmt.Sprintf("p%02d=%d", i, i))
+	}
+	urls := []asset.URL{mustURL(t, "https://admin.example.com/x?"+strings.Join(q, "&"))}
+	in := priorityInput(mustDomain(t, "example.com"), domains, nil, urls, &recordingCache{})
+
+	res, err := NewPriorityStage(interesting, risk).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome = %s, want completed (truncation degrades the input, never fails the asset)", res.Outcome)
+	}
+	if res.ItemsProcessed != 2 || res.ItemsFailed != 0 {
+		t.Errorf("counters = %d/%d, want 2/0 (declared domain + URL)", res.ItemsProcessed, res.ItemsFailed)
+	}
+	if !res.Truncated {
+		t.Error("Truncated = true required")
+	}
+	if !res.StickyFlags[priorityParamsTruncated] {
+		t.Errorf("StickyFlags = %v, want %q set", res.StickyFlags, priorityParamsTruncated)
+	}
+	if len(res.Results.Surfaces) != 2 {
+		t.Fatalf("surfaces = %d, want 2 (the domain and the scored URL)", len(res.Results.Surfaces))
+	}
+
+	// Unit-level: the derivation itself retains exactly the bound and
+	// reports the cut.
+	names, truncated := queryParamNames(strings.Join(q, "&"))
+	if len(names) != priority.MaxParamsPerSignal || !truncated {
+		t.Errorf("derivation = %d names (trunc=%v), want exactly %d with truncation", len(names), truncated, priority.MaxParamsPerSignal)
+	}
+	if names[0] != "p00" || names[len(names)-1] != "p63" {
+		t.Errorf("retained names not the first bound-many in canonical order: %q..%q", names[0], names[len(names)-1])
+	}
+}

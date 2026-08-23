@@ -467,7 +467,6 @@ func TestIngestStageCancellationMidImport(t *testing.T) {
 	stage := &ingestStage{registry: reg}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	blocker.cancel = cancel
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		cancel()
@@ -943,7 +942,6 @@ func TestIngestStageCancelWithQueuedFilesReturnsPromptly(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	blocker.cancel = cancel
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		cancel()

@@ -151,16 +151,15 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 	}
 
 	// Host-failure accounting (crawl contract): the engine counts hosts
-	// whose katana invocation failed outright on Result.FailedHosts. A
-	// total failure must never report completed=len(hosts).
+	// whose katana invocation failed outright on Result.FailedHosts —
+	// including whole-run aborts like a missing binary (NEW-85: the engine
+	// owns the failure signal). The adapter trusts FailedHosts and never
+	// infers failure from diagnostics presence: a genuinely linkless
+	// success with benign diagnostics (e.g. skipped malformed lines) stays
+	// completed with ItemsFailed=0. A total failure still never reports
+	// completed=len(hosts).
 	failed := result.FailedHosts
 	if failed > len(hosts) {
-		failed = len(hosts)
-	}
-	if failed == 0 && len(result.URLs) == 0 && !result.Truncated &&
-		len(result.Diagnostics) > 0 {
-		// The engine aborted before any per-host attempt (e.g. katana
-		// absent from PATH): every requested host failed.
 		failed = len(hosts)
 	}
 

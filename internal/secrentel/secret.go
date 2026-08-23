@@ -129,19 +129,16 @@ func (c scannedCandidate) resultOf(doc DocumentRef, observations int, sources []
 // point; when the document came from a JavaScript asset this is the SAME
 // identity jsintel would produce for the same value, so the two phases
 // deduplicate on one Phase 2 candidate).
-func (c *scannedCandidate) candidateAsset(sd *scannedDocument) asset.SecretCandidate {
+//
+// The construction error is returned, never swallowed (L-6): a zero asset
+// flowing into reports — and into a cache record the next decode rejects —
+// was silent corruption. The caller counts the failure as a diagnostic and
+// drops the candidate.
+func (c *scannedCandidate) candidateAsset(sd *scannedDocument) (asset.SecretCandidate, error) {
 	prov := asset.Provenance{
 		Source:       c.provSource,
 		DiscoveredAt: c.observedAt,
 		Confidence:   c.confidence.Score,
 	}
-	cand, err := asset.NewSecretCandidate(c.typ, c.value, sd.candidateSource(), prov)
-	if err != nil {
-		// The scan stage only produces validated candidates; an error here
-		// means an internal invariant broke. The zero asset keeps the
-		// report structurally valid; engine tests pin that produced
-		// candidates always construct.
-		return asset.SecretCandidate{}
-	}
-	return cand
+	return asset.NewSecretCandidate(c.typ, c.value, sd.candidateSource(), prov)
 }

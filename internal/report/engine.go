@@ -183,7 +183,9 @@ type ReportResult struct {
 	// only — it never enters the report files.
 	RenderTime time.Duration `json:"-"`
 
-	// Err carries the structured error for failed reports.
+	// Err carries the structured error for failed reports, and the
+	// deadline error for a report cancelled by its per-render deadline
+	// (NEW-73d).
 	Err error `json:"-"`
 }
 
@@ -571,11 +573,20 @@ func validateAndCommit(plan reportPlan, sink *fileSink, parts []sinkPartInfo) ([
 }
 
 // failedOrCancelled classifies an error path: context cancellation (of the
-// run or the job) is a cancelled report; anything else is a failure with
-// the structured error attached.
+// run or the job) is a cancelled report; so is a job killed by its
+// DEADLINE — the runtime taxonomy classes DeadlineExceeded with
+// cancellation (the render never completed), never with content failure,
+// and the deadline error stays attached to the cancelled result for
+// diagnosis (NEW-73d). Anything else is a failure with the structured
+// error attached.
 func failedOrCancelled(ctx context.Context, plan reportPlan, err error) ReportResult {
 	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		return cancelledResult(plan)
+	}
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
+		res := cancelledResult(plan)
+		res.Err = err
+		return res
 	}
 	return failedResult(plan, err)
 }

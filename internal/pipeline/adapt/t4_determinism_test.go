@@ -39,7 +39,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -56,12 +55,6 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/report"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
-
-func init() {
-	if os.Getenv("PDCP_API_KEY") == "" {
-		_ = os.Setenv("PDCP_API_KEY", "testkey")
-	}
-}
 
 // t4DiscoveryScript scripts the four built-in discovery tools to emit
 // exactly the corpus the T3d3 harness seeds (www/api/admin.example.com),
@@ -193,6 +186,9 @@ type t4Harness struct {
 
 func newT4Harness(t *testing.T) *t4Harness {
 	t.Helper()
+	// The four-source discovery script includes chaos: pin its API key for
+	// this test (L-14 — hermetic, auto-restored; no package init leak).
+	t.Setenv("PDCP_API_KEY", "testkey")
 	h := &t4Harness{
 		discoveryRunner: newFakeRunner(t4DiscoveryScript()),
 		gauRunner:       newFakeRunner(gauLines("example.com", "http://www.example.com/app.js", "http://api.example.com/lib.js?v=2", "http://www.example.com/graphql", "http://www.example.com/app.js")),

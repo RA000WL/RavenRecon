@@ -3200,7 +3200,12 @@ the library never probes the terminal, never enters raw mode, never reads
 keys, and never touches signals. Every dynamic string — stage names,
 outcomes, and stage error text included — is sanitized at the controller
 boundary (ESC sequences, C0/C1 controls, DEL, and invalid UTF-8
-stripped; the renderer adds only its own fixed ANSI codes), and every
+stripped; the renderer adds only its own fixed ANSI codes). One honest
+limit: Unicode format controls such as bidirectional overrides
+(U+202A–U+202E, U+2066–U+2069) are valid non-C1 codepoints and pass
+through Sanitize — visually confusing text remains possible in
+terminals that honor them, though they cannot move the cursor or change
+terminal state. Every
 structure is bounded — subscriber buffer, history ring, throughput sample
 rings (128 samples per metric), a 64-item interesting feed, a 32-group
 error feed, 200-byte lines, 64 KiB frames — with drop counters exposed
@@ -3277,7 +3282,11 @@ transparent via `openStream` with total decompressed bytes capped at
 `MaxDecompressedBytes` (100 MiB, exact tally incl. inter-element bytes);
 the retained set caps at `MaxOutput` (100k records, tail-drop).
 Cancellation is checked per record; progress events flow through the
-Observer seam every 64 KiB or 10k records. Truncation is honest:
+Observer seam every 64 KiB or 10k counted units, where a unit is one
+`progress.add` call — per read fragment, not strictly per logical
+record (a line spanning several read-buffer fragments counts once per
+fragment), so the unit tally can exceed the true record count for
+long-line inputs. Truncation is honest:
 `Truncated=true` plus the sticky flag `import_truncated` on the stats —
 never silently completed.
 
@@ -3585,7 +3594,7 @@ Implemented:
 * pipeline acceptance framework (v1.7, `internal/pipeline/adapt` + `fixtures/` + `testdata/bench/` + `internal/golden`):
   hybrid weighted-static fixtures (`fixtures/{clean-baseline,messy-contradictory,hostile-adversarial}/`
   manifests materialized through the existing T4 harness seams — fixed clock, fresh temp-dir cache,
-  loopback JS bodies — deterministic via `internal/pipeline/adapt/fixture_manifest.go`); per-stage goldens
+  loopback JS bodies — deterministic via `internal/pipeline/adapt/fixture_manifest_support_test.go`); per-stage goldens
   (`internal/pipeline/adapt/testdata/acceptance_{clean,messy,hostile}/` normalized `RunReport` + 12
   stage-named `RunReport` shards + markdown report golden via shared `internal/golden` with `-update`,
   LCS diff, atomic write; failing subtest IS the stage name); bench baselines (`testdata/bench/*.txt`

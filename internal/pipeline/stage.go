@@ -135,6 +135,15 @@ type StageInput struct {
 	// attribution input (internal/report Context.Attribution); every
 	// other stage ignores it.
 	Provenance []importer.ProvenanceRecord
+
+	// StageErrors carries the structured failures of the stages that ran
+	// BEFORE this one, in run order, deduplicated by stage name (first
+	// error per name wins; NEW-90). Runner-injected and read-only — like
+	// RunStartedAt it is runner bookkeeping, never stage output: a stage
+	// never sees its own error. The report stage folds these into
+	// Context.Errors so stage failures reach the operator-facing error
+	// summary; every other stage ignores it.
+	StageErrors []StageError
 }
 
 // StageResult is what one stage run reports.

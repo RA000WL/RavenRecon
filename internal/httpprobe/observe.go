@@ -104,6 +104,12 @@ type HeaderEntry struct {
 // target carrying credentials can never be echoed into the retained headers
 // of the terminal response — and therefore never into reports or cache
 // records. The key and the rest of each value are preserved as observed.
+//
+// Set-Cookie values are likewise redacted at retention: every "name=value"
+// pair's value becomes "[redacted]" while cookie names and bare attributes
+// are preserved verbatim, so session credentials are never echoed into
+// records or reports and name-keyed technology fingerprints keep matching
+// (see redactSetCookieValue).
 func boundedHeaders(h http.Header) ([]HeaderEntry, bool) {
 	keys := make([]string, 0, len(h))
 	for k := range h {
@@ -119,6 +125,9 @@ func boundedHeaders(h http.Header) ([]HeaderEntry, bool) {
 		vals := h[k]
 		if k == "Location" {
 			vals = redactLocationValues(vals)
+		}
+		if k == setCookieHeader {
+			vals = redactSetCookieValues(vals)
 		}
 		entries = append(entries, HeaderEntry{Key: k, Values: vals})
 	}

@@ -1330,3 +1330,79 @@ func TestDNSBruteFailedFlagOnWildcardProbeEngineError(t *testing.T) {
 		t.Fatalf("wildcard probe host was never queried (fault injection missed): seen=%v", seen)
 	}
 }
+
+// insertionSortHostsReference is the exact pre-L-11 insertion sort, kept as
+// the behavioral reference: sortHosts must produce IDENTICAL element order
+// (stability on equal names included).
+func insertionSortHostsReference(hosts []asset.Host) {
+	for i := 1; i < len(hosts); i++ {
+		for j := i; j > 0 && hosts[j].Name < hosts[j-1].Name; j-- {
+			hosts[j], hosts[j-1] = hosts[j-1], hosts[j]
+		}
+	}
+}
+
+func TestSortHostsMatchesReferenceOrderOnShuffledFixture(t *testing.T) {
+	// L-11 determinism pin: the stdlib replacement must order exactly like
+	// the old insertion sort — including ties (equal names keep input
+	// order). The fixture interleaves duplicate names across sources in a
+	// scrambled order.
+	names := []string{"api.example.com", "www.example.com", "mail.example.com",
+		"www.example.com", "a.example.com", "www.example.com",
+		"api.example.com", "zz.example.com", "b.example.com", "www.example.com"}
+	sources := []string{"subfinder", "assetfinder", "amass", "chaos"}
+	var shuffled []asset.Host
+	for i, n := range names {
+		h, err := asset.NewHost(n, asset.Provenance{Source: sources[i%len(sources)]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		shuffled = append(shuffled, h)
+	}
+	want := append([]asset.Host(nil), shuffled...)
+	insertionSortHostsReference(want)
+
+	got := append([]asset.Host(nil), shuffled...)
+	sortHosts(got)
+
+	if len(got) != len(want) {
+		t.Fatalf("length drift: got %d want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i].Name != want[i].Name || got[i].Prov.Source != want[i].Prov.Source {
+			t.Errorf("order drift at %d: got {%s %s} want {%s %s}",
+				i, got[i].Name, got[i].Prov.Source, want[i].Name, want[i].Prov.Source)
+		}
+	}
+}
+
+func TestSortIPsDeterministicOnShuffledFixture(t *testing.T) {
+	raw := []string{"192.0.2.9", "192.0.2.2", "2001:db8::1", "192.0.2.10",
+		"192.0.2.2", "198.51.100.7", "192.0.2.1", "2001:db8::2"}
+	var ips []asset.IP
+	for _, r := range raw {
+		ip, err := asset.NewIP(r, asset.Provenance{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ips = append(ips, ip)
+	}
+	sortIPs(ips)
+	for i := 1; i < len(ips); i++ {
+		if ips[i-1].String() > ips[i].String() {
+			t.Fatalf("not sorted at %d: %s > %s", i, ips[i-1].String(), ips[i].String())
+		}
+	}
+	// Determinism: the same input re-sorts to the identical sequence.
+	var again []asset.IP
+	for _, r := range raw {
+		ip, _ := asset.NewIP(r, asset.Provenance{})
+		again = append(again, ip)
+	}
+	sortIPs(again)
+	for i := range again {
+		if again[i].String() != ips[i].String() {
+			t.Fatalf("nondeterministic order at %d: %s vs %s", i, again[i].String(), ips[i].String())
+		}
+	}
+}

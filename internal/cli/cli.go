@@ -49,7 +49,12 @@ The scan command runs discover → dns → httpprobe → urlintel → crawl →
 techintel → jsintel → secrentel → urllive → priority → detect → report
 (twelve stages) and writes the report into an output directory
 (default ravenrecon-report).
-No active enumeration, brute force, or intel modes are ever run.
+Passive-first reconnaissance only: discovery sources run in their passive
+modes, the crawl stage is same-site link exploration of already-discovered
+live hosts (depth-capped katana, no form filling), and DNS brute force
+exists solely behind the dns stage's explicit opt-in parameter
+(dnsx_brute; off by default). No exploitation, credential attacks, or
+vulnerability verification exists.
 
 RavenRecon is intended for authorized security testing and
 bug bounty programs where the target is explicitly in scope.
@@ -73,11 +78,12 @@ immediate exit.
 Target validation: the domain is normalized through the Phase 2 asset model;
 uppercase, surrounding whitespace, and a trailing dot are normalized away.
 
-Discovery invokes only passive enumeration:
+Discovery invokes only the passive modes above:
   subfinder -d <domain> -silent
   assetfinder <domain>
   amass enum -passive -d <domain>
-No active enumeration, brute force, or intel modes are ever run.
+No crawling, active enumeration, brute force, exploitation, credential
+attacks, or vulnerability verification exists in this command.
 
 RavenRecon is intended for authorized security testing and
 bug bounty programs where the target is explicitly in scope.

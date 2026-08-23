@@ -36,6 +36,14 @@ import (
 // confidence bump. Both probes decline XML/JSON signatures, and the CDX
 // majority requirement keeps one-URL-per-line crawl outputs (katana,
 // hakrawler, gospider, gau, waymore text mode) owned by the plain family.
+//
+// Plain branch (TODO NEW-60): the line-shape classifier is gzip-transparent
+// too. A gzipped peek is inflated ONCE, bounded (inflatePeek ≤PeekSize);
+// corrupt or unreadable streams decline honestly, and the inflated bytes must
+// re-pass the XML/JSON signature guards before classification — gzipped
+// JSON/XML exports are never claimed by the plain family. Confidence equals
+// what the equivalent uncompressed content earns, with the extension
+// tie-break seeing through a trailing ".gz".
 
 // looksLikeXMLPeek lives in xml_stream.go beside the rest of the XML
 // streaming machinery; it is the single definition of "peek looks like XML".
@@ -356,12 +364,39 @@ func mimeExtensionConfidence(path string, peek []byte) float64 {
 
 // plainConfidence computes confidence for a plain importer given peek and
 // shape expectation. Used by each plain importer's CanImport.
+//
+// Gzipped peeks (TODO NEW-60) are probed through one bounded inflation
+// (inflatePeek, ≤inflateCap decompressed bytes — the same helper the archive
+// probes use): corrupt or unreadable streams decline honestly, and the
+// inflated bytes must re-pass the XML/JSON guards so compressed JSON/XML
+// exports stay with their own families. Confidence is identical to what the
+// equivalent uncompressed content earns; the extension tie-break sees through
+// a trailing ".gz" (urls.txt.gz ≡ urls.txt).
 func plainConfidence(path string, peek []byte, want LineShape, expectedExts []string) (float64, bool) {
-	// Signature stage: if peek is XML / JSON / gzip, plain importers decline.
+	// Signature stage: if peek is XML / JSON, plain importers decline.
 	// The XML check is the broad looksLikeXMLPeek (declaration-less fragments
 	// too), so tag-laden content never reaches the line-shape classifier.
-	if looksLikeXMLPeek(peek) || isJSONStructure(peek) || isGzipped(peek) {
+	if looksLikeXMLPeek(peek) || isJSONStructure(peek) {
 		return 0, false
+	}
+	if isGzipped(peek) {
+		inflated := inflatePeek(peek, inflateCap)
+		if inflated == nil {
+			// Corrupt or unreadable gzip stream is not our file — decline.
+			return 0, false
+		}
+		// An inflated peek must re-pass the same guards: gzipped JSON/XML
+		// exports belong to those families, never the plain family.
+		if looksLikeXMLPeek(inflated) || isJSONStructure(inflated) {
+			return 0, false
+		}
+		peek = inflated
+		// Parity with uncompressed detection: strip the compression suffix
+		// for the extension tie-break below. TrimSuffix is safe with e taken
+		// verbatim from filepath.Ext(path).
+		if e := filepath.Ext(path); strings.EqualFold(e, ".gz") {
+			path = strings.TrimSuffix(path, e)
+		}
 	}
 	if len(bytes.TrimSpace(peek)) == 0 {
 		// empty file — no claim

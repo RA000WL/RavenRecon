@@ -126,6 +126,13 @@ const (
 	maxFactors = 32
 )
 
+// MaxParamsPerSignal mirrors the engine's fixed per-signal parameter-name
+// bound (maxSignalParams) for adapters that derive bounded signal input
+// (NEW-14): a derivation that would exceed it truncates to this many names
+// and reports an explicit truncation signal instead of handing the engine
+// an input its validation must reject.
+const MaxParamsPerSignal = maxSignalParams
+
 // Signal bounds (fixed constants; violations are input errors).
 const (
 	maxSignalPathBytes    = 16384

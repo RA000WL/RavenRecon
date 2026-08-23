@@ -84,6 +84,7 @@ func TestRunCacheCorruptEntrySelfHeals(t *testing.T) {
 // the next Get on every versioned source hits and decodes cleanly. The
 // never-cached assetfinder must not have been stored by any run.
 func TestRunConcurrentCacheAccess(t *testing.T) {
+	setChaosKey(t) // the four-source fake environment includes chaos
 	target := mustDomain(t, "example.com")
 	r := newFakeRunner(t, fullScript())
 	cfg := testConfig(r, newFakeLookup())

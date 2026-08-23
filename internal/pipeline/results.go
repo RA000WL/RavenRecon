@@ -126,6 +126,22 @@ type Results struct {
 	LiveRecords []httpprobe.LiveRecord
 }
 
+// StageError is one stage's recorded structured failure (NEW-90): the
+// runner collects every non-nil StageRecord.Err — first error per stage
+// name wins, run order kept — and hands the list to later stages through
+// StageInput.StageErrors, so the report stage can fold stage-level
+// failures into its operator-facing error summary (Context.Errors) instead
+// of leaving them visible only in the stages table. Err is never nil on a
+// collected entry; classification and message bounding happen report-side
+// through the Context's normal error-record path.
+type StageError struct {
+	// Name is the failing stage's pipeline name.
+	Name StageName
+
+	// Err is the recorded failure detail (never nil here).
+	Err error
+}
+
 // mergeResults appends one stage's result additions to the run's
 // accumulated Results channel, dropping entries whose canonical identity
 // already appeared (first-seen wins, stable order — identical to the

@@ -110,14 +110,12 @@ func TestRunScriptToolWithRealWrapper(t *testing.T) {
 // the PRODUCTION seams (nil runner = ExecRunner, nil lookup = exec.LookPath)
 // under a context with NO deadline; the adapter's own execution budget must
 // kill it, and Run must classify the result as deadline-exceeded. The
-// budget value itself is compressed for the test (toolRunBudget, restored
-// on defer); TestRunDefaultBudgetConstant pins the production default at 2m
-// and TestRunDefaultBudgetInstalledForUndeadlinedCaller proves an
-// undealined caller receives exactly that budget.
+// budget value itself is compressed via the env seam (a zero env with only
+// the budget set — production defaults everywhere else); no package-level
+// state is mutated. TestRunDefaultBudgetConstant pins the production
+// default at 2m and TestRunDefaultBudgetInstalledForUndeadlinedCaller
+// proves an undealined caller receives exactly that budget.
 func TestRunRealExecutableKilledAtBudget(t *testing.T) {
-	toolRunBudget = 500 * time.Millisecond
-	defer func() { toolRunBudget = DefaultToolTimeout }()
-
 	dir := t.TempDir()
 	sf := filepath.Join(dir, "SecretFinder.py")
 	script := "#!/bin/sh\n" +
@@ -128,8 +126,9 @@ func TestRunRealExecutableKilledAtBudget(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	e := env{budget: 500 * time.Millisecond}.sanitized()
 	start := time.Now()
-	src, err := Run(context.Background(), nil, Tools["secretfinder"], "https://example.com/", nil)
+	src, err := e.runTool(context.Background(), Tools["secretfinder"], "https://example.com/")
 	el := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run err = %v, want wrap context.DeadlineExceeded", err)

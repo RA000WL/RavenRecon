@@ -246,6 +246,15 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		rctx.Attribution = attributionFromProvenance(in.Provenance, reportContextIdentities(rctx))
 	}
 
+	// Stage-level structured failures (NEW-90): fold every prior stage's
+	// recorded error into the Context's error summary so a failed stage is
+	// visible to operators alongside per-observation errors — not only in
+	// the stages table. The runner deduplicates by stage name (first error
+	// wins); each record passes through NewModel's bounds and merge.
+	for _, se := range in.StageErrors {
+		rctx.Errors = append(rctx.Errors, report.NewStageErrorRecord(string(se.Name), se.Err))
+	}
+
 	return s.runReport(ctx, in, reg, rctx)
 }
 

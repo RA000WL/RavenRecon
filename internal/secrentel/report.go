@@ -255,7 +255,8 @@ func mergeEntries(a, b *ReportEntry) (*ReportEntry, error) {
 // scanCountsTotal sums one counts record (merge bookkeeping only).
 func scanCountsTotal(c scanCounts) int {
 	return c.SuppressedFP + c.DroppedNegative + c.DroppedValidator +
-		c.DroppedEntropy + c.DroppedLength + c.DroppedDuplicateValue + c.OverflowDropped
+		c.DroppedEntropy + c.DroppedLength + c.DroppedDuplicateValue +
+		c.OverflowDropped + c.DroppedIdentity
 }
 
 // mergeCandidates folds two candidate lists into one deterministic list,

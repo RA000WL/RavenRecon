@@ -100,7 +100,8 @@ type storedProbe struct {
 // asset model (canonical form required), refuses payloads whose target or
 // scheme does not match the probe, whose redirect chain is internally
 // inconsistent, whose final URL does not match the chain, whose header
-// entries are not canonical, whose URLs carry credentials in their original
+// entries are not canonical, whose Set-Cookie values are not redacted,
+// whose URLs carry credentials in their original
 // form, and whose outcome flags contradict each other (a completed record
 // with a truncated flag, a failed reason, a missing status code, a redirect
 // status with a followed chain and a Location header, ...) — so a corrupt,
@@ -173,6 +174,14 @@ func decodeStoredProbe(raw json.RawMessage, target asset.URL, scheme string, dom
 		}
 		if len(h.Values) == 0 {
 			return s, fmt.Errorf("stored result header %q has no values", h.Key)
+		}
+		// Credential self-heal for Set-Cookie: pre-redaction cached records
+		// could carry verbatim session-cookie values. The probe redacts at
+		// the observation boundary (redactSetCookieValue), so a stored
+		// value that is not exactly what the redactor retains must be
+		// refused and recomputed, never served as a hit.
+		if h.Key == setCookieHeader && !storedSetCookieValuesRedacted(h.Values) {
+			return s, fmt.Errorf("stored result header %q retains unredacted cookie values", h.Key)
 		}
 	}
 	if len(s.Headers) > MaxHeaders {

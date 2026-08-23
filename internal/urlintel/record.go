@@ -391,6 +391,14 @@ func (e *env) recordCacheDiagnostic(u asset.URL, what string, err error) {
 //
 // An observation whose tool version is unknown is non-cacheable by policy
 // (see urlKey): it never writes a record.
+//
+// A key-build failure is handled distinctly, mirroring lookupURL's
+// read-side classification: it is never silently absorbed into the next
+// assignment, so it can neither reach Marshal/Put (where it would surface
+// as a misleading "cache put" diagnostic for a write that was never
+// attempted) nor lose its cause. The observation itself already succeeded,
+// so the completed result is preserved with the classification-grade
+// diagnostic joined onto the entry — the same treatment as a Put failure.
 func storeURL(ctx context.Context, u asset.URL, entry URLEntry, e *env) URLEntry {
 	if entry.Status != StatusCompleted {
 		// Failed / cancelled observations are never cached: a later run
@@ -400,7 +408,30 @@ func storeURL(ctx context.Context, u asset.URL, entry URLEntry, e *env) URLEntry
 	if e.cache == nil || e.toolVersion == "" {
 		return entry
 	}
-	key, err := urlKey(u, e.adapter, e.toolVersion, e.parseParams)
+	key, kerr := urlKey(u, e.adapter, e.toolVersion, e.parseParams)
+	if kerr != nil {
+		return storeKeyFailed(u, entry, e, kerr)
+	}
+	return storeURLByKey(ctx, u, entry, e, key)
+}
+
+// storeKeyFailed applies the store-side outcome of a key-build failure: the
+// completed result is preserved (the extraction succeeded — only persistence
+// failed, exactly like a Put failure) and the cause is surfaced twice with
+// its own classification — joined onto the entry's Err, and as a bounded run
+// diagnostic (cancellation-class causes filtered, see recordCacheDiagnostic).
+// It never marshals a payload or touches the cache.
+func storeKeyFailed(u asset.URL, entry URLEntry, e *env, kerr error) URLEntry {
+	entry.Err = errors.Join(entry.Err, fmt.Errorf("urlintel: %s: build cache key: %w", u.String(), kerr))
+	e.recordCacheDiagnostic(u, "build cache key", kerr)
+	return entry
+}
+
+// storeURLByKey marshals the stored payload and writes the record under the
+// ALREADY-DERIVED key. Splitting the write side behind the key derivation
+// makes the empty-key state unreachable by construction: every path here
+// carries a key cache.NewKey produced, never "".
+func storeURLByKey(ctx context.Context, u asset.URL, entry URLEntry, e *env, key cache.Key) URLEntry {
 	st := entryToStored(entry, e.adapter)
 	data, err := json.Marshal(st)
 	if err != nil {

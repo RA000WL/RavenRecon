@@ -525,6 +525,7 @@ func (c *recordingCache) putCountFor(tool string) int {
 // behavior; this test pins the full chain reject -> delete -> execute ->
 // canonical store -> hit.
 func TestRunCacheTamperedRecordSelfHeals(t *testing.T) {
+	setChaosKey(t) // re-execution barriers arm for all four sources
 	target := mustDomain(t, "example.com")
 	key := keyFor(t, target, "subfinder", "v2.6.3")
 

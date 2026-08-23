@@ -67,10 +67,12 @@ Options (after the target):
                           progress counters (completed/remaining/in-flight/
                           elapsed/eta), warnings/errors, the declared target
                           and output directory, and one deterministic final
-                          summary frame. Worker, throughput, and
-                          interesting-asset sections appear only when their
-                          event streams are published; production runs emit
-                          none today, so those sections stay empty.
+                          summary frame. Production runs publish only run
+                          metadata and stage lifecycle events today, so the
+                          totals render unknown, in-flight renders zero, the
+                          ETA stays unknown, and the worker, throughput, and
+                          interesting-asset sections stay empty until their
+                          event streams are published.
                           Mutually exclusive with --verbose.
   --tui-compact           Condense the --tui frame (drops the resource
                           section). Requires --tui.
@@ -87,8 +89,13 @@ and is excluded via --sources.
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
   amass enum -passive -d <domain>.
-Run 'ravenrecon doctor' to check which discovery tools are installed. No
-active enumeration, brute force, or intel modes are ever run.
+Run 'ravenrecon doctor' to check which discovery tools are installed.
+Passive-first reconnaissance only: discovery sources run in their passive
+modes, the crawl stage is same-site link exploration of already-discovered
+live hosts (depth-capped katana, no form filling), and DNS brute force
+exists solely behind the dns stage's explicit opt-in parameter
+(dnsx_brute; off by default). No exploitation, credential attacks, or
+vulnerability verification exists.
 
 The default run carries NO detection rules (the framework ships no rules, by
 design), so the detect stage completes with zero findings unless a caller

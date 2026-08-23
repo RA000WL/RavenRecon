@@ -37,9 +37,14 @@ const (
 	// each raw byte into a three-byte percent escape, so 32 KiB covers
 	// every identity string the codebase can produce today with headroom.
 	maxIdentityStringBytes = 32 * 1024
-	// maxPayloadPathBytes bounds AssetDiscovered.Path (asset.URL.Path): a
-	// subset of a parsed URL's escaped path, itself bounded by ParseURL's
-	// 8 KiB raw-input cap.
+	// maxPayloadPathBytes bounds AssetDiscovered.Path: asset.URL.Path, the
+	// canonical ESCAPED path (removeDotSegments over url.URL.EscapedPath).
+	// The derivation is NOT "ParseURL's 8 KiB raw-input cap": percent-
+	// escaping can expand a raw path byte to three bytes (" " -> "%20"),
+	// so an 8 KiB raw input's escaped path may exceed this bound. No
+	// production emitter publishes this payload today; when one exists it
+	// must pass a Path that fits this bound — truncating or skipping an
+	// oversized asset at emission time, never relying on the input cap.
 	maxPayloadPathBytes = 8 * 1024
 	// maxKindLabelBytes bounds short vocabulary labels: AssetDiscovered.
 	// Kind (asset.Kind values, longest "secret_candidate"),

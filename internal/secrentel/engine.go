@@ -65,6 +65,7 @@ type Metrics struct {
 	dropLength  int
 	dropDup     int
 	overflow    int
+	dropIdent   int
 }
 
 // MetricsSnapshot is a consistent point-in-time copy of the counters.
@@ -81,6 +82,7 @@ type MetricsSnapshot struct {
 	DroppedLength    int
 	DroppedDuplicate int
 	OverflowDropped  int
+	DroppedIdentity  int
 }
 
 func (m *Metrics) add(f func(*MetricsSnapshot)) {
@@ -101,6 +103,7 @@ func (m *Metrics) snapshotLocked() MetricsSnapshot {
 		DroppedNegative: m.dropNeg, DroppedValidator: m.dropValid,
 		DroppedEntropy: m.dropEntropy, DroppedLength: m.dropLength,
 		DroppedDuplicate: m.dropDup, OverflowDropped: m.overflow,
+		DroppedIdentity: m.dropIdent,
 	}
 }
 
@@ -109,6 +112,7 @@ func (m *Metrics) load(s MetricsSnapshot) {
 	m.reads, m.malformed, m.suppressed = s.Reads, s.Malformed, s.SuppressedFP
 	m.dropNeg, m.dropValid, m.dropEntropy = s.DroppedNegative, s.DroppedValidator, s.DroppedEntropy
 	m.dropLength, m.dropDup, m.overflow = s.DroppedLength, s.DroppedDuplicate, s.OverflowDropped
+	m.dropIdent = s.DroppedIdentity
 }
 
 // addScanCounts folds one document's scan accounting into the metrics.
@@ -121,6 +125,7 @@ func (m *Metrics) addScanCounts(c scanCounts) {
 		s.DroppedLength += c.DroppedLength
 		s.DroppedDuplicate += c.DroppedDuplicateValue
 		s.OverflowDropped += c.OverflowDropped
+		s.DroppedIdentity += c.DroppedIdentity
 	})
 }
 

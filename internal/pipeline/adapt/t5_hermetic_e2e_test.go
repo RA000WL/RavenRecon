@@ -154,6 +154,9 @@ type t5Harness struct {
 // database.
 func newT5Harness(t *testing.T) *t5Harness {
 	t.Helper()
+	// The four-source discovery script includes chaos: pin its API key for
+	// this test (L-14 — hermetic, auto-restored; no package init leak).
+	t.Setenv("PDCP_API_KEY", "testkey")
 	h := &t5Harness{
 		discoveryRunner: newFakeRunner(t4DiscoveryScript()),
 		gauRunner: newFakeRunner(gauLines("example.com",

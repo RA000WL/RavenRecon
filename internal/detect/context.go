@@ -59,12 +59,15 @@ type Snapshot struct {
 	Endpoints []asset.Endpoint `json:"endpoints,omitempty"`
 }
 
-// Context is the immutable detection context every rule receives: the
-// normalized snapshot domains, the run's bounded configuration, a bounded
-// Logger, and the injected Clock — nothing else. The cancellation context is
-// passed separately (it is the detector's first argument). Rules must not
-// mutate the Context; the engine shares one Context across every rule of a
-// run.
+// Context is the detection context every rule receives: the normalized
+// snapshot domains, the run's bounded configuration, a bounded Logger, and
+// the injected Clock — nothing else. The cancellation context is passed
+// separately (it is the detector's first argument). "Immutable" here is a
+// convention, not an enforced invariant: the engine shares one *Context
+// across every rule of a run (rules within a level run in parallel), Go
+// cannot enforce immutability of the slice/map fields, and a rule that
+// mutates the Context or its state is a data race by definition — a rule
+// bug the engine neither detects nor isolates.
 type Context struct {
 	// Assets is the deduplicated, identity-sorted core asset list.
 	Assets []asset.Identity `json:"assets"`

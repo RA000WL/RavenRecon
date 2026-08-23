@@ -28,6 +28,15 @@ const priorityGroupsTruncated = "priority_groups_truncated"
 // paths even when every group was retained.
 const priorityPathsTruncated = "priority_paths_truncated"
 
+// priorityParamsTruncated is the sticky flag this adapter records when a
+// URL's canonical query carries MORE parameter names than the engine's
+// fixed per-signal bound (priority.MaxParamsPerSignal): the derivation
+// retains the first bound-many names in canonical (sorted) order and marks
+// the retained set incomplete instead of handing the engine an input its
+// validation rejects — a pathological URL degrades to an explicit
+// truncation signal, never a failed asset (NEW-14).
+const priorityParamsTruncated = "priority_params_truncated"
+
 // priorityStage adapts internal/priority (priority.Score) into a
 // pipeline.Stage.
 //
@@ -158,12 +167,16 @@ func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriorit
 //
 // Truncation: the scoring engine reports NO truncation or overflow
 // signals through this adapter's input path (its retention model has no
-// caps on the asset count it reports), so the ONLY signal this adapter
-// can observe is the correlation cut — Correlate's run-level truncation
+// caps on the asset count it reports). The signals this adapter can
+// observe are (a) the correlation cut — Correlate's run-level truncation
 // (groups beyond the engine's fixed maxCorrelationGroups), mapped to
-// Truncated + the priority_groups_truncated sticky flag, never swallowed
-// (AGENTS §0.6). Group-level member truncation (Group.Truncated) rides on
-// the group values only.
+// Truncated + the priority_groups_truncated sticky flag, and (b) the
+// adapter-side parameter-name derivation cut (NEW-14): a URL whose
+// canonical query yields more names than priority.MaxParamsPerSignal
+// retains the first bound-many and maps to Truncated +
+// priority_params_truncated instead of a failed asset. Neither cut is ever
+// swallowed (AGENTS §0.6). Group-level member truncation (Group.Truncated)
+// rides on the group values only.
 func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
@@ -190,7 +203,7 @@ func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 	// single normalization point.
 	if len(domains)+len(hosts)+len(urls) == 0 {
 		if !targetCanonical(in.Target) {
-			return s.runScore(ctx, in, nil)
+			return s.runScore(ctx, in, nil, false)
 		}
 		if err := ctx.Err(); err != nil {
 			wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
@@ -200,16 +213,33 @@ func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 	}
 
 	// One signal per in-scope corpus asset, carrying only what the corpus
-	// assets canonically carry (see Run).
-	return s.runScore(ctx, in, buildPrioritySignals(domains, hosts, urls))
+	// assets canonically carry (see Run). A URL whose query yields more
+	// parameter names than the engine's bound truncates the derivation and
+	// reports it (NEW-14).
+	sigs, paramsTruncated := buildPrioritySignals(domains, hosts, urls)
+	return s.runScore(ctx, in, sigs, paramsTruncated)
 }
 
 // runScore derives the engine config from the StageInput, calls
 // priority.Score, and maps the engine's report and error onto the
 // pipeline's StageResult shape. It is shared by the normal path and the
 // non-canonical-target fall-through so both honor the identical error and
-// cancellation mapping.
-func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, sigs []priority.Signal) (pipeline.StageResult, error) {
+// cancellation mapping. paramsTruncated (NEW-14) applies the parameter-name
+// truncation signal to every returned result — on any outcome path: a cut
+// input set is never silently completed, even when the engine itself fails.
+func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, sigs []priority.Signal, paramsTruncated bool) (res pipeline.StageResult, _ error) {
+	defer func() {
+		if paramsTruncated {
+			// The derivation retained only the first
+			// priority.MaxParamsPerSignal names of at least one URL:
+			// mark the retained set incomplete (AGENTS §0.6).
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = make(map[string]bool)
+			}
+			res.StickyFlags[priorityParamsTruncated] = true
+		}
+	}()
 	cfg := priority.EngineConfig{
 		// Bounds pass-through: 0 = engine default/disabled per the engine's
 		// own documented semantics, never pre-resolved pipeline defaults
@@ -272,7 +302,7 @@ func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, si
 
 	// Aggregate-outcome mapping (the engine folds per-asset statuses itself;
 	// mapping table documented on Run).
-	res := s.buildPriorityResult(rep, foldPriorityOutcome(rep.Outcome), nil)
+	res = s.buildPriorityResult(rep, foldPriorityOutcome(rep.Outcome), nil)
 	if res.Outcome == pipeline.OutcomeCancelled && ctx.Err() != nil {
 		// Per-asset cancellations with a still-live stage context report
 		// cancelled with a nil Err (documented on Run). If the stage
@@ -385,9 +415,12 @@ func filterDomains(declared asset.Domain, domains []asset.Domain) []asset.Domain
 // canonical names as the hostname field; URLs contribute their canonical
 // path, hostname, and the parameter names derived from the canonical query
 // string. The order is deterministic (the filtered slices are in corpus
-// order: domains, then hosts, then URLs).
-func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []asset.URL) []priority.Signal {
+// order: domains, then hosts, then URLs). The second return reports whether
+// any URL's parameter-name derivation was cut at the engine's bound
+// (NEW-14).
+func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []asset.URL) ([]priority.Signal, bool) {
 	sigs := make([]priority.Signal, 0, len(domains)+len(hosts)+len(urls))
+	paramsTruncated := false
 	for _, d := range domains {
 		sigs = append(sigs, priority.Signal{
 			Identity: d.Identity(),
@@ -409,38 +442,53 @@ func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []ass
 			// defensive — an unparseable host is never a scorable signal.
 			continue
 		}
+		names, truncated := queryParamNames(u.Query)
+		paramsTruncated = paramsTruncated || truncated
 		sigs = append(sigs, priority.Signal{
 			Identity:       u.Identity(),
 			Kind:           asset.KindURL,
 			Path:           u.Path,
 			Hostname:       h.Name,
-			ParameterNames: queryParamNames(u.Query),
+			ParameterNames: names,
 		})
 	}
-	return sigs
+	return sigs, paramsTruncated
 }
 
-// queryParamNames derives the sorted parameter-name list from a canonical
-// query string ("a=1&b=2", keys sorted, no leading "?"). The canonical
+// queryParamNames derives the parameter-name list from a canonical query
+// string ("a=1&b=2", keys sorted, no leading "?"), aligned with urlintel's
+// extraction semantics (internal/urlintel extractParams): a pair carrying
+// NO observed value ("?flag" or "?flag=") yields no name — the same rule
+// that keeps value-less keys out of the Parameter channel. The canonical
 // query's keys are already sorted, so the derived list is deterministic by
-// construction. Empty keys are skipped; a query with no parameters yields
-// nil.
-func queryParamNames(query string) []string {
+// construction; duplicate keys keep every occurrence (urlintel merges
+// them into one Parameter — a residual divergence, deliberately out of
+// NEW-14 scope). A query with no eligible parameters yields nil.
+//
+// When more than priority.MaxParamsPerSignal names would be handed to the
+// engine, the list retains exactly the first bound-many names and the
+// second return reports the cut (NEW-14): the adapter surfaces an explicit
+// truncation signal instead of letting the whole asset fail engine
+// validation.
+func queryParamNames(query string) (names []string, truncated bool) {
 	if query == "" {
-		return nil
+		return nil, false
 	}
-	var names []string
 	for _, pair := range strings.Split(query, "&") {
 		if pair == "" {
 			continue
 		}
-		name := pair
-		if i := strings.IndexByte(pair, '='); i >= 0 {
-			name = pair[:i]
+		name, value, _ := strings.Cut(pair, "=")
+		if name == "" || value == "" {
+			// "?flag" / "?flag=" / "=value": no observed (name, value)
+			// pair — skipped by design, mirroring urlintel.
+			continue
 		}
-		if name != "" {
-			names = append(names, name)
+		if len(names) >= priority.MaxParamsPerSignal {
+			truncated = true // keep scanning: later names only confirm the cut
+			continue
 		}
+		names = append(names, name)
 	}
-	return names
+	return names, truncated
 }

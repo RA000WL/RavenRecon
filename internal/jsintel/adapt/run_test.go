@@ -19,6 +19,17 @@ func runWith(runner discovery.Runner, t Tool, target string, overrides map[strin
 	return Run(context.Background(), &r, t, target, overrides)
 }
 
+// runWithBudget runs the tool under an explicitly compressed execution
+// budget over otherwise-default seams: it builds the env directly and sets
+// only the budget — replacing the former package-level budget variable
+// (§7.2), so no global mutable state is touched and the test stays safe
+// under parallel scheduling.
+func runWithBudget(budget time.Duration, runner discovery.Runner, t Tool, target string, overrides map[string]string) (jsintel.Source, error) {
+	r := discovery.Runner(runner)
+	e := env{runner: runnerOf(&r), overrides: overrides, budget: budget}.sanitized()
+	return e.runTool(context.Background(), t, target)
+}
+
 // drainItems streams a source to EOF and returns the items.
 func drainItems(t *testing.T, src jsintel.Source) []jsintel.Item {
 	t.Helper()
@@ -450,17 +461,13 @@ func (h *hangingRunner) Run(ctx context.Context, _ discovery.Cmd, _ discovery.Li
 // (context.Background — what every existing test passed) must still be
 // bounded. A hanging tool is killed by the adapter's own budget, the error
 // wraps context.DeadlineExceeded per the house contract, and Run returns
-// nil source. The budget is compressed to 80ms for the test; a companion
-// test pins the production value at 2m and the subprocess suite exercises
-// the real ExecRunner kill. REVIEW-2026-08-23 M-5.
+// nil source. The budget is compressed to 80ms via the env seam; a
+// companion test pins the production value at 2m and the subprocess suite
+// exercises the real ExecRunner kill. REVIEW-2026-08-23 M-5.
 func TestRunDefaultBudgetKillsHangingTool(t *testing.T) {
-	toolRunBudget = 80 * time.Millisecond
-	defer func() { toolRunBudget = DefaultToolTimeout }()
-
 	h := &hangingRunner{}
-	r := discovery.Runner(h)
 	start := time.Now()
-	src, err := Run(context.Background(), &r, Tools["secretfinder"], testTarget, nil)
+	src, err := runWithBudget(80*time.Millisecond, h, Tools["secretfinder"], testTarget, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run err = %v, want wrap context.DeadlineExceeded", err)
 	}

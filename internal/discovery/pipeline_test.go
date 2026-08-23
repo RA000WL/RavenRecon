@@ -30,6 +30,7 @@ func fullScript() map[string]func(Cmd) (RunResult, error) {
 
 func mustRun(t *testing.T, target asset.Domain, cfg Config) Report {
 	t.Helper()
+	setChaosKey(t) // the four-source fake environment includes chaos
 	rep, err := Run(context.Background(), target, cfg)
 	if err != nil {
 		t.Fatalf("Run: %v", err)

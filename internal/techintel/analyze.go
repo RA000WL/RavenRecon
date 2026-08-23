@@ -40,8 +40,9 @@ func truncateUTF8(s string, limit int) string {
 		return s
 	}
 	prefix := s[:limit]
-	// Trim an incomplete trailing UTF-8 sequence. For valid UTF-8 input this
-	// loop does not run.
+	// Trim an incomplete trailing UTF-8 sequence: the loop runs exactly when
+	// the cut lands mid-rune, backing up to the last rune start so the
+	// retained value stays valid UTF-8.
 	for len(prefix) > 0 {
 		r, size := utf8.DecodeLastRuneInString(prefix)
 		if r != utf8.RuneError || size > 1 {

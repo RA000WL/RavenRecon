@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -832,15 +833,12 @@ func dedupeHosts(hosts []asset.Host) []asset.Host {
 	return out
 }
 
-// sortHosts sorts hosts by canonical name.
+// sortHosts sorts hosts by canonical name (stable: equal names keep their
+// input order — the same semantics the previous insertion sort delivered,
+// now O(n log n) via the stdlib; L-11 removed the quadratic brute-path
+// sort).
 func sortHosts(hosts []asset.Host) {
-	// Use a simple sort to keep hermetic and avoid extra imports beyond
-	// what the file already has; time is already imported for BruteTimeout.
-	for i := 1; i < len(hosts); i++ {
-		for j := i; j > 0 && hosts[j].Name < hosts[j-1].Name; j-- {
-			hosts[j], hosts[j-1] = hosts[j-1], hosts[j]
-		}
-	}
+	sort.SliceStable(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
 }
 
 // pipelineFilterIPs keeps only IPs that belong to resolving hosts.
@@ -908,13 +906,11 @@ func mergeBruteAdditions(base, brute pipeline.StageResult, target asset.Domain) 
 	return merged
 }
 
-// sortIPs sorts IPs by canonical string.
+// sortIPs sorts IPs by canonical string (stable — same ordering semantics
+// as the insertion sort it replaces, without the quadratic worst case;
+// L-11).
 func sortIPs(ips []asset.IP) {
-	for i := 1; i < len(ips); i++ {
-		for j := i; j > 0 && ips[j].String() < ips[j-1].String(); j-- {
-			ips[j], ips[j-1] = ips[j-1], ips[j]
-		}
-	}
+	sort.SliceStable(ips, func(i, j int) bool { return ips[i].String() < ips[j].String() })
 }
 
 // targetCanonical reports whether d is the canonical form asset.NewDomain

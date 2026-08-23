@@ -15,10 +15,10 @@ import (
 const maxEscapeScan = 4096
 
 // Sanitize strips terminal-corruption and escape-sequence vectors from s so
-// the rendered output can never move the cursor, change the terminal state,
-// or smuggle control text into the frame. Every dynamic string that reaches
-// a frame passes through Sanitize at ingestion (State.Apply), so the frame
-// builder itself only ever sees clean text.
+// the rendered output can never move the cursor or change the terminal
+// state. Every dynamic string that reaches a frame passes through Sanitize
+// at ingestion (State.Apply), so the frame builder itself only ever sees
+// clean text.
 //
 // What is stripped:
 //
@@ -35,7 +35,10 @@ const maxEscapeScan = 4096
 //
 // What is preserved: TAB, LF, CR, printable ASCII, and all valid non-C1
 // Unicode (é, €, ✓, CJK, ...) — sanitizing never corrupts legitimate
-// non-ASCII text.
+// non-ASCII text. That preservation deliberately includes Unicode format
+// controls such as bidirectional overrides (U+202A–U+202E, U+2066–U+2069):
+// they render invisibly and cannot corrupt terminal state, but visually
+// confusing (spoofing) text remains possible and is out of scope here.
 //
 // Sanitize is deterministic and allocation-free on already-clean input
 // (a byte scan decides; the common case is a single pass with no copy).

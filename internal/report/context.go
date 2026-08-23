@@ -217,10 +217,12 @@ const maxAttributionEntries = 100_000
 
 // AttributionEntry is one imported asset's provenance for the report: which
 // importer ingested it, which original tool produced the data, from which
-// file, at what time, with what confidence. Line is the record's line number
-// when known (0 otherwise; today's importer sidecar carries position info via
-// the asset provenance Reference "filename:line" — populating Line is the
-// CLI wiring task's concern, not the report model's).
+// file, at what time, with what confidence. Line is the record's in-file
+// position when known (0 otherwise; today's importer sidecar carries position
+// info via the asset provenance Reference — a "filename:line" string for
+// line-oriented formats, but an element ordinal for array/NDJSON framing, so
+// populating Line from it reliably is the CLI wiring task's concern, not the
+// report model's).
 type AttributionEntry struct {
 	// Importer is the internal/importer engine name ("plain-urls",
 	// "json-httpx", ...).
@@ -302,6 +304,29 @@ type ExecStats struct {
 	// CacheHits and CacheMisses count the rule cache outcomes.
 	CacheHits   int `json:"cache_hits,omitempty"`
 	CacheMisses int `json:"cache_misses,omitempty"`
+}
+
+// NewStageErrorRecord builds the ErrorRecord for one failed pipeline stage
+// (NEW-90): the category derives structurally from the error
+// (ClassifyError — deadline-exceeded classifies as timeout, cancellation as
+// cancellation), and the message is prefixed with the stage name so even
+// flattened views attribute the failure. The returned record passes through
+// NewModel's normal bounds (maxErrorStageBytes / maxErrorMessageBytes) and
+// dedup (records merge by category+stage+message).
+func NewStageErrorRecord(stage string, err error) ErrorRecord {
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+	if stage != "" {
+		msg = "stage " + stage + ": " + msg
+	}
+	return ErrorRecord{
+		Category: ClassifyError(err),
+		Stage:    stage,
+		Message:  msg,
+		Count:    1,
+	}
 }
 
 // normalizeErrorRecord validates, bounds, and canonicalizes one error

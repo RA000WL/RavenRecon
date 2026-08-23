@@ -24,6 +24,14 @@ type RunReport struct {
 	// error.
 	Stages []StageRecord
 
+	// StageErrors is the collected structured failure list (NEW-90): one
+	// entry per stage whose record carries a non-nil Err — first error per
+	// stage name wins, in run order. It mirrors the stages table for
+	// consumers that surface an operator-facing error summary (the report
+	// stage folds it into Context.Errors); nil when no stage failed.
+	// omitempty keeps passing runs byte-identical in serialized documents.
+	StageErrors []StageError `json:"StageErrors,omitempty"`
+
 	// Outcome is the pipeline-level fold of the per-stage outcomes (see
 	// foldOutcome for the exact precedence).
 	Outcome Outcome
@@ -146,7 +154,11 @@ type StageRecord struct {
 // once ctx is cancelled, every remaining stage is recorded with Outcome
 // cancelled (Err = ctx.Err()) without being invoked. A per-stage Timeout
 // cancels only that stage's context; the run itself continues with the
-// next stage.
+// next stage. Every record that carries a non-nil Err — failed or
+// cancelled alike — is additionally collected into RunReport.StageErrors
+// (first error per stage name wins, run order kept) and handed to later
+// stages through StageInput.StageErrors so the report stage can surface
+// stage-level failures in its error summary (NEW-90).
 //
 // Errors: Run returns an error only for configuration or resolution
 // problems (nil clock, invalid config, unresolvable stage). Run-level
@@ -217,6 +229,22 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	documentsSeen := make(map[string]struct{})
 	provenanceSeen := make(map[string]struct{})
 
+	// Stage-error collection (NEW-90): every record carrying a non-nil Err
+	// is folded into report.StageErrors — first error per stage name wins,
+	// run order kept — and handed to later stages via StageInput so the
+	// report stage can surface stage failures in the error summary.
+	stageErrSeen := make(map[StageName]struct{})
+	collectStageErr := func(sr StageRecord) {
+		if sr.Err == nil {
+			return
+		}
+		if _, dup := stageErrSeen[sr.Name]; dup {
+			return
+		}
+		stageErrSeen[sr.Name] = struct{}{}
+		report.StageErrors = append(report.StageErrors, StageError{Name: sr.Name, Err: sr.Err})
+	}
+
 	for i, entry := range entries {
 		name := cfg.Stages[i]
 		sr := StageRecord{Name: name}
@@ -227,6 +255,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			sr.Outcome = OutcomeCancelled
 			sr.Err = ctx.Err()
 			report.Stages = append(report.Stages, sr)
+			collectStageErr(sr)
 			emitStageFinished(cfg.Observer, clock, sr)
 			continue
 		}
@@ -236,6 +265,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			sr.Outcome = OutcomeFailed
 			sr.Err = entry.nameErr
 			report.Stages = append(report.Stages, sr)
+			collectStageErr(sr)
 			emitStageFinished(cfg.Observer, clock, sr)
 			continue
 		}
@@ -263,6 +293,11 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			// stage's attribution projection. A stage never sees its own
 			// additions — the merge below runs after the stage returns.
 			Provenance: provenance,
+			// Stage failures recorded so far (NEW-90): read-only for
+			// stages, folded into the error summary by the report stage.
+			// A stage never sees its own error — collection happens after
+			// its record is finalized.
+			StageErrors: report.StageErrors,
 		}
 		stageCtx := ctx
 		cancel := func() {}
@@ -276,6 +311,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 		sr = normalizeResult(sr, res, err)
 		sr.Duration = t1.Sub(t0)
 		report.Stages = append(report.Stages, sr)
+		collectStageErr(sr)
 		emitStageFinished(cfg.Observer, clock, sr)
 		// Corpus propagation: merge this stage's additions into the
 		// shared corpus handed to the remaining stages (first-seen dedup,

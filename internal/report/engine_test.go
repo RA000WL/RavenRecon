@@ -1013,3 +1013,68 @@ func (c EngineConfig) withReports(ids ...string) EngineConfig {
 	c.Reports = ids
 	return c
 }
+
+func TestRunDeadlineExceededCancelsNotFails(t *testing.T) {
+	// NEW-73d: a renderer killed by its per-render deadline never
+	// completed — the runtime taxonomy classes DeadlineExceeded with
+	// cancellation, so it reports cancelled with the deadline error
+	// attached, not failed.
+	dir := t.TempDir()
+	reg := NewRegistry()
+	slow := okReporter("slow")
+	slow.Format = FormatJSON
+	slow.Render = func(ctx context.Context, m *Model, s Sink) error {
+		<-ctx.Done()
+		return ctx.Err() // context.DeadlineExceeded from the job deadline
+	}
+	if err := reg.Register(slow); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	cfg := DefaultEngineConfig(reg, dir)
+	cfg.Timeout = 25 * time.Millisecond
+	res, err := Run(context.Background(), cfg, testContext(t))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Outcome != OutcomeCancelled {
+		t.Fatalf("outcome = %q, want cancelled (deadline kill is not a content failure)", res.Outcome)
+	}
+	rep := resultFor(t, res, "slow")
+	if rep.Status != ReportStatusCancelled {
+		t.Fatalf("status = %q, want cancelled", rep.Status)
+	}
+	if rep.Err == nil || !errors.Is(rep.Err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled-by-deadline result must keep the deadline error for diagnosis, got %v", rep.Err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tmpPrefix) {
+			t.Fatalf("temp file survived: %s", e.Name())
+		}
+	}
+}
+
+func TestRunLiveContextDeadlineReturnStaysFailed(t *testing.T) {
+	// NEW-73d guard semantics: a renderer that RETURNS DeadlineExceeded
+	// while its context is still live is a genuine renderer failure — only
+	// genuinely deadline-killed renders reclassify (digest stability:
+	// nothing else changes class).
+	dir := t.TempDir()
+	reg := NewRegistry()
+	giving := okReporter("giving-up")
+	giving.Format = FormatJSON
+	giving.Render = func(ctx context.Context, m *Model, s Sink) error {
+		return context.DeadlineExceeded // own timer; ctx still live
+	}
+	if err := reg.Register(giving); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	res, err := Run(context.Background(), DefaultEngineConfig(reg, dir), testContext(t))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	rep := resultFor(t, res, "giving-up")
+	if rep.Status != ReportStatusFailed || res.Outcome != OutcomeFailed {
+		t.Fatalf("status = %q outcome = %q, want failed/failed (live-context deadline return is a failure)", rep.Status, res.Outcome)
+	}
+}

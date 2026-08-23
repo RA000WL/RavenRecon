@@ -40,7 +40,14 @@ type scanCounts struct {
 	DroppedEntropy        int // entropy-rule failures
 	DroppedLength         int // outside pattern length bounds
 	DroppedDuplicateValue int // contextual duplicate of a structured value
-	OverflowDropped       int // beyond the per-document candidate cap
+	OverflowDropped       int // candidates refused because a cap was full:
+	// counted EXACTLY once per distinct (type, value) candidate (L-4): a
+	// value rejected repeatedly while the cap is full counts once, and the
+	// matches beyond the per-pattern match cap are counted as the distinct
+	// values they carry, not as a flat 1 per tripped pattern.
+	DroppedIdentity int // canonical asset construction failures (L-6):
+	// an internal invariant break; the candidate is dropped, never
+	// materialized as a zero asset.
 }
 
 // scanOutcome is the full result of scanning one document.
@@ -128,6 +135,25 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	structuredValues := make(map[string]struct{})
 	contextualValues := make(map[string]struct{})
 
+	// overflowSeen tracks the distinct (type, value) candidates already
+	// counted into OverflowDropped while a cap is full, so the same value
+	// rejected repeatedly counts EXACTLY once (L-4). Lazily allocated:
+	// it only exists after a cap trips.
+	var overflowSeen map[key]struct{}
+	countOverflow := func(k key) {
+		if _, ok := candIndex[k]; ok {
+			return
+		}
+		if _, dup := overflowSeen[k]; dup {
+			return
+		}
+		if overflowSeen == nil {
+			overflowSeen = make(map[key]struct{})
+		}
+		overflowSeen[k] = struct{}{}
+		out.counts.OverflowDropped++
+	}
+
 	// Phase 1: match, validate, dedup.
 	for _, p := range pats {
 		if len(p.Anchors) > 0 {
@@ -160,34 +186,26 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 		matches := p.Match().FindAllStringSubmatchIndex(strContent, limits.maxMatchesPerPattern+1)
 		for i, m := range matches {
 			if i >= limits.maxMatchesPerPattern {
-				out.counts.OverflowDropped += len(matches) - i
+				// Match cap tripped (M-1): every match the matcher still
+				// shows is material the cap refused. Count each distinct
+				// candidate value exactly once — not a flat 1 for the whole
+				// tripped pattern, and never twice for a repeated value
+				// (L-4). Matches beyond FindAll's truncation window cannot
+				// be enumerated without unbounding the scan; the count is
+				// exact over everything the bounded matcher produced.
 				out.overflowCandidates = true
+				for j := i; j < len(matches); j++ {
+					start, end, ok := matchSpan(p, content, matches[j])
+					if !ok {
+						continue
+					}
+					countOverflow(key{typ: p.Type, value: string(content[start:end])})
+				}
 				break
 			}
-			if m[0] < 0 || m[1] < m[0] {
+			start, end, ok := matchSpan(p, content, m)
+			if !ok {
 				continue
-			}
-			start, end := m[0], m[1]
-			if p.Group > 0 {
-				gs, ge := m[2*p.Group], m[2*p.Group+1]
-				if gs < 0 || ge < gs {
-					continue
-				}
-				start, end = gs, ge
-			}
-			if p.Trail > 0 && p.Group == 0 {
-				limit := end + p.Trail
-				if limit > len(content) {
-					limit = len(content)
-				}
-				// Back up to a UTF-8 rune boundary so the Trail extension
-				// never splits a multi-byte rune (NEW-83): values must stay
-				// valid UTF-8 and survive JSON round-trips unchanged (same
-				// approach as the asset-layer truncateEvidence helpers).
-				for limit > start && limit < len(content) && !utf8.RuneStart(content[limit]) {
-					limit--
-				}
-				end = limit
 			}
 			value := string(content[start:end])
 
@@ -239,8 +257,11 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 				continue
 			}
 			if len(out.candidates) >= limits.maxCandidates {
-				out.counts.OverflowDropped++
+				// Candidate cap tripped (M-1): count this distinct
+				// candidate exactly once, however many times it is
+				// re-observed while the cap stays full (L-4).
 				out.overflowCandidates = true
+				countOverflow(k)
 				continue
 			}
 			candIndex[k] = len(out.candidates)
@@ -310,6 +331,11 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 	}
 	fpCtx := classifyContext(sd.filename, urlPath)
 
+	// materialized rebuilds the candidate slice in place (same idiom as
+	// Phase 2): candidates whose canonical asset cannot be constructed are
+	// dropped here, before pairs/evidence/edges can reference a zero
+	// identity.
+	materialized := out.candidates[:0]
 	for i := range out.candidates {
 		c := &out.candidates[i]
 
@@ -348,12 +374,23 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 		c.confidence = deriveConfidence(in)
 
 		// Canonical asset: identity materialization (also assigns c.id and
-		// syncs the stored value with the asset layer's bounded form).
-		assetCand := c.candidateAsset(&sd)
+		// syncs the stored value with the asset layer's bounded form). A
+		// construction failure is an internal invariant break (the scan
+		// stage only produces validated candidates) — it is counted and
+		// the candidate dropped, never materialized as a zero asset that
+		// would flow into reports and a cache record the next decode
+		// rejects (L-6).
+		assetCand, err := c.candidateAsset(&sd)
+		if err != nil {
+			out.counts.DroppedIdentity++
+			continue
+		}
 		c.cand = assetCand
 		c.id = assetCand.ID()
 		c.value = assetCand.Value
+		materialized = append(materialized, *c)
 	}
+	out.candidates = materialized
 
 	// Phase 4: pair correlation (IDs are final), evidence records, and
 	// graph edges. A pair factor is appended through the confidence model's
@@ -383,6 +420,40 @@ func scanDocument(sd scannedDocument, db *patterns.DB, limits scanLimits) scanOu
 		return out.edges[i].ID() < out.edges[j].ID()
 	})
 	return out
+}
+
+// matchSpan resolves one raw submatch into the candidate's byte span in
+// content — the single span rule shared by the admission path and the
+// overflow accounting (L-4), so both count the same values: the capture
+// group when the pattern declares one, else the whole match extended by
+// the pattern's Trail with a UTF-8 rune-boundary backup (NEW-83).
+func matchSpan(p patterns.Pattern, content []byte, m []int) (start, end int, ok bool) {
+	if m[0] < 0 || m[1] < m[0] {
+		return 0, 0, false
+	}
+	start, end = m[0], m[1]
+	if p.Group > 0 {
+		gs, ge := m[2*p.Group], m[2*p.Group+1]
+		if gs < 0 || ge < gs {
+			return 0, 0, false
+		}
+		start, end = gs, ge
+	}
+	if p.Trail > 0 && p.Group == 0 {
+		limit := end + p.Trail
+		if limit > len(content) {
+			limit = len(content)
+		}
+		// Back up to a UTF-8 rune boundary so the Trail extension
+		// never splits a multi-byte rune (NEW-83): values must stay
+		// valid UTF-8 and survive JSON round-trips unchanged (same
+		// approach as the asset-layer truncateEvidence helpers).
+		for limit > start && limit < len(content) && !utf8.RuneStart(content[limit]) {
+			limit--
+		}
+		end = limit
+	}
+	return start, end, true
 }
 
 // evidenceRecords builds the candidate's evidence chain (MethodSecret),

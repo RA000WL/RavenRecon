@@ -70,11 +70,12 @@
 //     ([robots]/[js] prefixes) fall through honestly as unparseable.
 //   - waymore URL mode (-mode U) writes deduplicated bare links
 //     (waymore.txt / -oU file), plain text without headers/footers → plain
-//     family. UNCOMPRESSED outputs only at detection time: plain-family
-//     probes decline gzipped peeks (plainConfidence, detect.go), so a
-//     waymore.txt.gz link list is claimed by nobody today even though the
-//     streaming path itself is gzip-capable (openStream/readLines) once an
-//     importer is chosen — open detection gap recorded in TODO.md (NEW-60).
+//     family, in both uncompressed and gzipped form: plainConfidence inflates
+//     a gzipped peek once (bounded, ≤PeekSize) and classifies the inner
+//     lines, so a waymore.txt.gz link list is detected by content while the
+//     streaming path stays gzip-transparent (openStream/readLines). Corrupt
+//     gzip declines honestly; inflated JSON/XML signatures are never claimed
+//     by the plain family.
 //   - gau prints bare URLs to stdout/--o file → plain family; gau --json
 //     emits flat url-key objects → JSON family.
 //   - Archive sources: archive-cdx and archive-warc above cover local

@@ -224,13 +224,17 @@ func TestCrawlStageNoHostsShortCircuit(t *testing.T) {
 // --- crawl-adapter honesty: failed hosts are never completed=len(hosts) ---
 
 // TestCrawlStageAllHostsFailedReportsIncomplete pins the honesty contract:
-// a crawl engine result with ZERO URLs, non-empty diagnostics, and no
-// truncation marker means every host's katana invocation failed (e.g.
-// katana missing from PATH). The stage must report incomplete with honest
-// counters, never completed=len(hosts).
+// when the crawl ENGINE signals that every host's katana invocation failed
+// (Result.FailedHosts = len(hosts), e.g. katana missing from PATH), the
+// stage must report incomplete with honest counters, never
+// completed=len(hosts). The signal is explicit engine data (NEW-85) — the
+// stage never infers failure from diagnostics presence.
 func TestCrawlStageAllHostsFailedReportsIncomplete(t *testing.T) {
 	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
-		return crawl.Result{Diagnostics: []string{"katana not found: exec: \"katana\": executable file not found in $PATH"}}, nil
+		return crawl.Result{
+			Diagnostics: []string{"katana not found: exec: \"katana\": executable file not found in $PATH"},
+			FailedHosts: 2,
+		}, nil
 	}}
 	st := NewCrawlStage(src)
 	in := pipeline.StageInput{
@@ -246,6 +250,32 @@ func TestCrawlStageAllHostsFailedReportsIncomplete(t *testing.T) {
 	}
 	if res.ItemsProcessed != 0 || res.ItemsFailed != 2 {
 		t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 0/2", res.ItemsProcessed, res.ItemsFailed)
+	}
+}
+
+// TestCrawlStageLinklessSuccessWithBenignDiagnosticStaysCompleted pins
+// NEW-85: a genuinely linkless success that emitted only a benign diagnostic
+// (e.g. skipped malformed lines) carries FailedHosts=0 from the engine and
+// must report completed with ItemsFailed=0 — diagnostics presence alone is
+// never read as failure.
+func TestCrawlStageLinklessSuccessWithBenignDiagnosticStaysCompleted(t *testing.T) {
+	src := &fakeCrawlSource{fn: func(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg crawl.Config) (crawl.Result, error) {
+		return crawl.Result{Diagnostics: []string{"malformed lines: 3"}}, nil
+	}}
+	st := NewCrawlStage(src)
+	in := pipeline.StageInput{
+		Target: mustDomainCrawl(t, "example.com"),
+		Hosts:  []asset.Host{mustHostCrawl(t, "www.example.com")},
+	}
+	res, err := st.Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed for a linkless success with a benign diagnostic", res.Outcome)
+	}
+	if res.ItemsProcessed != 1 || res.ItemsFailed != 0 {
+		t.Fatalf("ItemsProcessed/ItemsFailed = %d/%d, want 1/0", res.ItemsProcessed, res.ItemsFailed)
 	}
 }
 
@@ -277,7 +307,7 @@ func TestCrawlStageFailedHostsReportsPartial(t *testing.T) {
 }
 
 // TestCrawlStageLegitimateEmptyAndDiagnosticsStayCompleted guards the
-// heuristic's other side: a genuinely linkless host (zero URLs, zero
+// contract's other side: a genuinely linkless host (zero URLs, zero
 // diagnostics) stays completed, and diagnostics beside real URLs do not
 // downgrade the outcome.
 func TestCrawlStageLegitimateEmptyAndDiagnosticsStayCompleted(t *testing.T) {

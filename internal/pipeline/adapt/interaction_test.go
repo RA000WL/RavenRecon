@@ -54,6 +54,10 @@ type interactionHarness struct {
 
 func newInteractionHarness(t *testing.T) *interactionHarness {
 	t.Helper()
+	// The harness runs the four-source discovery stage (chaos included):
+	// pin its API key for this test (L-14 — hermetic, auto-restored; no
+	// package init leak).
+	t.Setenv("PDCP_API_KEY", "testkey")
 	h := &interactionHarness{}
 	h.resolver = newFakeResolver()
 	// Seed three hosts for DNS; each has an A record so the baseline run is

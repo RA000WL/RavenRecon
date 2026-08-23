@@ -167,6 +167,12 @@ func TestKatanaMissingBinary(t *testing.T) {
 	if res.Truncated {
 		t.Errorf("Truncated = true, want false for missing")
 	}
+	// NEW-85: the whole-run abort must carry the failure signal itself —
+	// every requested host failed, and the engine says so explicitly
+	// instead of leaving consumers to infer it from diagnostics presence.
+	if res.FailedHosts != 1 {
+		t.Errorf("FailedHosts = %d, want 1 (whole-run abort counts every host)", res.FailedHosts)
+	}
 }
 
 func TestKatanaTruncationPerHost(t *testing.T) {
@@ -604,4 +610,180 @@ func TestKatanaCancellationPreservesEngineErrorAndDiagnostics(t *testing.T) {
 	if len(recs) != 0 {
 		t.Fatalf("cancelled run stored %d records, want none", len(recs))
 	}
+}
+
+// TestKatanaAllMalformedOutputStoresIncompleteAndReexecutes pins NEW-86:
+// hosts that exit cleanly but emit only malformed JSONL have a broken
+// output channel — they count toward FailedHosts, so an all-such-hosts run
+// stores StatusIncomplete (never a poisoned completed-empty corpus) and the
+// next run with the same cache re-executes.
+func TestKatanaAllMalformedOutputStoresIncompleteAndReexecutes(t *testing.T) {
+	var mu sync.Mutex
+	crawlCalls := 0
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		mu.Lock()
+		crawlCalls++
+		mu.Unlock()
+		// Exit 0; every emitted line is unparseable JSONL.
+		return discovery.RunResult{Stdout: []byte("not json at all\n{\"broken\": \n")}, nil
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "a.example.com"), mustHost(t, "b.example.com")}
+	cfg := Config{Depth: 2, Cache: mem}
+
+	res1, err := src.Crawl(context.Background(), domain, hosts, cfg)
+	if err != nil {
+		t.Fatalf("first Crawl: %v", err)
+	}
+	if res1.FailedHosts != 2 {
+		t.Fatalf("FailedHosts = %d, want 2 (all-malformed output is host failure)", res1.FailedHosts)
+	}
+	if len(res1.URLs) != 0 {
+		t.Fatalf("URLs = %d, want 0 from all-malformed run", len(res1.URLs))
+	}
+	recs, _ := mem.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("stored %d records, want 1", len(recs))
+	}
+	for key, rec := range recs {
+		if rec.Status == cache.StatusCompleted {
+			t.Fatalf("all-malformed run stored a completed record under %s", key)
+		}
+		if rec.Status != cache.StatusIncomplete {
+			t.Fatalf("stored status = %q, want incomplete", rec.Status)
+		}
+	}
+
+	// Second run with the same cache must re-execute every host: an
+	// incomplete record is never served as a hit.
+	res2, err := src.Crawl(context.Background(), domain, hosts, cfg)
+	if err != nil {
+		t.Fatalf("second Crawl: %v", err)
+	}
+	if res2.FailedHosts != 2 {
+		t.Fatalf("second run FailedHosts = %d, want 2", res2.FailedHosts)
+	}
+	mu.Lock()
+	got := crawlCalls
+	mu.Unlock()
+	if got != 4 {
+		t.Fatalf("runner crawl calls = %d, want 4 (2 per run: re-executed, not replayed)", got)
+	}
+}
+
+// TestKatanaMixedHealthyAndMalformedHostsStoresIncomplete pins the per-host
+// classification of the NEW-86 semantic: only the garbage-output host fails;
+// the healthy host's URLs are retained and the mixed corpus stores
+// incomplete.
+func TestKatanaMixedHealthyAndMalformedHostsStoresIncomplete(t *testing.T) {
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		for i, a := range cmd.Args {
+			if a == "-u" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "https://garbled.example.com" {
+				return discovery.RunResult{Stdout: []byte("garbage line\n")}, nil // exit 0, all malformed
+			}
+		}
+		return discovery.RunResult{Stdout: goodOutput("https://good.example.com/ok")}, nil
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "good.example.com"), mustHost(t, "garbled.example.com")}
+	res, err := src.Crawl(context.Background(), domain, hosts, Config{Depth: 2, Cache: mem})
+	if err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if res.FailedHosts != 1 {
+		t.Fatalf("FailedHosts = %d, want 1 (only the garbled host failed)", res.FailedHosts)
+	}
+	if len(res.URLs) != 1 || res.URLs[0].String() != "https://good.example.com/ok" {
+		t.Fatalf("URLs = %v, want the healthy host's endpoint kept", res.URLs)
+	}
+	recs, _ := mem.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("stored %d records, want 1", len(recs))
+	}
+	for _, rec := range recs {
+		if rec.Status != cache.StatusIncomplete {
+			t.Fatalf("mixed-run status = %q, want incomplete", rec.Status)
+		}
+	}
+}
+
+// TestKatanaEmptyAndOutOfDomainOnlyStayCompleted guards the NEW-86
+// semantic's other edge: a completed-empty cache store stays reachable when
+// every host truly produced zero output AND zero malformed lines — katana
+// ran cleanly and genuinely found nothing in scope. Such records replay as
+// hits on the next run.
+func TestKatanaEmptyAndOutOfDomainOnlyStayCompleted(t *testing.T) {
+	t.Run("empty stdout replays from cache", func(t *testing.T) {
+		var mu sync.Mutex
+		crawlCalls := 0
+		script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+			mu.Lock()
+			crawlCalls++
+			mu.Unlock()
+			return discovery.RunResult{}, nil // exit 0, zero bytes out
+		})
+		src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+		mem := newRecordingCache()
+		domain := mustDomain(t, "example.com")
+		hosts := []asset.Host{mustHost(t, "www.example.com")}
+		cfg := Config{Depth: 2, Cache: mem}
+		res, err := src.Crawl(context.Background(), domain, hosts, cfg)
+		if err != nil {
+			t.Fatalf("Crawl: %v", err)
+		}
+		if res.FailedHosts != 0 {
+			t.Fatalf("FailedHosts = %d, want 0 for a clean empty run", res.FailedHosts)
+		}
+		recs, _ := mem.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("stored %d records, want 1", len(recs))
+		}
+		for _, rec := range recs {
+			if rec.Status != cache.StatusCompleted {
+				t.Fatalf("clean-empty status = %q, want completed", rec.Status)
+			}
+		}
+		// Second run replays the completed record without re-executing.
+		res2, err := src.Crawl(context.Background(), domain, hosts, cfg)
+		if err != nil {
+			t.Fatalf("second Crawl: %v", err)
+		}
+		if len(res2.URLs) != 0 {
+			t.Fatalf("second run URLs = %d, want 0", len(res2.URLs))
+		}
+		mu.Lock()
+		got := crawlCalls
+		mu.Unlock()
+		if got != 1 {
+			t.Fatalf("runner crawl calls = %d, want 1 (second run replayed the completed hit)", got)
+		}
+	})
+	t.Run("out-of-domain-only output is not failure", func(t *testing.T) {
+		script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+			// Valid JSONL, but every endpoint is out of scope — dropped by
+			// the scope filter, not counted as malformed.
+			return discovery.RunResult{Stdout: goodOutput("https://evil.com/out")}, nil
+		})
+		src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+		mem := newRecordingCache()
+		domain := mustDomain(t, "example.com")
+		hosts := []asset.Host{mustHost(t, "www.example.com")}
+		res, err := src.Crawl(context.Background(), domain, hosts, Config{Depth: 2, Cache: mem})
+		if err != nil {
+			t.Fatalf("Crawl: %v", err)
+		}
+		if res.FailedHosts != 0 {
+			t.Fatalf("FailedHosts = %d, want 0 (scope drops are not malformed lines)", res.FailedHosts)
+		}
+		recs, _ := mem.snapshot()
+		for _, rec := range recs {
+			if rec.Status != cache.StatusCompleted {
+				t.Fatalf("out-of-domain-only status = %q, want completed", rec.Status)
+			}
+		}
+	})
 }

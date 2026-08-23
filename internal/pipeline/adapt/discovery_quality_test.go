@@ -150,6 +150,7 @@ func TestDiscoveryStageQualityGateAbortOnFlag(t *testing.T) {
 }
 
 func TestDiscoveryStageQualityGateThroughPipeline(t *testing.T) {
+	t.Setenv("PDCP_API_KEY", "testkey") // four-source script includes chaos (L-14)
 	runner := newFakeRunner(poisonedScript())
 	stage := NewDiscoveryStage(runner, fakeLookup)
 	cfg := pipeline.ScanConfig{

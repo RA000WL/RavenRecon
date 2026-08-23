@@ -794,3 +794,135 @@ func TestScanTrailCutIsRuneSafe(t *testing.T) {
 		t.Error("trail-cut value changed across a JSON round-trip")
 	}
 }
+
+func TestScanOverflowDroppedCountsRepeatedRejectionsOnce(t *testing.T) {
+	// L-4 regression: while the candidate cap is full, the SAME (type,
+	// value) candidate re-observed after its first rejection must be
+	// counted exactly once — it was never inserted into candIndex, so the
+	// pre-L-4 code counted one drop per occurrence. One admitted key, then
+	// K2 twice and K3 once: exact OverflowDropped = 2 (K2 + K3), not 3.
+	var b strings.Builder
+	b.WriteString("\"" + awsKeyID + "\"\n")
+	k2 := "AKIA" + detRand(16, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 5, 11)
+	k3 := "AKIA" + detRand(16, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 7, 13)
+	b.WriteString("\"" + k2 + "\"\n\"" + k2 + "\"\n\"" + k3 + "\"\n")
+
+	sd, err := prepareDocument(Document{Kind: KindJSON, Content: []byte(b.String())}, fixedTime(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := defaultScanLimits()
+	limits.maxCandidates = 1
+	out := scanDocument(sd, loadDB(t), limits)
+
+	if len(out.candidates) != 1 || out.candidates[0].value != awsKeyID {
+		t.Fatalf("candidates = %d, want only the admitted key; counts %+v", len(out.candidates), out.counts)
+	}
+	if out.counts.OverflowDropped != 2 {
+		t.Errorf("OverflowDropped = %d, want exactly 2 (K2 counted once despite two occurrences, plus K3)", out.counts.OverflowDropped)
+	}
+	if !out.overflowCandidates {
+		t.Error("overflowCandidates flag must survive (M-1/NEW-64 semantics)")
+	}
+}
+
+func TestScanOverflowCountExactWhenCapTripsAndDedupShrinks(t *testing.T) {
+	// L-4 + M-1 interplay: the cap trips during Phase 1 AND Phase-2
+	// cross-family dedup shrinks the kept set below the cap afterwards.
+	// The overflow count stays exact over what Phase 1 refused, and the
+	// flag survives the shrink.
+	//
+	// cap = 2. Patterns run pattern-major: the aws_secret line admits its
+	// contextual AWS candidate first (slot 0), then the generic
+	// assignment admits the SAME VALUE as a generic candidate (slot 1 —
+	// different type, so a distinct Phase-1 key) and the cap is full.
+	// The repeated password line is refused ONCE no matter how often it
+	// recurs. Phase 2 then drops the generic duplicate of the contextual
+	// value (shrink 2→1).
+	//
+	// High-entropy distinct-char fixtures (detRand steps coprime to the
+	// charset length yield 40 distinct characters, clearing the generic
+	// family's MinShannon 3.5 / MinNormalized 0.6 rule).
+	sk := detRand(40, alnumMixed+"/+=", 37, 11)
+	sk2 := detRand(40, alnumMixed+"/+=", 41, 5)
+	content := []byte("aws_secret_access_key = \"" + sk + "\"\n" +
+		"password = \"" + sk + "\"\n" +
+		"password = \"" + sk2 + "\"\n" +
+		"password = \"" + sk2 + "\"\n")
+
+	sd, err := prepareDocument(Document{Kind: KindJSON, Content: content}, fixedTime(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := defaultScanLimits()
+	limits.maxCandidates = 2
+	out := scanDocument(sd, loadDB(t), limits)
+
+	if out.counts.OverflowDropped != 1 {
+		t.Errorf("OverflowDropped = %d, want exactly 1 (the twice-repeated refused value counted once); counts %+v", out.counts.OverflowDropped, out.counts)
+	}
+	if out.counts.DroppedDuplicateValue != 1 {
+		t.Errorf("DroppedDuplicateValue = %d, want 1 (generic duplicate of the contextual value)", out.counts.DroppedDuplicateValue)
+	}
+	if len(out.candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1 (dedup shrank below the cap); counts %+v", len(out.candidates), out.counts)
+	}
+	if !out.overflowCandidates {
+		t.Error("overflowCandidates flag must survive the Phase-2 shrink (NEW-64/M-1)")
+	}
+}
+
+func TestScanMatchCapCountsOnlyUnretainedValues(t *testing.T) {
+	// L-4 match-cap precision: 65 identical JWTs — every visible value is
+	// already retained via dedup, so nothing was refused and
+	// OverflowDropped must be 0 (the pre-L-4 code added a flat 1 when the
+	// per-pattern match cap tripped). The trip itself still flags.
+	// A structurally valid synthetic JWT: the standard base64url header
+	// {"alg":"HS256"} plus high-entropy segments (the validator decodes
+	// the header and requires an "alg" member).
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJ" + detRand(20, alnumMixed+"-_", 11, 2) +
+		"." + detRand(24, alnumMixed+"-_", 13, 3)
+	content := []byte(strings.Repeat("token: "+jwt+"\n", 65))
+
+	sd, err := prepareDocument(Document{Kind: KindJS, Content: content}, fixedTime(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := scanDocument(sd, loadDB(t), defaultScanLimits())
+
+	if len(out.candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1 (identical values dedup); counts %+v", len(out.candidates), out.counts)
+	}
+	if out.counts.OverflowDropped != 0 {
+		t.Errorf("OverflowDropped = %d, want 0: every value the bounded matcher showed was already retained", out.counts.OverflowDropped)
+	}
+	if !out.overflowCandidates {
+		t.Error("overflowCandidates flag must record that the match cap tripped")
+	}
+}
+
+func TestCandidateAssetSurfacesConstructionFailure(t *testing.T) {
+	// L-6: construction errors surface; the zero asset never silently
+	// flows on. Failure path: a zero document source identity cannot
+	// ground a canonical candidate.
+	sd := &scannedDocument{}
+	c := scannedCandidate{typ: asset.SecretTypeAWS, value: awsKeyID}
+	got, err := c.candidateAsset(sd)
+	if err == nil {
+		t.Fatal("zero source identity must surface a construction error, not a swallowed zero asset")
+	}
+	if got != (asset.SecretCandidate{}) {
+		t.Errorf("failure must not return a populated asset: %+v", got)
+	}
+
+	// Happy path unchanged: a valid source identity constructs the
+	// canonical candidate.
+	ok := &scannedDocument{identity: asset.Identity{Kind: asset.KindURL, Value: "https://cdn.example.com/app.js"}}
+	got, err = c.candidateAsset(ok)
+	if err != nil {
+		t.Fatalf("valid inputs must construct: %v", err)
+	}
+	if got.ID() == "" || got.Value != awsKeyID {
+		t.Errorf("happy-path asset malformed: %+v", got)
+	}
+}

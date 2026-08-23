@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -23,12 +22,6 @@ import (
 // adapter's clock bridge (Now = in.Clock.Now) must surface exactly this as
 // every discovered host's provenance timestamp.
 var discoveryFixedTime = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
-
-func init() {
-	if os.Getenv("PDCP_API_KEY") == "" {
-		_ = os.Setenv("PDCP_API_KEY", "testkey")
-	}
-}
 
 // fakeClock is a deterministic runtime.Clock. Now returns the fixed
 // instant; After returns a channel that never fires — the discovery adapter
@@ -249,6 +242,9 @@ func standardScript() map[string]func(discovery.Cmd) (discovery.RunResult, error
 // test sets it.
 func newInput(t *testing.T, params map[string]string) pipeline.StageInput {
 	t.Helper()
+	// The four-source fake environment includes chaos: pin its API key for
+	// this test (L-14 — hermetic, auto-restored; no package init leak).
+	t.Setenv("PDCP_API_KEY", "testkey")
 	return pipeline.StageInput{
 		Target: discoveryMustDomain(t, "example.com"),
 		Bounds: pipeline.DefaultStageConfig(),
@@ -773,6 +769,7 @@ func TestDiscoveryStageThroughPipelineRun(t *testing.T) {
 	// End-to-end through the pipeline runner: the adapter's StageResult must
 	// survive normalizeResult (outcome, counts, additions) and merge into the
 	// shared corpus deterministically.
+	t.Setenv("PDCP_API_KEY", "testkey") // four-source script includes chaos (L-14)
 	runner := newFakeRunner(standardScript())
 	stage := NewDiscoveryStage(runner, fakeLookup)
 	cfg := pipeline.ScanConfig{

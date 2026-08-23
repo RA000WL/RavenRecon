@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,14 +16,14 @@ import (
 // fixedTime is the deterministic timestamp used by most fake environments.
 var fixedTime = time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 
-func init() {
-	// Chaos requires PDCP_API_KEY; the default fake environment assumes it is
-	// present so the four-tool default (subfinder, assetfinder, amass, chaos)
-	// exercises as completed. Tests that exercise the missing-key path set it
-	// to empty explicitly via t.Setenv.
-	if os.Getenv("PDCP_API_KEY") == "" {
-		_ = os.Setenv("PDCP_API_KEY", "testkey")
-	}
+// setChaosKey pins PDCP_API_KEY for the calling test (L-14): the key is
+// required for chaos to report usable, so tests exercising the four-source
+// environment set it explicitly via t.Setenv — auto-restored, never leaked
+// process-wide by a package init. Tests that exercise the missing-key path
+// set it to empty explicitly the same way.
+func setChaosKey(t *testing.T) {
+	t.Helper()
+	t.Setenv("PDCP_API_KEY", "testkey")
 }
 
 // fakeClock is a mutex-guarded mutable clock for deterministic provenance and
