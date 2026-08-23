@@ -16,7 +16,9 @@ var csvParts = []string{"endpoints", "findings", "hosts", "secrets", "technologi
 // the stdlib csv.Writer (correct quoting for every byte, UTF-8 preserved,
 // no BOM); every field additionally passes csvSafe, which neutralizes
 // spreadsheet formula injection. The complete, unmodified data lives in the
-// JSON export.
+// JSON export. The hosts/urls/findings tables carry an "origin" column
+// (v1.8 T13): discovered vs imported — derived from the model's attribution
+// map, presentation only.
 func renderCSV(ctx context.Context, m *Model, s Sink) error {
 	for _, part := range csvParts {
 		if err := ctx.Err(); err != nil {
@@ -55,14 +57,14 @@ func writeCSVTable(ctx context.Context, m *Model, part string, w io.Writer) erro
 
 	switch part {
 	case "hosts":
-		writeRecord([]string{"host", "source", "discovered_at"})
+		writeRecord([]string{"host", "origin", "source", "discovered_at"})
 		for _, h := range m.Hosts {
-			writeRecord([]string{h.Name, h.Prov.Source, formatTime(h.Prov.DiscoveredAt)})
+			writeRecord([]string{h.Name, string(m.OriginOf(h.Identity())), h.Prov.Source, formatTime(h.Prov.DiscoveredAt)})
 		}
 	case "urls":
-		writeRecord([]string{"url", "scheme", "hostport", "path", "query", "source", "discovered_at"})
+		writeRecord([]string{"url", "origin", "scheme", "hostport", "path", "query", "source", "discovered_at"})
 		for _, u := range m.URLs {
-			writeRecord([]string{u.String(), u.Scheme, u.HostPort, u.Path, u.Query, u.Prov.Source, formatTime(u.Prov.DiscoveredAt)})
+			writeRecord([]string{u.String(), string(m.OriginOf(u.Identity())), u.Scheme, u.HostPort, u.Path, u.Query, u.Prov.Source, formatTime(u.Prov.DiscoveredAt)})
 		}
 	case "endpoints":
 		writeRecord([]string{"method", "url", "source", "discovered_at"})
@@ -80,9 +82,9 @@ func writeCSVTable(ctx context.Context, m *Model, part string, w io.Writer) erro
 			writeRecord([]string{string(sec.Type), sec.Value, sec.Source.String(), conf(sec.Prov.Confidence), formatTime(sec.Prov.DiscoveredAt)})
 		}
 	case "findings":
-		writeRecord([]string{"finding", "rule_id", "rule_name", "category", "subject", "confidence", "priority", "status", "created_at"})
+		writeRecord([]string{"finding", "origin", "rule_id", "rule_name", "category", "subject", "confidence", "priority", "status", "created_at"})
 		for _, f := range m.Findings {
-			writeRecord([]string{f.Identity().String(), f.RuleID, f.RuleName, f.Category, f.Subject.String(), formatScore(f.Confidence), f.Priority, f.Status, formatTime(f.Created)})
+			writeRecord([]string{f.Identity().String(), string(m.OriginOf(f.Identity())), f.RuleID, f.RuleName, f.Category, f.Subject.String(), formatScore(f.Confidence), f.Priority, f.Status, formatTime(f.Created)})
 		}
 	default:
 		return fmt.Errorf("report: csv: unknown part %q", part)

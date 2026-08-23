@@ -423,6 +423,54 @@ func writeHTML(ctx context.Context, bw *bufio.Writer, m *Model) error {
 	if err := writeln("</details>"); err != nil {
 		return err
 	}
+
+	// Provenance (v1.8 T13). Rendered only when attribution exists — a run
+	// without ingestion renders byte-identically to the legacy report.
+	// Presentation only: sorted by identity, bounded display, never
+	// re-derived or mutated.
+	if len(m.Attribution) > 0 {
+		keys := make([]string, 0, len(m.Attribution))
+		for k := range m.Attribution {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		rows := make([][]string, 0, maxProvenanceRows)
+		shown := 0
+		for _, k := range keys {
+			if shown >= maxProvenanceRows {
+				break
+			}
+			e := m.Attribution[k]
+			line := ""
+			if e.Line > 0 {
+				line = fmt.Sprintf("%d", e.Line)
+			}
+			rows = append(rows, []string{
+				esc(k),
+				esc(e.Importer),
+				esc(e.OriginalTool),
+				esc(e.Filename),
+				line,
+				formatTime(e.ImportedAt),
+				formatScore(e.Confidence),
+			})
+			shown++
+		}
+		if err := writeln("<details id=\"provenance\"><summary>Provenance (%d imported)</summary>", len(m.Attribution)); err != nil {
+			return err
+		}
+		if err := writeHTMLTable(bw, "", []string{"asset", "importer", "tool", "file", "line", "imported_at", "confidence"}, rows); err != nil {
+			return err
+		}
+		if len(keys) > shown {
+			if err := writeln("<p class=\"note\">… and %d more provenance records — see the JSON export.</p>", len(keys)-shown); err != nil {
+				return err
+			}
+		}
+		if err := writeln("</details>"); err != nil {
+			return err
+		}
+	}
 	if err := writeln("</main>"); err != nil {
 		return err
 	}

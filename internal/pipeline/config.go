@@ -37,10 +37,17 @@ import (
 
 // StageName identifies one of the twelve engine stages in the fixed pipeline
 // order: discover → dns → httpprobe → urlintel → crawl → techintel → jsintel →
-// secrentel → urllive → priority → detect → report.
+// secrentel → urllive → priority → detect → report — plus the ingest stage
+// name ("ingest", v1.8 T11), which lives in the same vocabulary family but is
+// deliberately NOT part of the fixed production order: production scans stay
+// twelve stages (AllStages is unchanged, so v1.7 goldens hold), and the later
+// ravenrecon ingest command composes [ingest + selected downstream stages]
+// through the stages-factory seam. Ingestion feeds the SAME stages — there is
+// no parallel execution path.
 type StageName string
 
 const (
+	StageIngest      StageName = "ingest"
 	StageDiscover    StageName = "discover"
 	StageDNS         StageName = "dns"
 	StageHTTPProbe   StageName = "httpprobe"
@@ -55,21 +62,28 @@ const (
 	StageReport      StageName = "report"
 )
 
-// pipelineOrder is the fixed, deterministic pipeline order.
+// pipelineOrder is the fixed, deterministic pipeline order (the twelve
+// production stages; ingest is a valid selection but not part of this order).
 var pipelineOrder = []StageName{
 	StageDiscover, StageDNS, StageHTTPProbe, StageURLIntel, StageCrawl, StageTechIntel,
 	StageJSIntel, StageSecretIntel, StageURLLive, StagePriority, StageDetect, StageReport,
 }
 
 // AllStages returns the twelve stage names in pipeline order as a fresh slice.
+// The ingest stage (StageIngest) is intentionally absent: production scans
+// remain twelve stages.
 func AllStages() []StageName {
 	out := make([]StageName, len(pipelineOrder))
 	copy(out, pipelineOrder)
 	return out
 }
 
-// ValidStage reports whether name is one of the twelve engine stage names.
+// ValidStage reports whether name is one of the twelve engine stage names or
+// the ingest stage name (see StageName).
 func ValidStage(name StageName) bool {
+	if name == StageIngest {
+		return true
+	}
 	for _, s := range pipelineOrder {
 		if s == name {
 			return true
@@ -79,9 +93,10 @@ func ValidStage(name StageName) bool {
 }
 
 func stageVocabulary() string {
-	names := make([]string, len(pipelineOrder))
-	for i, s := range pipelineOrder {
-		names[i] = string(s)
+	names := make([]string, 0, len(pipelineOrder)+1)
+	names = append(names, string(StageIngest))
+	for _, s := range pipelineOrder {
+		names = append(names, string(s))
 	}
 	return strings.Join(names, ", ")
 }

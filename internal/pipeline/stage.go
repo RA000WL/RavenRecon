@@ -6,6 +6,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/importer"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -207,6 +208,21 @@ type StageResult struct {
 	// the document marked Truncated by the merge — never a partial prefix
 	// (see mergeDocuments).
 	Documents []Document
+
+	// Provenance is the stage's ADDITIONS to the import-provenance sidecar
+	// (v1.8 T11): per-imported-asset records (importer, original tool,
+	// filename, import time, bounded original record, confidence) keyed by
+	// canonical identity. Producer: the ingest stage family. Nil or empty
+	// is legal and means "nothing added". The runner merges them into
+	// RunReport.Provenance (first-seen dedup on the
+	// identity|filename|importer triple — the same asset legitimately
+	// imported from two files keeps both records; a re-served cache hit
+	// deduplicates to the first record), capped at the stage's MaxOutput,
+	// with any cut recorded as the import_provenance_truncated sticky flag
+	// at the report level (AGENTS §0.6 carve-out). The sidecar feeds the
+	// report's attribution input (internal/report Context.Attribution);
+	// it never mutates asset identities.
+	Provenance []importer.ProvenanceRecord
 
 	// Err is the failure detail for Outcome failed. For cancelled,
 	// return a nil Err: the outcome, not the error field, carries

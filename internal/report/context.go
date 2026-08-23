@@ -72,6 +72,17 @@ type Context struct {
 	// table/list in markdown/html.
 	LiveRecords []httpprobe.LiveRecord
 
+	// Attribution is the import-provenance input (v1.8 T13): per-asset
+	// records keyed by canonical identity string ("host:api.example.com"),
+	// stating where each IMPORTED asset came from. Optional — an absent or
+	// empty map leaves every derived value byte-identical to a run without
+	// ingestion (digest included). Keys must reference identities present
+	// in the corpora above; NewModel rejects unknown keys with a structured
+	// error. The map is bounded at maxAttributionEntries (sorted-key
+	// prefix kept, overflow flagged on the Model — never silently
+	// truncated).
+	Attribution map[string]AttributionEntry
+
 	// Errors is the run's error log for the error summary: one record per
 	// distinct error observation (identical records merge by summing
 	// counts).
@@ -193,6 +204,47 @@ type ErrorRecord struct {
 	// Count is how many times this exact error was observed (<= 0
 	// normalizes to 1).
 	Count int `json:"count"`
+}
+
+// maxAttributionBytes bounds one attribution entry's string fields (fixed
+// constant, mirroring the error-record bounds).
+const maxAttributionBytes = 512
+
+// maxAttributionEntries bounds the attribution map (the MaxOutput-style cap):
+// over-bound input keeps the first entries in sorted-key order and the Model
+// flags the overflow with AttributionTruncated — never a silent truncation.
+const maxAttributionEntries = 100_000
+
+// AttributionEntry is one imported asset's provenance for the report: which
+// importer ingested it, which original tool produced the data, from which
+// file, at what time, with what confidence. Line is the record's line number
+// when known (0 otherwise; today's importer sidecar carries position info via
+// the asset provenance Reference "filename:line" — populating Line is the
+// CLI wiring task's concern, not the report model's).
+type AttributionEntry struct {
+	// Importer is the internal/importer engine name ("plain-urls",
+	// "json-httpx", ...).
+	Importer string `json:"importer,omitempty"`
+
+	// OriginalTool is the tool whose output format was ingested ("httpx",
+	// "burpsuite", ... — the importer package's provenance mapping).
+	OriginalTool string `json:"original_tool,omitempty"`
+
+	// Filename is the base name of the ingested file.
+	Filename string `json:"filename,omitempty"`
+
+	// Line is the 1-based record line when known; 0 means unknown.
+	Line int `json:"line,omitempty"`
+
+	// ImportedAt is when the file was ingested (content provenance, not
+	// wall-clock timing metadata — it participates in the digest exactly
+	// like asset DiscoveredAt). No omitempty: omitempty never fires on a
+	// struct, so the tag would only mislead readers — the field always
+	// serializes.
+	ImportedAt time.Time `json:"imported_at"`
+
+	// Confidence is the observation confidence in [0,1].
+	Confidence float64 `json:"confidence,omitempty"`
 }
 
 // RuntimeStats carries the run's worker-pool statistics. Callers collect

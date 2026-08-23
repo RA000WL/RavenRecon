@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -15,6 +16,9 @@ const (
 	maxMarkdownTopFindings = 20
 	maxMarkdownTopSurfaces = 20
 	maxMarkdownTopPaths    = 10
+	// maxProvenanceRows bounds the Provenance section's table (v1.8 T13);
+	// the honest "and N more" line follows when cut.
+	maxProvenanceRows = 100
 )
 
 // renderMarkdown writes the human-readable summary report. Identical
@@ -439,6 +443,57 @@ func writeMarkdown(ctx context.Context, bw *bufio.Writer, m *Model) error {
 				return err
 			}
 			if err := writeln("_And %d more recommendations — see the JSON export._", len(m.Recommendations)-len(shown)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Provenance (v1.8 T13). Rendered only when attribution exists — a run
+	// without ingestion renders byte-identically to the legacy report.
+	// Presentation only: sorted by identity, bounded display, never
+	// re-derived or mutated.
+	if len(m.Attribution) > 0 {
+		if err := writeln(""); err != nil {
+			return err
+		}
+		if err := writeln("## Provenance"); err != nil {
+			return err
+		}
+		if err := writeln(""); err != nil {
+			return err
+		}
+		keys := make([]string, 0, len(m.Attribution))
+		for k := range m.Attribution {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		rows := make([][]string, 0, min(maxProvenanceRows, len(keys)))
+		shown := 0
+		for _, k := range keys {
+			if shown >= maxProvenanceRows {
+				break
+			}
+			e := m.Attribution[k]
+			line := ""
+			if e.Line > 0 {
+				line = fmt.Sprintf("%d", e.Line)
+			}
+			rows = append(rows, []string{
+				mdEscape(k),
+				mdEscape(e.Importer),
+				mdEscape(e.OriginalTool),
+				mdEscape(e.Filename),
+				line,
+				formatTime(e.ImportedAt),
+				formatScore(e.Confidence),
+			})
+			shown++
+		}
+		if err := writeMarkdownTable(bw, []string{"asset", "importer", "tool", "file", "line", "imported_at", "confidence"}, rows); err != nil {
+			return err
+		}
+		if len(keys) > shown {
+			if err := writeln("_… and %d more provenance records — see the JSON export._", len(keys)-shown); err != nil {
 				return err
 			}
 		}

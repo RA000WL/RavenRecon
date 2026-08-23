@@ -3,6 +3,7 @@ package pipeline
 import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/httpprobe"
+	"github.com/RA000WL/RavenRecon/internal/importer"
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
 
@@ -246,4 +247,20 @@ func mergeChannel[T any](cur []T, add []T, seen map[string]struct{}, ns string, 
 		return cur, true
 	}
 	return cur, false
+}
+
+// mergeProvenance merges one stage's import-provenance sidecar additions
+// into the run-level slice (v1.8 T11): first-seen dedup keyed by the
+// identity|filename|importer triple — the same canonical asset imported from
+// two files legitimately carries two records, while a re-served cache hit of
+// the same file deduplicates to the first record — then the per-stage
+// MaxOutput cap with a deterministic tail drop. It reports whether the cap
+// cut anything; the caller records import_provenance_truncated. The merge
+// runs regardless of the stage's outcome, mirroring Additions/Results/
+// Documents. The returned slice never aliases add; when add is empty, cur is
+// returned unchanged.
+func mergeProvenance(cur []importer.ProvenanceRecord, add []importer.ProvenanceRecord, seen map[string]struct{}, cap int) ([]importer.ProvenanceRecord, bool) {
+	return mergeChannel(cur, add, seen, "import_provenance", cap, func(r importer.ProvenanceRecord) string {
+		return r.Identity + "\x1f" + r.Filename + "\x1f" + r.Importer
+	})
 }

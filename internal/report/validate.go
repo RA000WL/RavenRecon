@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -201,4 +202,52 @@ func validateNonEmpty(path string, compressed bool) error {
 		return fmt.Errorf("report: validate: read %s: %w", path, err)
 	}
 	return nil
+}
+
+// normalizeAttribution validates and canonicalizes the caller's attribution
+// input against the model's identity universe (v1.8 T13). Rules:
+//
+//   - every key must reference a known identity from the model's corpora —
+//     an attribution referencing an unknown identity is a caller bug and is
+//     rejected with a structured error naming it (schema honesty);
+//   - string fields are bounded at maxAttributionBytes (rune-safe truncate
+//     with marker); a negative Line becomes 0; Confidence outside [0,1] is
+//     rejected;
+//   - over-bound maps keep the first maxAttributionEntries keys in sorted
+//     order and report truncated=true — never a silent cut.
+//
+// The returned map is always a fresh copy; the input is never mutated.
+func normalizeAttribution(input map[string]AttributionEntry, known map[string]struct{}) (map[string]AttributionEntry, bool, error) {
+	if len(input) == 0 {
+		return nil, false, nil
+	}
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	out := make(map[string]AttributionEntry, len(keys))
+	truncated := false
+	for i, k := range keys {
+		if i >= maxAttributionEntries {
+			truncated = true
+			break
+		}
+		if _, ok := known[k]; !ok {
+			return nil, false, fmt.Errorf("report: attribution references unknown identity %q (keys must be canonical identities present in the model)", k)
+		}
+		e := input[k]
+		e.Importer = truncateRunes(e.Importer, maxAttributionBytes)
+		e.OriginalTool = truncateRunes(e.OriginalTool, maxAttributionBytes)
+		e.Filename = truncateRunes(e.Filename, maxAttributionBytes)
+		if e.Line < 0 {
+			e.Line = 0
+		}
+		if e.Confidence < 0 || e.Confidence > 1 {
+			return nil, false, fmt.Errorf("report: attribution for %q has confidence %g outside [0,1]", k, e.Confidence)
+		}
+		out[k] = e
+	}
+	return out, truncated, nil
 }

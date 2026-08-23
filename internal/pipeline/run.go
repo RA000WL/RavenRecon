@@ -9,6 +9,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/event"
+	"github.com/RA000WL/RavenRecon/internal/importer"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -76,11 +77,25 @@ type RunReport struct {
 	// per-stage MaxCorpusSize cut the corpus at a merge, plus one
 	// "<channel>_truncated" flag per results channel a per-stage
 	// MaxOutput cap cut (ips_truncated, attack_paths_truncated, ...; see
-	// mergeResults for the full vocabulary). Preserved end-to-end (result
-	// → RunReport → report stage): consumers must treat a flagged run as
-	// an incomplete retained set (AGENTS §0.6 carve-out — a completed
-	// run may carry the flags, never silence them).
+	// mergeResults for the full vocabulary) and for the import-provenance
+	// sidecar ("import_provenance_truncated", see Provenance below).
+	// Preserved end-to-end (result → RunReport → report stage): consumers
+	// must treat a flagged run as an incomplete retained set (AGENTS §0.6
+	// carve-out — a completed run may carry the flags, never silence
+	// them).
 	StickyFlags map[string]bool
+
+	// Provenance is the merged import-provenance sidecar after all stages
+	// (v1.8 T11): per-imported-asset records from the ingest stage family,
+	// first-seen dedup on the identity|filename|importer triple, capped at
+	// each producing stage's MaxOutput (a cut records the
+	// import_provenance_truncated sticky flag above). It is the pipeline's
+	// carrier for the report Context's attribution input.
+	//
+	// omitempty keeps every run without ingestion byte-identical in the
+	// acceptance golden documents (which serialize this struct) — the
+	// field simply never appears unless an ingest stage produced records.
+	Provenance []importer.ProvenanceRecord `json:"Provenance,omitempty"`
 }
 
 // StageRecord is one stage's recorded outcome in run order.
@@ -196,9 +211,11 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	var urls []asset.URL
 	var results Results
 	var documents []Document
+	var provenance []importer.ProvenanceRecord
 	seen := make(map[asset.Identity]struct{})
 	resultsSeen := make(map[string]struct{})
 	documentsSeen := make(map[string]struct{})
+	provenanceSeen := make(map[string]struct{})
 
 	for i, entry := range entries {
 		name := cfg.Stages[i]
@@ -316,6 +333,22 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags[ch+"_truncated"] = true
 		}
+		// Import-provenance propagation (v1.8 T11): merge this stage's
+		// sidecar additions into the run-level provenance slice (first-seen
+		// dedup on identity|filename|importer, deterministic order), then
+		// enforce this stage's MaxOutput cap. The merge runs regardless of
+		// the stage's outcome, mirroring Additions/Results/Documents. A cut
+		// records the import_provenance_truncated sticky flag at the report
+		// level (AGENTS §0.6 carve-out).
+		var provCut bool
+		provenance, provCut = mergeProvenance(provenance, res.Provenance, provenanceSeen, eff.MaxOutput)
+		if provCut {
+			report.Truncated = true
+			if report.StickyFlags == nil {
+				report.StickyFlags = make(map[string]bool)
+			}
+			report.StickyFlags["import_provenance_truncated"] = true
+		}
 	}
 
 	report.EndAt = clock.Now()
@@ -330,6 +363,7 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 	report.URLs = urls
 	report.Results = results
 	report.Documents = documents
+	report.Provenance = provenance
 	for _, sr := range report.Stages {
 		report.ItemsProcessed += sr.ItemsProcessed
 		report.ItemsFailed += sr.ItemsFailed

@@ -92,6 +92,27 @@ type Model struct {
 	// them as a table/list in markdown/html.
 	LiveRecords []httpprobe.LiveRecord `json:"live_records,omitempty"`
 
+	// Attribution is the normalized import-provenance map (v1.8 T13):
+	// canonical identity string → where that asset was imported from.
+	// Sorted-key iteration is guaranteed by the JSON encoder. Empty/absent
+	// when no ingestion happened — every derived value (digest included)
+	// stays byte-identical to a run without attribution.
+	Attribution map[string]AttributionEntry `json:"attribution,omitempty"`
+
+	// AttributionTruncated reports that the caller's attribution input
+	// exceeded maxAttributionEntries and the sorted-key prefix was kept —
+	// the retained set is incomplete by definition (never silently
+	// completed).
+	AttributionTruncated bool `json:"attribution_truncated,omitempty"`
+
+	// Origins is the derived per-origin asset census over the model's
+	// identity universe: {"discovered": N, "imported": M}. Present only
+	// when attribution exists (absent attribution keeps legacy exports
+	// byte-identical). "enriched"/"generated" origins are deferred until a
+	// subsystem derives them from existing model data — none does today,
+	// and inventing one here would fabricate provenance.
+	Origins map[string]int `json:"origins,omitempty"`
+
 	// Recommendations is the deterministic projection of the surfaces'
 	// factor lists through priority.Recommend (surface order, factor
 	// order), capped at maxModelRecommendations.
@@ -240,6 +261,15 @@ func NewModel(input Context) (*Model, error) {
 	if err := validateExecStats(m.Execution); err != nil {
 		return nil, err
 	}
+	// Attribution normalization runs AFTER the corpora are normalized so
+	// every key can be checked against the model's actual identity universe
+	// (schema honesty: an attribution referencing an unknown identity is a
+	// caller bug and is rejected with a structured error).
+	known := modelIdentitySet(m)
+	if m.Attribution, m.AttributionTruncated, err = normalizeAttribution(input.Attribution, known); err != nil {
+		return nil, err
+	}
+	m.Origins = buildOrigins(m, known)
 
 	m.Recommendations = projectRecommendations(m.Surfaces)
 	m.Stats = buildStatistics(m)
@@ -250,6 +280,127 @@ func NewModel(input Context) (*Model, error) {
 	}
 	m.Digest = digest
 	return m, nil
+}
+
+// ---- attribution and origins (v1.8 T13) ----
+
+// Origin is the fixed per-asset provenance vocabulary: where an asset in the
+// model came from. The report derives it structurally — imported-set
+// membership only — never from message text or guesses.
+type Origin string
+
+const (
+	// OriginDiscovered marks assets the run's own recon stages observed.
+	OriginDiscovered Origin = "discovered"
+	// OriginImported marks assets that arrived through ingestion (the
+	// ingest stage family / Context.Attribution).
+	OriginImported Origin = "imported"
+)
+
+// KnownOrigins returns every origin value in canonical sorted order.
+func KnownOrigins() []Origin {
+	return []Origin{OriginDiscovered, OriginImported}
+}
+
+// Valid reports whether o is one of the known origin values.
+func (o Origin) Valid() bool {
+	switch o {
+	case OriginDiscovered, OriginImported:
+		return true
+	}
+	return false
+}
+
+// OriginOf classifies one identity against the model: membership in the
+// attribution map means imported; anything else discovered. The
+// "enriched"/"generated" origins from the roadmap are deliberately deferred:
+// no existing subsystem derives them from model data today, and fabricating
+// them here would invent provenance (see Origins field documentation).
+func (m *Model) OriginOf(identity asset.Identity) Origin {
+	if m == nil || len(m.Attribution) == 0 {
+		return OriginDiscovered
+	}
+	if _, ok := m.Attribution[identity.String()]; ok {
+		return OriginImported
+	}
+	return OriginDiscovered
+}
+
+// modelIdentitySet collects the canonical identity strings of every asset
+// list the model carries — the universe attribution keys may reference.
+func modelIdentitySet(m *Model) map[string]struct{} {
+	known := make(map[string]struct{})
+	add := func(id asset.Identity) { known[id.String()] = struct{}{} }
+	for _, d := range m.Domains {
+		add(d.Identity())
+	}
+	for _, h := range m.Hosts {
+		add(h.Identity())
+	}
+	for _, ip := range m.IPs {
+		add(ip.Identity())
+	}
+	for _, p := range m.Ports {
+		add(p.Identity())
+	}
+	for _, s := range m.Services {
+		add(s.Identity())
+	}
+	for _, u := range m.URLs {
+		add(u.Identity())
+	}
+	for _, ep := range m.Endpoints {
+		add(ep.Identity())
+	}
+	for _, j := range m.JavaScript {
+		add(j.Identity())
+	}
+	for _, p := range m.Parameters {
+		add(p.Identity())
+	}
+	for _, t := range m.Technologies {
+		add(t.Identity())
+	}
+	for _, s := range m.Secrets {
+		add(s.Identity())
+	}
+	for _, e := range m.Evidence {
+		add(e.Identity())
+	}
+	for _, f := range m.Findings {
+		add(f.Identity())
+	}
+	for _, c := range m.TLSCertificates {
+		add(c.Identity())
+	}
+	for _, sm := range m.SourceMaps {
+		add(sm.Identity())
+	}
+	for _, lr := range m.LiveRecords {
+		add(lr.URL.Identity())
+	}
+	return known
+}
+
+// buildOrigins derives the per-origin asset census over the model's identity
+// universe: discovered = total − imported, imported = the attribution
+// membership. Present only when attribution exists; absent attribution keeps
+// legacy exports byte-identical (the Origins field stays nil). Keys are the
+// fixed Origin vocabulary values.
+func buildOrigins(m *Model, known map[string]struct{}) map[string]int {
+	if len(m.Attribution) == 0 {
+		return nil
+	}
+	imported := 0
+	for id := range m.Attribution {
+		if _, ok := known[id]; ok {
+			imported++
+		}
+	}
+	return map[string]int{
+		string(OriginDiscovered): len(known) - imported,
+		string(OriginImported):   imported,
+	}
 }
 
 // ---- per-kind validation + normalization ----
@@ -997,6 +1148,15 @@ type digestPayload struct {
 	// exported summary) is its deterministic projection.
 	ErrorRecords []ErrorRecord `json:"error_records,omitempty"`
 
+	// Attribution is the normalized import-provenance map (the encoder
+	// sorts map keys, so it digests deterministically). ImportedAt is
+	// content provenance — included — while run brackets stay excluded.
+	// All three fields are omitempty: a report without attribution hashes
+	// byte-identically to the legacy payload.
+	Attribution          map[string]AttributionEntry `json:"attribution,omitempty"`
+	AttributionTruncated bool                        `json:"attribution_truncated,omitempty"`
+	Origins              map[string]int              `json:"origins,omitempty"`
+
 	Runtime   RuntimeStats `json:"runtime"`
 	Cache     CacheStats   `json:"cache"`
 	Execution ExecStats    `json:"execution"`
@@ -1040,33 +1200,36 @@ func computeDigest(m *Model) (string, error) {
 		Target: m.Target,
 		// StartedAt and EndedAt are wall-clock brackets — excluded
 		// from the digest for the same stability reason (see above).
-		Domains:         m.Domains,
-		Hosts:           m.Hosts,
-		IPs:             m.IPs,
-		Ports:           m.Ports,
-		Services:        m.Services,
-		URLs:            m.URLs,
-		Endpoints:       m.Endpoints,
-		JavaScript:      m.JavaScript,
-		Parameters:      m.Parameters,
-		Technologies:    m.Technologies,
-		Secrets:         m.Secrets,
-		Evidence:        m.Evidence,
-		Findings:        m.Findings,
-		TLSCertificates: m.TLSCertificates,
-		SourceMaps:      m.SourceMaps,
-		Relationships:   m.Relationships,
-		LiveRecords:     m.LiveRecords,
-		Surfaces:        m.Surfaces,
-		Groups:          m.Groups,
-		AttackPaths:     m.AttackPaths,
-		Recommendations: m.Recommendations,
-		Statistics:      statsForDigest,
-		Summary:         summaryForDigest,
-		ErrorRecords:    m.errorRecords,
-		Runtime:         runtimeForDigest,
-		Cache:           m.Cache,
-		Execution:       m.Execution,
+		Domains:              m.Domains,
+		Hosts:                m.Hosts,
+		IPs:                  m.IPs,
+		Ports:                m.Ports,
+		Services:             m.Services,
+		URLs:                 m.URLs,
+		Endpoints:            m.Endpoints,
+		JavaScript:           m.JavaScript,
+		Parameters:           m.Parameters,
+		Technologies:         m.Technologies,
+		Secrets:              m.Secrets,
+		Evidence:             m.Evidence,
+		Findings:             m.Findings,
+		TLSCertificates:      m.TLSCertificates,
+		SourceMaps:           m.SourceMaps,
+		Relationships:        m.Relationships,
+		LiveRecords:          m.LiveRecords,
+		Surfaces:             m.Surfaces,
+		Groups:               m.Groups,
+		AttackPaths:          m.AttackPaths,
+		Recommendations:      m.Recommendations,
+		Statistics:           statsForDigest,
+		Summary:              summaryForDigest,
+		ErrorRecords:         m.errorRecords,
+		Attribution:          m.Attribution,
+		AttributionTruncated: m.AttributionTruncated,
+		Origins:              m.Origins,
+		Runtime:              runtimeForDigest,
+		Cache:                m.Cache,
+		Execution:            m.Execution,
 	}
 
 	buf, err := json.Marshal(p)

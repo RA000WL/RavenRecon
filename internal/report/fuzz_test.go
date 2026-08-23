@@ -82,8 +82,8 @@ func FuzzRenderCSV(f *testing.F) {
 		}
 
 		wantCols := map[string]int{
-			"hosts": 3, "urls": 7, "endpoints": 4,
-			"technologies": 6, "secrets": 5, "findings": 9,
+			"hosts": 4, "urls": 8, "endpoints": 4,
+			"technologies": 6, "secrets": 5, "findings": 10,
 		}
 		for part, cols := range wantCols {
 			bufBytes, ok := sink.parts[part]
