@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/importer"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/report"
 )
@@ -229,7 +231,115 @@ func (s *reportStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		LiveRecords:     in.Results.LiveRecords,
 	}
 
+	// Import attribution (v1.8 T12 wiring): project the run's provenance
+	// sidecar (StageInput.Provenance, merged by the runner from the ingest
+	// stage family) into the Context's attribution input. Keys must
+	// reference identities present in THIS context — NewModel rejects an
+	// unknown key outright — so every record whose identity is not in the
+	// corpus/results above is dropped here. Those are entries the boundary
+	// filters removed on the way in (out-of-scope hosts, IP-literal URLs)
+	// or assets a cap cut: attributing an absent asset would be false
+	// provenance. First record per identity wins (the sidecar is in the
+	// runner's deterministic merge order; two files importing the same
+	// asset keep both records there, and the report names the first).
+	if len(in.Provenance) > 0 {
+		rctx.Attribution = attributionFromProvenance(in.Provenance, reportContextIdentities(rctx))
+	}
+
 	return s.runReport(ctx, in, reg, rctx)
+}
+
+// attributionFromProvenance projects provenance records into the report
+// engine's attribution map: one entry per known identity (first record per
+// identity wins), keyed by the canonical identity string. Records for
+// identities absent from known are skipped — they reference assets that did
+// not reach this context (boundary-filtered or capped), and the report model
+// rejects attribution keys outside its corpus universe.
+func attributionFromProvenance(records []importer.ProvenanceRecord, known map[string]struct{}) map[string]report.AttributionEntry {
+	out := make(map[string]report.AttributionEntry)
+	for _, rec := range records {
+		if rec.Identity == "" {
+			continue
+		}
+		if _, ok := known[rec.Identity]; !ok {
+			continue
+		}
+		if _, dup := out[rec.Identity]; dup {
+			continue
+		}
+		out[rec.Identity] = report.AttributionEntry{
+			Importer:     rec.Importer,
+			OriginalTool: rec.OriginalTool,
+			Filename:     rec.Filename,
+			ImportedAt:   rec.ImportTime,
+			Confidence:   rec.Confidence,
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// reportContextIdentities collects the canonical identity strings of every
+// asset list about to be handed to report.Run — the same universe
+// NewModel's attribution validation accepts keys from (domains, hosts,
+// IPs, ports, services, URLs, endpoints, JavaScript, parameters,
+// technologies, secrets, evidence, findings, TLS certificates, source
+// maps, and live records' URLs). Relationships and the priority outputs
+// carry no asset identities; LiveRecords attribute through their URL.
+func reportContextIdentities(rctx report.Context) map[string]struct{} {
+	known := make(map[string]struct{})
+	add := func(id asset.Identity) { known[id.String()] = struct{}{} }
+	for _, d := range rctx.Domains {
+		add(d.Identity())
+	}
+	for _, h := range rctx.Hosts {
+		add(h.Identity())
+	}
+	for _, ip := range rctx.IPs {
+		add(ip.Identity())
+	}
+	for _, p := range rctx.Ports {
+		add(p.Identity())
+	}
+	for _, s := range rctx.Services {
+		add(s.Identity())
+	}
+	for _, u := range rctx.URLs {
+		add(u.Identity())
+	}
+	for _, ep := range rctx.Endpoints {
+		add(ep.Identity())
+	}
+	for _, j := range rctx.JavaScript {
+		add(j.Identity())
+	}
+	for _, p := range rctx.Parameters {
+		add(p.Identity())
+	}
+	for _, t := range rctx.Technologies {
+		add(t.Identity())
+	}
+	for _, s := range rctx.Secrets {
+		add(s.Identity())
+	}
+	for _, e := range rctx.Evidence {
+		add(e.Identity())
+	}
+	for _, f := range rctx.Findings {
+		add(f.Identity())
+	}
+	for _, c := range rctx.TLSCertificates {
+		add(c.Identity())
+	}
+	for _, sm := range rctx.SourceMaps {
+		add(sm.Identity())
+	}
+	for _, lr := range rctx.LiveRecords {
+		add(lr.URL.Identity())
+	}
+	return known
 }
 
 // runReport derives the engine config from the StageInput, calls

@@ -258,6 +258,11 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			// zero — EndAt does not exist until the loop below completes;
 			// the report stage falls back to its own render-time read.
 			RunStartedAt: report.StartAt,
+			// The merged import-provenance sidecar so far (v1.8 T12
+			// wiring): read-only for stages, consumed by the report
+			// stage's attribution projection. A stage never sees its own
+			// additions — the merge below runs after the stage returns.
+			Provenance: provenance,
 		}
 		stageCtx := ctx
 		cancel := func() {}

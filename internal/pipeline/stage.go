@@ -120,6 +120,21 @@ type StageInput struct {
 	// falls back to its own render-time clock read; a caller composing
 	// inputs after a completed run may set it explicitly. Zero = unknown.
 	RunEndedAt time.Time
+
+	// Provenance is the merged import-provenance sidecar accumulated by
+	// the earlier stages (v1.8 T12 wiring): the same records the runner
+	// merges into RunReport.Provenance (first-seen dedup on the
+	// identity|filename|importer triple, deterministic order, per-stage
+	// MaxOutput caps). Stages must treat the slice as read-only, with the
+	// identical contract as the corpus/results slices: the runner passes
+	// its live slice, so an in-place write corrupts the sidecar handed to
+	// later stages and the final report; the runner only copies at the
+	// merge. A stage never sees its own additions: StageInput.Provenance
+	// is the merged state before this stage's turn. The consumer is the
+	// report stage, which projects it into the report Context's
+	// attribution input (internal/report Context.Attribution); every
+	// other stage ignores it.
+	Provenance []importer.ProvenanceRecord
 }
 
 // StageResult is what one stage run reports.

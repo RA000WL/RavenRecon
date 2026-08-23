@@ -28,6 +28,7 @@ Commands:
   doctor        Check the local RavenRecon environment
   discover      Run passive subdomain discovery for a domain
   scan          Run the full end-to-end reconnaissance pipeline for a domain
+  ingest        Import existing reconnaissance data files and enrich them
 
 Options:
   -h, --help    Show this help message
@@ -39,6 +40,7 @@ Examples:
   ravenrecon discover example.com --sources subfinder,amass
   ravenrecon scan example.com
   ravenrecon scan example.com --stages discover,dns,httpprobe --output out/
+  ravenrecon ingest --output out/ example.com urls.txt
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
@@ -145,6 +147,9 @@ func Run(ctx context.Context, args []string) error {
 
 	case "scan":
 		return runScan(ctx, os.Stdout, args[1:], newScanStages, newScanTUI)
+
+	case "ingest":
+		return runIngest(ctx, os.Stdout, args[1:], newIngestStages, newScanTUI)
 
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
