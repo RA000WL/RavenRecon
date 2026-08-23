@@ -10,21 +10,24 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
 
-// Format detection waterfall for Phase 1 plain-text family:
+// Format detection waterfall for the importer families:
 //
 //   1. signature: <?xml / json.Valid / gzip magic (0x1f 0x8b)
-//   2. structure probe: json.Decoder / xml token peek (on peek slice)
+//   2. structure probe: json.Decoder / xml.Decoder root-element token peek
+//      (on the bounded peek slice — see jsonProbeShape / xmlProbeShape)
 //   3. MIME + extension tie-break: extension hints confidence but never solely decides
 //   4. line-shape classifier: asset.ParseURL/NewHost, netip.ParseAddr/Prefix, js heuristic
 //
-// This file implements steps 1-4 for plain-text. Future phases add JSON/XML
-// importers; the waterfall ordering is preserved so those outrank plain.
+// The XML branch maps root elements <items>/<issues> → "burp" and
+// <OWASPZAPReport> (case-insensitive; zaproxy emits the same root) → "zap".
+// Unknown XML roots yield no claim from either XML importer — there is no
+// generic-XML fallback by design; such files fall through honestly to
+// plain-generic's last-resort catch-all. Specific plain importers decline
+// any XML-looking peek (looksLikeXMLPeek) so tag-laden content is never
+// mis-ranked above an XML importer.
 
-// isXMLSignature reports whether peek looks like XML (<?xml prefix).
-func isXMLSignature(peek []byte) bool {
-	trim := bytes.TrimSpace(peek)
-	return bytes.HasPrefix(trim, []byte("<?xml"))
-}
+// looksLikeXMLPeek lives in xml_stream.go beside the rest of the XML
+// streaming machinery; it is the single definition of "peek looks like XML".
 
 // isJSONStructure reports whether peek is JSON (object/array) via json.Valid
 // after trimming leading BOM/whitespace. For NDJSON (multiple JSON values
@@ -311,9 +314,10 @@ func mimeExtensionConfidence(path string, peek []byte) float64 {
 // plainConfidence computes confidence for a plain importer given peek and
 // shape expectation. Used by each plain importer's CanImport.
 func plainConfidence(path string, peek []byte, want LineShape, expectedExts []string) (float64, bool) {
-	// Signature stage: if peek is XML / JSON / gzip, plain importers decline
-	// (low confidence) — those belong to future phases.
-	if isXMLSignature(peek) || isJSONStructure(peek) || isGzipped(peek) {
+	// Signature stage: if peek is XML / JSON / gzip, plain importers decline.
+	// The XML check is the broad looksLikeXMLPeek (declaration-less fragments
+	// too), so tag-laden content never reaches the line-shape classifier.
+	if looksLikeXMLPeek(peek) || isJSONStructure(peek) || isGzipped(peek) {
 		return 0, false
 	}
 	if len(bytes.TrimSpace(peek)) == 0 {

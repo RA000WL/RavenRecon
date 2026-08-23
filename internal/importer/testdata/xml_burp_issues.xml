@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<issues>
+<issue>
+  <serial>1985730948263546123</serial>
+  <name>Content type is not specified</name>
+  <severity>Low</severity>
+  <host>https://api.example.com</host>
+  <path>/v1/users</path>
+</issue>
+<issue>
+  <serial>1985730948263546999</serial>
+  <name>Cross-domain POST</name>
+  <severity>Information</severity>
+  <host>https://api.example.com</host>
+  <path>/v1/submit</path>
+</issue>
+</issues>

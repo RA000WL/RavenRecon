@@ -38,6 +38,10 @@ func ProvenanceSourceForImporter(importerName string) string {
 		return "nuclei"
 	case "json-generic":
 		return "json-generic"
+	case "xml-burp":
+		return "burpsuite"
+	case "xml-zap":
+		return "owaspzap"
 	default:
 		return importerName
 	}

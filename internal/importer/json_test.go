@@ -471,6 +471,13 @@ func TestJSONStreamingBounded(t *testing.T) {
 		fmt.Fprintf(f, "{\"url\":\"https://example.com/%d\",\"status_code\":200}\n", i)
 	}
 	f.Close()
+	// What this heap guard honestly measures: RETAINED heap after GC with the
+	// sink pinned live past the m2 snapshot (count reads below + KeepAlive).
+	// With distinct URLs and MaxOutput=100000 the retained set IS the dominant
+	// term by design (measured ≈600 B per record ⇒ ~60 MiB retained at the
+	// cap), so the bound below pins output-retention cost plus streaming
+	// overhead; it does NOT isolate streaming overhead, and peak transient
+	// allocations are not observable via MemStats deltas at all.
 	var m1, m2 runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
@@ -483,6 +490,22 @@ func TestJSONStreamingBounded(t *testing.T) {
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&m2)
+
+	// Sink liveness is structural: these reads happen after m2, so the GC
+	// cannot have freed the retained assets before measurement, and a freed
+	// sink could not satisfy them either.
+	const wantRetained = 100000 // tail-dropped at MaxOutput
+	if got := len(sink.URLs); got != wantRetained {
+		t.Fatalf("retained urls %d want %d (cap)", got, wantRetained)
+	}
+	if got := len(sink.ProvenanceRecords); got != wantRetained {
+		t.Fatalf("retained provenance %d want %d", got, wantRetained)
+	}
+	if !stats.Truncated || stats.ItemsProcessed != wantRetained {
+		t.Fatalf("truncated=%v processed=%d want true/%d", stats.Truncated, stats.ItemsProcessed, wantRetained)
+	}
+	runtime.KeepAlive(sink)
+
 	if stats.ItemsFailed != 0 {
 		t.Fatalf("failed %d", stats.ItemsFailed)
 	}
@@ -490,12 +513,10 @@ func TestJSONStreamingBounded(t *testing.T) {
 	if m2.HeapInuse > m1.HeapInuse {
 		heapDelta = m2.HeapInuse - m1.HeapInuse
 	}
-	const maxDelta = 5 << 20
+	t.Logf("measured retained heap delta: %d bytes (%.1f MiB) for %d records", heapDelta, float64(heapDelta)/(1<<20), wantRetained)
+	const maxDelta = 128 << 20 // measured 59.6 MiB retention @100k + >2x slack
 	if heapDelta > maxDelta {
-		t.Fatalf("heap delta too large: %d (max %d) streaming not bounded?", heapDelta, maxDelta)
-	}
-	if stats.ItemsProcessed == 0 {
-		t.Fatalf("no processed")
+		t.Fatalf("heap delta %d exceeds retention bound %d — unbounded retention?", heapDelta, maxDelta)
 	}
 }
 

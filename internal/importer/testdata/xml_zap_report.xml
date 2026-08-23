@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OWASPZAPReport version="2.16.0">
+<site name="https://www.example.com" host="www.example.com" port="443" ssl="true">
+<alerts>
+<alertitem>
+  <pluginid>10038</pluginid>
+  <alert>CSP: strict-dynamic</alert>
+  <name>CSP: strict-dynamic</name>
+  <riskcode>2</riskcode>
+  <confidence>Medium</confidence>
+  <url>https://www.example.com/index.html</url>
+</alertitem>
+<alertitem>
+  <pluginid>10015</pluginid>
+  <alert>Incomplete or No Cache-control Header Set</alert>
+  <riskcode>1</riskcode>
+  <url>https://www.example.com/assets/app.css</url>
+</alertitem>
+<alertitem>
+  <pluginid>10098</pluginid>
+  <alert>Cross-Domain Misconfiguration</alert>
+  <riskcode>0</riskcode>
+  <url>https://www.example.com/crossdomain.xml</url>
+</alertitem>
+</alerts>
+</site>
+</OWASPZAPReport>

@@ -27,6 +27,24 @@
 //     (helpers in cache.go expose the parts for cache.NewKey without
 //     importing internal/cache inside this package, preserving layering §0.4).
 //
+// Registration checklist — every importer below must be registered together
+// at the future ingest composition point (registration is caller-side; there
+// is deliberately no production compose point before that milestone, see
+// TestXMLRegistryDeterminism / newFullRegistry for the canonical set):
+//
+//	plain ×7   NewPlainDomainsImporter, NewPlainSubdomainsImporter,
+//	           NewPlainURLsImporter, NewPlainAliveImporter, NewPlainJSImporter,
+//	           NewPlainIPsImporter, NewPlainCIDRsImporter
+//	json ×5    NewJSONHttpxImporter, NewJSONDnsxImporter, NewJSONNaabuImporter,
+//	           NewJSONKatanaImporter, NewJSONNucleiImporter
+//	xml ×2     NewXMLBurpImporter (sitemap + issues shapes), NewXMLZapImporter
+//	fallbacks  NewJSONGenericImporter then NewPlainGenericImporter — always LAST
+//	           (registry sorts confidence desc, Name asc within a tier)
+//
+// Do not wire a subset: Detect's generic-last fallback only behaves as tested
+// when this exact 14-specific-importer set (+2 generic fallbacks = 16 total)
+// is registered.
+//
 // This package imports only stdlib, internal/asset, and internal/event
 // (never internal/cache, internal/runtime, internal/pipeline, internal/report).
 package importer

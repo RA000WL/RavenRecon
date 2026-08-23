@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<items>
+<item>
+  <url>https://www.example.com/</url>
+</item>
+<item>
+  <url>https://api.example.com/v1/status</url>
+</item>
+<item>
+  <url>http://legacy.example.com/login?next=%2Fhome</url>
+</item>
+</items>
