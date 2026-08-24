@@ -90,8 +90,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks: %v", err)
 	}
-	if reg.Len() != 11 {
-		t.Fatalf("registry len %d, want 11 (5 web + 3 js + 3 apis)", reg.Len())
+	if reg.Len() != 14 {
+		t.Fatalf("registry len %d, want 14 (5 web + 3 js + 3 apis + 3 cloud)", reg.Len())
 	}
 	if _, ok := reg.Get("web.csp.missing"); !ok {
 		t.Fatalf("web.csp.missing missing (web family not loaded)")
@@ -110,6 +110,15 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	}
 	if _, ok := reg.Get("api.graphql.introspection"); !ok {
 		t.Fatalf("api.graphql.introspection missing")
+	}
+	if _, ok := reg.Get("cloud.aws.key-indicator"); !ok {
+		t.Fatalf("cloud.aws.key-indicator missing (cloud family not loaded)")
+	}
+	if _, ok := reg.Get("cloud.bucket.url"); !ok {
+		t.Fatalf("cloud.bucket.url missing")
+	}
+	if _, ok := reg.Get("cloud.firebase.indicator"); !ok {
+		t.Fatalf("cloud.firebase.indicator missing")
 	}
 	// Validate graph still passes after both packs.
 	if err := reg.Validate(); err != nil {
@@ -133,8 +142,11 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err := reg.Register(custom); err == nil || err.Error() != "detect: registry is sealed" {
 		t.Fatalf("sealed not enforced: %v", err)
 	}
-	// Stage should run with both families: provide JS + host + endpoints + evidence so all packs have work
-	// (web.csp/hsts need host, web.robots/apis need endpoint, web.sourcemap/js need javascript, web.cors needs evidence).
+	// Stage should run with all four families: provide JS + host + endpoints +
+	// evidence + a secret candidate so every pack has work (web.csp/hsts need
+	// host, web.robots/apis need endpoint, web.sourcemap/js need javascript,
+	// web.cors needs evidence, cloud.aws needs secrets, cloud.firebase needs
+	// evidence, cloud.bucket needs endpoints).
 	host := mustHost(t, "www.example.com")
 	js, err := asset.NewJavaScript("https://www.example.com/app_xss.js", asset.Provenance{Source: "js-test"})
 	if err != nil {
@@ -148,6 +160,10 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEvidence: %v", err)
 	}
+	sec, err := asset.NewSecretCandidate(asset.SecretTypeGeneric, "synthetic-not-a-secret-value", host.Identity(), asset.Provenance{Source: "cloud-test"})
+	if err != nil {
+		t.Fatalf("NewSecretCandidate: %v", err)
+	}
 	in := pipeline.StageInput{
 		Target:  mustDomain(t, "example.com"),
 		Domains: []asset.Domain{mustDomain(t, "example.com")},
@@ -158,14 +174,15 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	in.Results.JavaScript = []asset.JavaScript{js}
 	in.Results.Endpoints = []asset.Endpoint{ep}
 	in.Results.Evidence = []asset.Evidence{ev}
+	in.Results.Secrets = []asset.SecretCandidate{sec}
 	res, err := stage.Run(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Run with both packs: %v", err)
 	}
-	if res.ItemsProcessed < 11 {
-		t.Fatalf("ItemsProcessed %d, want 11 (all rules from all packs attempted)", res.ItemsProcessed)
+	if res.ItemsProcessed < 14 {
+		t.Fatalf("ItemsProcessed %d, want 14 (all rules from all packs attempted)", res.ItemsProcessed)
 	}
-	// Also verify nil-registry path still yields 11 and is sealed.
+	// Also verify nil-registry path still yields 14 and is sealed.
 	stage2, err := NewDetectStageWithAllPacks(nil)
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks(nil): %v", err)
@@ -230,5 +247,69 @@ func TestLoadJsPackHelper(t *testing.T) {
 	}
 	if err := LoadJsPack(nil); err == nil {
 		t.Fatalf("nil registry should fail")
+	}
+}
+
+func TestLoadCloudPackHelper(t *testing.T) {
+	if got := len(pipeline.AllStages()); got != 12 {
+		t.Fatalf("AllStages = %d, want 12", got)
+	}
+	reg := detect.NewRegistry()
+	if err := LoadCloudPack(reg); err != nil {
+		t.Fatalf("LoadCloudPack: %v", err)
+	}
+	if reg.Len() != 3 {
+		t.Fatalf("len %d, want 3 (cloud pack)", reg.Len())
+	}
+	if _, ok := reg.Get("cloud.aws.key-indicator"); !ok {
+		t.Fatalf("cloud.aws.key-indicator missing")
+	}
+	if _, ok := reg.Get("cloud.bucket.url"); !ok {
+		t.Fatalf("cloud.bucket.url missing")
+	}
+	if _, ok := reg.Get("cloud.firebase.indicator"); !ok {
+		t.Fatalf("cloud.firebase.indicator missing")
+	}
+	// Validate still passes (deepCopy→Validate).
+	if err := reg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	// Deep copy: Get returns a copy; mutating it does not affect registry.
+	got, ok := reg.Get("cloud.aws.key-indicator")
+	if !ok {
+		t.Fatalf("Get cloud.aws.key-indicator missing for deepCopy check")
+	}
+	got.ID = "mutated"
+	got2, ok := reg.Get("cloud.aws.key-indicator")
+	if !ok || got2.ID != "cloud.aws.key-indicator" {
+		t.Fatalf("deep copy broken via Get alias: got2.ID=%q", got2.ID)
+	}
+	// Seal: further Register must fail.
+	custom := detect.Rule{
+		ID:            "custom.test.cloud",
+		Name:          "Custom Cloud Test",
+		Description:   "Custom",
+		Category:      detect.CategoryInformation,
+		Version:       "1.0.0",
+		Inputs:        []detect.RuleInput{detect.InputAssets},
+		Outputs:       []detect.RuleOutput{detect.OutputFindings},
+		EstimatedCost: detect.CostLow,
+		Timeout:       1000000000,
+		Author:        "test",
+		Enabled:       true,
+		Detector:      func(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) { return nil, nil },
+	}
+	if err := reg.Register(custom); err == nil || err.Error() != "detect: registry is sealed" {
+		t.Fatalf("sealed not enforced after LoadCloudPack: %v", err)
+	}
+	if err := LoadCloudPack(nil); err == nil {
+		t.Fatalf("nil registry should fail")
+	}
+	stage, err := NewDetectStageWithCloudPack(nil)
+	if err != nil {
+		t.Fatalf("NewDetectStageWithCloudPack(nil): %v", err)
+	}
+	if stage.Name() != pipeline.StageDetect {
+		t.Fatalf("Name %q, want %q", stage.Name(), pipeline.StageDetect)
 	}
 }
