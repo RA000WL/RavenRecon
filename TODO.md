@@ -78,7 +78,7 @@ orchestrator; every agent may append or update its own entries.
 > the sweep surfaced.
 
 ### NEW-95 (HIGH) — v2.0 Detection packs (ROADMAP v2.0)
-- Status: IN PROGRESS (orchestrator, 2026-08-24) — scoping round dispatched; Batch 1 (OPT-P1-2) IMPLEMENTED + REVIEWED + VERIFIED
+- Status: IN PROGRESS (orchestrator, 2026-08-24) — scoping round; Batch 1 (OPT-P1-2) IMPLEMENTED + REVIEWED + VERIFIED; Batch 2 (Web pack) IMPLEMENTED + REVIEWED + VERIFIED
 - Reporter: master
 - Owner: builder (per-wave dispatches)
 - Problem: ROADMAP v2.0 — detection packs loadable through frozen SDK v1
@@ -89,6 +89,7 @@ orchestrator; every agent may append or update its own entries.
   (v1.2.5 golden) — exported-API additions require formal reopening; fixes
   must stay inside package internals.
 - Batch 1 — OPT-P1-2 Context/Model isolation (builder; reviewer APPROVE after interior-clone fix; orchestrator VERIFIED 2026-08-24): internal per-job cloning via unexported cloneContextForRule (slices.Clone per slice + maps.Clone) and cloneModel deep-cloning interior slices (Surfaces.Factors, Groups.Members, etc.); barrier tests TestContextIsolation + TestModelIsolation FAIL→PASS, interior deep-clone tests, TestContractContextImmutabilityHonestBoundary updated, golden byte-identical, full gates green incl. -race on detect/report.
+- Batch 2 — Web pack (builder ses_fcccba2d6ffeFmcgwNDv2vSxBf, 2026-08-24) IMPLEMENTED + REVIEWED + VERIFIED (reviewer ses_fccb9d416ffe7BGGhl0wxdYQWz APPROVE 2026-08-24; orchestrator VERIFIED: re-ran gofmt/vet/build/test/race + surface golden, no exported drift): internal/detect/packs/web (doc.go, helpers.go, csp.go, hsts.go, cors.go, robots.go, sourcemap.go, rules.go) exporting Rules() with CheckAPIVersion(1,0) → 5 rules web.csp.missing / web.hsts.missing / web.cors.wildcard / web.robots.exposed / web.sourcemap.exposed (each <100 lines, deterministic, context-honoring, RequiredAssetTypes gated, Config deterministic via sortedKeys, bounded at 256, PriorityInfo/StatusOpen/CategoryInformation or Misconfig, MethodDetection evidence, observed-host/endpoint/js subjects); pipeline seam internal/pipeline/adapt/detect.go NewDetectStageWithPacks / LoadWebPack (nil→empty unchanged, web pack loaded via ValidateRule→Register deepCopy→Validate→Seal, AllStages unchanged); tests hermetic: packs/web/web_test.go (13 tests: CheckAPIVersion, LoadsThroughSDK deepCopy+Seal, MetadataDepsCompat, RequiredAssetTypesSkipHonestly, DetectorsHonorContext, FailuresIsolated panic→failed not crashed, CacheColdWarmParity same FindingsTruncated, DeterminismGolden via internal/golden -update byte-stable 2 runs equal, per-rule emission, ConfigDeterministic sorted) + adapt/detect_web_test.go (3 tests: WithPacks loads 5, ProvidedRegistry merges+seal, EmptyStillEmpty); goldens internal/detect/packs/web/testdata/web_report.golden (-update regenerates byte-identical); gates gofmt/go vet/go build green, go test ./... 28/28 pass (discovery 112s), go test -race ./internal/detect/... green, api_v1.golden untouched (TestSDKAPISurfaceSnapshot pass without -update).
 - Verification: per ROADMAP v2.0 acceptance criteria.
 
 ## Operational warnings (all agents)

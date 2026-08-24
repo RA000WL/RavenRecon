@@ -7,6 +7,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/web"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 )
 
@@ -61,6 +62,60 @@ var _ pipeline.Stage = (*detectStage)(nil)
 // StageParams — params are operator configuration, not test plumbing.
 func NewDetectStage(registry *detect.Registry) pipeline.Stage {
 	return &detectStage{registry: registry}
+}
+
+// NewDetectStageWithPacks returns a detect stage pre-loaded with the web
+// pack (v2.0 Batch 2). If registry is nil a fresh registry is created;
+// otherwise the provided registry is reused. Web pack rules are loaded via
+// web.Rules() → ValidateRule → Registry.Register (deep copy) → Validate
+// graph → Seal (startup confinement), matching the Batch 1 loader story.
+// The original NewDetectStage(nil) empty-registry behavior is unchanged;
+// callers that want the web pack use this constructor or LoadWebPack.
+//
+// The registry is sealed before returning, confining further registration
+// to startup (the Q1 lock). AllStages is unchanged — the pack is an
+// explicit opt-in, never auto-discovered.
+func NewDetectStageWithPacks(registry *detect.Registry) (pipeline.Stage, error) {
+	if registry == nil {
+		registry = detect.NewRegistry()
+	}
+	rules, err := web.Rules()
+	if err != nil {
+		return nil, fmt.Errorf("web pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return nil, fmt.Errorf("web pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return nil, err
+	}
+	registry.Seal()
+	return NewDetectStage(registry), nil
+}
+
+// LoadWebPack loads the web pack into registry through the SDK's
+// ValidateRule → Register → Validate → Seal path. It is the wiring helper
+// for callers that already own a registry and want explicit control.
+func LoadWebPack(registry *detect.Registry) error {
+	if registry == nil {
+		return fmt.Errorf("web pack: registry must not be nil")
+	}
+	rules, err := web.Rules()
+	if err != nil {
+		return fmt.Errorf("web pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return fmt.Errorf("web pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return err
+	}
+	registry.Seal()
+	return nil
 }
 
 // Name implements pipeline.Stage.
