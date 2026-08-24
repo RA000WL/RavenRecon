@@ -721,16 +721,17 @@ func TestContractContextImmutabilityHonestBoundary(t *testing.T) {
 		t.Fatalf("the caller's snapshot was corrupted by the run")
 	}
 
-	// The honest boundary, pinned: the engine shares ONE Context per run
-	// and does not enforce immutability — a mutating rule CAN corrupt what
-	// a same-run sibling observes (the dependency ordering makes this
-	// deterministic: reads.x runs only after mut.x completed). The
-	// framework's protection is downstream: the corrupted observation can
-	// never reach the report as a finding about an unobserved asset.
+	// The honest boundary after OPT-P1-2: the engine clones the Context
+	// per rule job (cloneContextForRule), so a mutating rule CANNOT corrupt
+	// what a same-run sibling observes — even with dependency ordering
+	// (reads.x runs only after mut.x completed) the sibling sees the
+	// pristine corpus. The framework's downstream protection still holds
+	// (a finding about an unobserved asset would fail), but isolation
+	// prevents the corruption from ever reaching the sibling.
 	readsRule := makeRule(t, "reads.x", &ruleOptions{
 		deps: []string{"mut.x"},
 		detector: func(ctx context.Context, dctx *Context) ([]asset.Finding, error) {
-			subject := dctx.Assets[0] // observes the tampered corpus
+			subject := dctx.Assets[0] // observes the pristine corpus (isolated)
 			f, err := subjectFinding(dctx, "reads.x", "Rule reads.x", CategoryInformation, subject, 0)
 			if err != nil {
 				return nil, err
@@ -752,14 +753,13 @@ func TestContractContextImmutabilityHonestBoundary(t *testing.T) {
 		t.Fatalf("mutating rule must complete: %+v", r)
 	}
 	rReads := resultOf(t, rep, "reads.x")
-	if rReads.Status != RuleStatusFailed || rReads.Err == nil ||
-		!strings.Contains(rReads.Err.Error(), "not observed in the corpus") {
-		t.Fatalf("sibling must fail on the corrupted observation: %+v", rReads)
+	if rReads.Status != RuleStatusCompleted {
+		t.Fatalf("sibling must complete with isolated pristine context (per-rule cloning): %+v", rReads)
 	}
-	if rep.Outcome != OutcomeIncomplete {
-		t.Fatalf("outcome %s, want incomplete", rep.Outcome)
+	if rep.Outcome != OutcomeCompleted {
+		t.Fatalf("outcome %s, want completed (isolated sibling cannot be corrupted)", rep.Outcome)
 	}
-	if len(rep.Findings) != 1 {
-		t.Fatalf("the corrupted observation must never reach the report findings")
+	if len(rep.Findings) != 2 {
+		t.Fatalf("both findings must reach the report when isolated: got %d", len(rep.Findings))
 	}
 }

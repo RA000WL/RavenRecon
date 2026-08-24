@@ -408,8 +408,10 @@ func Run(ctx context.Context, cfg EngineConfig, input Context) (RunResult, error
 // files removed, and the panic value surfaced in the error), never a
 // cancelled report, which the framework reserves for run teardown. The
 // pool's own recovery remains the last-resort net for panics outside this
-// function.
+// function. The Model is cloned per job so parallel reporters cannot
+// observe each other's mutations (OPT-P1-2).
 func processReport(jctx context.Context, cfg *EngineConfig, m *Model, plan reportPlan) (res ReportResult) {
+	m = cloneModel(m)
 	// The sink is created up front and aborted by the recovery on ANY
 	// panic, so no temp file can survive a panic on any path — including
 	// the cache-hit commit, which streams through this same sink.

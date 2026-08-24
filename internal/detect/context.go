@@ -2,6 +2,8 @@ package detect
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -62,12 +64,10 @@ type Snapshot struct {
 // Context is the detection context every rule receives: the normalized
 // snapshot domains, the run's bounded configuration, a bounded Logger, and
 // the injected Clock — nothing else. The cancellation context is passed
-// separately (it is the detector's first argument). "Immutable" here is a
-// convention, not an enforced invariant: the engine shares one *Context
-// across every rule of a run (rules within a level run in parallel), Go
-// cannot enforce immutability of the slice/map fields, and a rule that
-// mutates the Context or its state is a data race by definition — a rule
-// bug the engine neither detects nor isolates.
+// separately (it is the detector's first argument). "Immutable" here was a
+// convention until OPT-P1-2: the engine now clones the Context per rule job
+// (cloneContextForRule) so a buggy or hostile rule that mutates its view
+// cannot affect peers running in parallel.
 type Context struct {
 	// Assets is the deduplicated, identity-sorted core asset list.
 	Assets []asset.Identity `json:"assets"`
@@ -98,6 +98,28 @@ type Context struct {
 
 	// Clock is the injectable time seam (never nil).
 	Clock runtime.Clock `json:"-"`
+}
+
+// cloneContextForRule returns a per-rule shallow copy of src so parallel
+// detectors cannot observe each other's mutations. Slices are cloned via
+// slices.Clone (new backing array) and the Config map via maps.Clone; the
+// Logger and Clock interfaces are shared (they are concurrency-safe).
+// Unexported: per-job cloning is an internal isolation mechanism; the
+// exported Context type and its API remain frozen (SDK v1 golden).
+func cloneContextForRule(src *Context) *Context {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	cp.Assets = slices.Clone(src.Assets)
+	cp.Relationships = slices.Clone(src.Relationships)
+	cp.Evidence = slices.Clone(src.Evidence)
+	cp.Technologies = slices.Clone(src.Technologies)
+	cp.Secrets = slices.Clone(src.Secrets)
+	cp.JavaScript = slices.Clone(src.JavaScript)
+	cp.Endpoints = slices.Clone(src.Endpoints)
+	cp.Config = maps.Clone(src.Config)
+	return &cp
 }
 
 // LogLevel is the severity of one rule log entry.

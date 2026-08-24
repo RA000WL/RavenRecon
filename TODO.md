@@ -10,7 +10,7 @@ orchestrator; every agent may append or update its own entries.
 - **One entry per issue.** Keep it small and actionable.
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-95).
+  next free `NEW-n` (currently NEW-96).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -76,6 +76,20 @@ orchestrator; every agent may append or update its own entries.
 > verified 2026-08-23 (4-cluster reviewer sweep + gap fixes): all 22 entries
 > VERIFIED and archived to TODO.closed.md. NEW-85..NEW-89 filed from findings
 > the sweep surfaced.
+
+### NEW-95 (HIGH) — v2.0 Detection packs (ROADMAP v2.0)
+- Status: IN PROGRESS (orchestrator, 2026-08-24) — scoping round dispatched; Batch 1 (OPT-P1-2) IMPLEMENTED + REVIEWED + VERIFIED
+- Reporter: master
+- Owner: builder (per-wave dispatches)
+- Problem: ROADMAP v2.0 — detection packs loadable through frozen SDK v1
+  without core edits (families: Web/Auth/AuthZ/APIs/JS/Cloud/Business-logic),
+  metadata+deps+compat declarations, failure isolation, normalized evidence,
+  pack-level tests. Prerequisite OPT-P1-2 (shared mutable Context/Model)
+  rises to HIGH once third-party packs exist. Constraint: SDK surface frozen
+  (v1.2.5 golden) — exported-API additions require formal reopening; fixes
+  must stay inside package internals.
+- Batch 1 — OPT-P1-2 Context/Model isolation (builder; reviewer APPROVE after interior-clone fix; orchestrator VERIFIED 2026-08-24): internal per-job cloning via unexported cloneContextForRule (slices.Clone per slice + maps.Clone) and cloneModel deep-cloning interior slices (Surfaces.Factors, Groups.Members, etc.); barrier tests TestContextIsolation + TestModelIsolation FAIL→PASS, interior deep-clone tests, TestContractContextImmutabilityHonestBoundary updated, golden byte-identical, full gates green incl. -race on detect/report.
+- Verification: per ROADMAP v2.0 acceptance criteria.
 
 ## Operational warnings (all agents)
 

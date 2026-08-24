@@ -770,7 +770,8 @@ func executeRule(ctx context.Context, r Rule, e *env) (RuleResult, []asset.Findi
 // runDetector invokes the rule's detector with panic isolation and returns
 // the measured duration. A panicking detector never takes down the worker,
 // the run, or sibling rules: the panic is recovered and surfaced as the
-// rule's structured error.
+// rule's structured error. The Context is cloned per invocation so parallel
+// detectors cannot observe each other's mutations (OPT-P1-2).
 func (e *env) runDetector(ctx context.Context, r Rule) (findings []asset.Finding, d time.Duration, err error) {
 	started := e.clock.Now()
 	defer func() {
@@ -780,7 +781,7 @@ func (e *env) runDetector(ctx context.Context, r Rule) (findings []asset.Finding
 			err = fmt.Errorf("%w: rule %q: %v", errPanicked, r.ID, p)
 		}
 	}()
-	findings, err = r.Detector(ctx, e.dctx)
+	findings, err = r.Detector(ctx, cloneContextForRule(e.dctx))
 	return findings, d, err
 }
 

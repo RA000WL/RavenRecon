@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"time"
 	"unicode/utf8"
@@ -47,8 +49,10 @@ const maxTargetBytes = 253
 // HTML, or any future format — renders from the same Model, so no format
 // re-validates, re-sorts, or re-traverses the corpus.
 //
-// A Model is immutable by contract: renderers must not mutate it, and the
-// engine shares one Model across every concurrent render job.
+// A Model is immutable by contract: renderers must not mutate it. The
+// engine clones the Model per render job (cloneModel) so a buggy or
+// hostile reporter that mutates its view cannot affect peers running in
+// parallel (OPT-P1-2).
 type Model struct {
 	// SchemaVersion is the report schema version (always SchemaVersion).
 	SchemaVersion int `json:"schema_version"`
@@ -144,6 +148,137 @@ type Model struct {
 	// change changes the digest; identical content produces an identical
 	// digest.
 	Digest string `json:"digest"`
+}
+
+// cloneModel returns a per-render deep copy of src so parallel reporters
+// cannot observe each other's mutations. Top-level slices are cloned via
+// slices.Clone (new backing array) and maps via maps.Clone. Priority
+// interior slices are also deep-cloned so hostile reporters cannot leak
+// mutations through shared backing arrays:
+//
+//   - for each Surface: Factors and each Factors[i].Evidence
+//   - for each Group: Members and each Members[i].Factors (+ Evidence) and SharedIndicators
+//   - for each AttackPath: Steps and each Steps[i].Evidence
+//   - for each Recommendation: Evidence
+//
+// The inner ErrorSummary categories and their Samples slices are also
+// cloned so mutations inside the summary are isolated. All clones are
+// bounded by the existing per-list and per-record caps already enforced by
+// normalization (maxModelPerKind, maxModelGroups, maxModelPaths, etc.), so
+// no unbounded allocation occurs. Unexported: per-job cloning is an
+// internal isolation mechanism; the exported Model type and its API
+// remain frozen.
+func cloneModel(src *Model) *Model {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	cp.Domains = slices.Clone(src.Domains)
+	cp.Hosts = slices.Clone(src.Hosts)
+	cp.IPs = slices.Clone(src.IPs)
+	cp.Ports = slices.Clone(src.Ports)
+	cp.Services = slices.Clone(src.Services)
+	cp.URLs = slices.Clone(src.URLs)
+	cp.Endpoints = slices.Clone(src.Endpoints)
+	cp.JavaScript = slices.Clone(src.JavaScript)
+	cp.Parameters = slices.Clone(src.Parameters)
+	cp.Technologies = slices.Clone(src.Technologies)
+	cp.Secrets = slices.Clone(src.Secrets)
+	cp.Evidence = slices.Clone(src.Evidence)
+	cp.Findings = slices.Clone(src.Findings)
+	cp.TLSCertificates = slices.Clone(src.TLSCertificates)
+	cp.SourceMaps = slices.Clone(src.SourceMaps)
+	cp.Relationships = slices.Clone(src.Relationships)
+	cp.Surfaces = cloneSurfaces(src.Surfaces)
+	cp.Groups = cloneGroups(src.Groups)
+	cp.AttackPaths = cloneAttackPaths(src.AttackPaths)
+	cp.LiveRecords = slices.Clone(src.LiveRecords)
+	cp.Recommendations = cloneRecommendations(src.Recommendations)
+	cp.Attribution = maps.Clone(src.Attribution)
+	cp.Origins = maps.Clone(src.Origins)
+	cp.errorRecords = slices.Clone(src.errorRecords)
+	if src.Errors.Categories != nil {
+		cp.Errors.Categories = slices.Clone(src.Errors.Categories)
+		for i := range cp.Errors.Categories {
+			cp.Errors.Categories[i].Samples = slices.Clone(src.Errors.Categories[i].Samples)
+		}
+	}
+	return &cp
+}
+
+// cloneSurfaces deep-clones the surface list and each surface's interior
+// slices (Factors and each Factor.Evidence). Bounded by maxModelPerKind
+// and maxFactorsPerSurface / maxFactorEvidenceRefs.
+func cloneSurfaces(src []priority.SurfaceAsset) []priority.SurfaceAsset {
+	if src == nil {
+		return nil
+	}
+	cp := slices.Clone(src)
+	for i := range cp {
+		cp[i].Factors = slices.Clone(src[i].Factors)
+		for j := range cp[i].Factors {
+			cp[i].Factors[j].Evidence = slices.Clone(src[i].Factors[j].Evidence)
+		}
+	}
+	return cp
+}
+
+// cloneGroups deep-clones the group list, each group's Members and
+// SharedIndicators, and each member's Factors (+ Evidence). Bounded by
+// maxModelGroups, maxGroupMembers, etc.
+func cloneGroups(src []priority.Group) []priority.Group {
+	if src == nil {
+		return nil
+	}
+	cp := slices.Clone(src)
+	for i := range cp {
+		cp[i].SharedIndicators = slices.Clone(src[i].SharedIndicators)
+		if src[i].Members != nil {
+			cp[i].Members = slices.Clone(src[i].Members)
+			for mi := range cp[i].Members {
+				cp[i].Members[mi].Factors = slices.Clone(src[i].Members[mi].Factors)
+				for fi := range cp[i].Members[mi].Factors {
+					cp[i].Members[mi].Factors[fi].Evidence = slices.Clone(src[i].Members[mi].Factors[fi].Evidence)
+				}
+			}
+		} else {
+			cp[i].Members = nil
+		}
+	}
+	return cp
+}
+
+// cloneAttackPaths deep-clones the attack-path list and each path's Steps
+// and each Steps[i].Evidence. Bounded by maxModelPaths / maxStepsPerPath.
+func cloneAttackPaths(src []priority.AttackPath) []priority.AttackPath {
+	if src == nil {
+		return nil
+	}
+	cp := slices.Clone(src)
+	for i := range cp {
+		if src[i].Steps != nil {
+			cp[i].Steps = slices.Clone(src[i].Steps)
+			for si := range cp[i].Steps {
+				cp[i].Steps[si].Evidence = slices.Clone(src[i].Steps[si].Evidence)
+			}
+		} else {
+			cp[i].Steps = nil
+		}
+	}
+	return cp
+}
+
+// cloneRecommendations deep-clones the recommendation list and each
+// recommendation's Evidence. Bounded by maxModelRecommendations.
+func cloneRecommendations(src []SurfaceRecommendation) []SurfaceRecommendation {
+	if src == nil {
+		return nil
+	}
+	cp := slices.Clone(src)
+	for i := range cp {
+		cp[i].Evidence = slices.Clone(src[i].Evidence)
+	}
+	return cp
 }
 
 // SurfaceRecommendation is one evidence-tied reconnaissance recommendation
