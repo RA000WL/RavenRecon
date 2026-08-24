@@ -90,8 +90,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks: %v", err)
 	}
-	if reg.Len() != 8 {
-		t.Fatalf("registry len %d, want 8 (5 web + 3 js)", reg.Len())
+	if reg.Len() != 11 {
+		t.Fatalf("registry len %d, want 11 (5 web + 3 js + 3 apis)", reg.Len())
 	}
 	if _, ok := reg.Get("web.csp.missing"); !ok {
 		t.Fatalf("web.csp.missing missing (web family not loaded)")
@@ -104,6 +104,12 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	}
 	if _, ok := reg.Get("js.prototype.pollution"); !ok {
 		t.Fatalf("js.prototype.pollution missing")
+	}
+	if _, ok := reg.Get("api.openapi.exposed"); !ok {
+		t.Fatalf("api.openapi.exposed missing (apis family not loaded)")
+	}
+	if _, ok := reg.Get("api.graphql.introspection"); !ok {
+		t.Fatalf("api.graphql.introspection missing")
 	}
 	// Validate graph still passes after both packs.
 	if err := reg.Validate(); err != nil {
@@ -127,27 +133,39 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err := reg.Register(custom); err == nil || err.Error() != "detect: registry is sealed" {
 		t.Fatalf("sealed not enforced: %v", err)
 	}
-	// Stage should run with both families: provide JS + host so both packs have work.
+	// Stage should run with both families: provide JS + host + endpoints + evidence so all packs have work
+	// (web.csp/hsts need host, web.robots/apis need endpoint, web.sourcemap/js need javascript, web.cors needs evidence).
+	host := mustHost(t, "www.example.com")
 	js, err := asset.NewJavaScript("https://www.example.com/app_xss.js", asset.Provenance{Source: "js-test"})
 	if err != nil {
 		t.Fatalf("NewJavaScript: %v", err)
 	}
+	ep, err := asset.NewEndpoint("GET", "https://www.example.com/api/v1/users/123", asset.Provenance{Source: "apis-test"})
+	if err != nil {
+		t.Fatalf("NewEndpoint: %v", err)
+	}
+	ev, err := asset.NewEvidence(asset.MethodHeader, "header:access-control-allow-origin", "*", host.Identity(), asset.Provenance{Source: "apis-test"})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
 	in := pipeline.StageInput{
 		Target:  mustDomain(t, "example.com"),
 		Domains: []asset.Domain{mustDomain(t, "example.com")},
-		Hosts:   []asset.Host{mustHost(t, "www.example.com")},
+		Hosts:   []asset.Host{host},
 		Bounds:  pipeline.DefaultStageConfig(),
 		Clock:   fixedClock{now: fixedTime},
 	}
 	in.Results.JavaScript = []asset.JavaScript{js}
+	in.Results.Endpoints = []asset.Endpoint{ep}
+	in.Results.Evidence = []asset.Evidence{ev}
 	res, err := stage.Run(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Run with both packs: %v", err)
 	}
-	if res.ItemsProcessed < 8 {
-		t.Fatalf("ItemsProcessed %d, want 8 (all rules from both packs attempted)", res.ItemsProcessed)
+	if res.ItemsProcessed < 11 {
+		t.Fatalf("ItemsProcessed %d, want 11 (all rules from all packs attempted)", res.ItemsProcessed)
 	}
-	// Also verify nil-registry path still yields 8 and is sealed.
+	// Also verify nil-registry path still yields 11 and is sealed.
 	stage2, err := NewDetectStageWithAllPacks(nil)
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks(nil): %v", err)

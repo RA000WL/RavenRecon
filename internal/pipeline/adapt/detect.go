@@ -7,6 +7,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/apis"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/js"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/web"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
@@ -143,6 +144,30 @@ func LoadJsPack(registry *detect.Registry) error {
 	return nil
 }
 
+// LoadApisPack loads the APIs pack (v2.0 Batch 4) into registry through the
+// same SDK path as LoadWebPack/LoadJsPack: ValidateRule → Register → Validate → Seal.
+// It is the wiring helper for callers that want explicit control over the
+// APIs pack. The registry is sealed before returning.
+func LoadApisPack(registry *detect.Registry) error {
+	if registry == nil {
+		return fmt.Errorf("apis pack: registry must not be nil")
+	}
+	rules, err := apis.Rules()
+	if err != nil {
+		return fmt.Errorf("apis pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return fmt.Errorf("apis pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return err
+	}
+	registry.Seal()
+	return nil
+}
+
 // NewDetectStageWithJsPack returns a detect stage pre-loaded with the JS
 // pack (v2.0 Batch 3). It mirrors NewDetectStageWithPacks but for the JS
 // pack. If registry is nil a fresh registry is created. The registry is
@@ -168,19 +193,44 @@ func NewDetectStageWithJsPack(registry *detect.Registry) (pipeline.Stage, error)
 	return NewDetectStage(registry), nil
 }
 
-// NewDetectStageWithAllPacks returns a detect stage pre-loaded with both
-// the web pack (Batch 2) and the JS pack (Batch 3). If registry is nil a
-// fresh registry is created; otherwise the provided registry is reused.
-// Both packs are loaded via ValidateRule → Register → Validate → Seal
-// (startup confinement). AllStages is unchanged — packs are explicit
-// opt-in. The original NewDetectStageWithPacks (web-only) and
-// NewDetectStageWithJsPack (js-only) remain available for callers that
-// want a single pack.
+// NewDetectStageWithApisPack returns a detect stage pre-loaded with the APIs
+// pack (v2.0 Batch 4). It mirrors NewDetectStageWithJsPack but for the APIs
+// pack. If registry is nil a fresh registry is created. The registry is
+// sealed before returning. AllStages is unchanged — the pack is explicit
+// opt-in, never auto-discovered.
+func NewDetectStageWithApisPack(registry *detect.Registry) (pipeline.Stage, error) {
+	if registry == nil {
+		registry = detect.NewRegistry()
+	}
+	rules, err := apis.Rules()
+	if err != nil {
+		return nil, fmt.Errorf("apis pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return nil, fmt.Errorf("apis pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return nil, err
+	}
+	registry.Seal()
+	return NewDetectStage(registry), nil
+}
+
+// NewDetectStageWithAllPacks returns a detect stage pre-loaded with the web
+// pack (Batch 2), the JS pack (Batch 3), and the APIs pack (Batch 4). If
+// registry is nil a fresh registry is created; otherwise the provided
+// registry is reused. All packs are loaded via ValidateRule → Register →
+// Validate → Seal (startup confinement). AllStages is unchanged — packs are
+// explicit opt-in. The original NewDetectStageWithPacks (web-only),
+// NewDetectStageWithJsPack (js-only), and NewDetectStageWithApisPack
+// (apis-only) remain available for callers that want a single pack.
 func NewDetectStageWithAllPacks(registry *detect.Registry) (pipeline.Stage, error) {
 	if registry == nil {
 		registry = detect.NewRegistry()
 	}
-	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules} {
+	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules} {
 		rules, err := load()
 		if err != nil {
 			return nil, err
