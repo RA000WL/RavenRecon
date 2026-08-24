@@ -7,6 +7,15 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-93 (HIGH) — crawl adapter argv rejected by installed katana + record parser misses modern JSONL shape (internal/crawl)
+- Status: VERIFIED — fixed (builder ses_fcd7cdcf5ffeqN8PRakBfWX3kz) and LIVE-VALIDATED on pentest-ground.com rescan 2026-08-24: crawl stage completed processed=2 failed=0 with honest crawl_truncated flag (was: failed, all 4 hosts exit 2, zero output). Red→green argv-pin + nested-shape parse regressions; cli smoke fixture argv updated (flagged §5 crossing, justified).
+- Reporter: orchestrator (pentest-ground.com field test, 2026-08-24)
+- Owner: builder
+- Problem: two compounding defects make crawl systematically non-functional: (1) argv passes `-ps` (undefined in installed katana — every invocation exits 2 at flag parsing with zero output; second invalid flag `-retries` renamed `-retry`) — manual repro: `flag provided but not defined: -ps`, exit 2; corrected argv exits 0 with 1077 endpoints. (2) `katanaRecord` (katana.go:102-106) parses only top-level `endpoint`, but modern katana -jsonl nests it under `request.endpoint` — even with valid argv every line would parse malformed → zero URLs → all hosts failed per NEW-86 semantics. Explains crawl failure on vulnbank.org AND pentest-ground.com (5/5 hosts exit 2).
+- Fix: drop `-ps`; `-retries`→`-retry`; add nested `request.endpoint` fallback to katanaRecord parsing (mirror importer's json-katana fix); update argv-pinning tests; add modern-shape parse regression.
+- Verification: exact adapter argv exits 0 manually; unit test parses nested line; live scan crawl stage completes with URLs>0.
+
+
 ### NEW-92 (LOW) — cli/ingest.go doc comment still describes the pre-NEW-73-residual paths separator contract (internal/cli)
 - Status: VERIFIED — orchestrator-fixed inline 2026-08-23 (one comment line): internal/cli/ingest.go buildIngestConfig doc now states newline is the ONLY separator and commas are reserved/rejected, matching the wave-c contract.
 - Reporter: wave-c agent 1

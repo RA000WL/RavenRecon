@@ -63,7 +63,8 @@ orchestrator; every agent may append or update its own entries.
 > vulnbank.org field test) dispatched to six parallel builders; merged diff reviewer-APPROVED
 > (merge-level cross-agent review) and orchestrator-verified same day.
 > NEW-3/14/60/85..90 archived to TODO.closed.md; NEW-73/74 keep only their
-> genuinely-open residuals; NEW-91 filed from merge-review Finding 1.
+> genuinely-open residuals; NEW-91 filed from merge-review Finding 1. NEW-93 (live-found crawl
+> breakage) fixed + live-validated; NEW-94 remains OPEN for design decision.
 
 > **2026-08-23 implementation wave:** NEW-61 through NEW-84 were implemented
 > by a builder batch (10 parallel fix agents + orchestrator integration).
@@ -75,6 +76,14 @@ orchestrator; every agent may append or update its own entries.
 > verified 2026-08-23 (4-cluster reviewer sweep + gap fixes): all 22 entries
 > VERIFIED and archived to TODO.closed.md. NEW-85..NEW-89 filed from findings
 > the sweep surfaced.
+
+### NEW-94 (MEDIUM) — discover transient shutdown-deadline discards fully-enumerated host corpus (internal/pipeline)
+- Status: OPEN
+- Reporter: orchestrator (vulnbank.org + pentest-ground.com field tests, 2026-08-24)
+- Owner: (unassigned)
+- Problem: in-scan discover hit "pool shutdown: context deadline exceeded" on BOTH live scans (standalone discover completed fine minutes prior each time — subfinder enumerated 21 hosts for pentest-ground before the deadline). The failed stage's additions are dropped → dns/httpprobe processed 0 despite a full host list existing; cascade starves half the pipeline off one transient budget miss.
+- Fix (needs design decision): retain partial additions when the failure is shutdown/deadline-class and the quality gate passed (enumerate-then-timeout is not untrusted data), OR extend the discovery shutdown budget to cover subfinder's worst-case runtime. Evidence: pentest-scan.log discover error + dns processed=0 vs standalone discover 21 hosts.
+- Verification: fault-injected slow source → hosts retained (or documented policy pinned); quality gate still enforced.
 
 ## Operational warnings (all agents)
 

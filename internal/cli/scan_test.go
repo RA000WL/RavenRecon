@@ -1419,7 +1419,7 @@ var smokeScript = map[string]smokeScriptEntry{
 	// stage's happy path genuinely exercised (H-1 honesty contract: an
 	// unscripted/failing katana run now folds the stage to incomplete, so
 	// the smoke fixture must script a healthy crawl).
-	"katana -u https://www.example.com -d 3 -jc -ps -xhr -aff=false -fs fqdn -kf all -rl 150 -c 4 -timeout 5 -retries 1 -jsonl -o - -silent": {
+	"katana -u https://www.example.com -d 3 -jc -xhr -aff=false -fs fqdn -kf all -rl 150 -c 4 -timeout 5 -retry 1 -jsonl -o - -silent": {
 		stdout: "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"endpoint\":\"https://www.example.com/about\",\"source\":\"js\",\"tag\":\"a\"}\n",
 	},
 }

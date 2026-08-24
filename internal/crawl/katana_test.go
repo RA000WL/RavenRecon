@@ -337,39 +337,100 @@ func TestKatanaDetectArgShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Crawl: %v", err)
 	}
-	// Check required flags present.
-	mustContain := func(flag string) {
-		for _, a := range seenArgs {
-			if a == flag {
-				return
-			}
-		}
-		t.Errorf("args %v missing flag %q", seenArgs, flag)
+	// Pin the exact corrected argv (NEW-93 defect 1): the previously pinned
+	// flags were broken — "-ps" is undefined in installed katana (every
+	// invocation exited 2 at flag parsing) and "-retries" was renamed
+	// "-retry". The pinned slice below matches the verified-working
+	// invocation flag-for-flag.
+	want := []string{
+		"-u", "https://www.example.com",
+		"-d", "2",
+		"-jc", "-xhr",
+		"-aff=false",
+		"-fs", "fqdn",
+		"-kf", "all",
+		"-rl", "123",
+		"-c", "7",
+		"-timeout", fmt.Sprint(DefaultKatanaTimeout),
+		"-retry", "1",
+		"-jsonl",
+		"-o", "-",
+		"-silent",
 	}
-	mustContain("-jc")
-	mustContain("-ps")
-	mustContain("-xhr")
-	mustContain("-fs")
-	mustContain("fqdn")
-	mustContain("-aff=false")
-	mustContain("-kf")
-	mustContain("all")
-	// Never headless, never aff true.
+	if !reflect.DeepEqual(seenArgs, want) {
+		t.Errorf("args = %v, want pinned argv %v", seenArgs, want)
+	}
+	// Never headless, never aff true; never the removed/renamed flags.
 	for _, a := range seenArgs {
-		if a == "-headless" || a == "-aff=true" || a == "-aff" {
+		if a == "-headless" || a == "-aff=true" || a == "-aff" || a == "-ps" || a == "-retries" {
 			t.Errorf("args must never contain %q, got %v", a, seenArgs)
 		}
 	}
-	// Depth check.
-	foundDepth := false
-	for i, a := range seenArgs {
-		if a == "-d" && i+1 < len(seenArgs) && seenArgs[i+1] == "2" {
-			foundDepth = true
-		}
-	}
+}
 
-	if !foundDepth {
-		t.Errorf("args %v missing -d 2", seenArgs)
+// TestKatanaParseRecordShapes pins NEW-93 defect 2 at the parser level:
+// modern katana -jsonl nests the endpoint under request.endpoint; the
+// legacy flat top-level shape keeps working; a line carrying neither shape
+// stays malformed.
+func TestKatanaParseRecordShapes(t *testing.T) {
+	domain := mustDomain(t, "example.com")
+	nested := `{"timestamp":"2026-01-01T00:00:00Z","request":{"method":"GET","endpoint":"https://example.com/nested","raw":"GET /nested HTTP/1.1\r\nHost: example.com"},"response":{"status_code":200,"headers":{"Content-Type":"text/html"}}}`
+	flat := `{"endpoint":"https://example.com/flat","source":"katana","tag":"href"}`
+	neither := `{"request":{"method":"HEAD"},"response":{"status_code":301}}`
+	out := []byte(strings.Join([]string{nested, flat, neither}, "\n") + "\n")
+	urls, malformed, diag := parseKatanaOutput(out, domain)
+	if malformed != 1 {
+		t.Fatalf("malformed = %d, want 1 (only the shapeless line)", malformed)
+	}
+	if diag == "" {
+		t.Errorf("diag = %q, want malformed-count diagnostic", diag)
+	}
+	var got []string
+	for _, u := range urls {
+		got = append(got, u.String())
+	}
+	sort.Strings(got)
+	want := []string{"https://example.com/flat", "https://example.com/nested"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("urls = %v, want %v (both record shapes resolved)", got, want)
+	}
+}
+
+// TestKatanaCrawlModernNestedJSONLYieldsUsableEndpoints pins the NEW-93
+// failure mode end-to-end: a host emitting only modern nested-shape JSONL
+// yields usable endpoints — its lines are not misclassified as malformed,
+// so the host does not fail via the NEW-86 zero-usable-output semantics.
+func TestKatanaCrawlModernNestedJSONLYieldsUsableEndpoints(t *testing.T) {
+	script := katanaScript("v1.1.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		lines := []string{
+			`{"timestamp":"2026-01-01T00:00:00Z","request":{"method":"GET","endpoint":"https://example.com/api/a"},"response":{"status_code":200}}`,
+			`{"timestamp":"2026-01-01T00:00:01Z","request":{"method":"GET","endpoint":"https://www.example.com/api/b"},"response":{"status_code":200}}`,
+			`{"timestamp":"2026-01-01T00:00:02Z","request":{"method":"POST","endpoint":"https://evil.com/out"},"response":{"status_code":200}}`,
+		}
+		return discovery.RunResult{Stdout: []byte(strings.Join(lines, "\n") + "\n")}, nil
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "www.example.com")}
+	res, err := src.Crawl(context.Background(), domain, hosts, Config{Depth: 2, Cache: mem})
+	if err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if res.FailedHosts != 0 {
+		t.Fatalf("FailedHosts = %d, want 0 (nested-shape lines are usable output, not malformed)", res.FailedHosts)
+	}
+	if len(res.URLs) != 2 {
+		t.Fatalf("URLs = %d (%v), want 2 in-domain nested endpoints", len(res.URLs), res.URLs)
+	}
+	var got []string
+	for _, u := range res.URLs {
+		got = append(got, u.String())
+	}
+	sort.Strings(got)
+	want := []string{"https://example.com/api/a", "https://www.example.com/api/b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("urls = %v, want %v", got, want)
 	}
 }
 

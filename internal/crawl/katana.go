@@ -98,11 +98,34 @@ func NewKatanaSource(runner discovery.Runner, lookPath discovery.LookupFunc) *Ka
 
 var _ Source = (*KatanaSource)(nil)
 
-// katanaRecord is one JSONL line emitted by katana -jsonl.
-type katanaRecord struct {
+// katanaRequest mirrors the nested request object of modern katana -jsonl
+// output. Only Endpoint is consumed; unknown fields (and the whole
+// "response" object) are skipped by the struct decoder without retention.
+type katanaRequest struct {
 	Endpoint string `json:"endpoint"`
-	Source   string `json:"source"`
-	Tag      string `json:"tag"`
+	Method   string `json:"method"`
+}
+
+// katanaRecord is one JSONL line emitted by katana -jsonl. Older versions
+// emit the endpoint at the top level; modern versions nest it under
+// request.endpoint (NEW-93 defect 2). Both shapes resolve.
+type katanaRecord struct {
+	Endpoint string         `json:"endpoint"`
+	Source   string         `json:"source"`
+	Tag      string         `json:"tag"`
+	Request  *katanaRequest `json:"request"`
+}
+
+// resolvedEndpoint returns this record's endpoint: the legacy top-level
+// field when set, otherwise the nested request.endpoint.
+func (r *katanaRecord) resolvedEndpoint() string {
+	if ep := strings.TrimSpace(r.Endpoint); ep != "" {
+		return ep
+	}
+	if r.Request != nil {
+		return strings.TrimSpace(r.Request.Endpoint)
+	}
+	return ""
 }
 
 // storedCrawl is the cache payload for a crawl operation.
@@ -231,14 +254,14 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 		args := []string{
 			"-u", targetURL,
 			"-d", fmt.Sprint(cfg.Depth),
-			"-jc", "-ps", "-xhr",
+			"-jc", "-xhr",
 			"-aff=false",
 			"-fs", "fqdn",
 			"-kf", "all",
 			"-rl", fmt.Sprint(cfg.RateLimit),
 			"-c", fmt.Sprint(cfg.Concurrency),
 			"-timeout", fmt.Sprint(DefaultKatanaTimeout),
-			"-retries", "1",
+			"-retry", "1",
 			"-jsonl",
 			"-o", "-",
 			"-silent",
@@ -442,7 +465,7 @@ func parseKatanaOutput(stdout []byte, domain asset.Domain) ([]asset.URL, int, st
 			malformed++
 			continue
 		}
-		ep := strings.TrimSpace(rec.Endpoint)
+		ep := rec.resolvedEndpoint()
 		if ep == "" {
 			malformed++
 			continue
