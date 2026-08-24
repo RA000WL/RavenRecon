@@ -59,9 +59,22 @@ var registry = map[string]func(e toolEnv) Source{
 // runAndParse executes one tool invocation and normalizes its stdout. It is
 // shared by all three adapters; tool differences are the argv passed in.
 //
-// A non-zero exit does not discard captured output: the caller receives both
-// the parsed partial result and an error carrying the exit code, and the
-// pipeline classifies partial results as incomplete rather than failing them.
+// No error path discards captured output. The Runner contract guarantees a
+// final, quiescent capture on every path — including a cancellation kill,
+// where Run returns the bytes streamed before the process died alongside the
+// joined context error (runner.go waitCommand/ExecRunner.Run). The capture is
+// therefore parsed even when Run fails, so a source killed mid-stream by a
+// deadline or a forced shutdown retains whatever it enumerated before the
+// kill: the caller receives the parsed result AND the error, and classify
+// maps the outcome honestly (cancelled for context errors, partial for other
+// failures with usable output) while the retained hosts propagate into the
+// report (NEW-94: a fully-enumerated host corpus must never vanish because
+// the process was killed after the data had already been captured).
+//
+// A non-zero exit likewise does not discard captured output: the caller
+// receives both the parsed partial result and an error carrying the exit
+// code, and the pipeline classifies partial results as incomplete rather
+// than failing them.
 func runAndParse(ctx context.Context, e toolEnv, name string, args []string) (DiscoverResult, error) {
 	e = e.sanitized()
 	path, err := e.lookup(e.binOrName())
@@ -71,12 +84,16 @@ func runAndParse(ctx context.Context, e toolEnv, name string, args []string) (Di
 		}
 		return DiscoverResult{}, fmt.Errorf("%s: %w (%s)", name, ErrExecutableNotFound, e.binOrName())
 	}
-	res, err := e.runner.Run(ctx, Cmd{Path: path, Args: args}, e.limits)
-	if err != nil {
-		return DiscoverResult{}, fmt.Errorf("%s: %w", name, err)
-	}
+	res, rerr := e.runner.Run(ctx, Cmd{Path: path, Args: args}, e.limits)
+	// Parse whatever was captured, error or not: res is valid on every path
+	// (a start failure yields the zero RunResult, whose empty capture parses
+	// to an empty result — harmless), and the buffers are quiescent before
+	// Run returned.
 	hosts, malformed := parseHostLines(res.Stdout, e.provenance())
 	dres := DiscoverResult{Hosts: hosts, Malformed: malformed, Truncated: res.StdoutTruncated}
+	if rerr != nil {
+		return dres, fmt.Errorf("%s: %w", name, rerr)
+	}
 	if res.ExitCode != 0 {
 		return dres, fmt.Errorf("%s: exited with code %d", name, res.ExitCode)
 	}

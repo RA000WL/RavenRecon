@@ -647,7 +647,13 @@ upgrade can never serve stale results.
   data attached (a later run may inspect it; discovery has no sub-work units,
   so a rerun reruns the source).
 - Cancellation or timeout: `StatusCancelled`; the report keeps whatever each
-  job observed.
+  job observed, including the partial stdout a killed tool had already
+  streamed — the runner returns a final quiescent capture on every path and
+  the adapters parse it post-mortem, so an interrupted enumeration retains
+  its host corpus under the honest cancelled status (NEW-94). Such records
+  are never served from cache, and the data-quality gate applies to retained
+  sets exactly as to completed ones; the pipeline adapter marks the stage
+  with the `discovery_partial_retained` sticky flag.
 - Clean failure with no usable output: `StatusFailed`.
 - Established success (exit 0, stdout within the capture cap): `StatusCompleted`.
   Empty-but-successful output is a legitimate completed-empty result.
@@ -666,7 +672,13 @@ One `runtime.Pool` per discover run, configured from `discovery.Config`
 from the global configuration. Each selected source is exactly one pool job;
 discovery spawns no goroutines of its own, and there is no second worker
 pool. `Run`'s `Shutdown` is the join point: it drains queued and in-flight
-jobs with a bounded budget, and the report carries every job's outcome.
+jobs with a budget derived from the actual job structure — every submitted
+job's full deadline across all concurrency waves plus rate-limited start
+stagger plus a 15 s grace when deadlines are enabled, or a documented 3-minute
+bounded completion window when they are disabled (the pipeline adapter's
+default bounds) — so a legitimately slow streaming source is not force-killed
+merely for outliving one wave; expiry still forces, and partial captures are
+retained post-mortem (NEW-94). The report carries every job's outcome.
 
 The pool's central limiter gates job STARTS only. It does not and cannot
 rate-limit network requests inside an external binary: subfinder and amass

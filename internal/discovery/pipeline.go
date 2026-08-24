@@ -28,15 +28,68 @@ const defaultDetectTimeout = 5 * time.Second
 // shutdown on a pathological filesystem.
 const storeTimeout = 5 * time.Second
 
-// shutdownGrace is added to the pool timeout to bound Shutdown's drain: jobs
-// already respect their per-job deadline, so a clean drain needs at most the
-// timeout plus one grace period. When a job ignores cancellation, this budget
-// force-cancels the remaining jobs and unwinds the pool.
+// shutdownGrace is added to the derived drain budget to bound Shutdown's
+// drain: jobs already respect their per-job deadline, so a clean drain needs
+// at most every submitted job's full deadline (in concurrency waves, plus
+// rate-limited start stagger) plus one grace period. When a job ignores
+// cancellation, this budget force-cancels the remaining jobs and unwinds the
+// pool.
 const shutdownGrace = 15 * time.Second
 
-// shutdownForceBudget bounds Shutdown's drain when the pool per-job timeout
-// is disabled (0).
-const shutdownForceBudget = 30 * time.Second
+// shutdownNoDeadlineBudget bounds Shutdown's drain when the pool per-job
+// timeout is disabled (0) — the configuration the pipeline adapter runs
+// under by default (pipeline StageConfig.Timeout resolves to 0). With no
+// per-job deadline there is no per-source runtime bound at all, so the drain
+// itself is the only wall-clock cap on a streaming enumeration; it must
+// therefore cover a realistic passive-enumeration runtime, not an arbitrary
+// short constant. Field evidence (NEW-94, 2026-08-24): subfinder completed a
+// 21-host standalone enumeration within its 30 s per-job deadline, and the
+// same source exceeded the previous flat 30 s force budget under in-scan CPU
+// contention — passive sources stream until done, so the window is sized to
+// multi-minute enumerations while staying strictly bounded. The outer bounds
+// remain the caller's run context (Ctrl-C) and any operator-set stage
+// timeout; a source still running at expiry is force-cancelled and its
+// partial capture is retained (see runAndParse).
+const shutdownNoDeadlineBudget = 3 * time.Minute
+
+// shutdownDrainBudget derives Shutdown's drain budget for one run from the
+// actual job structure, so the drain covers the worst-case CLEAN completion
+// of every submitted job before it ever considers forcing:
+//
+//   - With per-job deadlines (Timeout > 0): each job runs at most Timeout,
+//     workers process ceil(submitted/Concurrency) sequential waves, and
+//     rate-limited starts add at most (submitted - Burst)/Rate of stagger.
+//     The budget is that worst case plus one grace period — bounded,
+//     deterministic, and derived entirely from cfg.
+//   - Without deadlines (Timeout <= 0): no per-job bound exists, so the
+//     documented fixed window applies (shutdownNoDeadlineBudget).
+//
+// Before NEW-94 the budget was Timeout + shutdownGrace regardless of how
+// many waves the pool would actually run (and a flat 30 s without
+// deadlines), so any run whose queued jobs legitimately outlived ONE wave —
+// or any streaming source under the pipeline's default no-deadline bounds —
+// hit the forced path mid-enumeration and lost the host corpus.
+func shutdownDrainBudget(cfg Config, submitted int) time.Duration {
+	if cfg.Timeout <= 0 {
+		return shutdownNoDeadlineBudget
+	}
+	c := cfg.Concurrency
+	if c < 1 {
+		c = 1
+	}
+	waves := (submitted + c - 1) / c
+	budget := time.Duration(waves) * cfg.Timeout
+	if cfg.Rate > 0 {
+		burst := cfg.Burst
+		if burst < 1 {
+			burst = 1
+		}
+		if extra := submitted - burst; extra > 0 {
+			budget += time.Duration(float64(time.Second) * float64(extra) / cfg.Rate)
+		}
+	}
+	return budget + shutdownGrace
+}
 
 // Config configures one passive discovery run.
 //
@@ -302,8 +355,10 @@ func validateTarget(target asset.Domain) error {
 
 // Run executes passive discovery for target. It returns a structured report
 // and an error; when the run context is cancelled or the pool had to be
-// forced down, the report still carries whatever each job observed (partial
-// results are never lost).
+// forced down, the report still carries whatever each job observed —
+// including the partial stdout a killed source had already streamed, which
+// is parsed post-mortem and retained under the honest cancelled/partial
+// status (partial results are never lost; NEW-94).
 func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 	if ctx == nil {
 		return Report{}, fmt.Errorf("discovery: context must not be nil")
@@ -355,6 +410,7 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 	// AGENTS §0.6).
 	keys := make([]cache.Key, len(results))
 	stores := make([]bool, len(results))
+	submitted := 0
 	for i, s := range sources {
 		if results[i].Status == OutSkipped {
 			continue
@@ -387,16 +443,15 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 			// sources keep their initialized cancelled status.
 			break
 		}
+		submitted++
 	}
 
 	// Shutdown is the join point: it drains every queued and in-flight job
-	// before returning. The drain is bounded so a job that ignores
-	// cancellation cannot wedge the run forever.
-	budget := cfg.Timeout + shutdownGrace
-	if cfg.Timeout <= 0 {
-		budget = shutdownForceBudget
-	}
-	shutCtx, cancel := context.WithTimeout(context.Background(), budget)
+	// before returning. The drain budget is derived from the actual job
+	// structure (shutdownDrainBudget) so it covers the worst-case clean
+	// completion of every submitted job; expiry force-cancels the stragglers
+	// and their partial captures are still retained post-mortem.
+	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainBudget(cfg, submitted))
 	shutdownErr := pool.Shutdown(shutCtx)
 	cancel()
 

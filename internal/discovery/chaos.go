@@ -110,12 +110,17 @@ func (c chaos) Discover(ctx context.Context, target asset.Domain) (DiscoverResul
 		}
 		return DiscoverResult{}, fmt.Errorf("%s: %w (%s)", c.Name(), ErrExecutableNotFound, e.binOrName())
 	}
-	res, err := e.runner.Run(ctx, Cmd{Path: path, Args: []string{"-d", target.Name, "-silent", "-json"}}, e.limits)
-	if err != nil {
-		return DiscoverResult{}, fmt.Errorf("%s: %w", c.Name(), err)
-	}
+	res, rerr := e.runner.Run(ctx, Cmd{Path: path, Args: []string{"-d", target.Name, "-silent", "-json"}}, e.limits)
+	// Parse whatever was captured even on error (mirrors runAndParse): the
+	// Runner returns a final quiescent capture on every path, so a chaos run
+	// killed mid-stream retains the hosts it emitted before the kill instead
+	// of discarding them; classify keeps the honest cancelled/partial
+	// outcome while the retained hosts propagate into the report (NEW-94).
 	hosts, malformed := parseChaosLines(res.Stdout, target.Name, e.provenance())
 	dres := DiscoverResult{Hosts: hosts, Malformed: malformed, Truncated: res.StdoutTruncated}
+	if rerr != nil {
+		return dres, fmt.Errorf("%s: %w", c.Name(), rerr)
+	}
 	if res.ExitCode != 0 {
 		return dres, fmt.Errorf("%s: exited with code %d", c.Name(), res.ExitCode)
 	}

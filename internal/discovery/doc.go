@@ -103,13 +103,20 @@
 // An adapter that produced partial output and exited non-zero is stored as
 // StatusIncomplete with the partial data attached (a later run can inspect
 // it, though discovery has no sub-work units to resume, so a rerun reruns
-// the source). Cancellation and timeouts are stored as StatusCancelled.
-// Clean failure with no usable output is stored as StatusFailed. Only
-// established success — exit code 0 with stdout within the capture cap — is
-// stored as StatusCompleted; empty-but-successful output is a legitimate
-// completed empty result. Truncated stdout (an oversized stream) is stored
-// as StatusIncomplete: the captured set is incomplete by definition.
-// Tool execution failures are never cached as successful discoveries.
+// the source). Cancellation and timeouts are stored as StatusCancelled —
+// with whatever hosts the killed tool had already streamed retained in the
+// report: the Runner returns a final quiescent capture on every path and the
+// adapters parse it post-mortem (NEW-94), so an interrupted enumeration
+// keeps its enumerated corpus under the honest cancelled status. Such
+// records are never served from cache (only completed entries are hits),
+// and the run-level data-quality gate applies to retained sets exactly as to
+// completed ones. Clean failure with no usable output is stored as
+// StatusFailed. Only established success — exit code 0 with stdout within
+// the capture cap — is stored as StatusCompleted; empty-but-successful
+// output is a legitimate completed empty result. Truncated stdout (an
+// oversized stream) is stored as StatusIncomplete: the captured set is
+// incomplete by definition. Tool execution failures are never cached as
+// successful discoveries.
 //
 // # Runtime integration and rate limiting
 //

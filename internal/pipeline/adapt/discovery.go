@@ -38,6 +38,18 @@ const discoveryTruncatedFlag = "discovery_truncated"
 // discovery_quality_flagged is a stage-level sticky flag (like priority_groups_truncated) — it lives in StageRecord.StickyFlags, survives cache replay, and is not auto-merged to RunReport.StickyFlags; consumers must check stage flags.
 const discoveryQualityFlag = "discovery_quality_flagged"
 
+// discoveryPartialRetainedFlag is the stage-level sticky flag this adapter
+// sets when a source that did NOT complete (cancelled or failed) still
+// retained hosts in its result — an enumeration killed mid-stream whose
+// already-captured output was parsed post-mortem and carried into Additions
+// (NEW-94). The stage outcome stays cancelled/failed honestly (never silently
+// completed); the flag tells consumers that this stage's additions are an
+// incomplete retained set from an interrupted run, distinct from both a
+// capture-cap truncation (discovery_truncated) and a clean empty failure.
+// Like the other adapt flags it is <engine>_<what>_<verdict>-shaped so names
+// cannot collide across engines in one report.
+const discoveryPartialRetainedFlag = "discovery_partial_retained"
+
 // discoveryStage adapts the passive-subdomain-discovery engine
 // (internal/discovery) to the pipeline Stage contract.
 //
@@ -177,10 +189,11 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// Every error path still merges the engine report's honest retained
 		// observations into Additions (LOW-2 review finding): the only
 		// populated-report+error path is a forced pool shutdown, whose report
-		// carries the sources that did run, and the runner merges a failed
-		// stage's additions anyway. The quality flag is preserved even on
-		// error paths: a gate abort (qualityGateError) returns a populated
-		// report with QualityIssues alongside the error.
+		// carries the sources that did run — including post-mortem-parsed
+		// partial captures (NEW-94) — and the runner merges a failed stage's
+		// additions anyway. The quality flag is preserved even on error
+		// paths: a gate abort (qualityGateError) returns a populated report
+		// with QualityIssues alongside the error.
 		additions := discoveryAdditions(in, report)
 		var qflags map[string]bool
 		if len(report.QualityIssues) > 0 {
@@ -190,6 +203,12 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 			}
 		} else if anyTruncated(report.Results) {
 			qflags = map[string]bool{discoveryTruncatedFlag: true}
+		}
+		if anyPartialRetained(report.Results) {
+			if qflags == nil {
+				qflags = make(map[string]bool)
+			}
+			qflags[discoveryPartialRetainedFlag] = true
 		}
 		if ctx.Err() != nil {
 			// The stage context fired (the engine surfaces it as a wrapped
@@ -208,14 +227,18 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 
 	truncated := anyTruncated(report.Results)
 	qualityFlagged := len(report.QualityIssues) > 0
+	partialRetained := anyPartialRetained(report.Results)
 	var flags map[string]bool
-	if truncated || qualityFlagged {
+	if truncated || qualityFlagged || partialRetained {
 		flags = make(map[string]bool)
 		if truncated {
 			flags[discoveryTruncatedFlag] = true
 		}
 		if qualityFlagged {
 			flags[discoveryQualityFlag] = true
+		}
+		if partialRetained {
+			flags[discoveryPartialRetainedFlag] = true
 		}
 	}
 	res := pipeline.StageResult{
@@ -358,6 +381,21 @@ func foldReportOutcome(results []discovery.SourceResult) pipeline.Outcome {
 func anyTruncated(results []discovery.SourceResult) bool {
 	for _, r := range results {
 		if r.Truncated {
+			return true
+		}
+	}
+	return false
+}
+
+// anyPartialRetained reports whether any source result retained hosts from
+// an execution that did NOT complete (cancelled or failed status with a
+// non-empty host list): the engine parsed the tool's captured output
+// post-mortem after a kill (NEW-94), so this stage's additions carry an
+// incomplete retained set from an interrupted enumeration. The flag is
+// mapped to discovery_partial_retained on every path, never swallowed.
+func anyPartialRetained(results []discovery.SourceResult) bool {
+	for _, r := range results {
+		if len(r.Hosts) > 0 && (r.Status == discovery.OutCancelled || r.Status == discovery.OutFailed) {
 			return true
 		}
 	}

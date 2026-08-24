@@ -658,6 +658,61 @@ func TestDiscoveryStageCancellationMidRun(t *testing.T) {
 	}
 }
 
+// TestDiscoveryStagePartialRetainedOnCancellation pins the NEW-94 adapter
+// contract: a source killed mid-stream whose partial capture was parsed
+// post-mortem by the engine propagates into Additions even though the stage
+// outcome stays honestly cancelled, and the stage records the
+// discovery_partial_retained sticky flag so consumers treat the retained set
+// as incomplete-by-interruption. The fake mirrors ExecRunner's cancellation
+// path: block until ctx fires, return the captured bytes AND the context
+// error. Only subfinder is selected, so no other source's scheduling can
+// race the cancellation.
+func TestDiscoveryStagePartialRetainedOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	script := standardScript()
+	jobStarted := make(chan struct{})
+	var startedOnce sync.Once
+	script["subfinder -d example.com -silent"] = func(discovery.Cmd) (discovery.RunResult, error) {
+		startedOnce.Do(func() { close(jobStarted) })
+		<-ctx.Done()
+		return discovery.RunResult{Stdout: []byte("api.example.com\nwww.example.com\n")}, ctx.Err()
+	}
+	runner := newFakeRunner(script)
+	stage := NewDiscoveryStage(runner, fakeLookup)
+
+	in := newInput(t, map[string]string{"sources": "subfinder"})
+	var res pipeline.StageResult
+	var err error
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		res, err = stage.Run(ctx, in)
+	}()
+	<-jobStarted
+	cancel()
+	<-runDone
+
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCancelled {
+		t.Errorf("Outcome = %q, want cancelled (retention never upgrades the outcome)", res.Outcome)
+	}
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Errorf("res.Err = %v, want context.Canceled", res.Err)
+	}
+	want := []string{"api.example.com", "www.example.com"}
+	if got := discoveryHostNames(res.Additions.Hosts); !reflect.DeepEqual(got, want) {
+		t.Errorf("Additions.Hosts = %v, want %v (the killed source's capture must be retained)", got, want)
+	}
+	if !res.StickyFlags["discovery_partial_retained"] {
+		t.Errorf("StickyFlags = %v, want discovery_partial_retained set", res.StickyFlags)
+	}
+	if res.StickyFlags["discovery_truncated"] || res.Truncated {
+		t.Errorf("truncated flag/field set (%v/%v), want unset: retention-by-interruption is distinct from a capture-cap truncation", res.StickyFlags, res.Truncated)
+	}
+}
+
 func TestDiscoveryStageAdditionsPreservedOnEngineError(t *testing.T) {
 	if testing.Short() {
 		t.Skip("17s real-time drain test; run the full suite for coverage")

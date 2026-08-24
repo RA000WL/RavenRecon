@@ -77,14 +77,6 @@ orchestrator; every agent may append or update its own entries.
 > VERIFIED and archived to TODO.closed.md. NEW-85..NEW-89 filed from findings
 > the sweep surfaced.
 
-### NEW-94 (MEDIUM) — discover transient shutdown-deadline discards fully-enumerated host corpus (internal/pipeline)
-- Status: OPEN
-- Reporter: orchestrator (vulnbank.org + pentest-ground.com field tests, 2026-08-24)
-- Owner: (unassigned)
-- Problem: in-scan discover hit "pool shutdown: context deadline exceeded" on BOTH live scans (standalone discover completed fine minutes prior each time — subfinder enumerated 21 hosts for pentest-ground before the deadline). The failed stage's additions are dropped → dns/httpprobe processed 0 despite a full host list existing; cascade starves half the pipeline off one transient budget miss.
-- Fix (needs design decision): retain partial additions when the failure is shutdown/deadline-class and the quality gate passed (enumerate-then-timeout is not untrusted data), OR extend the discovery shutdown budget to cover subfinder's worst-case runtime. Evidence: pentest-scan.log discover error + dns processed=0 vs standalone discover 21 hosts.
-- Verification: fault-injected slow source → hosts retained (or documented policy pinned); quality gate still enforced.
-
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this
