@@ -7,6 +7,48 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-95 (HIGH) — v2.0 Detection packs (ROADMAP v2.0)
+- Status: VERIFIED — closed 2026-08-24 (orchestrator-directed close-out; five batches,
+  all reviewer-APPROVED and orchestrator-verified). Batch 1 — OPT-P1-2 isolation:
+  per-rule Context clones via unexported `cloneContextForRule` (`internal/detect/context.go`,
+  `slices.Clone`/`maps.Clone`) + per-render Model deep clones via `cloneModel`
+  (`internal/report/model.go`, priority interiors deep-cloned); `TestContextIsolation`/
+  `TestModelIsolation` FAIL→PASS, `-race` green (7956f0d). Batch 2 — Web pack
+  `internal/detect/packs/web`: 5 rules web.csp.missing / web.hsts.missing /
+  web.cors.wildcard / web.robots.exposed / web.sourcemap.exposed (7d71aa8).
+  Batch 3 — JS pack `internal/detect/packs/js`: 3 rules js.dom.xss /
+  js.postmessage.no-origin-check / js.prototype.pollution via jsintel parse seam
+  (453de88). Batch 4 — APIs pack `internal/detect/packs/apis`: 3 rules
+  api.openapi.exposed / api.rest.idor-indicator / api.graphql.introspection (7c2c3f1).
+  Batch 5 — Cloud pack `internal/detect/packs/cloud`: 3 INFORMATIONAL-only rules
+  cloud.aws.key-indicator / cloud.bucket.url / cloud.firebase.indicator — shape
+  indicators over the observed corpus only; descriptions explicitly disclaim
+  validity/publicness/exposure claims, no live verification performed or represented
+  per §0.1 (c9e45fa). All four packs load through frozen SDK v1: `Rules()` →
+  `CheckAPIVersion(1,0)` → ValidateRule → Register (deep copy) → Validate → Seal via
+  pipeline seam `internal/pipeline/adapt/detect.go`; NewDetectStageWithAllPacks =
+  14 rules, AllStages() unchanged at 12; 13 hermetic tests + determinism golden per
+  pack, seam tests in adapt/detect_seam_test.go.
+- Reporter: master
+- Owner: builder (per-wave dispatches)
+- Problem: ROADMAP v2.0 — detection packs loadable through frozen SDK v1 without core
+  edits (families Web/Auth/AuthZ/APIs/JS/Cloud/Business-logic), metadata+deps+compat
+  declarations, failure isolation, normalized evidence, pack-level tests. Prerequisite
+  OPT-P1-2 (shared mutable Context/Model across parallel jobs) rises to HIGH once
+  third-party packs exist. Constraint: SDK surface frozen (v1.2.5 golden) — exported-API
+  additions require formal reopening.
+- Dispositions: Authentication / Authorization / Business-logic families DEFERRED to
+  v2.1+ — they need inter-rule data flow / graph traversal not present on SDK v1
+  (dependencies order execution but never flow data between rules); reopening goes
+  through the ARCHITECTURE.md SDK stability policy. Cloud shipped informational-only
+  per the §0.1 recon-only boundary. OPTIMIZATION.md appendix rows OPT-P3-3 and OPT-P1-2
+  flipped VERIFIED with the commits above; ROADMAP v2.0 acceptance criteria all checked
+  with evidence pointers.
+- Verification: per-batch gates gofmt/go vet/go build/go test ./... green plus
+  `-race` on detect/report/adapt; api_v1.golden untouched (TestSDKAPISurfaceSnapshot
+  passing without -update every batch); determinism goldens byte-stable twice-run.
+
+
 ### NEW-94 (MEDIUM) — discover transient shutdown-deadline discards fully-enumerated host corpus (internal/pipeline)
 - Status: VERIFIED — fixed (builder ses_fcd6307caffe3vpMlWQVbdYFOH) and LIVE-VALIDATED on pentest-ground.com run 3 (2026-08-24): discover incomplete processed=21 failed=0 (hosts RETAINED; both prior runs lost them), dns completed processed=21, httpprobe partial processed=21, crawl completed processed=21, 21 hosts in final report. Root cause: runAndParse/chaos.Discover discarded captured stdout on error though runner guarantees quiescent capture incl. cancellation kill; two-layer fix (derived drain budget + post-mortem parse retention) with discovery_partial_retained sticky flag (StageRecord-level; report-level surfacing noted). Note: run-3 overall outcome cancelled was the orchestrator's own 45-min shell ceiling firing mid-urllive — graceful external-cancellation drain + full report render, itself an honesty validation.
 - Reporter: orchestrator (vulnbank.org + pentest-ground.com field tests, 2026-08-24)

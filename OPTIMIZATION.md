@@ -450,7 +450,7 @@ hardening — per `AGENTS.md:5` scope policy.
 | OPT-P0-4 | Per-tool deadlines + amass opt-in | HIGH | `urlintel/adapt/source.go:525` | v1.5 | VERIFIED (f44cecc, TODO.closed.md NEW-20) |
 | OPT-P0-5 | Honest run duration in report | LOW | `report/model.go:142` | v1.5 | VERIFIED (593177a + 08861f0, TODO.closed.md NEW-40) |
 | OPT-P1-1 | Dir fsync durability | MEDIUM | `report/writer.go:334` `cache/cache.go:292` | — | VERIFIED (1f4b0c8, TODO.closed.md NEW-33) |
-| OPT-P1-2 | Shared `Context`/`Model` alias | MEDIUM | `detect/context.go:68` `report/model.go:147` | v2.0 gate | OPEN (deferred to v2.0) |
+| OPT-P1-2 | Shared `Context`/`Model` alias | MEDIUM | `detect/context.go:68` `report/model.go:147` | v2.0 gate | VERIFIED (7956f0d, TODO.closed.md NEW-95) |
 | OPT-P1-3 | Fuzz harnesses | MEDIUM | `ROADMAP.md:v1.6` | v1.6 | VERIFIED (3b21401, TODO.closed.md NEW-49) |
 | OPT-P1-4 | Silent truncation merges | LOW | `tls_certificate.go:334` `finding.go:313` | v1.6 | VERIFIED (d10d719, TODO.closed.md NEW-49) |
 | OPT-P1-5 | Weak `jsintel` TLS fallback | LOW | `jsintel/fetch.go:678` | — | VERIFIED (9575e14, TODO.closed.md NEW-49) |
@@ -463,13 +463,18 @@ hardening — per `AGENTS.md:5` scope policy.
 | OPT-P2-6 | Dedup helpers | INFO | `dns/scope.go:15` `discovery/detect.go:215` | — | VERIFIED (4e31f8d + 321c55d, TODO.closed.md NEW-49/53) |
 | OPT-P3-1 | Fixtures/snapshots/bench | — | `ROADMAP.md:v1.7` | v1.7 | VERIFIED (53f2f46 + 2dcdc96 + 9370f3f + 14f61a9 + e043555, TODO.closed.md NEW-56) |
 | OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | VERIFIED (1ede060 + 81785f2 + 3e5ba4e + 5e806fe + 7fd312a + cf0e939 + T14 close-out, TODO.md NEW-59) |
-| OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` | v2.0 | PLANNED |
+| OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` | v2.0 | VERIFIED (7956f0d + 7d71aa8 + 453de88 + 7c2c3f1 + c9e45fa, TODO.closed.md NEW-95) |
 | OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` | post-v1.4 | PLANNED |
 
 ---
 
 ## Change log
 
+- `2026-08-24` — v2.0 close-out: `OPT-P3-3` detection packs VERIFIED (Web/JS/APIs/Cloud
+  packs in `internal/detect/packs/`, 14 rules via frozen SDK v1; commits 7d71aa8, 453de88,
+  7c2c3f1, c9e45fa) and `OPT-P1-2` Context/Model isolation VERIFIED (7956f0d). Auth/AuthZ/
+  Business-logic pack families deferred to v2.1+ (see ROADMAP v2.0 dispositions).
+  `OPT-P3-4` logger/replay remains PLANNED.
 - `2026-08-20` — Created from full architecture audit (`v1.4.0`). All optimizations and upgrade
   recommendations consolidated with `file:line` evidence. Next update when `v1.4` closes
   (`NEW-21`) and `v1.5` refinement lands.

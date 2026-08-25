@@ -55,7 +55,7 @@ Every phase must satisfy these before it is complete:
 | v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
 | v1.7 | Integration and acceptance testing | ✅ Complete | Closed 2026-08-23 — fixtures/goldens/bench-gate landed (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; NEW-56/57/58): `fixtures/<profile>/` hybrid manifests, per-stage goldens via `internal/golden` (`-update`), `testdata/bench/*.txt` + `cmd/benchgate` stdlib comparator (D4, no `benchstat`), CI bench-gate job, memory guards (C-4 drift + HeapInuse), D6 interaction suite across 12 stages; validated deterministic, `gofmt`/`vet`/`build`/`test`/`-race` green. |
 | v1.8 | Universal Asset Ingestion Framework | ✅ Complete | Closed 2026-08-23 — `internal/importer` (18 importers behind one interface, auto detection, bounded streaming, provenance sidecar, cache integration), pipeline ingest stage + report attribution, `ravenrecon ingest` CLI, benchmarks + memory guards (1ede060, 81785f2, 3e5ba4e, 5e806fe, 7fd312a, cf0e939). Deferred: Common Crawl remote ingestion; Enriched/Generated origin derivation; CIDR report channel. Optimizations: `OPT-P3-2`. |
-| v2.0 | Detection packs | ⏳ Planned | Unchanged by the 2026-08-20 renumber. Optimizations: `OPT-P3-3` + `OPT-P1-2` isolation for third-party packs. |
+| v2.0 | Detection packs | ✅ Complete | Closed 2026-08-24 — OPT-P1-2 per-rule Context + per-render Model isolation (7956f0d); four built-in packs load through frozen SDK v1 via the pipeline seam: Web (7d71aa8), JS (453de88), APIs (7c2c3f1), Cloud informational-only per §0.1 (c9e45fa). Deferred to v2.1+: Auth/AuthZ/Business-logic families (need inter-rule data flow / graph traversal not present on SDK v1). `OPT-P3-4` logger/replay remains open. |
 
 ---
 
@@ -558,7 +558,7 @@ Honest dispositions (recorded at close-out):
 
 ## v2.0 — Detection packs
 
-Status: planned
+Status: complete (closed 2026-08-24)
 
 Goal: shift new detection logic into stable, versioned packs built on the frozen SDK.
 
@@ -570,23 +570,50 @@ Design rule: core packages stay stable. New detection capabilities should be imp
 
 ### Pack families
 
-- **Web** — security headers, CSP, CORS, source maps, robots, backup files, debug endpoints
-- **Authentication** — JWT, OAuth, session handling, cookie analysis
-- **Authorization** — IDOR heuristics, privilege boundaries, role relationships
-- **APIs** — REST, GraphQL, OpenAPI, endpoint clustering
-- **JavaScript** — DOM XSS indicators, postMessage analysis, prototype pollution indicators, dangerous API usage
-- **Cloud** — AWS, Azure, GCP, Firebase, buckets, IAM indicators
-- **Business logic** — workflow mapping, state transitions, multi-step process analysis
+Landed in `internal/detect/packs/<family>`; every pack enters only through
+the frozen SDK (`Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` →
+`Register` → `Validate` → `Seal`) via the pipeline seam
+(`internal/pipeline/adapt/detect.go`). 14 built-in rules load through
+`NewDetectStageWithAllPacks`; `AllStages()` stays 12.
+
+- **Web** ✅ SHIPPED (7d71aa8) — 5 rules: `web.csp.missing`, `web.hsts.missing`,
+  `web.cors.wildcard`, `web.robots.exposed`, `web.sourcemap.exposed`
+- **Authentication** ⏳ DEFERRED to v2.1+ — JWT/OAuth/session/cookie analysis needs
+  inter-rule data flow and graph traversal that SDK v1 does not carry
+- **Authorization** ⏳ DEFERRED to v2.1+ — IDOR heuristics and privilege-boundary
+  reasoning need cross-asset relationship traversal not present on SDK v1
+- **APIs** ✅ SHIPPED (7c2c3f1) — 3 rules: `api.openapi.exposed`,
+  `api.rest.idor-indicator`, `api.graphql.introspection`
+- **JavaScript** ✅ SHIPPED (453de88) — 3 rules: `js.dom.xss`,
+  `js.postmessage.no-origin-check`, `js.prototype.pollution`
+- **Cloud** ✅ SHIPPED, INFORMATIONAL-ONLY per §0.1 (c9e45fa) — 3 indicator-shape
+  rules: `cloud.aws.key-indicator`, `cloud.bucket.url`, `cloud.firebase.indicator`;
+  descriptions explicitly disclaim validity/publicness/exposure claims, no live
+  verification performed or represented
+- **Business logic** ⏳ DEFERRED to v2.1+ — workflow/state-transition analysis needs
+  multi-step data flow across rules; not expressible on SDK v1 without a formal
+  SDK reopening (stability policy gates apply)
 
 Acceptance criteria:
 
-- Packs load through the SDK without core edits.
-- Packs declare metadata, dependencies, and compatibility versions.
-- Pack output is normalized into the same evidence model as core engines.
-- Pack failures are isolated and do not crash the platform.
-- Pack behavior is covered by pack-level tests and fixtures.
-- `OPT-P1-2` landed: `detect/context.go:68` `Context` per-rule cloning (or getter-only view) +
-  `report/model.go:147` `Model` per-render isolation; `go test -race` `TestContextIsolation` green.
+- [x] Packs load through the SDK without core edits. (`internal/detect/packs/{web,js,apis,cloud}`
+      compile against only the exported `detect` surface; loaders live in
+      `internal/pipeline/adapt/detect.go`; the framework gained no pack-specific
+      code paths — the only post-freeze `detect` change is the unexported
+      OPT-P1-2 cloning internals, 7956f0d)
+- [x] Packs declare metadata, dependencies, and compatibility versions. (every
+      `Rules()` gates on `CheckAPIVersion(1,0)`; per-pack `MetadataDepsCompat` tests)
+- [x] Pack output is normalized into the same evidence model as core engines.
+      (canonical `asset.Finding` through the shared engine; deterministic per-pack
+      report goldens under `internal/detect/packs/*/testdata/`)
+- [x] Pack failures are isolated and do not crash the platform. (per-pack
+      `FailuresIsolated` panic→failed-not-crashed tests)
+- [x] Pack behavior is covered by pack-level tests and fixtures. (13 hermetic tests +
+      golden per pack; seam tests in `internal/pipeline/adapt/detect_seam_test.go`)
+- [x] `OPT-P1-2` landed: `detect/context.go:109` `cloneContextForRule` gives every rule
+      its own Context copy and `report/model.go:171` `cloneModel` deep-clones the Model
+      per render; `TestContextIsolation`/`TestModelIsolation` red→green, `-race` green
+      (7956f0d).
 
 ---
 

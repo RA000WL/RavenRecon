@@ -4,7 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v1.8.0 — Universal Asset Ingestion complete**
+**v2.0.0 — Detection packs complete**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
@@ -73,7 +73,15 @@ knowledge graph on the shared runtime pool with dependency-ordered levels,
 per-rule timeouts, panic isolation, a rule result cache, execution metrics,
 and a canonical Finding model; the framework itself detects nothing and no
 vulnerability-specific rules ship (see "Detection framework (library)"
-below). The reporting framework (`internal/report`, phase 11) adds the
+below). v2.0 adds four built-in detection packs under
+`internal/detect/packs/` — Web (5 rules), JavaScript (3), APIs (3), and
+Cloud (3, informational-only indicator shapes per the recon-only
+boundary) — loading through the frozen SDK v1 via the pipeline seam with
+no core edits; per-rule `Context` clones and per-render report `Model`
+deep clones isolate third-party pack bugs from each other and from the
+platform. Authentication, Authorization, and Business-logic pack
+families are deferred to v2.1+ (they need inter-rule data flow / graph
+traversal the frozen SDK does not carry). The reporting framework (`internal/report`, phase 11) adds the
 Reporting & Evidence Export engine: a caller-composed run input is
 normalized once into the canonical report model (validated, deduplicated,
 merged, identity-sorted, with statistics, run/error summaries, and a
@@ -465,9 +473,27 @@ Detector, Registry, Context, the canonical Finding model, Snapshot, Run,
 and the run-contract surface. The freeze is enforced by an API-shape
 golden test (`surface_snapshot_test.go` against `testdata/api_v1.golden`)
 and nine behavior contracts; pack loaders gate on `CheckAPIVersion(1, 0)`
-before loading any rule. The module ships `internal/detect/examples` as
-the only rule pack — explicitly loaded, never auto-loaded — and the
-framework detects nothing on its own.
+before loading any rule.
+
+Detection packs: since v2.0 the module ships four built-in packs under
+`internal/detect/packs/` — `web` (5 rules: CSP missing, HSTS missing,
+CORS wildcard, robots exposed, source maps exposed), `js` (3 rules: DOM
+XSS indicators, postMessage without origin check, prototype-pollution
+indicators), `apis` (3 rules: exposed OpenAPI specs, REST IDOR
+indicators, GraphQL introspection enabled), and `cloud` (3
+INFORMATIONAL-only indicator rules: AWS access-key shapes, bucket URLs,
+Firebase indicators — shape matches over the observed corpus only, with
+explicit disclaimers; no validity, publicness, or exposure claims and no
+live verification, per the recon-only boundary) — plus the `examples`
+demonstration pack (explicitly loaded, never auto-loaded). The framework
+package still contains no rule definitions: every pack enters only
+through the exported SDK (`Rules()` → `CheckAPIVersion(1, 0)` →
+`ValidateRule` → `Register` → `Validate` → `Seal`, registration confined
+to startup) via the pipeline seam in `internal/pipeline/adapt/detect.go`
+(`NewDetectStageWithAllPacks` loads all 14 built-in rules). Pack output
+is canonical `asset.Finding` evidence, failures are isolated per rule,
+and every pack ships its own hermetic test suite with determinism
+goldens.
 
 Rules: every rule is an immutable descriptor — canonical ID, name,
 description, one of 14 categories, semantic version, declared input and
@@ -480,15 +506,16 @@ rule can never be mutated through a caller-held alias. The dependency
 graph is validated before every run: missing references and cycles are
 rejected at startup with the smallest offending rule named.
 
-Context and findings: detectors receive a shared Context that is immutable
-by convention, not by enforcement — the engine hands every rule of a run
-the same `*detect.Context` and a rule must not mutate it or any state it
-references (a mutating rule is a data race by definition; the engine
-documents this trust boundary, it does not police it) — carrying the
-normalized corpus domains (assets, relationships, evidence, technologies,
-secret candidates, JavaScript, endpoints), a bounded configuration map, a
-bounded Logger, the cancellation context, and the injected Clock — and
-nothing else. They operate only on structured assets (no raw HTTP, JS, or
+Context and findings: the engine normalizes the run corpus once into a
+Context carrying the domains (assets, relationships, evidence,
+technologies, secret candidates, JavaScript, endpoints), a bounded
+configuration map, a bounded Logger, the cancellation context, and the
+injected Clock — and hands every rule its OWN copy: each per-rule job
+receives a clone (`cloneContextForRule` — slices re-backed, Config map
+copied), so a rule that mutates its view cannot leak mutations into
+sibling rules executing in parallel (the mutation contract still holds;
+violations are contained per rule instead of being cross-rule data
+races). They operate only on structured assets (no raw HTTP, JS, or
 URL parsing — those phases are complete) and return canonical
 `asset.Finding` values: identity (`ruleID@subject`, namespaced by the new
 `finding` kind), category, rule metadata, confidence, evidence records,

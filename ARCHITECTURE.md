@@ -26,24 +26,24 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Cache and resume — concurrency model | 376-392 | bounded cache access under the runtime pool |
 | Cache and resume — instrumentation | 393-426 | observer option: exactly one canonical hit/miss event per Get |
 | Runtime engine | 427-505 | bounded pool, central rate limiter, cancellation/shutdown, observer bridge; cache-independent |
-| Passive discovery | 506-723 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
-| DNS pipeline | 724-910 | A/AAAA/CNAME resolution into typed observations; library only |
-| HTTP probing | 911-1251 | root-path probes, TLS metadata capture, observations/relationships; library only |
-| URL intelligence | 1252-1464 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
-| Technology detection | 1465-1656 | fingerprint engine + database, analyzers, confidence scoring |
-| JavaScript intelligence | 1657-1865 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
-| Secret intelligence | 1866-2092 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
-| Priority engine | 2093-2295 | scoring catalogs, correlation, attack paths, recommendations |
-| Detection framework | 2296-2810 | Finding model, rule registration, dependency scheduling, execution, metrics |
-| Detection framework — SDK contract | 2515-2719 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story |
-| Detection framework — SDK stability policy | 2720-2810 | versioning contract, reopening criteria |
-| Reporting framework | 2811-2995 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes |
-| Event bus | 2996-3138 | canonical event model + bounded non-blocking bus; observer-only |
-| Terminal observability (TUI) | 3141-3233 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
-| Universal asset ingestion | 3235-3339 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
-| Configuration precedence | 3340-3353 | CLI flags → environment → config file → defaults |
-| Safety boundary | 3354-3366 | recon-only: what must never be added |
-| v0.3 boundary | 3367-3610 | implemented-vs-planned inventory of every subsystem |
+| Passive discovery | 506-735 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
+| DNS pipeline | 736-922 | A/AAAA/CNAME resolution into typed observations; library only |
+| HTTP probing | 923-1263 | root-path probes, TLS metadata capture, observations/relationships; library only |
+| URL intelligence | 1264-1476 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
+| Technology detection | 1477-1668 | fingerprint engine + database, analyzers, confidence scoring |
+| JavaScript intelligence | 1669-1877 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
+| Secret intelligence | 1878-2104 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
+| Priority engine | 2105-2307 | scoring catalogs, correlation, attack paths, recommendations |
+| Detection framework | 2308-2873 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) |
+| Detection framework — SDK contract | 2530-2782 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs |
+| Detection framework — SDK stability policy | 2783-2873 | versioning contract, reopening criteria |
+| Reporting framework | 2874-3064 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
+| Event bus | 3065-3209 | canonical event model + bounded non-blocking bus; observer-only |
+| Terminal observability (TUI) | 3210-3307 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
+| Universal asset ingestion | 3308-3416 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
+| Configuration precedence | 3417-3430 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3431-3443 | recon-only: what must never be added |
+| v0.3 boundary | 3444-3688 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -2397,15 +2397,16 @@ cancellation context is the detector's first argument. Rules operate only
 on these structured domains: no raw HTTP parsing, no JS parsing, no URL
 parsing (those phases are complete).
 
-The engine deliberately passes ONE Context to every rule of a run: the
-same immutable snapshot (all seven corpus domains), bounded Config map,
-bounded Logger, and injected Clock are shared across every rule, and
-rules within a level execute in parallel on the shared runtime pool. The
-Context is immutable by contract, not by enforcement — a rule must not
-mutate it or any state it references, and a mutating rule is a data race
-by definition. The engine neither detects nor isolates such violations:
-rules are trusted, in-repo code, and a rule that mutates its Context is
-a rule bug, not an engine hazard.
+The engine builds ONE normalized Context per run and hands every rule its
+OWN copy: since the v2.0 prerequisite (`OPT-P1-2`, commit 7956f0d), each
+per-rule job receives a clone produced by `cloneContextForRule`
+(`context.go`) — slices re-backed via `slices.Clone`, the Config map via
+`maps.Clone` — so a buggy or hostile rule that mutates its view can no
+longer leak mutations into sibling rules executing in parallel on the
+shared runtime pool (barrier test: `TestContextIsolation`). The contract
+still forbids mutation; the difference is that a violation is now
+contained per rule instead of being a cross-rule data race by
+definition.
 
 One bounded `runtime.Pool` per run owns all scheduling (no new
 scheduler): exactly one job per rule, per-job deadline = the rule's own
@@ -2511,11 +2512,13 @@ the same contract, deterministic min/max/mean/median duration summary.
 ### Known limitations
 
 - Library capability only: no `ravenrecon detect` CLI command.
-- No rules ship with phase 10; the framework is the plug-in surface for
-  future detector phases.
+- The framework package itself still ships no rules; the v2.0 built-in
+  packs live in their own packages under `internal/detect/packs/<family>`
+  and enter strictly through the exported SDK (see the pack story below).
 - Dependencies order execution but do not yet flow data between rules;
   the Context's domains are the fixed pre-run corpus (documented future
-  work).
+  work — the gate that defers the Auth/AuthZ/Business-logic pack
+  families to v2.1+).
 - The detector closure is not fingerprintable; the version-bump contract
   (bump Version when logic changes) is the cache-coherence mechanism.
 - Streaming order across parallel rules is completion order; the REPORT
@@ -2689,6 +2692,54 @@ never vulnerability detections). A pack's registration pattern is:
 `examples.Rules()` → `NewRegistry` + `Register` per rule →
 `Registry.Validate()` (dependency graph) → optional `Registry.Seal()` →
 `Run` with `DefaultEngineConfig`.
+
+#### Built-in packs (v2.0)
+
+The v2.0 milestone turned the pack story from one demonstration sibling
+into four real packs under `internal/detect/packs/` — `web`, `js`,
+`apis`, and `cloud` — each following the exact registration pattern the
+examples pack proved: its `Rules()` entry point begins with
+`detect.CheckAPIVersion(1, 0)`, rules go through
+`ValidateRule` → `Registry.Register` (deep copy) → `Registry.Validate`
+(dependency graph) → `Registry.Seal()`, so loading is confined to
+startup and a late registration attempt fails. The pipeline seam
+(`internal/pipeline/adapt/detect.go`) owns that sequence per pack
+(`LoadWebPack`, `LoadJsPack`, `LoadApisPack`, `LoadCloudPack`) and composes
+them into the detect stage (`NewDetectStageWithAllPacks`, 14 rules total;
+`AllStages()` stays at 12). The framework package itself remains
+rule-free — the compiler still enforces that a pack can use only what
+`internal/detect` exports.
+
+- **Web** (`internal/detect/packs/web`, commit 7d71aa8) — 5 rules:
+  `web.csp.missing`, `web.hsts.missing`, `web.cors.wildcard`,
+  `web.robots.exposed`, `web.sourcemap.exposed`.
+- **JavaScript** (`internal/detect/packs/js`, commit 453de88) — 3 rules:
+  `js.dom.xss`, `js.postmessage.no-origin-check`,
+  `js.prototype.pollution`; deterministic synthetic fixtures through the
+  jsintel parse seam.
+- **APIs** (`internal/detect/packs/apis`, commit 7c2c3f1) — 3 rules:
+  `api.openapi.exposed`, `api.rest.idor-indicator`,
+  `api.graphql.introspection`.
+- **Cloud** (`internal/detect/packs/cloud`, commit c9e45fa) — 3
+  INFORMATIONAL-only indicator rules: `cloud.aws.key-indicator`,
+  `cloud.bucket.url`, `cloud.firebase.indicator`. Per the §0.1
+  recon-only boundary these are shape indicators over the observed
+  corpus only: descriptions explicitly disclaim validity/publicness/
+  exposure claims, no live verification is performed or represented,
+  and candidate values are never copied into pack-authored fields
+  (test-enforced).
+
+Every pack ships the same hermetic test contract (13 tests each):
+CheckAPIVersion gate, loads-through-SDK with deep-copy + Seal,
+metadata/deps/compat declarations, honest `RequiredAssetTypes` skips,
+context-honoring detectors, failure isolation (panic → failed rule, not
+crashed platform), cache cold/warm parity, determinism goldens
+(`internal/detect/packs/<family>/testdata/<family>_report.golden`), and
+sorted-key Config determinism; seam tests live in
+`internal/pipeline/adapt/detect_seam_test.go`. The deferred families —
+Authentication, Authorization, Business logic — need inter-rule data
+flow / graph traversal that SDK v1 does not carry; they wait for v2.1+
+behind the stability policy's reopening criteria above.
 
 #### Executable documentation
 
@@ -2871,7 +2922,13 @@ yet.
 4. **Render + commit** — the engine runs every active reporter as exactly
    one job on one bounded `runtime.Pool` (no new scheduler; default 4
    workers, bounded queue, per-render deadline, cancellation honored
-   between output units). Each job renders into a `Sink`: every part
+   between output units). Since the v2.0 prerequisite (`OPT-P1-2`,
+   commit 7956f0d), each render job receives its own deep copy of the
+   model (`cloneModel`, `report/model.go`): top-level slices and maps are
+   cloned, priority interiors (factor lists, group membership, summary
+   interiors) are deep-cloned, so concurrent reporters can never observe
+   each other's mutations (barrier test: `TestModelIsolation`). Each job
+   renders into a `Sink`: every part
    writes to a unique temporary file in the output directory (created as
    needed, 0700/0600), is flushed and fsynced, VALIDATED on the temp
    file, and only then atomically renamed into place. A cancelled,
@@ -3452,7 +3509,9 @@ Implemented:
   per-rule deadlines with panic isolation, the fixed detection Context,
   a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
-  (`internal/detect`; no rules ship with the framework)
+  (`internal/detect`; since roadmap v2.0 built-in rule packs live beside
+  it under `internal/detect/packs/<family>` — web, js, apis, cloud — and
+  enter only through the frozen SDK; see "Built-in packs (v2.0)" above)
 * event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
   event model and the concurrent, bounded, non-blocking bus — typed,
   validated, clock-stamped events with sealed payloads, per-subscriber
