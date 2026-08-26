@@ -14,10 +14,10 @@ func TestNewRelationship(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelationship: %v", err)
 	}
-	if r.ID() != "host:api.example.com"+"host_to_ip\x00"+"ip:1.2.3.4" {
-		t.Errorf("relationship ID = %q", r.ID())
+	want := encodeIdentity(host.Identity().String()) + "\x00" + string(RelationshipHostToIP) + "\x00" + encodeIdentity(ip.Identity().String())
+	if r.ID() != want {
+		t.Errorf("relationship ID = %q, want %q", r.ID(), want)
 	}
-
 	r2, err := NewRelationship(host.Identity(), RelationshipHostToIP, ip.Identity())
 	if err != nil {
 		t.Fatalf("NewRelationship: %v", err)
@@ -84,8 +84,8 @@ func TestRelationshipConstants(t *testing.T) {
 }
 
 // TestNewRelationshipKindBounds pins NEW-83: relationship kinds are bounded
-// printable-ASCII labels (<= maxRelationshipKindBytes), like the other
-// identity-bearing labels of this package.
+// printable-ASCII labels (<= maxRelationshipKindBytes) and must be in the
+// fixed vocabulary, like the other identity-bearing labels of this package.
 func TestNewRelationshipKindBounds(t *testing.T) {
 	p := NewProvenance("manual")
 	host, _ := NewHost("api.example.com", p)
@@ -96,9 +96,11 @@ func TestNewRelationshipKindBounds(t *testing.T) {
 	if len(longest) >= maxRelationshipKindBytes {
 		t.Fatalf("longest vocabulary kind %q reached the bound; revisit maxRelationshipKindBytes", string(longest))
 	}
-
-	if _, err := NewRelationship(host.Identity(), RelationshipKind(strings.Repeat("k", maxRelationshipKindBytes)), ip.Identity()); err != nil {
-		t.Fatalf("kind exactly at the %d-byte bound must be accepted: %v", maxRelationshipKindBytes, err)
+	if _, err := NewRelationship(host.Identity(), longest, ip.Identity()); err != nil {
+		t.Fatalf("longest vocabulary kind %q must be accepted: %v", string(longest), err)
+	}
+	if _, err := NewRelationship(host.Identity(), RelationshipKind(strings.Repeat("k", maxRelationshipKindBytes)), ip.Identity()); err == nil {
+		t.Errorf("unknown kind %q must be rejected (vocabulary enforcement)", strings.Repeat("k", maxRelationshipKindBytes))
 	}
 	if _, err := NewRelationship(host.Identity(), RelationshipKind(strings.Repeat("k", maxRelationshipKindBytes+1)), ip.Identity()); err == nil {
 		t.Errorf("kind over the %d-byte bound must be rejected", maxRelationshipKindBytes)

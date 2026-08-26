@@ -706,7 +706,7 @@ func TestTLSCertificateRelationships(t *testing.T) {
 	if err != nil {
 		t.Fatalf("host->cert relationship: %v", err)
 	}
-	want := "host:www.example.com" + "host_to_tls_certificate\x00" + "tls_certificate:" + testTLSCertFingerprint
+	want := encodeIdentity(host.Identity().String()) + "\x00" + string(RelationshipHostToTLSCertificate) + "\x00" + encodeIdentity(c.Identity().String())
 	if hostEdge.ID() != want {
 		t.Errorf("ID = %q, want %q", hostEdge.ID(), want)
 	}

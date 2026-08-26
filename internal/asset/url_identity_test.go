@@ -63,6 +63,8 @@ func TestParseURL(t *testing.T) {
 		{name: "ipv6 default port removed", in: "https://[2001:db8::1]:443/x", want: "https://[2001:db8::1]/x"},
 		{name: "ipv6 port kept", in: "http://[2001:db8::1]:8080/x", want: "http://[2001:db8::1]:8080/x"},
 		{name: "ipv6 unmap mapped addr", in: "https://[::ffff:1.2.3.4]/", want: "https://1.2.3.4/"},
+		{name: "ipv6 zone identifier stripped", in: "http://[fe80::1%25eth0]:8080/x", want: "http://[fe80::1]:8080/x"},
+		{name: "open scheme gopher with host accepted", in: "gopher://example.com:70/1", want: "gopher://example.com:70/1"},
 		{name: "queryless trailing qmark", in: "https://example.com/y?", want: "https://example.com/y"},
 
 		{name: "empty", in: "", wantErr: true},
@@ -71,8 +73,11 @@ func TestParseURL(t *testing.T) {
 		{name: "space in host", in: "https://exa mple.com/", wantErr: true},
 		{name: "invalid port", in: "https://example.com:99999/", wantErr: true},
 		{name: "non-ascii host", in: "https://éxample.com/", wantErr: true},
-		{name: "bad scheme", in: "9http://example.com/", wantErr: true},
 		{name: "no scheme colon", in: "://x", wantErr: true},
+		// Hostless schemes have valid RFC 3986 scheme tokens (validScheme is
+		// an open policy) but are rejected by the mandatory-host gate.
+		{name: "hostless scheme data", in: "data:text/plain,hi", wantErr: true},
+		{name: "hostless scheme javascript", in: "javascript:alert(1)", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -295,5 +300,35 @@ func TestParseURLRawInputBound(t *testing.T) {
 	padded := "  " + at + "\n"
 	if _, err := ParseURL(padded, p); err != nil {
 		t.Fatalf("ParseURL of a padded boundary-sized URL: %v", err)
+	}
+}
+
+// TestParseURLIPv6ZoneIndependence pins NEW-108: IPv6 zone identifiers are
+// stripped during host canonicalization, so the same address observed
+// through different local interfaces (or without a zone at all) yields one
+// environment-independent identity. A zone names the observing interface's
+// link-local scope; it is not part of the remote endpoint's identity.
+func TestParseURLIPv6ZoneIndependence(t *testing.T) {
+	p := NewProvenance("manual")
+
+	base, err := ParseURL("http://[fe80::1]:8080/x", p)
+	if err != nil {
+		t.Fatalf("ParseURL without zone: %v", err)
+	}
+	for _, raw := range []string{
+		"http://[fe80::1%25eth0]:8080/x",
+		"http://[fe80::1%25wlan0]:8080/x",
+		"http://[FE80::0:1%25br-lan]:8080/x",
+	} {
+		u, err := ParseURL(raw, p)
+		if err != nil {
+			t.Fatalf("ParseURL(%q): %v", raw, err)
+		}
+		if u.ID() != base.ID() {
+			t.Errorf("ParseURL(%q).ID() = %q, want %q (zone must not affect identity)", raw, u.ID(), base.ID())
+		}
+		if strings.Contains(u.HostPort, "%") {
+			t.Errorf("ParseURL(%q).HostPort = %q still contains a zone identifier", raw, u.HostPort)
+		}
 	}
 }

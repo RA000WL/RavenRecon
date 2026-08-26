@@ -158,6 +158,14 @@ type TaskCompleted struct {
 	TaskTerminal
 
 	// Result: runtime.Event.Result of the completed job (may be nil).
+	//
+	// Aliasing contract: the value is shared READ-ONLY. The same Result is
+	// handed to every Deriver invocation at the pool-job boundary and is
+	// carried by the task_completed event and all events derived from it —
+	// there is exactly one value behind many events, never a copy per
+	// consumer. Consumers and derivations must treat it as immutable and
+	// MUST NOT mutate it; a projection that needs its own shape should
+	// derive new values instead of writing through the shared result.
 	Result any `json:"result,omitempty"`
 }
 

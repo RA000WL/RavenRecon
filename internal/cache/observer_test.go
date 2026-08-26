@@ -437,3 +437,18 @@ func TestCacheObserverConcurrentMixedOps(t *testing.T) {
 		}
 	}
 }
+
+// TestOutcomeStatesInEventVocabulary pins the bounded CacheAccess.State
+// vocabulary (internal/event): every OutcomeState.String() must be accepted
+// by event.ValidCacheAccessState, so a new cache state cannot silently fall
+// outside the vocabulary Event.Validate (and therefore the bus) enforces.
+func TestOutcomeStatesInEventVocabulary(t *testing.T) {
+	for s := StateHit; s <= StateError; s++ {
+		if !event.ValidCacheAccessState(s.String()) {
+			t.Errorf("state %q (%d) is missing from event's CacheAccess vocabulary", s.String(), int(s))
+		}
+	}
+	if !event.ValidCacheAccessState(StateHit.String()) || event.ValidCacheAccessState("evicted") {
+		t.Fatal("vocabulary check accepts/rejects the wrong values")
+	}
+}

@@ -21,7 +21,7 @@ func TestRelationshipHostToCNAME(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelationship: %v", err)
 	}
-	want := "host:www.example.com" + "host_to_cname\x00" + "host:origin.example.com"
+	want := encodeIdentity(host.Identity().String()) + "\x00" + string(RelationshipHostToCNAME) + "\x00" + encodeIdentity(target.Identity().String())
 	if r.ID() != want {
 		t.Errorf("relationship ID = %q, want %q", r.ID(), want)
 	}

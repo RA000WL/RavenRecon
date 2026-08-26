@@ -3,6 +3,7 @@ package asset
 import (
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // maxParameterValues bounds the number of observed values retained per
@@ -147,11 +148,12 @@ func (p Parameter) String() string { return p.Location + ":" + percentEncode(p.N
 //
 // A value already observed is not appended again (the list stays
 // deduplicated), but the observation itself is still recorded: LastSeen
-// advances and source is added to Sources once. When the ObservedValues
-// cap (maxParameterValues) is reached, NEW values are dropped — existing
-// values are never evicted — and Truncated is set; the Sources cap
-// (maxParameterSources) behaves identically for NEW sources, setting
-// SourcesTruncated. FirstSeen and Prov are never changed here; only
+// advances to the latest time, FirstSeen advances to the earliest time (the
+// minimum of the existing and new times), and source is added to Sources
+// once. When the ObservedValues cap (maxParameterValues) is reached, NEW
+// values are dropped — existing values are never evicted — and Truncated is
+// set; the Sources cap (maxParameterSources) behaves identically for NEW
+// sources, setting SourcesTruncated. Prov is never changed here; only
 // MergeParameters combines two observation histories.
 func WithValue(p Parameter, value string, source string, at time.Time) (Parameter, error) {
 	if err := validateParameterValue(value); err != nil {
@@ -161,7 +163,7 @@ func WithValue(p Parameter, value string, source string, at time.Time) (Paramete
 		return Parameter{}, err
 	}
 	out := p
-	if out.FirstSeen.IsZero() {
+	if out.FirstSeen.IsZero() || at.Before(out.FirstSeen) {
 		out.FirstSeen = at
 	}
 	if at.After(out.LastSeen) {
@@ -196,17 +198,21 @@ func validParameterLocation(location string) bool {
 }
 
 // validateParameterName enforces the name bounds: non-empty, at most
-// maxParameterNameBytes bytes, and no control characters (C0 controls and
-// DEL). Non-ASCII bytes are allowed: they arrive from URL query strings
-// exactly as observed and stay as-observed.
+// maxParameterNameBytes bytes, no control characters (C0 controls and
+// DEL), and valid UTF-8. Non-ASCII bytes are allowed only as valid UTF-8
+// sequences; they arrive from URL query strings exactly as observed and stay
+// as-observed, but invalid UTF-8 is rejected to keep JSON round-trip stable.
 func validateParameterName(name string) error {
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("parameter name must be valid UTF-8")
+	}
 	if len(name) == 0 {
 		return fmt.Errorf("parameter name must not be empty")
 	}
 	if len(name) > maxParameterNameBytes {
 		return fmt.Errorf("parameter name is longer than %d bytes", maxParameterNameBytes)
 	}
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		if name[i] < 0x20 || name[i] == 0x7f {
 			return fmt.Errorf("parameter name %q contains a control character", name)
 		}
@@ -214,10 +220,14 @@ func validateParameterName(name string) error {
 	return nil
 }
 
-// validateParameterValue enforces the value bounds: non-empty and at most
-// maxParameterValueBytes bytes. Values are opaque observed bytes; no
-// character restrictions apply beyond the size bound.
+// validateParameterValue enforces the value bounds: non-empty, at most
+// maxParameterValueBytes bytes, and valid UTF-8. Values are opaque observed
+// bytes; no character restrictions apply beyond the size bound and UTF-8
+// validity.
 func validateParameterValue(value string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("parameter value must be valid UTF-8")
+	}
 	if len(value) == 0 {
 		return fmt.Errorf("parameter value must not be empty")
 	}
@@ -227,9 +237,12 @@ func validateParameterValue(value string) error {
 	return nil
 }
 
-// validateParameterSource enforces the source bounds: non-empty and at most
-// maxParameterSourceBytes bytes.
+// validateParameterSource enforces the source bounds: non-empty, at most
+// maxParameterSourceBytes bytes, and valid UTF-8.
 func validateParameterSource(source string) error {
+	if !utf8.ValidString(source) {
+		return fmt.Errorf("parameter source must be valid UTF-8")
+	}
 	if len(source) == 0 {
 		return fmt.Errorf("parameter source must not be empty")
 	}

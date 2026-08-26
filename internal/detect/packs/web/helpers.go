@@ -66,6 +66,30 @@ func hasCSP(dctx *detect.Context) bool {
 	return false
 }
 
+// hostHasCSP reports whether a specific host has CSP evidence.
+func hostHasCSP(dctx *detect.Context, host asset.Identity) bool {
+	for _, t := range dctx.Technologies {
+		n := strings.ToLower(t.Name)
+		if strings.Contains(n, "csp") || strings.Contains(n, "content-security-policy") {
+			return true
+		}
+	}
+	for _, ev := range dctx.Evidence {
+		if ev.Source != host {
+			continue
+		}
+		ind := strings.ToLower(ev.Indicator)
+		val := strings.ToLower(ev.Value)
+		if strings.Contains(ind, "content-security-policy") || strings.Contains(ind, "csp") {
+			return true
+		}
+		if strings.Contains(val, "content-security-policy") {
+			return true
+		}
+	}
+	return false
+}
+
 // hasHSTS reports whether the corpus contains an HSTS indicator.
 func hasHSTS(dctx *detect.Context) bool {
 	for _, ev := range dctx.Evidence {
@@ -77,6 +101,26 @@ func hasHSTS(dctx *detect.Context) bool {
 	}
 	for _, t := range dctx.Technologies {
 		if strings.Contains(strings.ToLower(t.Name), "hsts") {
+			return true
+		}
+	}
+	return false
+}
+
+// hostHasHSTS reports whether a specific host has HSTS evidence.
+func hostHasHSTS(dctx *detect.Context, host asset.Identity) bool {
+	for _, t := range dctx.Technologies {
+		if strings.Contains(strings.ToLower(t.Name), "hsts") {
+			return true
+		}
+	}
+	for _, ev := range dctx.Evidence {
+		if ev.Source != host {
+			continue
+		}
+		ind := strings.ToLower(ev.Indicator)
+		val := strings.ToLower(ev.Value)
+		if strings.Contains(ind, "strict-transport-security") || strings.Contains(val, "strict-transport-security") {
 			return true
 		}
 	}

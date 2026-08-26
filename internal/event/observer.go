@@ -13,6 +13,15 @@ package event
 // (invalid events are dropped and counted, never delivered), and delivery
 // never calls back into emitter code. Consumers that re-validate events
 // (see the package documentation) must treat invalid events as absent.
+//
+// Panic containment is the EMITTER's responsibility where it emits from
+// goroutines it spawned: the runtime pool recovers a panicking Observer at
+// its single emission choke point and counts the panics
+// (runtime.Pool.ObserverPanics), symmetric with this package's Deriving
+// bridge recovering panicking Derivers (DeriverPanics). A stage that emits
+// on the caller's own goroutine (the cache's Get) propagates an Observer
+// panic to that caller instead — there is no spawned goroutine whose crash
+// it could cause, so recovery would only hide the failure.
 type Observer interface {
 	// Observe receives one canonical event.
 	Observe(ev Event)

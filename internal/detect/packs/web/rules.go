@@ -46,7 +46,7 @@ func Rules() ([]detect.Rule, error) {
 			[]detect.RuleInput{detect.InputEvidence},
 			corsWildcardDetector, "1.0.0"),
 		newWebRule(ruleRobotsExposed, "Robots Exposed",
-			"Detects exposed /robots.txt via endpoint URL path /robots.txt or evidence indicator/value containing robots. Informational, per-endpoint/source finding.",
+			"Detects exposed /robots.txt via endpoint URL path /robots.txt or evidence indicator/value naming robots.txt. Informational, per-endpoint/source finding.",
 			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputEndpoints, detect.InputEvidence, detect.InputTechnology},
 			robotsExposedDetector, "1.0.0"),
@@ -56,6 +56,14 @@ func Rules() ([]detect.Rule, error) {
 			[]detect.RuleInput{detect.InputJavaScript, detect.InputEvidence},
 			sourcemapExposedDetector, "1.0.0"),
 	}
+	// RequiredAssetTypes gates (NEW-108 single-kind-gate sweep). Each rule
+	// declares ONE primary kind because the census gate is conjunctive —
+	// listing every input domain would skip the rule whenever ANY domain is
+	// absent (cloud pack precedent). The documented tradeoff: a multi-domain
+	// rule is skipped even when its OTHER domains carry legitimate carriers
+	// (e.g. robots.txt evidence without any endpoint asset), but the engine
+	// records the honest skip reason naming the missing kind (engine.go
+	// missingRequiredKind → SkipReason), so the drop is never silent.
 	rules[0].RequiredAssetTypes = []asset.Kind{asset.KindHost}
 	rules[1].RequiredAssetTypes = []asset.Kind{asset.KindHost}
 	rules[2].RequiredAssetTypes = []asset.Kind{asset.KindEvidence}

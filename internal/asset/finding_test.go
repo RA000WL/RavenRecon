@@ -454,7 +454,7 @@ func TestMergeFindingsTruncatedFlag(t *testing.T) {
 	mkRelationships := func(from, to int) []Relationship {
 		rels := make([]Relationship, 0, to-from)
 		for i := from; i < to; i++ {
-			rel, err := NewRelationship(subject, RelationshipKind("observed-on"),
+			rel, err := NewRelationship(subject, RelationshipHostToTechnology,
 				Identity{Kind: KindHost, Value: fmt.Sprintf("edge-%02d.example.com", i)})
 			if err != nil {
 				t.Fatalf("NewRelationship: %v", err)

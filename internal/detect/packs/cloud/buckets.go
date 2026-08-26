@@ -2,6 +2,8 @@ package cloud
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -25,24 +27,49 @@ func bucketURLDetector(ctx context.Context, dctx *detect.Context) ([]asset.Findi
 	if dctx.Config[ruleBucketURL+".disabled"] == "true" {
 		return nil, nil
 	}
-	var out []asset.Finding
+	seen := make(map[asset.Identity]struct{})
+	var subjects []asset.Identity
+	carrier := make(map[asset.Identity]string)
 	for _, ep := range dctx.Endpoints {
 		if err := ctx.Err(); err != nil {
 			return nil, err
-		}
-		if len(out) >= maxFindingsPerRule {
-			break
 		}
 		provider := bucketProvider(ep.URL.HostPort)
 		if provider == "" {
 			continue
 		}
-		f, err := cloudFinding(dctx, ruleBucketURL, "Cloud Bucket URL", bucketConfidence, ep.Identity(),
-			map[string]string{"signal": "cloud_storage_endpoint", "provider": provider})
+		id := ep.Identity()
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		subjects = append(subjects, id)
+		carrier[id] = provider
+	}
+	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > maxFindingsPerRule {
+		dropped = len(subjects) - maxFindingsPerRule
+		subjects = subjects[:maxFindingsPerRule]
+	}
+	var out []asset.Finding
+	for _, s := range subjects {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		meta := map[string]string{"signal": "cloud_storage_endpoint", "provider": carrier[s]}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
+		}
+		f, err := cloudFinding(dctx, ruleBucketURL, "Cloud Bucket URL", bucketConfidence, s, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleBucketURL, fmt.Sprintf("truncated %d subjects over bound %d", dropped, maxFindingsPerRule))
 	}
 	formatConfigKeys(dctx, ruleBucketURL)
 	return out, nil
@@ -59,7 +86,7 @@ func bucketProvider(hostport string) string {
 	}
 	host := strings.ToLower(hostport)
 	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i] // strip a non-default port; the hostname itself is already canonical lowercase
+		host = host[:i]
 	}
 	switch {
 	case host == "s3.amazonaws.com" || strings.HasSuffix(host, ".s3.amazonaws.com"):

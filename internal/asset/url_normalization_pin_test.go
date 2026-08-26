@@ -91,9 +91,8 @@ func TestURLNormalizationPins(t *testing.T) {
 		// raw pass-through (query, value-preserving).
 		{name: "non-ascii host rejected", in: "https://éxample.com/", wantErr: "invalid host"},
 		{name: "non-ascii path escaped deterministically", in: "https://example.com/café", want: "https://example.com/caf%C3%A9"},
-		{name: "non-ascii query deterministic", in: "https://example.com/p?q=café", want: "https://example.com/p?q=café"},
+		{name: "non-ascii query deterministic", in: "https://example.com/p?q=café", want: "https://example.com/p?q=caf%C3%A9"},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			u, err := ParseURL(tt.in, p)
@@ -132,7 +131,6 @@ func TestURLNormalizationPinDistinctness(t *testing.T) {
 		{"query value forms", []string{"https://example.com/p?x=a%20b", "https://example.com/p?x=a+b"}},
 		{"escaped vs plain path byte", []string{"https://example.com/%41", "https://example.com/A"}},
 		{"escaped slash vs slash", []string{"https://example.com/a%2Fb", "https://example.com/a/b"}},
-		{"raw vs escaped unicode query", []string{"https://example.com/p?q=café", "https://example.com/p?q=caf%C3%A9"}},
 	}
 	for _, g := range groups {
 		t.Run(g.name, func(t *testing.T) {
@@ -165,6 +163,7 @@ func TestURLNormalizationPinEquivalence(t *testing.T) {
 		{"http://example.com:80/", "http://example.com/"},
 		{"https://example.com/p?q=a b", "https://example.com/p?q=a%20b"},
 		{"https://example.com/café", "https://example.com/caf%C3%A9"},
+		{"https://example.com/p?q=café", "https://example.com/p?q=caf%C3%A9"},
 	}
 	for _, group := range groups {
 		t.Run(group[0], func(t *testing.T) {

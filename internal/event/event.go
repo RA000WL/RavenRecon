@@ -88,6 +88,29 @@ const (
 	maxMetadataBytes = 4096
 )
 
+// CacheAccess carries the outcome state of a cache lookup in its State
+// field. The vocabulary is bounded: it is the String() form of
+// internal/cache's OutcomeState. This package cannot import internal/cache
+// (the cache imports event), so the set is pinned here; the cache package's
+// tests assert that every OutcomeState.String() is in this set, so a new
+// cache state cannot silently fall outside the vocabulary.
+var cacheStates = []string{
+	"hit", "miss", "expired", "corrupt", "schema-incompatible",
+	"incomplete", "error",
+}
+
+// ValidCacheAccessState reports whether s is in the bounded CacheAccess
+// State vocabulary (internal/cache OutcomeState.String()). The bus drops
+// CacheAccess events whose State falls outside it.
+func ValidCacheAccessState(s string) bool {
+	for _, v := range cacheStates {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
 // Event is one canonical observability event. It is structured, typed, and
 // deterministic: Kind classifies it, Sequence is assigned by the bus at
 // publish time (strictly increasing), At is the injected-clock timestamp,
@@ -190,7 +213,6 @@ func (e Event) Validate() error {
 // validatePayload checks that the payload matches the kind and that the
 // payload's own bounded fields stay within bounds.
 func validatePayload(kind Kind, p Payload) error {
-	// Optional payloads first.
 	switch kind {
 	case KindSummaryReady:
 		if _, ok := p.(SummaryReady); p != nil && !ok {
@@ -205,6 +227,11 @@ func validatePayload(kind Kind, p Payload) error {
 	case ScanStarted:
 		if kind != KindScanStarted {
 			return payloadMismatch(kind, p)
+		}
+		// Timeout mirrors runtime.Config.Timeout ("0 = none"); a negative
+		// duration is never a valid configuration projection.
+		if p.Timeout < 0 {
+			return fmt.Errorf("event: scan_started timeout must not be negative, got %s", p.Timeout)
 		}
 	case ScanStopped:
 		if kind != KindScanStopped {
@@ -324,6 +351,15 @@ func validatePayload(kind Kind, p Payload) error {
 		}
 		if len(p.State) > maxCacheStateBytes {
 			return fmt.Errorf("event: cache state is %d bytes over bound %d", len(p.State), maxCacheStateBytes)
+		}
+		// State is not free-form: it must be the String() of an
+		// internal/cache OutcomeState (see cacheStates above), and Hit is
+		// true exactly for the "hit" state (mirroring cache.Outcome.IsHit).
+		if !ValidCacheAccessState(p.State) {
+			return fmt.Errorf("event: cache state %q is outside the outcome-state vocabulary", p.State)
+		}
+		if p.Hit != (p.State == "hit") {
+			return fmt.Errorf("event: cache hit flag contradicts state %q (hit=%v)", p.State, p.Hit)
 		}
 		if (kind == KindCacheHit) != p.Hit {
 			return fmt.Errorf("event: cache payload contradicts its kind (hit=%v)", p.Hit)
@@ -482,6 +518,12 @@ func validatePayload(kind Kind, p Payload) error {
 		}
 		if p.Completed < 0 || p.Total < 0 {
 			return fmt.Errorf("event: progress counts must not be negative (completed=%d total=%d)", p.Completed, p.Total)
+		}
+		// A declared total makes Completed>Total a lie on the wire: such an
+		// event is rejected here, so emitters must clamp at the emission
+		// point instead of publishing a progress event the bus drops.
+		if p.TotalKnown && p.Completed > p.Total {
+			return fmt.Errorf("event: progress completed=%d exceeds its known total=%d", p.Completed, p.Total)
 		}
 	case PhaseTransition:
 		if kind != KindPhaseTransition {

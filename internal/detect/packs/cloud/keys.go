@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -67,20 +68,29 @@ func awsKeyIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]asset
 		carrier[id] = "evidence"
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > maxFindingsPerRule {
+		dropped = len(subjects) - maxFindingsPerRule
+		subjects = subjects[:maxFindingsPerRule]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= maxFindingsPerRule {
-			break
+		meta := map[string]string{"signal": "aws_credential_indicator", "observed_in": carrier[s]}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := cloudFinding(dctx, ruleAWSKeyIndicator, "AWS Key Indicator", awsKeyConfidence, s,
-			map[string]string{"signal": "aws_credential_indicator", "observed_in": carrier[s]})
+		f, err := cloudFinding(dctx, ruleAWSKeyIndicator, "AWS Key Indicator", awsKeyConfidence, s, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleAWSKeyIndicator, fmt.Sprintf("truncated %d subjects over bound %d", dropped, maxFindingsPerRule))
 	}
 	formatConfigKeys(dctx, ruleAWSKeyIndicator)
 	return out, nil

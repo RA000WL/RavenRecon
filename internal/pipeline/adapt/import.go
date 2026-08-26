@@ -315,9 +315,21 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 
 	res, execErr := foldIngestOutcomes(in, files, outcomes)
 	if res.Outcome == pipeline.OutcomeCancelled && ctx.Err() != nil {
-		// Attach the context error so the runner's cancellation
-		// classification is unambiguous (isContextError traverses it).
-		res.Err = ctx.Err()
+		// Cancellation is carried by the outcome alone; the context error is
+		// attached so the runner's classification is unambiguous
+		// (isContextError traverses joins). Files that genuinely FAILED keep
+		// their detail joined in — cancelled precedence must not silently
+		// drop a real failure ("nil run error unless something genuinely
+		// failed", NEW-108) — while per-file cancellation errors (including
+		// any best-effort cache diagnostics from importOne's self-heal path,
+		// which never leave it) are reclassified as cancellation and never
+		// surface here. The Go error return below stays nil: a non-context
+		// return would force the runner's failed classification.
+		if execErr != nil {
+			res.Err = errors.Join(ctx.Err(), fmt.Errorf("stage %s: %w", s.Name(), execErr))
+		} else {
+			res.Err = ctx.Err()
+		}
 	} else if res.Outcome == pipeline.OutcomeFailed && execErr != nil {
 		res.Err = fmt.Errorf("stage %s: %w", s.Name(), execErr)
 	}
@@ -365,8 +377,16 @@ func (s *ingestStage) importOne(ctx context.Context, env importer.ImportEnv, c c
 					}
 					// Semantically wrong record: self-heal by deleting and
 					// falling through to a fresh execution (mirrors the
-					// discovery engine's decodeStored contract).
-					_ = c.Delete(ctx, key)
+					// discovery engine's decodeStored contract). Best-effort
+					// and diagnostic-only by design (the stage's never-error
+					// invariant): a failed delete is never surfaced. On an
+					// already-cancelled context the delete is skipped
+					// outright (NEW-108) — the fresh execution it would set
+					// up can never run, so the cancellation path records
+					// nothing but the cancellation itself.
+					if ctx.Err() == nil {
+						_ = c.Delete(ctx, key)
+					}
 				}
 				sink, stats, execErr := s.execute(ctx, env, imp, path)
 				if execErr == nil {

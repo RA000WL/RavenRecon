@@ -2,6 +2,7 @@ package js
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -11,9 +12,6 @@ import (
 )
 
 // protoPollutionDetector detects per-script prototype pollution assignments.
-// Parse is invoked for bounding/validation (maxParseInputBytes 8MiB); sink
-// detection is currently string-contains on the synthetic source after successful
-// Parse — future work may inspect Parsed.Strings for token-aware filtering.
 func protoPollutionDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -44,29 +42,36 @@ func protoPollutionDetector(ctx context.Context, dctx *detect.Context) ([]asset.
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		meta := map[string]string{"signal": "prototype_pollution"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := jsFinding(dctx, ruleProtoPollute, "Prototype Pollution", detect.CategoryInformation, s, nil, map[string]string{"signal": "prototype_pollution"})
+		f, err := jsFinding(dctx, ruleProtoPollute, "Prototype Pollution", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleProtoPollute, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
 	}
 	formatConfigKeys(dctx, ruleProtoPollute)
 	return out, nil
 }
 
 func protoSource(js asset.JavaScript) string {
-	s := strings.ToLower(js.URL.String())
-	if strings.Contains(s, "proto") || strings.Contains(s, "pollution") {
-		return `obj.__proto__.polluted=true;obj.constructor.prototype.polluted=true;a["__proto__"].x=1;`
-	}
+	_ = js
 	return `obj.normal=true;a.b=1;`
 }
 

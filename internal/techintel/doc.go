@@ -66,7 +66,7 @@
 // fingerprint indicator matches against its kind's slots:
 //
 //	header          -> "Name: value" lines, case-insensitive substring
-//	cookie          -> cookie name OR value, case-insensitive substring
+//	cookie          -> cookie name only, case-insensitive substring
 //	html_regex      -> compiled regex search of the body
 //	html_substring  -> case-insensitive substring of the body; the
 //	                   evidence value is the matched span of the ORIGINAL
@@ -106,7 +106,10 @@
 //
 // Level = High/Medium/Low/Unknown. Score = 1 − ∏(1 − wᵢ) over INDEPENDENT
 // matches; independence is exactly: distinct indicator kinds OR distinct
-// match slots (same kind+slot collapses to max weight). Weights are
+// match slots (same kind+slot collapses to max weight), CAPPED at one
+// contribution per DISTINCT indicator (NEW-108): one indicator echoed
+// across several slots of an observation is still a single piece of
+// evidence and never accumulates; only distinct indicators do. Weights are
 // validated at load (NaN rejected), and deriveConfidence additionally
 // SKIPS any NaN-weight group as carrying no evidence (defense in depth), so
 // the score is always finite and its level is always the honest threshold
@@ -135,9 +138,12 @@
 // DNS, e endpoint, h headers, t TLS)}. Bumping fingerprints.SchemaVersion —
 // or any DATA-ONLY edit to the fingerprint tables, which changes the
 // content digest — invalidates every cached detection by construction.
-// Timings, concurrency, the status code, and the fixed caps never enter
-// keys; the analysis caps are bounded by decode re-checking retained
-// counts against the current run's caps. Decode score re-validation
+// Timings, concurrency, and the status code never enter keys. The analysis
+// caps DO enter keys (cap_tech/cap_ind): they are configuration
+// (MaxTechnologiesPerObservation/MaxIndicatorsPerObservation), not fixed
+// constants, so a record stored under one cap pair is never replayed under
+// another. Decode re-checking retained counts against the current run's
+// caps stays as defense in depth. Decode score re-validation
 // rejects NaN scores explicitly (defense in depth: encoding/json can
 // neither marshal nor unmarshal NaN, so a stored payload can never carry
 // one). On a cache HIT the

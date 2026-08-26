@@ -180,7 +180,7 @@ func TestIngestContentChangeSelfHeal(t *testing.T) {
 		t.Fatalf("first run metrics = %+v, want analyzed 1 stored 1", got)
 	}
 	// Verify the stored record carries the hello hash.
-	key, err := techKey(obsHello, fingerprints.SchemaVersion, techDigest(t))
+	key, err := techKey(obsHello, fingerprints.SchemaVersion, techDigest(t), 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestIngestLegacyRecordSelfHeal(t *testing.T) {
 	s.ContentHash = "" // strip for legacy
 	data, _ := json.Marshal(s)
 	rec.Data = data
-	key, _ := techKey(obs, fingerprints.SchemaVersion, techDigest(t))
+	key, _ := techKey(obs, fingerprints.SchemaVersion, techDigest(t), 128, 512)
 	if err := cfg.Cache.Put(context.Background(), key, rec); err != nil {
 		t.Fatal(err)
 	}

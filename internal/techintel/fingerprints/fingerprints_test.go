@@ -475,7 +475,16 @@ func TestLoadValidationErrors(t *testing.T) {
 	try("negative version group", func(fp *Fingerprint) {
 		fp.Indicators[0].Version = &VersionSpec{Pattern: `v([0-9]+)`, Group: -1}
 	}, "must not be negative")
-
+	// NEW-106: Group must be within [1, NumSubexp] — 0, 5 on one-group pattern, and 2 on no-group pattern fail.
+	try("zero version group", func(fp *Fingerprint) {
+		fp.Indicators[0].Version = &VersionSpec{Pattern: `v([0-9]+)`, Group: 0}
+	}, "out of range")
+	try("version group out of range", func(fp *Fingerprint) {
+		fp.Indicators[0].Version = &VersionSpec{Pattern: `v([0-9]+)`, Group: 5}
+	}, "out of range")
+	try("version group beyond groups", func(fp *Fingerprint) {
+		fp.Indicators[0].Version = &VersionSpec{Pattern: `v[0-9]+`, Group: 1}
+	}, "out of range")
 	// Duplicate names across entries are rejected.
 	first := valid
 	second := valid

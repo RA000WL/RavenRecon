@@ -2,6 +2,7 @@ package apis
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -17,7 +18,16 @@ func graphqlIntrospectionDetector(ctx context.Context, dctx *detect.Context) ([]
 		return nil, nil
 	}
 	seen := make(map[asset.Identity]struct{})
+	carrier := make(map[asset.Identity]string)
 	var subjects []asset.Identity
+	add := func(id asset.Identity, via string) {
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		subjects = append(subjects, id)
+		carrier[id] = via
+	}
 	for _, ep := range dctx.Endpoints {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -25,12 +35,7 @@ func graphqlIntrospectionDetector(ctx context.Context, dctx *detect.Context) ([]
 		lowPath := strings.ToLower(ep.URL.Path)
 		lowURL := strings.ToLower(ep.URL.String())
 		if strings.Contains(lowPath, "/graphql") || strings.Contains(lowURL, "/graphql") {
-			id := ep.Identity()
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				subjects = append(subjects, id)
-			}
-			continue
+			add(ep.Identity(), "endpoint")
 		}
 	}
 	for _, ev := range dctx.Evidence {
@@ -39,45 +44,50 @@ func graphqlIntrospectionDetector(ctx context.Context, dctx *detect.Context) ([]
 		}
 		ind := strings.ToLower(ev.Indicator)
 		val := strings.ToLower(ev.Value)
-		if strings.Contains(ind, "graphql") || strings.Contains(val, "graphql") {
-			if strings.Contains(ind, "introspection") || strings.Contains(val, "introspection") || strings.Contains(val, "graphql") {
+		hasIntrospection := strings.Contains(val, "__schema") || strings.Contains(val, "introspection") || strings.Contains(ind, "introspection") || strings.Contains(ind, "__schema")
+		if hasIntrospection {
+			if strings.Contains(ind, "graphql") || strings.Contains(val, "graphql") || strings.Contains(ind, "__schema") {
 				src := ev.Source
 				if src.IsZero() {
 					continue
 				}
-				if _, ok := seen[src]; !ok {
-					seen[src] = struct{}{}
-					subjects = append(subjects, src)
-				}
+				add(src, "introspection")
 			}
 		}
 	}
-	for _, t := range dctx.Technologies {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if strings.Contains(strings.ToLower(t.Name), "graphql") {
-			id := t.Identity()
-			if _, ok := seen[id]; !ok {
-				seen[id] = struct{}{}
-				subjects = append(subjects, id)
-			}
-		}
-	}
+	// Technology graphql alone is not introspection — skip per R2-M4.
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		sig := "graphql_endpoint"
+		if carrier[s] == "introspection" {
+			sig = "graphql_introspection"
 		}
-		f, err := apisFinding(dctx, ruleGraphQLIntrospection, "GraphQL Introspection", detect.CategoryAPI, s, nil, map[string]string{"signal": "graphql_introspection"})
+		meta := map[string]string{"signal": sig}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
+		}
+		// Use same finder but differentiate signal; confidence lower for endpoint.
+		cat := detect.CategoryAPI
+		// For endpoint, informational confidence lower; but apisFinding sets 0.9 fixed.
+		// Keep using apisFinding for both; signal distinguishes.
+		f, err := apisFinding(dctx, ruleGraphQLIntrospection, "GraphQL Introspection", cat, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleGraphQLIntrospection, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
 	}
 	formatConfigKeys(dctx, ruleGraphQLIntrospection)
 	return out, nil

@@ -36,6 +36,21 @@ func (d *DB) Digest() string {
 // (strconv.FormatUint(math.Float64bits(w), 16)), so no rounding, locale,
 // or formatting difference can ever alias two distinct values — including
 // NaN, which serializes to its canonical quiet-NaN bit pattern.
+//
+// Choice/collision posture (NEW-108): FNV-1a 64 is chosen for
+// determinism, order-independence, and speed — it is NOT a cryptographic
+// hash, and it does not need to be. The digest only gates cache reuse:
+// its worst failure mode is an undetected table edit colliding with the
+// previous content (~2^-64 per pair), whose consequence is a stale cached
+// detection replayed once — not a security boundary crossing, and bounded
+// in blast radius by SchemaVersion (any layout-affecting change bumps it
+// unconditionally). The 0x1f unit separator keeps adjacent-field
+// boundaries unambiguous for textual table data (authored names, match
+// strings, and patterns never contain control bytes); a field that DID
+// embed 0x1f could alias across field boundaries, but that requires
+// editing a fingerprint table, and any such edit changes the serialized
+// bytes anyway — the digest's job is detecting edits, not adversarial
+// preimage construction.
 func digestEntries(entries []Fingerprint) string {
 	sorted := make([]Fingerprint, len(entries))
 	copy(sorted, entries)

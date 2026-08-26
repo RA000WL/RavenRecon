@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -43,8 +44,6 @@ func firebaseIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]ass
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// "firebase" covers the service hosts (firebaseio.com,
-		// firebaseapp.com) and Firebase console/hosting paths alike.
 		if strings.Contains(strings.ToLower(ep.URL.String()), "firebase") {
 			add(ep.Identity(), "endpoint")
 		}
@@ -72,20 +71,29 @@ func firebaseIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]ass
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > maxFindingsPerRule {
+		dropped = len(subjects) - maxFindingsPerRule
+		subjects = subjects[:maxFindingsPerRule]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= maxFindingsPerRule {
-			break
+		meta := map[string]string{"signal": "firebase_indicator", "carrier": carrier[s]}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := cloudFinding(dctx, ruleFirebaseIndicator, "Firebase Indicator", firebaseConfidence, s,
-			map[string]string{"signal": "firebase_indicator", "carrier": carrier[s]})
+		f, err := cloudFinding(dctx, ruleFirebaseIndicator, "Firebase Indicator", firebaseConfidence, s, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleFirebaseIndicator, fmt.Sprintf("truncated %d subjects over bound %d", dropped, maxFindingsPerRule))
 	}
 	formatConfigKeys(dctx, ruleFirebaseIndicator)
 	return out, nil

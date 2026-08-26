@@ -37,7 +37,7 @@ func validPayloadFor(kind Kind) Payload {
 	case KindTaskTimedOut:
 		return TaskTimedOut{TaskTerminal: TaskTerminal{JobID: 1, Worker: 0, Category: "timeout"}}
 	case KindCacheHit, KindCacheMiss:
-		return CacheAccess{Key: strings.Repeat("a", 64), State: "hit", Hit: kind == KindCacheHit}
+		return CacheAccess{Key: strings.Repeat("a", 64), State: map[bool]string{true: "hit", false: "miss"}[kind == KindCacheHit], Hit: kind == KindCacheHit}
 	case KindAssetDiscovered:
 		return AssetDiscovered{Identity: "host:example.com", Kind: "host"}
 	case KindRelationshipCreated:
@@ -216,6 +216,10 @@ func TestValidateRejectsPayloadFieldRules(t *testing.T) {
 		{"error oversized message", New(KindError, at, Error{Message: big})},
 		{"progress negative completed", New(KindProgress, at, Progress{Completed: -1, Total: 1})},
 		{"progress negative total", New(KindProgress, at, Progress{Completed: 0, Total: -1})},
+		{"progress completed above known total", New(KindProgress, at, Progress{Phase: "dns", Completed: 3, Total: 2, TotalKnown: true})},
+		{"cache unknown state", New(KindCacheHit, at, CacheAccess{Key: strings.Repeat("a", 64), State: "evicted", Hit: true})},
+		{"cache hit flag contradicts state", New(KindCacheMiss, at, CacheAccess{Key: strings.Repeat("a", 64), State: "expired", Hit: true})},
+		{"scan_started negative timeout", New(KindScanStarted, at, ScanStarted{Concurrency: 1, QueueSize: 1, Timeout: -time.Second})},
 		{"phase_transition empty", New(KindPhaseTransition, at, PhaseTransition{Phase: ""})},
 		{"shutdown bad reason", New(KindShutdown, at, Shutdown{Reason: "abrupt"})},
 
@@ -276,7 +280,12 @@ func TestValidateAcceptsPayloadBounds(t *testing.T) {
 		{"stage_started bound name", New(KindStageStarted, at, StageStarted{Name: strings.Repeat("s", maxStageNameBytes)})},
 		{"stage_finished bound fields", New(KindStageFinished, at, StageFinished{Name: strings.Repeat("s", maxStageNameBytes), Outcome: "failed", Err: strings.Repeat("e", maxMessageBytes)})},
 		{"task_completed bound category", New(KindTaskCompleted, at, TaskCompleted{TaskTerminal: TaskTerminal{Category: strings.Repeat("c", maxLabelBytes)}})},
-		{"cache bound fields", New(KindCacheHit, at, CacheAccess{Key: strings.Repeat("a", maxCacheKeyBytes), State: strings.Repeat("s", maxCacheStateBytes), Hit: true})},
+		// The longest real vocabulary state must stay valid (the old
+		// free-form filler here predates the bounded vocabulary).
+		{"cache bound fields", New(KindCacheMiss, at, CacheAccess{Key: strings.Repeat("a", maxCacheKeyBytes), State: "schema-incompatible"})},
+		{"progress completed equals known total", New(KindProgress, at, Progress{Phase: "dns", Completed: 2, Total: 2, TotalKnown: true})},
+		{"progress above total without known total", New(KindProgress, at, Progress{Phase: "dns", Completed: 5, Total: 0})},
+		{"scan_started bound fields", New(KindScanStarted, at, ScanStarted{Concurrency: 1, QueueSize: 1, Timeout: 30 * time.Second, Rate: 1})},
 		{"asset bound fields", New(KindAssetDiscovered, at, AssetDiscovered{
 			Identity: "endpoint:" + strings.Repeat("h", maxIdentityStringBytes-9),
 			Kind:     strings.Repeat("k", maxKindLabelBytes),

@@ -208,6 +208,9 @@ func NewSecretCandidate(t SecretType, value string, source Identity, p Provenanc
 	if !t.Valid() {
 		return SecretCandidate{}, fmt.Errorf("invalid secret type %q", t)
 	}
+	if !utf8.ValidString(value) {
+		return SecretCandidate{}, fmt.Errorf("secret candidate value must be valid UTF-8")
+	}
 	if source.IsZero() {
 		return SecretCandidate{}, fmt.Errorf("secret candidate source identity must not be zero")
 	}

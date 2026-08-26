@@ -3,6 +3,7 @@ package adapt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -480,6 +481,128 @@ func TestIngestStageCancellationMidImport(t *testing.T) {
 	}
 }
 
+// --- NEW-108: the ingest never-error invariant on the cancellation path ---
+
+// TestIngestStageCancelledNilRunErrorWithCacheDiagnostics pins the stage's
+// never-error invariant end to end: cancelling mid-import with a warm-but-
+// corrupt cache entry present must report Outcome cancelled with a nil Go
+// error return, and the attached Err must be the pure context signal — no
+// best-effort self-heal cache-delete diagnostic may leak into it (the
+// self-heal path is diagnostic-only by design, and skipped outright once
+// the context has fired).
+func TestIngestStageCancelledNilRunErrorWithCacheDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "domains.txt")
+	if err := os.WriteFile(path, []byte("a.example.com\nb.example.com\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	clk := fixedClock{now: fixedTime}
+	corrupt := &cache.Record{Data: []byte("{not json")}
+	c := &ingestStaticCache{
+		rec:       corrupt,
+		deleteErr: errors.New("cache delete diagnostic: simulated backend failure"),
+	}
+	reg := importer.NewRegistry()
+	blocker := &blockingImporter{imp: importer.NewPlainDomainsImporter()}
+	if err := reg.Register(blocker); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	reg.Seal()
+	stage := &ingestStage{registry: reg}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	res, err := stage.Run(ctx, ingestInput(t, clk, c, path, nil))
+	if err != nil {
+		t.Fatalf("Run returned error on cancellation: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCancelled {
+		t.Fatalf("outcome = %q (err=%v flags=%v), want cancelled", res.Outcome, res.Err, res.StickyFlags)
+	}
+	if res.Err == nil || !errors.Is(res.Err, context.Canceled) {
+		t.Fatalf("res.Err = %v, want the pure context cancellation signal", res.Err)
+	}
+	if strings.Contains(res.Err.Error(), "delete") || strings.Contains(res.Err.Error(), "simulated backend failure") {
+		t.Fatalf("res.Err = %v, want no cache-delete diagnostic leaked into the cancelled result", res.Err)
+	}
+}
+
+// TestImportOneCancelledSkipsSelfHealDelete pins the importOne half of the
+// invariant deterministically: on an already-fired context the self-heal
+// delete of a semantically-wrong cached record is SKIPPED (deletes == 0),
+// the fresh execution it would enable can never run, and the outcome is
+// honestly cancelled — never failed by anything on this path.
+func TestImportOneCancelledSkipsSelfHealDelete(t *testing.T) {
+	_, urlsPath, _ := ingestFixtures(t)
+	s := NewIngestStage().(*ingestStage)
+	env := importer.ImportEnv{Bounds: importer.Bounds{MaxOutput: 100000}}
+	c := &ingestStaticCache{
+		rec:       &cache.Record{Data: []byte("{not json")},
+		deleteErr: errors.New("cache delete diagnostic: simulated backend failure"),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	oc := s.importOne(ctx, env, c, urlsPath, env.Bounds)
+	if got := c.deletes.Load(); got != 0 {
+		t.Fatalf("self-heal deletes on cancelled context = %d, want 0 (skipped outright)", got)
+	}
+	if oc.status != ingestCancelled {
+		t.Fatalf("status = %d, want cancelled", oc.status)
+	}
+	if oc.err != nil && !errors.Is(oc.err, context.Canceled) {
+		t.Fatalf("err = %v, want the context cancellation", oc.err)
+	}
+}
+
+// TestImportOneLiveDeleteFailureStaysDiagnostic pins the other half: with a
+// LIVE context the self-heal delete runs exactly once, and even a failing
+// delete stays a swallowed diagnostic — the fresh execution proceeds and
+// completes; nothing surfaces into the outcome.
+func TestImportOneLiveDeleteFailureStaysDiagnostic(t *testing.T) {
+	_, urlsPath, _ := ingestFixtures(t)
+	s := NewIngestStage().(*ingestStage)
+	env := importer.ImportEnv{Bounds: importer.Bounds{MaxOutput: 100000}}
+	c := &ingestStaticCache{
+		rec:       &cache.Record{Data: []byte("{not json")},
+		deleteErr: errors.New("cache delete diagnostic: simulated backend failure"),
+	}
+
+	oc := s.importOne(context.Background(), env, c, urlsPath, env.Bounds)
+	if got := c.deletes.Load(); got != 1 {
+		t.Fatalf("self-heal deletes = %d, want exactly 1", got)
+	}
+	if oc.status != ingestCompleted {
+		t.Fatalf("status = %d (err=%v), want completed via the fresh execution", oc.status, oc.err)
+	}
+	if oc.err != nil {
+		t.Fatalf("err = %v, want nil (the delete failure is diagnostic-only)", oc.err)
+	}
+}
+
+// TestFoldIngestCancelledKeepsGenuineFailureDetail pins the honesty side of
+// the NEW-108 invariant: when cancelled precedence wins the fold, files
+// that genuinely FAILED still surface through the fold's error join —
+// cancellation must not become a sink that silently drops real failures
+// (the stage attaches them alongside the context error).
+func TestFoldIngestCancelledKeepsGenuineFailureDetail(t *testing.T) {
+	in := pipeline.StageInput{Target: inTarget(t)}
+	outcomes := []ingestFileOutcome{
+		{status: ingestFailed, err: errors.New("no importer claims aaa.bin")},
+		{status: ingestCancelled},
+	}
+	res, execErr := foldIngestOutcomes(in, []string{"aaa.bin", "b.txt"}, outcomes)
+	if res.Outcome != pipeline.OutcomeCancelled {
+		t.Fatalf("outcome = %q, want cancelled (precedence unchanged)", res.Outcome)
+	}
+	if execErr == nil || !strings.Contains(execErr.Error(), "no importer claims aaa.bin") {
+		t.Fatalf("execErr = %v, want the genuinely failed file's detail preserved", execErr)
+	}
+}
+
 // TestIngestStageTruncatedPartialSticky drives max_output to 2 over three
 // URLs: the retained set cuts at the cap → partial + Truncated + the engine's
 // own sticky flag, with honest counters, and the truncated record is stored
@@ -841,10 +964,11 @@ func TestIngestStageDeterministicColdRuns(t *testing.T) {
 // ingestStaticCache serves one fixed record for every Get (a planted cache
 // entry, e.g. tampered) and counts deletes/puts. It never touches disk.
 type ingestStaticCache struct {
-	rec     *cache.Record
-	gets    atomic.Int64
-	deletes atomic.Int64
-	puts    atomic.Int64
+	rec       *cache.Record
+	gets      atomic.Int64
+	deletes   atomic.Int64
+	puts      atomic.Int64
+	deleteErr error // when non-nil, every Delete fails with it (diagnostic-only)
 }
 
 func (c *ingestStaticCache) Get(ctx context.Context, key cache.Key) cache.Outcome {
@@ -862,7 +986,7 @@ func (c *ingestStaticCache) Put(ctx context.Context, key cache.Key, record cache
 
 func (c *ingestStaticCache) Delete(ctx context.Context, key cache.Key) error {
 	c.deletes.Add(1)
-	return nil
+	return c.deleteErr
 }
 
 func (c *ingestStaticCache) Clear(ctx context.Context) error { return nil }

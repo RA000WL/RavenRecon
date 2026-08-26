@@ -523,12 +523,12 @@ func TestProbeAssembleAssetsAndRelationships(t *testing.T) {
 
 	// www: 80 served (http), 443 tls-proven -> ip->port edges for both.
 	wantWWWRels := []string{
-		"host:www.example.comhost_to_url\x00url:http://www.example.com/",
-		"ip:192.0.2.1ip_to_port\x00port:443/tcp",
-		"ip:192.0.2.1ip_to_port\x00port:80/tcp",
-		"port:80/tcpport_to_service\x00service:80/tcp/http",
-		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
-		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+		"host:www.example.com" + "\x00" + "host_to_url\x00url:http://www.example.com/",
+		"ip:192.0.2.1" + "\x00" + "ip_to_port\x00port:443/tcp",
+		"ip:192.0.2.1" + "\x00" + "ip_to_port\x00port:80/tcp",
+		"port:80/tcp" + "\x00" + "port_to_service\x00service:80/tcp/http",
+		"url:http://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET https://www.example.com/",
 	}
 	requireEqualStrings(t, "www relationships", relationshipIDs(www), wantWWWRels)
 	if len(api.Relationships) == 0 {

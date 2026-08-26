@@ -1,8 +1,12 @@
 package event
 
-import "sync/atomic"
+import (
+	"fmt"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+)
 
-// Deriver converts the raw result of a completed pool job into canonical
 // derived events (asset discovered, finding created, relationship created,
 // ...). Engine packages never emit derived events themselves: the
 // pool-job-boundary bridge (Deriving) holds the Deriver and derives at the
@@ -48,6 +52,12 @@ type Deriver interface {
 //
 // A nil Deriver forwards events untouched; a nil Observer drops everything
 // (the bridge is inert, matching the nil-observer off switch).
+type panicSlot struct {
+	mu    sync.Mutex
+	value string
+	stack string
+}
+
 type Deriving struct {
 	// Observer receives the forwarded and derived events (may be nil).
 	Observer Observer
@@ -62,14 +72,20 @@ type Deriving struct {
 	// bridge was built as a plain struct literal (recovery without
 	// counting).
 	panics *atomic.Uint64
+
+	// last records the most recent panic value and stack, protected by its
+	// own mutex and shared across copies via pointer (like panics). Nil
+	// when the bridge was built as a plain struct literal.
+	last *panicSlot
 }
 
 // NewDeriving returns the Deriving bridge with its panic counter
 // installed: DeriverPanics reports how many hostile Derive calls were
-// recovered and dropped. Plain struct literals (Deriving{Observer: ...,
-// Deriver: ...}) recover identically but count nothing.
+// recovered and dropped, and LastPanic exposes the last panic value/stack.
+// Plain struct literals (Deriving{Observer: ..., Deriver: ...}) recover
+// identically but count nothing and have no LastPanic.
 func NewDeriving(observer Observer, deriver Deriver) Deriving {
-	return Deriving{Observer: observer, Deriver: deriver, panics: new(atomic.Uint64)}
+	return Deriving{Observer: observer, Deriver: deriver, panics: new(atomic.Uint64), last: &panicSlot{}}
 }
 
 // DeriverPanics returns how many Derive calls panicked and had their
@@ -80,6 +96,21 @@ func (d Deriving) DeriverPanics() uint64 {
 		return 0
 	}
 	return d.panics.Load()
+}
+
+// LastPanic returns the last recovered Derive panic value and its stack
+// trace. Both are empty when no panic has been recovered or when the
+// bridge was built as a plain struct literal. Callers that construct
+// their own Deriving and pass it as Config.Observer (leaving
+// Config.Deriver nil) can query DeriverPanics/LastPanic after the run to
+// surface a warning.
+func (d Deriving) LastPanic() (string, string) {
+	if d.last == nil {
+		return "", ""
+	}
+	d.last.mu.Lock()
+	defer d.last.mu.Unlock()
+	return d.last.value, d.last.stack
 }
 
 // Observe implements Observer.
@@ -94,7 +125,7 @@ func (d Deriving) Observe(ev Event) {
 	if !ok {
 		return
 	}
-	derived, ok := deriveSafe(d.Deriver, ev, completed.Result)
+	derived, ok := d.deriveSafe(ev, completed.Result)
 	if !ok {
 		// The deriver panicked: the batch is dropped and counted; the
 		// stream continues (the terminal event was already forwarded).
@@ -112,12 +143,20 @@ func (d Deriving) Observe(ev Event) {
 
 // deriveSafe invokes d.Derive under panic recovery. A panicking deriver is
 // a hostile batch, never a process crash: the whole batch is dropped and
-// reported false so the caller can count it.
-func deriveSafe(d Deriver, ev Event, result any) (derived []Event, ok bool) {
+// reported false so the caller can count it. The panic value
+// (fmt.Sprintf("%v", rec)) and debug.Stack() are stored in d.last for
+// later inspection via LastPanic.
+func (d Deriving) deriveSafe(ev Event, result any) (derived []Event, ok bool) {
 	defer func() {
-		if recover() != nil {
+		if rec := recover(); rec != nil {
+			if d.last != nil {
+				d.last.mu.Lock()
+				d.last.value = fmt.Sprintf("%v", rec)
+				d.last.stack = string(debug.Stack())
+				d.last.mu.Unlock()
+			}
 			derived, ok = nil, false
 		}
 	}()
-	return d.Derive(ev, result), true
+	return d.Deriver.Derive(ev, result), true
 }

@@ -2,7 +2,8 @@ package web
 
 import (
 	"context"
-	"strings"
+	"fmt"
+	"sort"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
@@ -15,31 +16,47 @@ func cspMissingDetector(ctx context.Context, dctx *detect.Context) ([]asset.Find
 	if dctx.Config["web.csp.disabled"] == "true" {
 		return nil, nil
 	}
-	if hasCSP(dctx) {
-		return nil, nil
-	}
 	var hosts []asset.Identity
 	for _, id := range dctx.Assets {
 		if id.Kind == asset.KindHost {
 			hosts = append(hosts, id)
 		}
 	}
-	var out []asset.Finding
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].String() < hosts[j].String() })
+	var subjects []asset.Identity
 	for _, h := range hosts {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		if hostHasCSP(dctx, h) {
+			continue
 		}
-		f, err := webFinding(dctx, ruleCSPMissing, "CSP Missing", detect.CategoryInformation, h, nil, map[string]string{"signal": "csp_missing", "host": h.Value})
+		subjects = append(subjects, h)
+	}
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
+	var out []asset.Finding
+	for _, h := range subjects {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		meta := map[string]string{"signal": "csp_missing", "host": h.Value}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
+		}
+		f, err := webFinding(dctx, ruleCSPMissing, "CSP Missing", detect.CategoryInformation, h, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
 	}
-	// Deterministic Config handling.
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleCSPMissing, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
+	}
 	formatConfigKeys(dctx, ruleCSPMissing)
-	_ = strings.Join(sortedKeys(dctx.Config), ",")
 	return out, nil
 }

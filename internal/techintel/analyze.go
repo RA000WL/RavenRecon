@@ -739,8 +739,6 @@ func matchIndicator(ind fingerprints.Indicator, c *obsCorpus) []match {
 		for i, ck := range c.cookies {
 			if containsFold(c.cookieNamesLower[i], matchStr) {
 				add(i, ck.name, "")
-			} else if containsFold(c.cookieValuesLower[i], matchStr) {
-				add(i, ck.value, "")
 			}
 		}
 	case fingerprints.IndicatorHTMLSubstring:
@@ -872,6 +870,11 @@ type analysisOutcome struct {
 // desc, then name asc). Evidence records (indicator matches plus cookie-flag
 // evidence) are deduplicated by identity and cut at capIndicators in
 // deterministic order — all in one bounded pass.
+//
+// Scoring caps each DISTINCT indicator at one contribution (NEW-108): an
+// indicator echoed across several slots of the same observation is still one
+// piece of evidence, so its repeats never inflate confidence; distinct
+// indicators accumulate independently as before.
 func analyze(o Observation, fps []fingerprints.Fingerprint, capTechnologies, capIndicators int, prov asset.Provenance) analysisOutcome {
 	out := analysisOutcome{
 		techEvidence: make(map[string][]string),
@@ -952,9 +955,16 @@ func analyze(o Observation, fps []fingerprints.Fingerprint, capTechnologies, cap
 		var versionMatch *match
 		versionOrd := 0 // DB ordinal of the version-bearing indicator (0 = none)
 		versionWeight := -1.0
-
+		// Per-distinct-indicator contribution cap (NEW-108): one indicator
+		// matching in N slots is ONE observation, not N independent ones.
+		// Groups therefore carry at most one entry per indicator identity
+		// (kind+match), represented by the first match in deterministic
+		// order (DB order, then slot order). Conflict counting and version
+		// selection below still see every match: conflicts describe observed
+		// disagreement across slots, and the version rule already picks a
+		// single winner.
+		seenInd := make(map[string]bool, len(fm.ms))
 		for _, tm := range fm.ms {
-			groups = append(groups, indicatorGroup{kind: tm.ind.Kind, slot: tm.m.slot, weight: tm.ind.Weight})
 			slotKey := string(tm.ind.Kind) + ":" + fmt.Sprintf("%d", tm.m.slot)
 			slotFPs[slotKey] = append(slotFPs[slotKey], fp.Name)
 
@@ -965,6 +975,12 @@ func analyze(o Observation, fps []fingerprints.Fingerprint, capTechnologies, cap
 				versionMatch = &m
 				versionWeight = tm.ind.Weight
 				versionOrd = versionOrdinalBase[fm.fpIdx] + tm.indIdx + 1
+			}
+
+			k := indicatorKey(tm.ind.Kind, tm.ind.Match)
+			if !seenInd[k] {
+				seenInd[k] = true
+				groups = append(groups, indicatorGroup{kind: tm.ind.Kind, slot: tm.m.slot, weight: tm.ind.Weight})
 			}
 		}
 

@@ -4,7 +4,7 @@ Intelligent reconnaissance framework for authorized bug bounty and security test
 
 ## Status
 
-**v2.0.0 — Detection packs complete**
+**Detection packs complete**
 
 RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,

@@ -375,9 +375,28 @@ func TestMatchIndicator(t *testing.T) {
 		if len(ms) != 1 || ms[0].slot != 0 || ms[0].value != "phx_session" {
 			t.Errorf("cookie name match = %v", ms)
 		}
+		// NEW-98: cookie matching is name-only — value containing "session" must not match.
 		ms = matchIndicator(ind(fingerprints.IndicatorCookie, "grafana_session"), c)
-		if len(ms) != 1 || ms[0].slot != 1 || ms[0].value != "grafana_session=1" {
-			t.Errorf("cookie value match = %v", ms)
+		if len(ms) != 0 {
+			t.Errorf("cookie value must not match (name-only): got %v", ms)
+		}
+	})
+
+	t.Run("cookie value-only must not match", func(t *testing.T) {
+		o := newObs(t, "https://ok.example/")
+		o.Cookies = []CookieEntry{{Name: "a", Value: "session"}}
+		c := testCorpus(o)
+		ms := matchIndicator(ind(fingerprints.IndicatorCookie, "session"), c)
+		if len(ms) != 0 {
+			t.Errorf("value-only cookie must not match: got %v", ms)
+		}
+		// Name match still fires.
+		o2 := newObs(t, "https://ok.example/")
+		o2.Cookies = []CookieEntry{{Name: "session", Value: "x"}}
+		c2 := testCorpus(o2)
+		ms = matchIndicator(ind(fingerprints.IndicatorCookie, "session"), c2)
+		if len(ms) != 1 || ms[0].value != "session" {
+			t.Errorf("cookie name must match: got %v", ms)
 		}
 	})
 
@@ -737,6 +756,50 @@ func TestAnalyzeEvidenceDedupe(t *testing.T) {
 	ids := out.techEvidence[out.technologies[0].Technology.ID()]
 	if len(ids) != 1 {
 		t.Errorf("techEvidence = %v, want 1 id", ids)
+	}
+}
+
+// NEW-108 regression: repeated occurrences of ONE indicator must not
+// inflate confidence — the same marker echoed across five header slots
+// scores (and grades) exactly as high as a single occurrence — while two
+// DISTINCT indicators of one fingerprint still accumulate.
+func TestAnalyzePerIndicatorContributionCap(t *testing.T) {
+	echoed := func(n int) Observation {
+		o := newObs(t, "https://ok.example/")
+		for range n {
+			o.Headers = append(o.Headers, HeaderEntry{Name: "X-Marker", Value: "widget"})
+		}
+		return o
+	}
+	fps := []fingerprints.Fingerprint{testFP("marker tech", hdrInd("x-marker", 0.6))}
+
+	one := analyze(echoed(1), fps, 128, 512, testProv())
+	five := analyze(echoed(5), fps, 128, 512, testProv())
+	if len(one.technologies) != 1 || len(five.technologies) != 1 {
+		t.Fatalf("technologies = %d/%d, want 1/1", len(one.technologies), len(five.technologies))
+	}
+	if five.technologies[0].Score != one.technologies[0].Score ||
+		five.technologies[0].Level != one.technologies[0].Level {
+		t.Errorf("echoed indicator inflated confidence: once = %v/%q, 5x = %v/%q",
+			one.technologies[0].Score, one.technologies[0].Level,
+			five.technologies[0].Score, five.technologies[0].Level)
+	}
+
+	// Two distinct indicators still accumulate: header + structural HTML
+	// substring score strictly above either alone and reach High.
+	bothFPS := []fingerprints.Fingerprint{testFP("marker tech",
+		hdrInd("x-marker", 0.6),
+		fingerprints.Indicator{Kind: fingerprints.IndicatorHTMLSubstring, Match: "widget-marker-body", Weight: 0.6},
+	)}
+	withBody := echoed(5)
+	withBody.Body = `<p>widget-marker-body</p>`
+	both := analyze(withBody, bothFPS, 128, 512, testProv())
+	if len(both.technologies) != 1 {
+		t.Fatalf("technologies = %d, want 1", len(both.technologies))
+	}
+	if got := both.technologies[0]; got.Score <= one.technologies[0].Score || got.Level != LevelHigh {
+		t.Errorf("distinct indicators must accumulate: got %v/%q, want > %v/high",
+			got.Score, got.Level, one.technologies[0].Score)
 	}
 }
 

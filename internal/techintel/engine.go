@@ -465,13 +465,18 @@ func callEmit(ctx context.Context, fn func(context.Context, Observation, ReportE
 func processObservation(ctx context.Context, o Observation, truncated bool, e *env) ReportEntry {
 	prov := asset.Provenance{Source: o.Source, DiscoveredAt: o.ObservedAt}
 
+	// The cache key is built ONCE per stored observation and reused for
+	// both the lookup and the store (NEW-108): same inputs, same key, so
+	// the second build was pure waste.
+	var cacheKey cache.Key
 	if e.cache != nil {
-		key, err := techKey(o, e.schema, e.digest)
+		key, err := techKey(o, e.schema, e.digest, e.capTech, e.capInd)
 		if err != nil {
 			e.recordErr(fmt.Errorf("techintel: cache key: %w", err))
 			return failedEntry(o, err)
 		}
-		if out := lookupTech(ctx, key, o, e); out != nil {
+		cacheKey = key
+		if out := lookupTech(ctx, cacheKey, o, e); out != nil {
 			return *out
 		}
 	}
@@ -487,11 +492,7 @@ func processObservation(ctx context.Context, o Observation, truncated bool, e *e
 	entry := completedEntry(o, outcome, prov)
 
 	if e.cache != nil {
-		key, err := techKey(o, e.schema, e.digest)
-		if err != nil {
-			return entry // analysis succeeded; key failure only skips the store
-		}
-		storeTechDetached(ctx, key, o, entry, e)
+		storeTechDetached(ctx, cacheKey, o, entry, e)
 	}
 	return entry
 }

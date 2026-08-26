@@ -74,12 +74,12 @@ func TestAssembleServed(t *testing.T) {
 		t.Fatalf("endpoints = %d, want 2", len(hr.Endpoints))
 	}
 	wantRels := []string{
-		"host:www.example.comhost_to_url\x00url:http://www.example.com/",
-		"host:www.example.comhost_to_url\x00url:https://www.example.com/",
-		"port:443/tcpport_to_service\x00service:443/tcp/https",
-		"port:80/tcpport_to_service\x00service:80/tcp/http",
-		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
-		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+		"host:www.example.com" + "\x00" + "host_to_url\x00url:http://www.example.com/",
+		"host:www.example.com" + "\x00" + "host_to_url\x00url:https://www.example.com/",
+		"port:443/tcp" + "\x00" + "port_to_service\x00service:443/tcp/https",
+		"port:80/tcp" + "\x00" + "port_to_service\x00service:80/tcp/http",
+		"url:http://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET https://www.example.com/",
 	}
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), wantRels)
 }
@@ -118,9 +118,9 @@ func TestAssembleLegitimateNegatives(t *testing.T) {
 	// Only the endpoint edge for each probe and the ip->port edge for 443
 	// (sorted by edge identity: "ip:..." < "url:...").
 	wantRels := []string{
-		"ip:192.0.2.7ip_to_port\x00port:443/tcp",
-		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
-		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+		"ip:192.0.2.7" + "\x00" + "ip_to_port\x00port:443/tcp",
+		"url:http://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET https://www.example.com/",
 	}
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), wantRels)
 }
@@ -159,8 +159,8 @@ func TestAssembleFailedAndCancelled(t *testing.T) {
 	}
 	// The executed jobs still contribute their endpoint shapes.
 	wantRels := []string{
-		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
-		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+		"url:http://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET https://www.example.com/",
 	}
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), wantRels)
 }
@@ -315,16 +315,16 @@ func TestAssembleTLSCertificates(t *testing.T) {
 		t.Fatalf("certificates = %+v, want the merged observations", hr.TLSCertificates)
 	}
 	wantRels := []string{
-		"host:www.example.comhost_to_tls_certificate\x00tls_certificate:" + fpA,
-		"host:www.example.comhost_to_tls_certificate\x00tls_certificate:" + fpB,
-		"host:www.example.comhost_to_url\x00url:http://www.example.com/",
-		"host:www.example.comhost_to_url\x00url:https://www.example.com/",
-		"port:443/tcpport_to_service\x00service:443/tcp/https",
-		"port:443/tcpport_to_tls_certificate\x00tls_certificate:" + fpA,
-		"port:443/tcpport_to_tls_certificate\x00tls_certificate:" + fpB,
-		"port:80/tcpport_to_service\x00service:80/tcp/http",
-		"url:http://www.example.com/url_to_endpoint\x00endpoint:GET http://www.example.com/",
-		"url:https://www.example.com/url_to_endpoint\x00endpoint:GET https://www.example.com/",
+		"host:www.example.com" + "\x00" + "host_to_tls_certificate\x00tls_certificate:" + fpA,
+		"host:www.example.com" + "\x00" + "host_to_tls_certificate\x00tls_certificate:" + fpB,
+		"host:www.example.com" + "\x00" + "host_to_url\x00url:http://www.example.com/",
+		"host:www.example.com" + "\x00" + "host_to_url\x00url:https://www.example.com/",
+		"port:443/tcp" + "\x00" + "port_to_service\x00service:443/tcp/https",
+		"port:443/tcp" + "\x00" + "port_to_tls_certificate\x00tls_certificate:" + fpA,
+		"port:443/tcp" + "\x00" + "port_to_tls_certificate\x00tls_certificate:" + fpB,
+		"port:80/tcp" + "\x00" + "port_to_service\x00service:80/tcp/http",
+		"url:http://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET http://www.example.com/",
+		"url:https://www.example.com/" + "\x00" + "url_to_endpoint\x00endpoint:GET https://www.example.com/",
 	}
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), wantRels)
 }

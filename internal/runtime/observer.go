@@ -45,11 +45,35 @@ import (
 // boundary. Engines never emit those events themselves.
 
 // observe delivers ev to the pool's observer (nil observer: no-op).
+//
+// Panic containment (NEW-108): this is the single emission choke point for
+// every event the pool publishes, including emissions from worker
+// goroutines the pool spawned. A panicking Observer is recovered here and
+// counted in observerPanics (surfaced by ObserverPanics) instead of
+// crashing a worker — the same containment the Deriving bridge applies to
+// panicking Derivers, so the threat model is symmetric: neither half of the
+// observer seam can take down the process, and neither failure mode is
+// silent (the bridge counts DeriverPanics; the pool counts
+// ObserverPanics). A panic escaping through Submit or Shutdown (both run on
+// the caller's goroutine) is likewise recovered AND counted, never
+// swallowed without a trace.
 func (p *Pool) observe(ev event.Event) {
-	if p.observer != nil {
-		p.observer.Observe(ev)
+	if p.observer == nil {
+		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.observerPanics.Add(1)
+		}
+	}()
+	p.observer.Observe(ev)
 }
+
+// ObserverPanics returns how many times the configured Observer panicked
+// inside Observe and was recovered by the pool. Zero for a well-behaved
+// observer; anything above zero means the observer is losing events it was
+// handed (the event itself is dropped with the panicked call).
+func (p *Pool) ObserverPanics() uint64 { return p.observerPanics.Load() }
 
 // buildObserver wraps the configured observer in the Deriving bridge when a
 // deriver is present. NewDeriving installs the bridge's panic counter, so a
@@ -69,12 +93,22 @@ func buildObserver(cfg Config) event.Observer {
 	return event.NewDeriving(cfg.Observer, cfg.Deriver)
 }
 
-// emitScanStarted publishes the pool-configuration projection.
+// emitScanStarted publishes the pool-configuration projection. A negative
+// Timeout is clamped to 0 ("none"): NewPool rejects negative timeouts
+// today, so this is unreachable through the public constructor, but the
+// wire contract (event.ScanStarted.Timeout, "0 = none"; Event.Validate
+// rejects a negative value) must not depend on that upstream check — a
+// future caller path that relaxes it would otherwise put an invalid event
+// on the wire.
 func (p *Pool) emitScanStarted(cfg Config) {
+	timeout := cfg.Timeout
+	if timeout < 0 {
+		timeout = 0
+	}
 	p.observe(event.New(event.KindScanStarted, p.clock.Now(), event.ScanStarted{
 		Concurrency: cfg.Concurrency,
 		QueueSize:   cfg.QueueSize,
-		Timeout:     cfg.Timeout,
+		Timeout:     timeout,
 		Rate:        cfg.Rate,
 	}))
 }
@@ -192,12 +226,17 @@ func eventErrorMessage(ev Event) string {
 //
 // The wire contract: the Completed values a consumer sees are
 // non-decreasing, never exceed the true termination count at the moment of
-// emission, and the final progress event carries the exact total. The
-// terminated counter alone cannot guarantee that — concurrent workers
-// terminate out of order relative to their emissions, so a worker that
-// increments the counter early and emits late could otherwise put a larger
-// Completed before a smaller one. The emission is therefore serialized
-// under progressMu and clamped to min(actual, watermark+1) (clampProgress).
+// emission, never exceed Total (TotalKnown makes a Completed>Total event
+// invalid — Event.Validate rejects it and the bus would drop it), and the
+// final progress event carries the exact total. The terminated counter
+// alone cannot guarantee that — concurrent workers terminate out of order
+// relative to their emissions, so a worker that increments the counter
+// early and emits late could otherwise put a larger Completed before a
+// smaller one. The emission is therefore serialized under progressMu and
+// clamped to min(actual, watermark+1) (clampProgress), then clamped once
+// more to the submission count: both counters are non-decreasing and read
+// under the same lock, so the min stays non-decreasing and the second
+// clamp can only delay honesty, never fabricate or regress it.
 //
 // The Observe call happens under progressMu deliberately: the wire order is
 // the order the observer sees, so only emitting while holding the lock
@@ -208,7 +247,15 @@ func (p *Pool) emitProgress() {
 		return
 	}
 	p.progressMu.Lock()
+	total := int(p.submitted.Load())
 	completed := p.clampProgress(int(p.terminated.Load()))
+	if completed > total {
+		// Defensive: Event.Validate rejects a Progress whose Completed
+		// exceeds its TotalKnown total, so emitting one past the submission
+		// counter would get the event dropped at the bus instead of being
+		// observed. Hold at Total; the next emission reports the truth.
+		completed = total
+	}
 	// The phase comes from the pool's stored lifecycle phase, never a
 	// hardcoded value: once Shutdown has put "draining" on the wire, no
 	// progress event may regress it to "running" (see emitPhase).
@@ -219,7 +266,7 @@ func (p *Pool) emitProgress() {
 	p.observe(event.New(event.KindProgress, p.clock.Now(), event.Progress{
 		Phase:      phase,
 		Completed:  completed,
-		Total:      int(p.submitted.Load()),
+		Total:      total,
 		TotalKnown: true,
 	}))
 	p.progressMu.Unlock()
@@ -242,6 +289,12 @@ func (p *Pool) emitProgress() {
 //     own increment plus those of every earlier emission, all of whose
 //     increments precede their emissions), so after all N terminals the
 //     watermark has caught up to exactly N.
+//
+// int-wrap note: actual comes from terminated.Load() bounded by submitted
+// count (fits int on both 32- and 64-bit); progressEmitted mirrors it. If
+// actual were to wrap negative (2^31 on 32-bit, impossible for real runs),
+// the clamp degrades honestly: actual <= last returns last (non-decreasing,
+// never above truth), so overflow cannot fabricate progress.
 func (p *Pool) clampProgress(actual int) int {
 	last := int(p.progressEmitted)
 	if actual <= last {

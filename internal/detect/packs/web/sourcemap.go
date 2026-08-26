@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -22,11 +23,10 @@ func sourcemapExposedDetector(ctx context.Context, dctx *detect.Context) ([]asse
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		uStr := strings.ToLower(js.URL.String())
 		path := strings.ToLower(js.URL.Path)
 		disc := strings.ToLower(js.DiscoverySource)
 		ct := strings.ToLower(js.ContentType)
-		isMap := strings.HasSuffix(path, ".map") || strings.Contains(uStr, ".map") || disc == "sourcemap" || strings.Contains(ct, "sourcemap") || strings.Contains(uStr, "sourcemap")
+		isMap := strings.HasSuffix(path, ".map") || disc == "sourcemap" || strings.Contains(ct, "sourcemap")
 		if isMap {
 			id := js.Identity()
 			if _, ok := seen[id]; !ok {
@@ -59,18 +59,30 @@ func sourcemapExposedDetector(ctx context.Context, dctx *detect.Context) ([]asse
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
-		if len(out) >= 256 {
-			break
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		f, err := webFinding(dctx, ruleSourceMapExposed, "Source Map Exposed", detect.CategoryInformation, s, nil, map[string]string{"signal": "sourcemap_exposed"})
+		meta := map[string]string{"signal": "sourcemap_exposed"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
+		}
+		f, err := webFinding(dctx, ruleSourceMapExposed, "Source Map Exposed", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
 	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleSourceMapExposed, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
+	}
 	formatConfigKeys(dctx, ruleSourceMapExposed)
-	_ = strings.Join(sortedKeys(dctx.Config), ",")
 	return out, nil
 }

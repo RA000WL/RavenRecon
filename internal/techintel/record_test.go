@@ -68,11 +68,11 @@ func canonicalObs(t *testing.T) Observation {
 func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	o := canonicalObs(t)
 	dig := techDigest(t)
-	k1, err := techKey(o, 1, dig)
+	k1, err := techKey(o, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k2, err := techKey(o, 1, dig)
+	k2, err := techKey(o, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,12 +81,23 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	}
 
 	// Schema sensitivity: a bumped schema version changes the key.
-	otherSchema, err := techKey(o, 2, dig)
+	otherSchema, err := techKey(o, 2, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if k1 == otherSchema {
 		t.Error("schema version must enter the key")
+	}
+
+	// Cap sensitivity: the analysis caps are configuration, not fixed
+	// constants, so a record stored under one cap pair must never share a
+	// key with one stored under another (NEW-108).
+	otherCaps, err := techKey(o, 1, dig, 64, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k1 == otherCaps {
+		t.Error("run caps must enter the key")
 	}
 
 	// Database-content sensitivity: ANY data-only edit to the fingerprint
@@ -116,7 +127,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	if modDigest == dig {
 		t.Fatal("a mutated table must change the content digest")
 	}
-	if k, err := techKey(o, 1, modDigest); err != nil || k == k1 {
+	if k, err := techKey(o, 1, modDigest, 128, 512); err != nil || k == k1 {
 		t.Errorf("database content digest must enter the key (err=%v)", err)
 	}
 
@@ -125,7 +136,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	headersOnly := newObs(t, "https://ok.example/api")
 	headersOnly.Headers = o.Headers
 	headersOnly.StatusCode = o.StatusCode
-	ko, err := techKey(headersOnly, 1, dig)
+	ko, err := techKey(headersOnly, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +148,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	// never part of the key.
 	withStatus := newObs(t, "https://ok.example/api")
 	withStatus.Headers = o.Headers
-	ks, err := techKey(withStatus, 1, dig)
+	ks, err := techKey(withStatus, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +157,7 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	}
 
 	// Target sensitivity: a different URL yields a different key.
-	other, err := techKey(newObs(t, "https://other.example/api"), 1, dig)
+	other, err := techKey(newObs(t, "https://other.example/api"), 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,11 +169,11 @@ func TestTechKeyDeterministicAndSensitive(t *testing.T) {
 	withEndpoint := canonicalObs(t)
 	withoutEndpoint := canonicalObs(t)
 	withoutEndpoint.Endpoint = nil
-	ke, err := techKey(withEndpoint, 1, dig)
+	ke, err := techKey(withEndpoint, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
-	kn, err := techKey(withoutEndpoint, 1, dig)
+	kn, err := techKey(withoutEndpoint, 1, dig, 128, 512)
 	if err != nil {
 		t.Fatal(err)
 	}

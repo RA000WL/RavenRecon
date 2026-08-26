@@ -53,6 +53,14 @@ func WithObserver(obs event.Observer) Option {
 // emitAccess publishes the outcome of one lookup as a canonical cache
 // event when an observer is configured. A nil observer is the off switch:
 // a single nil check, nothing else.
+//
+// Panic stance (NEW-108, deliberate asymmetry vs the runtime pool): the
+// cache never spawns a goroutine around its emissions — Get runs on the
+// caller's own goroutine — so a panicking Observer propagates to that
+// caller instead of being swallowed here; there is no package-spawned
+// goroutine whose crash it could cause and no counter to hide behind.
+// (The runtime pool recovers AND counts, because it emits from worker
+// goroutines it spawned itself.)
 func (c *FS) emitAccess(key Key, out Outcome) {
 	if c.observer == nil {
 		return

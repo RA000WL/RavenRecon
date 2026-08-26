@@ -13,9 +13,12 @@
 // The pool starts exactly Config.Concurrency worker goroutines; jobs are
 // submitted through Submit, which enqueues into a channel of bounded capacity
 // Config.QueueSize, and run inline inside workers. The pool never creates a
-// goroutine per job, so at any instant at most Concurrency jobs are
-// executing (plus at most Concurrency more parked on the rate limiter or on
-// event delivery).
+// goroutine per job: every job occupies one of the Concurrency workers for
+// its whole stay in the pool, so at most Concurrency jobs are executing at
+// any instant — never more. A worker waiting for a rate-limit token has not
+// started its job yet (the job is not executing), and a worker blocked on
+// event delivery has already finished it; neither adds to the executing
+// count.
 //
 // # Jobs
 //
@@ -103,7 +106,14 @@
 // converts raw job results into derived canonical events at the pool-job
 // boundary; engines never emit those events themselves. Observer safety is
 // the interface contract (Observe must never block beyond a bounded
-// enqueue and must never panic on hostile events); the pool relies on it.
+// enqueue and must never panic on hostile events), and the pool enforces
+// the panic half itself: every emission goes through one choke point
+// (observe), where a panicking Observer is recovered and counted
+// (Pool.ObserverPanics) instead of crashing a pool-owned worker goroutine —
+// symmetric with the Deriving bridge's DeriverPanics containment, and
+// never silent (each recovered panic increments the counter). A panicking
+// Observer handed directly to the cache or another stage that emits on the
+// caller's own goroutine propagates to that caller by design.
 //
 // # Known limitations
 //

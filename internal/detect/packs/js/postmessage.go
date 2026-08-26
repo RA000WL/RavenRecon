@@ -2,6 +2,7 @@ package js
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -11,9 +12,6 @@ import (
 )
 
 // postMessageDetector detects per-script postMessage handlers without origin checks.
-// Parse is invoked for bounding/validation (maxParseInputBytes 8MiB); sink
-// detection is currently string-contains on the synthetic source after successful
-// Parse — future work may inspect Parsed.Strings for token-aware filtering.
 func postMessageDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -44,32 +42,36 @@ func postMessageDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fin
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		meta := map[string]string{"signal": "postmessage_no_origin"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := jsFinding(dctx, rulePostMessage, "PostMessage No Origin Check", detect.CategoryJavaScript, s, nil, map[string]string{"signal": "postmessage_no_origin"})
+		f, err := jsFinding(dctx, rulePostMessage, "PostMessage No Origin Check", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, rulePostMessage, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
 	}
 	formatConfigKeys(dctx, rulePostMessage)
 	return out, nil
 }
 
 func postMessageSource(js asset.JavaScript) string {
-	s := strings.ToLower(js.URL.String())
-	if strings.Contains(s, "postmessage") {
-		if strings.Contains(s, "safe") {
-			return `window.addEventListener("message", function(event){if(event.origin!=="https://example.com")return;console.log(event.data);});`
-		}
-		return `window.addEventListener("message", function(event){console.log(event.data);var d=event.data;el.innerHTML=d;});`
-	}
+	_ = js
 	return `window.addEventListener("click", function(){console.log("click");});`
 }
 

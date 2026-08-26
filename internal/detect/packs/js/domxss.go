@@ -2,6 +2,7 @@ package js
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -44,29 +45,35 @@ func domXSSDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding,
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		meta := map[string]string{"signal": "dom_xss"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := jsFinding(dctx, ruleDomXSS, "DOM XSS", detect.CategoryJavaScript, s, nil, map[string]string{"signal": "dom_xss"})
+		f, err := jsFinding(dctx, ruleDomXSS, "DOM XSS", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
 	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleDomXSS, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
+	}
 	formatConfigKeys(dctx, ruleDomXSS)
 	return out, nil
 }
-
 func domXssSource(js asset.JavaScript) string {
-	s := strings.ToLower(js.URL.String())
-	if strings.Contains(s, "xss") || strings.Contains(s, "dom") {
-		return `var x=location.hash;el.innerHTML=x;el.outerHTML=y;document.write(z);`
-	}
+	_ = js
 	return `var x="safe";el.textContent=x;`
 }
 

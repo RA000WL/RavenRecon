@@ -29,13 +29,13 @@ func Rules() ([]detect.Rule, error) {
 	}
 	rules := []detect.Rule{
 		newJsRule(ruleDomXSS, "DOM XSS",
-			"Detects DOM XSS sinks innerHTML/outerHTML/document.write assignment via jsintel parse tree over synthetic script content derived from observed JavaScript URL. Per-script finding when sink present.",
-			detect.CategoryJavaScript,
+			"Detects DOM XSS sinks innerHTML/outerHTML/document.write assignment via jsintel parse tree over synthetic script content derived from observed JavaScript URL (whole-token heuristic, informational). Per-script finding when sink present.",
+			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputJavaScript},
 			domXSSDetector, "1.0.0"),
 		newJsRule(rulePostMessage, "PostMessage No Origin Check",
-			"Detects window.addEventListener(\"message\", handler) without origin check (no event.origin comparison in handler body) via jsintel parse tree. Per-script finding when handler lacks origin guard.",
-			detect.CategoryJavaScript,
+			"Detects window.addEventListener(\"message\", handler) without origin check (no event.origin comparison in handler body) via jsintel parse tree (whole-token heuristic, informational). Per-script finding when handler lacks origin guard.",
+			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputJavaScript},
 			postMessageDetector, "1.0.0"),
 		newJsRule(ruleProtoPollute, "Prototype Pollution",

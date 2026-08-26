@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // URL is a normalized absolute URL with a scheme and a host.
@@ -17,6 +18,9 @@ import (
 //   - the scheme is lowercased
 //   - the host is lowercased, a trailing root dot is removed, and IP literals
 //     are rewritten in canonical form
+//   - IPv6 zone identifiers are stripped ("fe80::1%eth0" canonicalizes to
+//     "fe80::1"): a zone is link-local scope metadata naming the observing
+//     interface, not part of the remote endpoint's identity
 //   - a default port for the scheme is removed; a non-default port is kept.
 //     Ports are canonicalized as numbers, so ":080" and ":80" are equal
 //   - an empty path is treated as "/"
@@ -78,27 +82,64 @@ func ParseURL(raw string, p Provenance) (URL, error) {
 	if len(raw) > maxRawURLBytes {
 		return URL{}, fmt.Errorf("URL exceeds %d bytes (got %d)", maxRawURLBytes, len(raw))
 	}
+	if !utf8.ValidString(raw) {
+		return URL{}, fmt.Errorf("invalid URL %q: must be valid UTF-8", redactURLForError(raw))
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return URL{}, fmt.Errorf("invalid URL %q: %w", raw, err)
+		return URL{}, fmt.Errorf("invalid URL %q: %w", redactURLForError(raw), err)
 	}
 	if u.Scheme == "" {
-		return URL{}, fmt.Errorf("invalid URL %q: missing scheme", raw)
+		return URL{}, fmt.Errorf("invalid URL %q: missing scheme", redactURLForError(raw))
 	}
 	if !validScheme(u.Scheme) {
-		return URL{}, fmt.Errorf("invalid URL %q: invalid scheme %q", raw, u.Scheme)
+		return URL{}, fmt.Errorf("invalid URL %q: invalid scheme %q", redactURLForError(raw), u.Scheme)
 	}
 	if u.Host == "" {
-		return URL{}, fmt.Errorf("invalid URL %q: missing host", raw)
+		return URL{}, fmt.Errorf("invalid URL %q: missing host", redactURLForError(raw))
 	}
 
 	canonical, err := canonicalURL(u)
 	if err != nil {
-		return URL{}, fmt.Errorf("invalid URL %q: %w", raw, err)
+		return URL{}, fmt.Errorf("invalid URL %q: %w", redactURLForError(raw), err)
 	}
 	canonical.Original = raw
 	canonical.Prov = p
 	return canonical, nil
+}
+
+// redactURLForError returns a redacted form of raw suitable for error messages.
+// It parses raw with url.Parse, clears any userinfo, and returns scheme+host
+// or a redacted fallback. This prevents credentials from leaking in errors.
+func redactURLForError(raw string) string {
+	u, err := url.Parse(raw)
+	if err == nil {
+		u.User = nil
+		if u.Scheme != "" && u.Host != "" {
+			return u.Scheme + "://" + u.Host
+		}
+		if u.Host != "" {
+			return u.Host
+		}
+		s := u.String()
+		if s != "" {
+			return s
+		}
+	}
+	// Fallback: strip userinfo manually.
+	if idx := strings.Index(raw, "://"); idx >= 0 {
+		rest := raw[idx+3:]
+		if at := strings.Index(rest, "@"); at >= 0 {
+			return raw[:idx+3] + rest[at+1:]
+		}
+	}
+	if idx := strings.Index(raw, "@"); idx >= 0 {
+		return "[redacted]@" + raw[idx+1:]
+	}
+	if len(raw) > 256 {
+		return raw[:256] + "…"
+	}
+	return raw
 }
 
 // Identity returns the deterministic identity used for deduplication.
@@ -134,6 +175,16 @@ func (u URL) canonicalString() string {
 	return b.String()
 }
 
+// validScheme reports whether s is a syntactically valid RFC 3986 scheme:
+// one leading ASCII letter, then letters, digits, '+', '-', or '.'. It is a
+// deliberately open policy: there is no scheme allowlist, so any
+// well-formed scheme token — http, https, ws, wss, gopher, ftp, ... — is
+// accepted. The real policy gate is the host requirement enforced by
+// ParseURL immediately after this check: every URL asset must carry a
+// host, so hostless schemes such as data: and javascript: are rejected
+// downstream by the empty-host error even though their scheme tokens are
+// valid here. Default-port knowledge lives in isDefaultPort; unknown
+// schemes simply never have a default port.
 func validScheme(s string) bool {
 	if s == "" {
 		return false
@@ -167,15 +218,17 @@ func canonicalURL(u *url.URL) (URL, error) {
 	canonical := URL{Scheme: strings.ToLower(u.Scheme)}
 
 	host := u.Hostname()
-	if host == "" {
-		return URL{}, fmt.Errorf("host must not be empty")
-	}
+	// IPv6 zone identifiers ("%25eth0" in a URL) are stripped deliberately:
+	// a zone names the local interface that observed the link-local address,
+	// so keeping it would make the asset identity environment-dependent
+	// ("[fe80::1%eth0]" on one machine vs "[fe80::1%wlan0]" on another).
+	// The remote endpoint's identity is the address alone.
 	if strings.Contains(u.Host, "[") {
 		addr, err := netip.ParseAddr(host)
 		if err != nil {
 			return URL{}, fmt.Errorf("invalid IPv6 literal host %q", u.Host)
 		}
-		host = addr.Unmap().String()
+		host = addr.WithZone("").Unmap().String()
 	} else {
 		host = strings.ToLower(host)
 		host = strings.TrimSuffix(host, ".")
@@ -183,7 +236,7 @@ func canonicalURL(u *url.URL) (URL, error) {
 			return URL{}, fmt.Errorf("host must not be empty")
 		}
 		if addr, err := netip.ParseAddr(host); err == nil {
-			host = addr.Unmap().String()
+			host = addr.WithZone("").Unmap().String()
 		} else if err := validateHostname(host); err != nil {
 			return URL{}, fmt.Errorf("invalid host: %w", err)
 		}
@@ -219,6 +272,23 @@ func canonicalURL(u *url.URL) (URL, error) {
 	canonical.Path = removeDotSegments(u.EscapedPath())
 	if canonical.Path == "" {
 		canonical.Path = "/"
+	}
+	// Validate raw query key/value are valid UTF-8 before canonicalization.
+	// Invalid UTF-8 would cause json.Marshal to emit U+FFFD drift, breaking
+	// ID stability across JSON round-trips.
+	if u.RawQuery != "" {
+		for _, pair := range strings.Split(u.RawQuery, "&") {
+			if pair == "" {
+				continue
+			}
+			k, v, _ := strings.Cut(pair, "=")
+			if !utf8.ValidString(k) {
+				return URL{}, fmt.Errorf("query key contains invalid UTF-8")
+			}
+			if !utf8.ValidString(v) {
+				return URL{}, fmt.Errorf("query value contains invalid UTF-8")
+			}
+		}
 	}
 	canonical.Query = sortQuery(u.RawQuery)
 	canonical.Fragment = u.Fragment
@@ -324,16 +394,28 @@ func sortQuery(raw string) string {
 
 // escapeRawQuery percent-encodes the literal raw bytes that would corrupt a
 // canonical query string: ' ' -> "%20", '#' -> "%23", '&' -> "%26",
-// '=' -> "%3D". Everything else is emitted verbatim, so already-escaped forms
-// such as "%26" or "%20" are never double-escaped.
+// '=' -> "%3D", and any byte >=0x80 (non-ASCII). Everything else is emitted
+// verbatim, so already-escaped forms such as "%26" or "%20" are never
+// double-escaped. Encoding bytes >=0x80 ensures the canonical query never
+// contains raw non-ASCII bytes, preserving valid UTF-8 for JSON stability.
 func escapeRawQuery(s string) string {
-	if !strings.ContainsAny(s, " #&=") {
+	needEscape := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '#' || c == '&' || c == '=' || c >= 0x80 {
+			needEscape = true
+			break
+		}
+	}
+	if !needEscape {
 		return s
 	}
+	const hexDigit = "0123456789ABCDEF"
 	var b strings.Builder
-	b.Grow(len(s))
+	b.Grow(len(s) * 3)
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
+		c := s[i]
+		switch c {
 		case ' ':
 			b.WriteString("%20")
 		case '#':
@@ -343,7 +425,13 @@ func escapeRawQuery(s string) string {
 		case '=':
 			b.WriteString("%3D")
 		default:
-			b.WriteByte(s[i])
+			if c >= 0x80 {
+				b.WriteByte('%')
+				b.WriteByte(hexDigit[c>>4])
+				b.WriteByte(hexDigit[c&0x0f])
+			} else {
+				b.WriteByte(c)
+			}
 		}
 	}
 	return b.String()

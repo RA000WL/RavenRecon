@@ -390,19 +390,12 @@ func TestJSPackDomXSSEmits(t *testing.T) {
 	for _, f := range rep.Findings {
 		if f.RuleID == ruleDomXSS {
 			count++
-			if f.Priority != detect.PriorityHigh.String() || f.Status != detect.StatusOpen.String() {
-				t.Fatalf("DOM XSS priority/status %s/%s", f.Priority, f.Status)
-			}
-			if f.Category != detect.CategoryJavaScript.String() {
-				t.Fatalf("DOM XSS category %s", f.Category)
-			}
-			if len(f.Evidence) == 0 {
-				t.Fatalf("DOM XSS no evidence")
-			}
 		}
 	}
-	if count != 1 {
-		t.Fatalf("DOM XSS findings %d, want 1", count)
+	// R2-H2: URL-substring heuristics removed — app_xss.js no longer fires.
+	// Without script body content, DOM XSS cannot be proven from URL alone.
+	if count != 0 {
+		t.Fatalf("DOM XSS findings %d, want 0 (URL heuristic removed)", count)
 	}
 }
 
@@ -421,10 +414,11 @@ func TestJSPackPostMessageEmits(t *testing.T) {
 			count++
 		}
 	}
-	if count != 1 {
-		t.Fatalf("postmessage findings %d, want 1", count)
+	// R2-H2: heuristic removed — app_postmessage.js no longer fires without body.
+	if count != 0 {
+		t.Fatalf("postmessage findings %d, want 0 (URL heuristic removed)", count)
 	}
-	// Safe postmessage (with origin check) should not emit.
+	// Safe postmessage (with origin check) should also not emit.
 	safe := mustJS(t, "https://www.example.com/app_postmessage_safe.js")
 	snap2 := detect.Snapshot{JavaScript: []asset.JavaScript{safe}}
 	cfg2 := detect.DefaultEngineConfig(reg)
@@ -455,8 +449,9 @@ func TestJSPackPrototypePollutionEmits(t *testing.T) {
 			count++
 		}
 	}
-	if count != 1 {
-		t.Fatalf("proto pollution findings %d, want 1", count)
+	// R2-H2: heuristic removed — app_proto.js no longer fires.
+	if count != 0 {
+		t.Fatalf("proto pollution findings %d, want 0 (URL heuristic removed)", count)
 	}
 }
 
@@ -473,14 +468,14 @@ func TestJSPackMixedPerRule(t *testing.T) {
 	for _, f := range rep.Findings {
 		counts[f.RuleID]++
 	}
-	if counts[ruleDomXSS] != 1 {
-		t.Fatalf("dom xss %d, want 1", counts[ruleDomXSS])
+	if counts[ruleDomXSS] != 0 {
+		t.Fatalf("dom xss %d, want 0", counts[ruleDomXSS])
 	}
-	if counts[rulePostMessage] != 1 {
-		t.Fatalf("postmessage %d, want 1", counts[rulePostMessage])
+	if counts[rulePostMessage] != 0 {
+		t.Fatalf("postmessage %d, want 0", counts[rulePostMessage])
 	}
-	if counts[ruleProtoPollute] != 1 {
-		t.Fatalf("proto %d, want 1", counts[ruleProtoPollute])
+	if counts[ruleProtoPollute] != 0 {
+		t.Fatalf("proto %d, want 0", counts[ruleProtoPollute])
 	}
 }
 

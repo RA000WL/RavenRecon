@@ -503,6 +503,63 @@ func TestWebPackRobotsExposed(t *testing.T) {
 	}
 }
 
+// TestWebPackRobotsTypedCarriersOnly is the NEW-108 precision regression:
+// the robots rule fires only on typed carriers — a /robots.txt endpoint, an
+// evidence indicator/value naming robots.txt itself, or a technology whose
+// name references robots.txt. Bare "robots" substrings (a "robots meta
+// tag" observation, a crawler product named "...robots...") must NOT fire.
+func TestWebPackRobotsTypedCarriersOnly(t *testing.T) {
+	reg := registerWebPack(t)
+	run := func(t *testing.T, snap detect.Snapshot) int {
+		t.Helper()
+		cfg := detect.DefaultEngineConfig(reg)
+		cfg.Clock = testClock
+		rep, err := detect.Run(context.Background(), cfg, snap)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		count := 0
+		for _, f := range rep.Findings {
+			if f.RuleID == ruleRobotsExposed {
+				count++
+			}
+		}
+		return count
+	}
+
+	t.Run("benign bare-robots carriers stay silent", func(t *testing.T) {
+		host := mustHost(t, "www.example.com")
+		src := mustHost(t, "api.example.com")
+		snap := detect.Snapshot{
+			Assets: []asset.Identity{host.Identity()},
+			Evidence: []asset.Evidence{
+				mustEvidence(t, asset.MethodMeta, "html:meta-robots", "robots meta tag: noindex", src.Identity()),
+				mustEvidence(t, asset.MethodHeader, "header:user-agent", "friendly robots walker/1.0", src.Identity()),
+			},
+			Technologies: []asset.Technology{mustTechnology(t, "CrawlerBots Scanner", asset.CategoryServer)},
+		}
+		if got := run(t, snap); got != 0 {
+			t.Fatalf("robots findings = %d, want 0 for bare-'robots' evidence and technology names", got)
+		}
+	})
+
+	t.Run("typed robots.txt carriers still fire", func(t *testing.T) {
+		host := mustHost(t, "www.example.com")
+		snap := detect.Snapshot{
+			Assets: []asset.Identity{host.Identity()},
+			Evidence: []asset.Evidence{
+				mustEvidence(t, asset.MethodHeader, "header:x-robots.txt", "disallowed: /admin", host.Identity()),
+			},
+			Endpoints: []asset.Endpoint{mustEndpoint(t, "GET", "https://www.example.com/robots.txt")},
+		}
+		// One finding per distinct subject: the /robots.txt endpoint and the
+		// evidence source carrying a robots.txt-named indicator.
+		if got := run(t, snap); got != 2 {
+			t.Fatalf("robots findings = %d, want 2 (endpoint + typed evidence source)", got)
+		}
+	})
+}
+
 func TestWebPackSourcemapExposed(t *testing.T) {
 	reg := registerWebPack(t)
 	snap := buildSourcemapSnapshot(t)

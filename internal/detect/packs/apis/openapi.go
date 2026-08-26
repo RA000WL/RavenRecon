@@ -2,6 +2,7 @@ package apis
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -63,19 +64,29 @@ func openapiExposedDetector(ctx context.Context, dctx *detect.Context) ([]asset.
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		meta := map[string]string{"signal": "openapi_exposed"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := apisFinding(dctx, ruleOpenAPIExposed, "OpenAPI Exposed", detect.CategoryInformation, s, nil, map[string]string{"signal": "openapi_exposed"})
+		f, err := apisFinding(dctx, ruleOpenAPIExposed, "OpenAPI Exposed", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleOpenAPIExposed, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
 	}
 	formatConfigKeys(dctx, ruleOpenAPIExposed)
 	return out, nil

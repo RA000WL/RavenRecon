@@ -70,12 +70,12 @@ func TestIngestBasic(t *testing.T) {
 	// endpoint->parameter x2. relationIDs sorts by edge identity, so the
 	// want-list is in sorted order (endpoint:... < host:... < url:...).
 	wantRels := []string{
-		"endpoint:GET http://example.com/p?a=1&b=2" + "endpoint_to_parameter\x00" + "parameter:query:a",
-		"endpoint:GET http://example.com/p?a=1&b=2" + "endpoint_to_parameter\x00" + "parameter:query:b",
-		"host:example.com" + "host_to_url\x00" + "url:http://example.com/p?a=1&b=2",
-		"url:http://example.com/p?a=1&b=2" + "url_to_endpoint\x00" + "endpoint:GET http://example.com/p?a=1&b=2",
-		"url:http://example.com/p?a=1&b=2" + "url_to_parameter\x00" + "parameter:query:a",
-		"url:http://example.com/p?a=1&b=2" + "url_to_parameter\x00" + "parameter:query:b",
+		"endpoint:GET http://example.com/p?a=1&b=2" + "\x00" + "endpoint_to_parameter\x00" + "parameter:query:a",
+		"endpoint:GET http://example.com/p?a=1&b=2" + "\x00" + "endpoint_to_parameter\x00" + "parameter:query:b",
+		"host:example.com" + "\x00" + "host_to_url\x00" + "url:http://example.com/p?a=1&b=2",
+		"url:http://example.com/p?a=1&b=2" + "\x00" + "url_to_endpoint\x00" + "endpoint:GET http://example.com/p?a=1&b=2",
+		"url:http://example.com/p?a=1&b=2" + "\x00" + "url_to_parameter\x00" + "parameter:query:a",
+		"url:http://example.com/p?a=1&b=2" + "\x00" + "url_to_parameter\x00" + "parameter:query:b",
 	}
 	requireEqualStrings(t, "relationships", relationIDs(e), wantRels)
 
@@ -633,17 +633,12 @@ func TestIngestParameterExtractionPin(t *testing.T) {
 		"http://example.com/p?x=a b",         // raw space: same identity as %20
 		"http://example.com/p?x=café",        // raw non-ASCII as-observed
 	})
-
-	// Six raw lines, five canonical URLs: the two %20 lines canonicalize
-	// together, the + form stays distinct, and the flag/2nd variants are
-	// their own URLs. The canonical query sorts keys by decoded name, so
-	// the value-less flag key sorts before x.
 	requireEqualStrings(t, "entries", entryStrings(rep), []string{
 		"http://example.com/p?flag&x=a%20b",
 		"http://example.com/p?x=a%20b",
 		"http://example.com/p?x=a%20b&x=2nd",
 		"http://example.com/p?x=a+b",
-		"http://example.com/p?x=café",
+		"http://example.com/p?x=caf%C3%A9",
 	})
 
 	values := func(canonical string) []string {
@@ -657,7 +652,8 @@ func TestIngestParameterExtractionPin(t *testing.T) {
 	requireEqualStrings(t, "x values (flag variant)", values("http://example.com/p?flag&x=a%20b"), []string{"a%20b"})
 	requireEqualStrings(t, "x values (2nd variant)", values("http://example.com/p?x=a%20b&x=2nd"), []string{"a%20b", "2nd"})
 	requireEqualStrings(t, "x values (plus)", values("http://example.com/p?x=a+b"), []string{"a+b"})
-	requireEqualStrings(t, "x values (raw non-ASCII)", values("http://example.com/p?x=café"), []string{"café"})
+	requireEqualStrings(t, "x values (raw non-ASCII)", values("http://example.com/p?x=caf%C3%A9"), []string{"caf%C3%A9"})
+
 }
 
 // TestIngestParameterOverflow pins the per-URL parameter cap: distinct

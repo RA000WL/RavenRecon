@@ -118,11 +118,15 @@ func validateFingerprint(fp Fingerprint) error {
 			if ind.Version.Pattern == "" {
 				return fmt.Errorf("indicator %d: version pattern must not be empty", i)
 			}
-			if _, err := regexp.Compile(ind.Version.Pattern); err != nil {
+			re, err := regexp.Compile(ind.Version.Pattern)
+			if err != nil {
 				return fmt.Errorf("indicator %d: version pattern %q is not a valid regex: %v", i, ind.Version.Pattern, err)
 			}
 			if ind.Version.Group < 0 {
 				return fmt.Errorf("indicator %d: version group %d must not be negative", i, ind.Version.Group)
+			}
+			if ind.Version.Group < 1 || ind.Version.Group > re.NumSubexp() {
+				return fmt.Errorf("indicator %d: version group %d out of range [1,%d] for pattern %q", i, ind.Version.Group, re.NumSubexp(), ind.Version.Pattern)
 			}
 		}
 	}

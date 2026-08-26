@@ -2,6 +2,7 @@ package apis
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -32,19 +33,29 @@ func restIDORIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]ass
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(out) >= 256 {
-			break
+		meta := map[string]string{"signal": "rest_idor_indicator"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
 		}
-		f, err := apisFinding(dctx, ruleRestIDORIndicator, "REST IDOR Indicator", detect.CategoryInformation, s, nil, map[string]string{"signal": "rest_idor_indicator"})
+		f, err := apisFinding(dctx, ruleRestIDORIndicator, "REST IDOR Indicator", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
+	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleRestIDORIndicator, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
 	}
 	formatConfigKeys(dctx, ruleRestIDORIndicator)
 	return out, nil
@@ -70,6 +81,15 @@ func isNumericSegment(s string) bool {
 		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
+	}
+	// R2-M4: exclude year-shaped (1900-2100) and short pagination (1-2 digits).
+	if len(s) == 4 {
+		if s >= "1900" && s <= "2100" {
+			return false
+		}
+	}
+	if len(s) <= 2 {
+		return false
 	}
 	return true
 }

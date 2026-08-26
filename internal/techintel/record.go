@@ -23,10 +23,20 @@ const Operation = "tech.detect"
 // (fingerprints.DB.Digest — ANY data-only edit to the fingerprint tables,
 // with no schema bump, changes the digest and invalidates every cached
 // detection, so stale detections can never be replayed after a table
-// edit); and the sources bitmask (sorted letters: b body, c cookies, d DNS,
-// e endpoint, h headers, t TLS). Timings, concurrency, the status code, and
-// the fixed analysis caps never enter keys.
-func techKey(o Observation, schema int, dbDigest string) (cache.Key, error) {
+// edit); the sources bitmask (sorted letters: b body, c cookies, d DNS,
+// e endpoint, h headers, t TLS); and the run's analysis caps as cap_tech /
+// cap_ind.
+//
+// Configurable-cap note: the caps are CONFIGURATION, not fixed constants
+// (Config.MaxTechnologiesPerObservation / MaxIndicatorsPerObservation, each
+// with a documented default), so they MUST enter the key: a record stored
+// under one cap pair must never be replayed under another, or a capped
+// retention set would silently differ from what a fresh analysis of the
+// same observation would retain. The sticky Overflow/Truncated flags stay
+// as the honesty backstop; decode re-checking retained counts against the
+// current run's caps remains defense in depth. Timings, concurrency, and
+// the status code never enter keys.
+func techKey(o Observation, schema int, dbDigest string, capTech, capInd int) (cache.Key, error) {
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    o.identity().String(),
@@ -34,6 +44,8 @@ func techKey(o Observation, schema int, dbDigest string) (cache.Key, error) {
 			"schema":    fmt.Sprintf("%d", schema),
 			"db_digest": dbDigest,
 			"sources":   sourcesMask(o),
+			"cap_tech":  fmt.Sprintf("%d", capTech),
+			"cap_ind":   fmt.Sprintf("%d", capInd),
 		},
 	})
 }

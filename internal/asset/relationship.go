@@ -83,6 +83,21 @@ const (
 	RelationshipSecretCandidateToEvidence RelationshipKind = "secret_candidate_to_evidence"
 )
 
+// Valid reports whether k is one of the known relationship kinds.
+func (k RelationshipKind) Valid() bool {
+	switch k {
+	case RelationshipHostToIP, RelationshipHostToCNAME, RelationshipIPToPort, RelationshipPortToService,
+		RelationshipHostToURL, RelationshipURLToEndpoint, RelationshipURLToJavaScript, RelationshipURLToParameter,
+		RelationshipEndpointToParameter, RelationshipHostToTechnology, RelationshipURLToTechnology, RelationshipEndpointToTechnology,
+		RelationshipTechnologyToEvidence, RelationshipHostToTLSCertificate, RelationshipPortToTLSCertificate,
+		RelationshipJavaScriptToJavaScript, RelationshipJavaScriptToEndpoint, RelationshipJavaScriptToSecretCandidate,
+		RelationshipJavaScriptToSourceMap, RelationshipJavaScriptToTechnology, RelationshipURLToSecretCandidate,
+		RelationshipSecretCandidateToEvidence:
+		return true
+	}
+	return false
+}
+
 // Relationship is a typed, directed edge between two asset identities.
 //
 // It is the primitive a future correlation engine uses to build the asset
@@ -117,10 +132,8 @@ func NewRelationship(from Identity, kind RelationshipKind, to Identity) (Relatio
 	if len(kind) > maxRelationshipKindBytes {
 		return Relationship{}, fmt.Errorf("relationship kind %q is longer than %d bytes", string(kind), maxRelationshipKindBytes)
 	}
-	for i := 0; i < len(kind); i++ {
-		if c := kind[i]; c < 0x20 || c > 0x7e {
-			return Relationship{}, fmt.Errorf("relationship kind %q contains a non-printable character", string(kind))
-		}
+	if !kind.Valid() {
+		return Relationship{}, fmt.Errorf("unknown relationship kind %q", string(kind))
 	}
 	if to.IsZero() {
 		return Relationship{}, fmt.Errorf("relationship destination must not be zero")
@@ -128,8 +141,35 @@ func NewRelationship(from Identity, kind RelationshipKind, to Identity) (Relatio
 	return Relationship{From: from, Kind: kind, To: to}, nil
 }
 
+// encodeIdentity percent-encodes the separator and escape bytes so that
+// identity boundaries can never be blurred. Only '%' and '\x00' (the
+// separator) plus non-printable bytes are escaped — ':' '/' '.' etc. stay
+// literal so normal host/url identities remain readable and existing tests
+// stay stable. The encoding is injective and the added "\x00"+Kind+"\x00"
+// prefix/suffix in ID() already prevents From/Kind prefix collisions.
+func encodeIdentity(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' {
+			b.WriteString("%25")
+		} else if c == 0x00 {
+			b.WriteString("%00")
+		} else if c < 0x20 || c == 0x7f {
+			const hex = "0123456789ABCDEF"
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 // ID returns a deterministic identity, so the same directed edge added twice
 // deduplicates while the reverse or differently-kind edge stays distinct.
 func (r Relationship) ID() string {
-	return r.From.String() + string(r.Kind) + "\x00" + r.To.String()
+	return encodeIdentity(r.From.String()) + "\x00" + string(r.Kind) + "\x00" + encodeIdentity(r.To.String())
 }

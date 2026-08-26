@@ -123,7 +123,11 @@ type indicatorGroup struct {
 // technology from its independent indicator groups.
 //
 // Score = 1 − ∏(1 − wᵢ) over independent groups (groups of the same
-// kind+slot collapse to their max weight). Then the documented caps apply:
+// kind+slot collapse to their max weight). The caller (analyze) caps its
+// input at one group per DISTINCT indicator (NEW-108): repeats of one
+// indicator across slots never reach this function, so only multi-
+// distinct-indicator firings accumulate here. Then the documented caps
+// apply:
 //
 //  1. spoofable-only: when NO matched indicator is structural (tier
 //     Structural), the score is capped at spoofableScoreCap (0.59), so the

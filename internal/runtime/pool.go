@@ -98,6 +98,11 @@ type Config struct {
 	// ...) after each task_completed event. Engines never emit those events
 	// themselves; a caller that does not want derived events leaves this
 	// nil.
+	//
+	// Trap: a Deriver WITHOUT an Observer builds an inert bridge —
+	// event.Deriving forwards every observed event to its Observer first,
+	// and a nil Observer drops everything, so all derived events are
+	// silently lost. Configure both or neither.
 	Deriver event.Deriver
 }
 
@@ -132,12 +137,17 @@ type Pool struct {
 	workers    sync.WaitGroup
 
 	subsMu sync.Mutex
-	subs   map[*Subscription]struct{}
-
 	// observer is the Phase 12 instrumentation sink (nil = off). It is the
 	// configured Observer wrapped in the Deriving bridge when a Deriver is
 	// present.
 	observer event.Observer
+
+	subs map[*Subscription]struct{}
+	// observerPanics counts Observer panics recovered at the pool's single
+	// emission choke point (observe in observer.go): a hostile observer
+	// must not crash the worker goroutines the pool spawned. Surfaced by
+	// Pool.ObserverPanics; never swallowed silently.
+	observerPanics atomic.Uint64
 
 	// submitted counts jobs successfully enqueued; terminated counts
 	// terminal events emitted. They back the pool's honest progress events.

@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -35,7 +36,12 @@ func robotsExposedDetector(ctx context.Context, dctx *detect.Context) ([]asset.F
 	for _, ev := range dctx.Evidence {
 		ind := strings.ToLower(ev.Indicator)
 		val := strings.ToLower(ev.Value)
-		if strings.Contains(ind, "robots") || strings.Contains(val, "robots.txt") {
+		// Typed carriers only (NEW-108): both sides must name robots.txt
+		// itself. A bare "robots" substring anywhere in the indicator (the
+		// old left operand) fired on unrelated observations — e.g. an
+		// indicator or value mentioning a "robots meta tag" — and dragged
+		// its source into this informational finding.
+		if strings.Contains(ind, "robots.txt") || strings.Contains(val, "robots.txt") {
 			src := ev.Source
 			if src.IsZero() {
 				continue
@@ -47,7 +53,10 @@ func robotsExposedDetector(ctx context.Context, dctx *detect.Context) ([]asset.F
 		}
 	}
 	for _, t := range dctx.Technologies {
-		if strings.Contains(strings.ToLower(t.Name), "robots") {
+		// Same typed-carrier bar as the evidence loop (NEW-108): the name
+		// must reference robots.txt itself, so crawler/security products
+		// merely containing "robots" in their name never fire here.
+		if strings.Contains(strings.ToLower(t.Name), "robots.txt") {
 			id := t.Identity()
 			if _, ok := seen[id]; !ok {
 				seen[id] = struct{}{}
@@ -56,18 +65,30 @@ func robotsExposedDetector(ctx context.Context, dctx *detect.Context) ([]asset.F
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
+	dropped := 0
+	if len(subjects) > 256 {
+		dropped = len(subjects) - 256
+		subjects = subjects[:256]
+	}
 	var out []asset.Finding
 	for _, s := range subjects {
-		if len(out) >= 256 {
-			break
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		f, err := webFinding(dctx, ruleRobotsExposed, "Robots Exposed", detect.CategoryInformation, s, nil, map[string]string{"signal": "robots_exposed"})
+		meta := map[string]string{"signal": "robots_exposed"}
+		if dropped > 0 {
+			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
+			meta["truncated"] = "true"
+		}
+		f, err := webFinding(dctx, ruleRobotsExposed, "Robots Exposed", detect.CategoryInformation, s, nil, meta)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, f)
 	}
+	if dropped > 0 {
+		dctx.Logger.Log(detect.LevelWarn, ruleRobotsExposed, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
+	}
 	formatConfigKeys(dctx, ruleRobotsExposed)
-	_ = strings.Join(sortedKeys(dctx.Config), ",")
 	return out, nil
 }

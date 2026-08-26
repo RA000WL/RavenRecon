@@ -434,7 +434,7 @@ func TestParameterRelationships(t *testing.T) {
 	if err != nil {
 		t.Fatalf("url->parameter relationship: %v", err)
 	}
-	want := "url:https://example.com/p?q=1" + "url_to_parameter\x00" + "parameter:query:q"
+	want := encodeIdentity(u.Identity().String()) + "\x00" + string(RelationshipURLToParameter) + "\x00" + encodeIdentity(prm.Identity().String())
 	if urlToPrm.ID() != want {
 		t.Errorf("ID = %q, want %q", urlToPrm.ID(), want)
 	}

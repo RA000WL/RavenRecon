@@ -150,6 +150,9 @@ func NewEvidence(method DetectionMethod, indicator, value string, source Identit
 	if err := validateEvidenceIndicator(indicator); err != nil {
 		return Evidence{}, err
 	}
+	if !utf8.ValidString(value) {
+		return Evidence{}, fmt.Errorf("evidence value must be valid UTF-8")
+	}
 	if source.IsZero() {
 		return Evidence{}, fmt.Errorf("evidence source identity must not be zero")
 	}
@@ -194,13 +197,16 @@ func (e Evidence) String() string { return e.Identity().Value }
 // indicator is an opaque canonical key; the fingerprint database defines its
 // universe.
 func validateEvidenceIndicator(indicator string) error {
+	if !utf8.ValidString(indicator) {
+		return fmt.Errorf("evidence indicator must be valid UTF-8")
+	}
 	if indicator == "" {
 		return fmt.Errorf("evidence indicator must not be empty")
 	}
 	if len(indicator) > maxEvidenceIndicatorBytes {
 		return fmt.Errorf("evidence indicator is longer than %d bytes", maxEvidenceIndicatorBytes)
 	}
-	for i := 0; i < len(indicator); i++ {
+	for i := range len(indicator) {
 		if indicator[i] < 0x20 || indicator[i] > 0x7e {
 			return fmt.Errorf("evidence indicator %q contains a non-printable character", indicator)
 		}

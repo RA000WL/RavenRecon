@@ -110,6 +110,28 @@ func TestNewHost(t *testing.T) {
 		}
 	}
 
+	// Leading-zero dotted quads are deliberately treated as hostnames, not
+	// IP literals: netip.ParseAddr refuses octets like "001" (octal/decimal
+	// ambiguity), so the value falls through to hostname validation, whose
+	// digit labels are legal DNS characters. See the asymmetry note in
+	// normalizeHost.
+	leadingZeroQuadValid := []struct {
+		in   string
+		want string
+	}{
+		{in: "192.168.001.1", want: "192.168.001.1"},
+		{in: "010.001.002.003", want: "010.001.002.003"},
+	}
+	for _, tc := range leadingZeroQuadValid {
+		h, err := NewHost(tc.in, p)
+		if err != nil {
+			t.Fatalf("NewHost(%q) unexpected error: %v", tc.in, err)
+		}
+		if h.Name != tc.want {
+			t.Errorf("NewHost(%q).Name = %q, want %q", tc.in, h.Name, tc.want)
+		}
+	}
+
 	invalid := []string{"", "1.2.3.4", "::1", "-x.com", "x_.com", "é.example"}
 	for _, in := range invalid {
 		if _, err := NewHost(in, p); err == nil {
@@ -149,8 +171,8 @@ func TestNewIP(t *testing.T) {
 		{in: "2001:DB8::1", want: "2001:db8::1", ok: true},
 		{in: "::ffff:1.2.3.4", want: "1.2.3.4", ok: true},
 		{in: "", ok: false},
-		{in: "1.2.3", ok: false},
 		{in: "300.1.1.1", ok: false},
+		{in: "192.168.001.1", ok: false},
 		{in: "abc", ok: false},
 		{in: "[::1]", ok: false},
 	}

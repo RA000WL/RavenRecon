@@ -49,7 +49,7 @@ func TestResolveASuccess(t *testing.T) {
 
 	// Typed relationships: host -> ip via RelationshipHostToIP.
 	want := []string{
-		"host:www.example.com" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
 	}
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), want)
 
@@ -83,8 +83,8 @@ func TestResolveAAAASuccess(t *testing.T) {
 
 	got := relationshipIDs(hr)
 	requireEqualStrings(t, "relationships", got, []string{
-		"host:www.example.com" + "host_to_ip\x00" + "ip:192.0.2.7",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:2001:db8::1",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.7",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::1",
 	})
 	requireEqualStrings(t, "AllIPs", ipNames(rep.AllIPs()), []string{"192.0.2.7", "2001:db8::1"})
 }
@@ -118,11 +118,11 @@ func TestResolveCNAMESuccess(t *testing.T) {
 	// Relationships: host->target (host_to_cname), host->address (closure),
 	// target->address (depth-1 resolution) — all typed edges.
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), []string{
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:198.51.100.9",
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:2001:db8::9",
-		"host:www.example.com" + "host_to_cname\x00" + "host:origin.example.net",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:198.51.100.9",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:2001:db8::9",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:198.51.100.9",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::9",
+		"host:www.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:198.51.100.9",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::9",
 	})
 
 	// Query plan: www A/AAAA/CNAME + origin A/AAAA = 5 queries; the target's
@@ -149,11 +149,11 @@ func TestResolveMultipleAnswers(t *testing.T) {
 	aaaa := typeResultFor(hr, hr.Host, TypeAAAA)
 	requireEqualStrings(t, "AAAA answers", ipNames(aaaa.IPs), []string{"2001:db8::1", "2001:db8::2"})
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), []string{
-		"host:api.example.com" + "host_to_ip\x00" + "ip:192.0.2.1",
-		"host:api.example.com" + "host_to_ip\x00" + "ip:192.0.2.2",
-		"host:api.example.com" + "host_to_ip\x00" + "ip:192.0.2.3",
-		"host:api.example.com" + "host_to_ip\x00" + "ip:2001:db8::1",
-		"host:api.example.com" + "host_to_ip\x00" + "ip:2001:db8::2",
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.2",
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.3",
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::1",
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::2",
 	})
 }
 
@@ -341,10 +341,10 @@ func TestResolvePartialResults(t *testing.T) {
 
 	// Relationships from the successful parts are all retained.
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), []string{
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:192.0.2.1",
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:2001:db8::1",
-		"host:www.example.com" + "host_to_cname\x00" + "host:origin.example.net",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::1",
+		"host:www.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
 	})
 	requireEqualStrings(t, "all IPs", ipNames(rep.AllIPs()), []string{"192.0.2.1", "2001:db8::1"})
 
@@ -522,11 +522,11 @@ func TestResolveCNAMEMultiHopFlattening(t *testing.T) {
 	requireEqualStrings(t, "CNAME targets", hostNames(hr.Targets), []string{"origin.example.net"})
 	requireEqualStrings(t, "A answers", ipNames(typeResultFor(hr, hr.Host, TypeA).IPs), []string{"203.0.113.5"})
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), []string{
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:2001:db8::5",
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:203.0.113.5",
-		"host:www.example.com" + "host_to_cname\x00" + "host:origin.example.net",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:2001:db8::5",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:203.0.113.5",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::5",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:203.0.113.5",
+		"host:www.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::5",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:203.0.113.5",
 	})
 }
 
@@ -690,10 +690,10 @@ func TestResolveDuplicateRelationships(t *testing.T) {
 
 	// www->192.0.2.1 appears via the closure AND via the target only once.
 	requireEqualStrings(t, "relationships", relationshipIDs(hr), []string{
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:192.0.2.1",
-		"host:origin.example.net" + "host_to_ip\x00" + "ip:192.0.2.2",
-		"host:www.example.com" + "host_to_cname\x00" + "host:origin.example.net",
-		"host:www.example.com" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.2",
+		"host:www.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
 	})
 }
 

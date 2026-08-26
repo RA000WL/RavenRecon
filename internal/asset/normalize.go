@@ -86,6 +86,16 @@ func normalizeHost(s string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// A value that parses as an IP literal is rejected here even though
+	// validateHostname would accept its characters, so a single value never
+	// has an ambiguous identity. This creates a deliberate asymmetry for
+	// dotted quads with leading-zero octets: netip.ParseAddr refuses octets
+	// like "001" (avoiding the classic octal-vs-decimal interpretation
+	// ambiguity), so "192.168.001.1" is NOT an IP literal and falls through
+	// as an ordinary hostname whose labels happen to be digits. The string
+	// is kept verbatim and never numerically interpreted, so identity stays
+	// stable; callers should merely know that "192.168.001.1" yields a Host
+	// asset while "192.168.1.1" is routed to the IP asset.
 	if _, err := netip.ParseAddr(canonical); err == nil {
 		return "", fmt.Errorf("value %q is an IP address, not a hostname", s)
 	}

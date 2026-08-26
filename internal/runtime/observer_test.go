@@ -641,11 +641,18 @@ func TestPoolProgressWireInvariantStress(t *testing.T) {
 	if len(progs) == 0 {
 		t.Fatal("no progress events")
 	}
+	prevCompleted := 0
 	for i, ev := range progs {
 		pl := ev.Payload.(event.Progress)
 		if pl.Completed > pl.Total {
 			t.Fatalf("progress %d: completed=%d > total=%d (wire invariant violated)", i, pl.Completed, pl.Total)
 		}
+		// Monotonicity (NEW-108): the emitted Completed sequence must be
+		// non-decreasing per scan — the serialized clamp's core promise.
+		if pl.Completed < prevCompleted {
+			t.Fatalf("progress %d: completed=%d went backwards from %d (wire must be non-decreasing)", i, pl.Completed, prevCompleted)
+		}
+		prevCompleted = pl.Completed
 	}
 	last := progs[len(progs)-1].Payload.(event.Progress)
 	if last.Completed != want || last.Total != want {
@@ -756,3 +763,63 @@ func hasDrainingTransition(rec *recorder) bool {
 	}
 	return false
 }
+
+// TestPoolObserverScanStartedClampsNegativeTimeout pins the ScanStarted
+// emission clamp (NEW-108): the wire must never carry a negative Timeout
+// ("0 = none"), even for a Config that bypassed NewPool's validation —
+// Event.Validate rejects a negative timeout, so emitting one would put a
+// droppable event on the wire.
+func TestPoolObserverScanStartedClampsNegativeTimeout(t *testing.T) {
+	rec := &recorder{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := NewPool(ctx, Config{Concurrency: 1, QueueSize: 2, Clock: newFakeClock(time.Unix(1_700_000_000, 0)), Observer: rec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownPool(t, p)
+	p.emitScanStarted(Config{Concurrency: 4, QueueSize: 8, Timeout: -time.Second, Rate: 0})
+	evs := rec.filter(event.KindScanStarted)
+	if len(evs) != 2 {
+		t.Fatalf("want two scan_started events (constructor + manual), got %d", len(evs))
+	}
+	pl := evs[1].Payload.(event.ScanStarted)
+	if pl.Timeout != 0 {
+		t.Fatalf("scan_started timeout = %s, want 0 (negative clamped at emission)", pl.Timeout)
+	}
+	if err := evs[0].Validate(); err != nil {
+		t.Fatalf("clamped event invalid: %v", err)
+	}
+}
+
+// TestPoolObserverContainsPanickingObserver pins the panic containment
+// (NEW-108): an Observer that panics must not crash the pool's worker
+// goroutines; every panic is recovered at the observe choke point AND
+// counted in ObserverPanics (never swallowed silently), and jobs still run
+// to completion with a clean shutdown.
+func TestPoolObserverContainsPanickingObserver(t *testing.T) {
+	boom := &panicObserver{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := NewPool(ctx, Config{Concurrency: 2, QueueSize: 8, Clock: newFakeClock(time.Unix(1_700_000_000, 0)), Observer: boom})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const jobs = 16
+	for i := range jobs {
+		if _, err := p.Submit(context.Background(), Job{Func: func(context.Context) (any, error) { return i, nil }}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := p.ObserverPanics(); got == 0 {
+		t.Fatal("ObserverPanics = 0, want > 0 (panics recovered but counted)")
+	}
+}
+
+// panicObserver panics on every Observe call.
+type panicObserver struct{}
+
+func (panicObserver) Observe(event.Event) { panic("hostile observer") }

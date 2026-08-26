@@ -100,10 +100,24 @@ type Context struct {
 	Clock runtime.Clock `json:"-"`
 }
 
-// cloneContextForRule returns a per-rule shallow copy of src so parallel
-// detectors cannot observe each other's mutations. Slices are cloned via
-// slices.Clone (new backing array) and the Config map via maps.Clone; the
-// Logger and Clock interfaces are shared (they are concurrency-safe).
+// cloneContextForRule returns a per-rule copy of src so parallel detectors
+// cannot observe each other's mutations. Depth contract, pinned by
+// TestCloneContextForRuleDepth (context_isolation_test.go) and the
+// end-to-end TestContextIsolation:
+//
+//   - one level deep at the Context's own fields: every corpus slice
+//     (Assets, Relationships, Evidence, Technologies, Secrets, JavaScript,
+//     Endpoints) is cloned via slices.Clone into a fresh backing array and
+//     Config via maps.Clone into a fresh map;
+//   - no deeper copy is needed: the slice element types
+//     (asset.Identity/Relationship/Evidence/Technology/SecretCandidate/
+//     JavaScript/Endpoint) are immutable-by-value structs with no interior
+//     slices, maps, or pointers, so copying the struct isolates it fully —
+//     a rule mutating cp.Evidence[i].Value or appending to cp.Evidence
+//     cannot affect siblings or the engine's original corpus;
+//   - Logger and Clock are shared interfaces (they are documented
+//     concurrency-safe seams, not per-rule state).
+//
 // Unexported: per-job cloning is an internal isolation mechanism; the
 // exported Context type and its API remain frozen (SDK v1 golden).
 func cloneContextForRule(src *Context) *Context {
