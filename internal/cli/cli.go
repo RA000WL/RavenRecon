@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -27,7 +28,8 @@ Commands:
   version       Show version information
   doctor        Check the local RavenRecon environment
   discover      Run passive subdomain discovery for a domain
-  scan          Run the full end-to-end reconnaissance pipeline for a domain
+  scan          Run the full end-to-end reconnaissance pipeline for one or
+                more domains
   ingest        Import existing reconnaissance data files and enrich them
 
 Options:
@@ -40,6 +42,8 @@ Examples:
   ravenrecon discover example.com --sources subfinder,amass
   ravenrecon scan example.com
   ravenrecon scan example.com --stages discover,dns,httpprobe --output out/
+  ravenrecon scan a.example.com b.example.com --output out/ --target-parallel 2
+  ravenrecon scan --targets targets.txt --output out/
   ravenrecon ingest --output out/ example.com urls.txt
 
 Discovery is passive-only. It invokes external tools in their passive modes:
@@ -103,13 +107,17 @@ var errScanHelp = errors.New("scan: help requested")
 // them (synchronously, in stage order). It observes only the stage
 // lifecycle kinds the pipeline emits — anything else is ignored, and a
 // hostile or invalid event can never panic the writer path (the payload
-// assertions are checked).
+// assertions are checked). Writes are serialized because multi-target
+// scans share one observer across concurrently running pipelines.
 type stageObserver struct {
-	w io.Writer
+	mu sync.Mutex
+	w  io.Writer
 }
 
 // Observe implements event.Observer.
 func (o *stageObserver) Observe(ev event.Event) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	switch ev.Kind {
 	case event.KindStageStarted:
 		p, _ := ev.Payload.(event.StageStarted)

@@ -259,6 +259,108 @@ orchestrator; every agent may append or update its own entries.
   NF-7 fixed (README header unversioned, wave 1). Remaining sub-items —
   content-hash covering unused DNSNames (conservative-miss only, deliberate)
   and post-NEW-96 fuzz additions — noted as accepted-as-is / follow-up.
+### NEW-110 (MEDIUM) — TLS SAN host expansion in the httpprobe stage (internal/pipeline/adapt)
+- Status: IN PROGRESS
+- Reporter: builder (orchestrator dispatch, NEW-95 follow-up enhancement wave)
+- Owner: builder (this session)
+- Problem: httpprobe captures TLS certificates with SAN DNS names (ProbeResult.TLSMeta,
+  internal/httpprobe/tls.go) but never feeds those names back as Host discoveries —
+  certificate SANs are a passive subdomain source the pipeline discards.
+- Fix: in adapt/httpprobe.go buildResult, when TLS certificates carry DNSNames, extract each
+  name that is a valid canonical in-domain host not already in the corpus and emit it as an
+  additional Additions.Hosts entry. Gated by StageParams["tls_san_expansion"] (default ON;
+  "false" disables). Wildcard/IP-literal/out-of-domain names are dropped at asset.NewHost /
+  pipeline.FilterHosts.
+- Verification: hermetic test — canned transport response carrying a synthetic
+  tls.ConnectionState whose leaf has an unlisted in-domain SAN → host appears in additions;
+  disabled param → no expansion; existing tests/goldens stay green.
+
+- Fix note (2026-08-26): IMPLEMENTED — adapt/httpprobe.go expandTLSSANHosts wired into
+  buildResult via probeResultOptions{sanExpansion}; gate tlsSANExpansionEnabled (default ON,
+  exact "false" case/space-insensitively disables); dedup vs corpus+report hosts; wildcard/
+  IP-literal names dropped at asset.NewHost, out-of-domain at pipeline.FilterHosts;
+  provenance Source "tls-san"; deterministic append-after-report-hosts placement.
+  Tests: TestHTTPProbeStageTLSSANExpansion{,Disabled,DropsNonHosts,NoCertificates} +
+  syntheticTLSCert/tlsStateFor/registerHTTPSWithTLS hermetic harness extension. Gates:
+  gofmt clean, go vet clean, go build OK, package suite + -race green, full repo suite 32/32.
+
+### NEW-111 (MEDIUM) — Optional naabu port discovery between dns and httpprobe (internal/pipeline/adapt)
+- Status: IN PROGRESS
+- Reporter: builder (orchestrator dispatch, NEW-95 follow-up enhancement wave)
+- Owner: builder (this session)
+- Problem: the pipeline has no active port discovery; open ports on resolved addresses are
+  only observed implicitly via HTTP probing of default-scheme targets.
+- Fix: new internal/pipeline/adapt/ports.go — naabu adapter following the discovery.Runner
+  pattern (exec.CommandContext semantics, separate argv values, bounded capture, per-tool
+  timeout). Wired into the httpprobe stage entry (after dns resolution, before probing):
+  StageParams["port_discovery"]=="true" + non-empty Results.IPs → run
+  `naabu -l <resolved-ips-file> -top-ports 100 -silent -rate 300 -c 25`, parse ip:port pairs,
+  emit asset.Port assets + ip→port relationships as results-channel additions. Cache op
+  "ports.discover" (scope hash of input IPs + config + tool version; unknown version ⇒ no
+  caching). Honest markers: ports_naabu_missing / ports_naabu_failed /
+  ports_output_truncated. AllStages stays 12; no new StageName.
+- Verification: fake-runner tests (no real naabu): absent param ⇒ zero executions; enabled ⇒
+  ports+relationships emitted with pinned argv and temp-file content; missing binary ⇒ flag;
+  runner failure ⇒ flag; cache round-trip; stdout truncation ⇒ Truncated+flag.
+
+- Fix note (2026-08-26): IMPLEMENTED — new adapt/ports.go (naabuPortSource over
+  discovery.Runner/LookupFunc seams; exec.CommandContext semantics via the runner, separate
+  argv values, target-derived IPs in a temp file named by ONE argv value, 4 MiB bounded
+  capture, 2m default per-tool timeout, context cancellation honored); cache op
+  "ports.discover" (schema+op+target identity+scope hash of sorted input IPs+
+  top_ports/rate/concurrency+tool version; unknown version ⇒ no caching; completed-only
+  serving with scope revalidation and self-heal). Wired into HTTPProbeStage.Run entry (after
+  dns resolution via StageInput.Results.IPs, before probing) gated by
+  StageParams["port_discovery"]; sticky flags ports_naabu_missing / ports_naabu_failed /
+  ports_output_truncated (+Truncated). Documented deferral: ports propagate through the
+  results channel; probe-target-list mutation and the host→ip graph leg stay deferred
+  (corpus carries no IPs — mirrors doc.go v1.3). AllStages unchanged at 12; no new
+  StageName. Tests: ports_test.go (fakeNaabuRunner/portsStaticCache — gates, argv+file
+  content pinning, missing binary, unknown-version no-cache, warm round-trip, corrupt-record
+  self-heal, failure mapping, truncation flag, parser shapes incl. bracketed IPv6, stage-level
+  emission/gating/inert cases). Gates: gofmt clean, go vet clean, go build OK, package suite
+  + -race green, full repo suite 32/32.
+
+### NEW-112 (MEDIUM) — Multi-target scan fan-out implemented; awaiting orchestrator verification (internal/cli)
+- Status: IN PROGRESS
+- Reporter: builder (orchestrator dispatch: multi-target scan task)
+- Owner: builder (this session)
+- Problem: `ravenrecon scan` accepted exactly one target domain (internal/cli/scan.go
+  parseScanArgs peeled a single positional and rejected any second as "unexpected argument"),
+  so scanning N domains required N invocations.
+- Fix (implemented, CLI-level fan-out only — no pipeline/cache/asset changes):
+  parseScanArgs now peels MULTIPLE leading positionals, adds `--targets FILE` (one domain per
+  line, blanks/`#` comments skipped, CRLF/padding trimmed, exact dupes collapsed, read at
+  parse time so file errors are usage errors) and `--target-parallel N` (unset=0→sequential,
+  explicit value validated 1–8). runScan normalizes EVERY target via asset.NewDomain up front
+  (any invalid target aborts the whole invocation before stages/cache); the historical
+  single-target flow is extracted verbatim into runScanSingleTarget (backward compat pinned by
+  test); >1 targets go through runScanMultiTarget: EXISTING pipeline.Run per target, each its
+  own ScanConfig + output subdir `<output>/<canonical-target>/`, shared cache handle (safe:
+  cache ops mutex-serialized, keys per-target), shared mutex-guarded stageObserver for
+  --verbose, bounded WaitGroup+semaphore fan-out capped at N (§10) with ctx.Done escape so
+  Ctrl-C can't deadlock queued targets (recorded cancelled/not-started), per-target summaries
+  buffered and flushed in input order under parallelism, combined summary block
+  ("RavenRecon scan summary: N targets" + per-target outcome lines + produced-data count),
+  exit 0 iff ≥1 target completed/partial else interrupted/all-failed error. --tui restricted
+  to exactly one resolved target at parse time (frame declares a single run); multi dry-run
+  prints one config block per target. Help text updated in cli.go + scanUsage.
+- Files: internal/cli/scan.go, internal/cli/cli.go (usage examples, stageObserver mutex),
+  internal/cli/scan_test.go (scanOptions.target→targets []string rename; removed the
+  now-valid two-positional error case), internal/cli/scan_multi_test.go (new: 9 test funcs —
+  parse grammar/file/dedupe/bounds/tui-rejection, sequential fan-out w/ per-target ScanConfig
+  capture, deterministic parallel-bounds proof via gated stage (peak==2 at parallelism 2),
+  pre-cancelled skip semantics, exit-code matrix, invalid-target aborts first, --targets E2E,
+  multi dry-run, single-target legacy pin).
+- Verification: gates run this session: gofmt clean (internal/cli); `go vet ./...` OK;
+  `go build ./...` OK; `go test -race ./internal/cli/ -count=1` PASS; `go test ./... -count=1`
+  green in every package EXCEPT internal/pipeline/adapt, whose 3 failures
+  (TestHTTPProbeStageTLSSANExpansion httpprobe_test.go:1139,
+  TestHTTPProbeStageTLSSANExpansionDropsNonHosts :1206, TestPortDiscoveryGates ports_test.go:207)
+  belong to the concurrent NEW-110/111 session's in-flight feature code+tests, not this diff
+  (internal/cli itself passes plain AND -race; re-checked after each adapt churn wave).
+  Orchestrator to verify both entries together once NEW-110/111 settle.
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this

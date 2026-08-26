@@ -90,7 +90,7 @@ func TestParseScanArgs(t *testing.T) {
 		{
 			name:     "domain only",
 			args:     []string{"example.com"},
-			wantOpts: scanOptions{target: "example.com", outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{"example.com"}, outputDir: defaultOutputDir},
 		},
 		{
 			name: "options after target",
@@ -105,7 +105,7 @@ func TestParseScanArgs(t *testing.T) {
 				"--output", "out/",
 				"--verbose"},
 			wantOpts: scanOptions{
-				target:            "example.com",
+				targets:           []string{"example.com"},
 				stages:            []pipeline.StageName{pipeline.StageDiscover, pipeline.StageDNS},
 				stagesSet:         true,
 				sources:           []string{"subfinder", "amass"},
@@ -125,17 +125,17 @@ func TestParseScanArgs(t *testing.T) {
 		{
 			name:     "default output dir",
 			args:     []string{"example.com", "--no-cache"},
-			wantOpts: scanOptions{target: "example.com", noCache: true, outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{"example.com"}, noCache: true, outputDir: defaultOutputDir},
 		},
 		{
 			name:     "tui flag",
 			args:     []string{"example.com", "--tui"},
-			wantOpts: scanOptions{target: "example.com", tui: true, outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{"example.com"}, tui: true, outputDir: defaultOutputDir},
 		},
 		{
 			name:     "tui compact flag requires tui",
 			args:     []string{"example.com", "--tui", "--tui-compact"},
-			wantOpts: scanOptions{target: "example.com", tui: true, tuiCompact: true, outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{"example.com"}, tui: true, tuiCompact: true, outputDir: defaultOutputDir},
 		},
 		{
 			name:     "tui and verbose mutually exclusive",
@@ -158,7 +158,7 @@ func TestParseScanArgs(t *testing.T) {
 		{
 			name:     "raw target preserved for normalization",
 			args:     []string{" EXAMPLE.COM. "},
-			wantOpts: scanOptions{target: " EXAMPLE.COM. ", outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{" EXAMPLE.COM. "}, outputDir: defaultOutputDir},
 		},
 		{
 			name:     "missing target",
@@ -243,7 +243,7 @@ func TestParseScanArgs(t *testing.T) {
 		{
 			name:     "zero request-timeout means engine default",
 			args:     []string{"example.com", "--request-timeout", "0"},
-			wantOpts: scanOptions{target: "example.com", requestTimeout: "0", requestTimeoutSet: true, outputDir: defaultOutputDir},
+			wantOpts: scanOptions{targets: []string{"example.com"}, requestTimeout: "0", requestTimeoutSet: true, outputDir: defaultOutputDir},
 		},
 		{
 			name:     "invalid timeout",
@@ -275,12 +275,8 @@ func TestParseScanArgs(t *testing.T) {
 			wantErr:  true,
 			wantErrf: "unexpected argument",
 		},
-		{
-			name:     "extra positional target",
-			args:     []string{"example.com", "other.org"},
-			wantErr:  true,
-			wantErrf: "unexpected argument",
-		},
+		// Note: a second positional is NO LONGER an error — it is a second
+		// multi-target scan target; see scan_multi_test.go.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -312,7 +308,7 @@ func TestBuildScanConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain: %v", err)
 	}
-	cfg, err := buildScanConfig(scanOptions{target: "example.com", outputDir: defaultOutputDir}, target)
+	cfg, err := buildScanConfig(scanOptions{targets: []string{"example.com"}, outputDir: defaultOutputDir}, target)
 	if err != nil {
 		t.Fatalf("buildScanConfig: %v", err)
 	}
@@ -339,7 +335,7 @@ func TestBuildScanConfigSelections(t *testing.T) {
 		t.Fatalf("NewDomain: %v", err)
 	}
 	opts := scanOptions{
-		target:            "example.com",
+		targets:           []string{"example.com"},
 		stages:            []pipeline.StageName{pipeline.StageDiscover, pipeline.StageDNS, pipeline.StageReport},
 		stagesSet:         true,
 		sources:           []string{"subfinder"},
@@ -1715,7 +1711,7 @@ func TestParseScanArgsHelpAfterOption(t *testing.T) {
 	if err != errScanHelp {
 		t.Fatalf("bare help after an option must return errScanHelp, got %v", err)
 	}
-	if opts.target != "" {
+	if len(opts.targets) != 0 {
 		t.Fatalf("help request must not produce options, got %+v", opts)
 	}
 }

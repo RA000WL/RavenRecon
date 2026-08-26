@@ -2,10 +2,17 @@ package adapt
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"reflect"
@@ -42,8 +49,9 @@ type cannedResponse struct {
 	status    int
 	body      string
 	headers   map[string]string
-	err       error // when set, RoundTrip returns it (classifies the probe)
-	oversized bool  // when true, RoundTrip returns a body exceeding engine caps (1 MiB for httpprobe)
+	err       error                // when set, RoundTrip returns it (classifies the probe)
+	oversized bool                 // when true, RoundTrip returns a body exceeding engine caps (1 MiB for httpprobe)
+	tlsState  *tls.ConnectionState // when set, rides the response as resp.TLS (hermetic handshake state)
 }
 
 // cannedTransport is a hermetic http.RoundTripper: it answers every request
@@ -126,14 +134,22 @@ func (t *cannedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for k, v := range resp.headers {
 		h.Set(k, v)
 	}
-	return &http.Response{
+	out := &http.Response{
 		StatusCode:    resp.status,
 		Status:        fmt.Sprintf("%d %s", resp.status, http.StatusText(resp.status)),
 		Header:        h,
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
 		Request:       req,
-	}, nil
+	}
+	// Hermetic TLS handshake state: when the canned response carries one,
+	// it rides the response exactly like a real transport's would, so the
+	// engine's 5C TLS capture observes the synthetic certificate without
+	// any network or real handshake.
+	if resp.tlsState != nil {
+		out.TLS = resp.tlsState
+	}
+	return out, nil
 }
 
 // requestCount reports how many requests the transport has served.
@@ -962,7 +978,7 @@ func TestHTTPProbeStageTLSDNSNamesTruncatedFlag(t *testing.T) {
 			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, true)},
 		}},
 	}
-	res := buildResult(target, marked, pipeline.OutcomeCompleted, nil)
+	res := buildResult(target, marked, pipeline.OutcomeCompleted, nil, probeResultOptions{sanExpansion: true})
 	if res.Outcome != pipeline.OutcomeCompleted {
 		t.Errorf("outcome = %s, want completed (the marker never changes the outcome)", res.Outcome)
 	}
@@ -984,7 +1000,7 @@ func TestHTTPProbeStageTLSDNSNamesTruncatedFlag(t *testing.T) {
 			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, false)},
 		}},
 	}
-	resClean := buildResult(target, clean, pipeline.OutcomeCompleted, nil)
+	resClean := buildResult(target, clean, pipeline.OutcomeCompleted, nil, probeResultOptions{sanExpansion: true})
 	if resClean.Truncated || len(resClean.StickyFlags) != 0 {
 		t.Errorf("unmarked certs: Truncated=%v StickyFlags=%v, want no signal",
 			resClean.Truncated, resClean.StickyFlags)
@@ -1006,7 +1022,7 @@ func TestHTTPProbeStageTruncationFlagsAccumulate(t *testing.T) {
 			TLSCertificates: []asset.TLSCertificate{httpProbeMarkedCert(t, true)},
 		}},
 	}
-	res := buildResult(target, rep, pipeline.OutcomePartial, nil)
+	res := buildResult(target, rep, pipeline.OutcomePartial, nil, probeResultOptions{sanExpansion: true})
 	if !res.Truncated {
 		t.Fatal("Truncated = false, want true when both signals fire")
 	}
@@ -1046,9 +1062,175 @@ func TestHTTPProbeStageTLSDNSNamesMarkerCacheRoundTrip(t *testing.T) {
 			TLSCertificates: []asset.TLSCertificate{replayed},
 		}},
 	}
-	res := buildResult(target, rep, pipeline.OutcomeCompleted, nil)
+	res := buildResult(target, rep, pipeline.OutcomeCompleted, nil, probeResultOptions{sanExpansion: true})
 	if !res.Truncated || !res.StickyFlags[HTTPProbeTLSDNSNamesStickyFlag] {
 		t.Errorf("warm-run replay: Truncated=%v StickyFlags=%v, want the flag to fire from the replayed marker",
 			res.Truncated, res.StickyFlags)
+	}
+}
+
+// syntheticTLSCert returns a self-signed leaf certificate carrying the given
+// subject CN and SAN DNS names (synthetic values only — never real target
+// data), suitable for a hermetic tls.ConnectionState fixture.
+func syntheticTLSCert(t testing.TB, cn string, sans ...string) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     sans,
+		NotBefore:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		NotAfter:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return cert
+}
+
+// tlsStateFor wraps a leaf in a ConnectionState shaped like a completed
+// handshake (the engine's captureTLS reads PeerCertificates and the
+// negotiated protocol only).
+func tlsStateFor(leaf *x509.Certificate) *tls.ConnectionState {
+	return &tls.ConnectionState{HandshakeComplete: true, PeerCertificates: []*x509.Certificate{leaf}}
+}
+
+// registerHTTPSWithTLS registers an https-only canned response carrying the
+// given handshake state (the http scheme stays TLS-free, modeling reality).
+func registerHTTPSWithTLS(tr *cannedTransport, host string, resp cannedResponse) {
+	if tr.byHost == nil {
+		tr.byHost = make(map[string]map[string]cannedResponse)
+	}
+	tr.byHost[host] = map[string]cannedResponse{
+		"http":  {status: resp.status, body: resp.body},
+		"https": resp,
+	}
+}
+
+// TestHTTPProbeStageTLSSANExpansion is the Enhancement A acceptance proof:
+// a canned https response whose synthetic leaf carries an unlisted in-domain
+// SAN ("hidden.example.com") plus one already-known name ("api.example.com"
+// arrives via the corpus) — the unlisted SAN appears in Additions.Hosts, the
+// known one does not duplicate, and probing itself still folds completed.
+func TestHTTPProbeStageTLSSANExpansion(t *testing.T) {
+	tr := &cannedTransport{}
+	cert := syntheticTLSCert(t, "www.example.com",
+		"www.example.com", "hidden.example.com", "api.example.com")
+	registerHTTPSWithTLS(tr, "www.example.com", cannedResponse{status: 200, body: "ok", tlsState: tlsStateFor(cert)})
+	// api.example.com is already in the corpus — serve it so its own probes
+	// complete (the dedup claim under test is about SAN expansion, not the
+	// per-host outcome fold).
+	cannedHost(tr, "api.example.com", cannedResponse{status: 200, body: "ok"})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+		httpProbeMustHost(t, "api.example.com"), // already in the corpus
+	}, nil, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	if len(res.Results.TLSCertificates) != 1 {
+		t.Fatalf("TLSCertificates = %d, want 1 (the canned handshake)", len(res.Results.TLSCertificates))
+	}
+	got := httpProbeHostStrings(res.Additions.Hosts)
+	// Engine-sorted report hosts first (api, www), the SAN-derived newcomer
+	// appended after — the documented deterministic placement.
+	want := []string{"api.example.com", "www.example.com", "hidden.example.com"}
+	httpProbeRequireStrings(t, "Additions.Hosts", got, want)
+
+	// Provenance marks the SAN-derived host.
+	var provOK bool
+	for _, h := range res.Additions.Hosts {
+		if h.Name == "hidden.example.com" && h.Prov.Source == "tls-san" {
+			provOK = true
+		}
+	}
+	if !provOK {
+		t.Fatalf("SAN-derived host provenance missing (want Source %q)", "tls-san")
+	}
+}
+
+// TestHTTPProbeStageTLSSANExpansionDisabled pins the opt-out: the exact value
+// "false" keeps additions exactly what the engine report produced.
+func TestHTTPProbeStageTLSSANExpansionDisabled(t *testing.T) {
+	tr := &cannedTransport{}
+	cert := syntheticTLSCert(t, "www.example.com",
+		"www.example.com", "hidden.example.com")
+	registerHTTPSWithTLS(tr, "www.example.com", cannedResponse{status: 200, body: "ok", tlsState: tlsStateFor(cert)})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+	}, map[string]string{"tls_san_expansion": "false"}, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := httpProbeHostStrings(res.Additions.Hosts)
+	want := []string{"www.example.com"}
+	httpProbeRequireStrings(t, "Additions.Hosts", got, want)
+	if len(res.Results.TLSCertificates) != 1 {
+		t.Fatalf("TLSCertificates = %d, want 1 (capture unaffected by the gate)",
+			len(res.Results.TLSCertificates))
+	}
+}
+
+// TestHTTPProbeStageTLSSANExpansionDropsNonHosts pins the boundary: wildcard
+// and IP-literal SANs are not Host assets, out-of-domain SANs leave scope,
+// and only the valid in-domain newcomer survives.
+func TestHTTPProbeStageTLSSANExpansionDropsNonHosts(t *testing.T) {
+	tr := &cannedTransport{}
+	cert := syntheticTLSCert(t, "www.example.com",
+		"*.example.com",     // wildcard: not a hostname asset
+		"192.168.1.1",       // IP literal: routed to the IP asset class, rejected here
+		"evil.example.net",  // out-of-domain: dropped by the mandatory output filter
+		"fresh.example.com", // the only qualifier
+	)
+	registerHTTPSWithTLS(tr, "www.example.com", cannedResponse{status: 200, body: "ok", tlsState: tlsStateFor(cert)})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+	}, nil, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := httpProbeHostStrings(res.Additions.Hosts)
+	// Report hosts first, SAN-derived names appended after (sorted among
+	// themselves) — the documented deterministic placement.
+	want := []string{"www.example.com", "fresh.example.com"}
+	httpProbeRequireStrings(t, "Additions.Hosts", got, want)
+}
+
+// TestHTTPProbeStageTLSSANExpansionNoCertificates guards the default path:
+// without TLS observations (every pre-existing canned run) expansion is inert
+// and results carry no certificates.
+func TestHTTPProbeStageTLSSANExpansionNoCertificates(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+	}, nil, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := httpProbeHostStrings(res.Additions.Hosts)
+	want := []string{"www.example.com"}
+	httpProbeRequireStrings(t, "Additions.Hosts", got, want)
+	if len(res.Results.TLSCertificates) != 0 {
+		t.Fatalf("TLSCertificates = %d, want 0", len(res.Results.TLSCertificates))
 	}
 }

@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -24,9 +27,10 @@ import (
 const scanUsage = `RavenRecon scan - end-to-end reconnaissance pipeline
 
 Usage:
-  ravenrecon scan <target> [options]
+  ravenrecon scan <target> [more targets...] [options]
+  ravenrecon scan --targets <file> [options]
 
-Runs the full deterministic pipeline for one domain target:
+Runs the full deterministic pipeline for one or more domain targets:
 
   discover → dns → httpprobe → urlintel → crawl → techintel → jsintel
   → secrentel → urllive → priority → detect → report
@@ -76,6 +80,26 @@ Options (after the target):
                           Mutually exclusive with --verbose.
   --tui-compact           Condense the --tui frame (drops the resource
                           section). Requires --tui.
+  --targets <file>        Read target domains from file, one per line;
+                          blank lines and # comment lines are skipped.
+                          Combined with any positional targets
+                          (exact duplicates removed, order kept).
+  --target-parallel <n>   With multiple targets: maximum number of targets
+                          scanned concurrently, 1-8 (default 1 =
+                          strictly sequential, in the order given).
+
+Multiple targets: each target runs the complete pipeline independently —
+its own ScanConfig and its own output subdirectory (<output>/<target>/,
+named after the canonical target). The persistent cache (--cache) is
+shared across targets; cache keys are per-target. Per-target summaries
+print as each run finishes (in the order given), followed by one combined
+summary block listing every target's outcome. The exit code is 0 when AT
+LEAST ONE target produced data (completed or partial) and 1 only when
+every target ended failed or cancelled. An invalid target aborts the
+whole invocation before anything runs. Ctrl-C/SIGTERM cancels the
+in-flight targets; targets not yet started are recorded as cancelled in
+the combined summary, and whatever was produced is still summarized.
+--tui requires exactly one target: the live frame declares a single run.
 
 Timeouts: each external discovery tool runs under a per-tool execution
 deadline — the configuration key Discovery.Timeout (internal/config; zero
@@ -103,10 +127,12 @@ supplies a rule registry programmatically.
 
 Exit codes:
   0   the run completed, or completed with partial results (usable report —
-      the summary states the outcome explicitly).
+      the summary states the outcome explicitly). With multiple targets: at
+      least one target produced data (completed or partial).
   1   usage/validation errors, cache open failures, and runs that ended
-      failed, cancelled, or incomplete (see the summary); also any run
-      interrupted by Ctrl-C/SIGTERM, which is still summarized first.
+      failed, cancelled, or incomplete (see the summary); with multiple
+      targets, only when EVERY target ended failed or cancelled; also any
+      run interrupted by Ctrl-C/SIGTERM, which is still summarized first.
 
 --tui renders on stderr as the run progresses and never changes the summary
 (stdout) or the exit codes: the frame is live diagnostics, the summary is
@@ -118,8 +144,9 @@ Signals: Ctrl-C or SIGTERM cancels the run gracefully — the partial summary
 is still printed and the exit code is 1. A second signal forces an immediate
 exit.
 
-Target validation: the domain is normalized through the Phase 2 asset model;
-uppercase, surrounding whitespace, and a trailing dot are normalized away.
+Target validation: every target is normalized through the Phase 2 asset
+model; uppercase, surrounding whitespace, and a trailing dot are normalized
+away. All targets are validated before the first stage runs.
 
 RavenRecon is intended for authorized security testing and
 bug bounty programs where the target is explicitly in scope.
@@ -135,9 +162,16 @@ const stageVocabularyCLI = "discover, dns, httpprobe, urlintel, crawl, techintel
 // working directory, created as needed by the report engine.
 const defaultOutputDir = "ravenrecon-report"
 
-// scanOptions is the parsed (target, flags) pair of the scan command.
+// scanOptions is the parsed (targets, flags) pair of the scan command.
 type scanOptions struct {
-	target string
+	// targets is every requested target in invocation order: positional
+	// targets first, then --targets file entries, exact duplicates removed.
+	targets []string
+
+	// targetParallel is --target-parallel: the maximum number of targets
+	// scanned concurrently (0 = unset → sequential; validated 1-8 when
+	// set). Meaningful only with multiple targets.
+	targetParallel int
 
 	// stages is the ordered stage selection; nil means all twelve stages.
 	stages    []pipeline.StageName
@@ -179,21 +213,39 @@ type scanOptions struct {
 	tuiCompact bool
 }
 
-// parseScanArgs parses "scan" arguments: exactly one target domain,
-// followed by options. Options must come after the target (the target is
-// positional); -h/--help anywhere, and a bare "help" as the first
-// post-option word, print scan usage via errScanHelp.
+// parseScanArgs parses "scan" arguments: one or more target domains
+// followed by options. Leading positional targets are peeled before flag
+// parsing (the flag package stops at the first non-flag argument);
+// additional targets come from --targets FILE. Options must follow the
+// positional targets; -h/--help anywhere, and a bare "help" as any leading
+// token or first post-option word, print scan usage via errScanHelp.
 // Validation happens here for flag values (stage names against the fixed
-// vocabulary, durations, concurrency); the target itself is validated and
-// normalized through asset.NewDomain — the single normalization point —
-// by runScan, mirroring how runDiscover handles the discover target.
+// vocabulary, durations, concurrency, target-parallelism bounds) and for
+// the --targets file (read here so a bad file is a usage error); targets
+// themselves are validated and normalized through asset.NewDomain — the
+// single normalization point — by runScan, mirroring how runDiscover
+// handles the discover target.
 func parseScanArgs(args []string) (scanOptions, error) {
 	if len(args) == 0 {
-		return scanOptions{}, fmt.Errorf("scan: missing target argument (usage: ravenrecon scan <target> [options])")
+		return scanOptions{}, fmt.Errorf("scan: missing target argument (usage: ravenrecon scan <target> [more targets...] [options])")
 	}
-	switch args[0] {
-	case "-h", "--help", "help":
-		return scanOptions{}, errScanHelp
+
+	// Peel leading positional targets: every argument up to the first
+	// option-like token ("-...") is a target. A leading "help" token is a
+	// help request per the contract above — never a stray domain that
+	// would fail normalization with a confusing invalid-target error.
+	var positionals []string
+	i := 0
+	for i < len(args) {
+		tok := args[i]
+		if tok == "help" {
+			return scanOptions{}, errScanHelp
+		}
+		if strings.HasPrefix(tok, "-") {
+			break
+		}
+		positionals = append(positionals, tok)
+		i++
 	}
 
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
@@ -206,11 +258,13 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	cacheDir := fs.String("cache", "", "cache directory")
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	outputDir := fs.String("output", "", "report output directory")
+	targetsFile := fs.String("targets", "", "file of target domains, one per line (# comments and blanks skipped)")
+	targetParallel := fs.Int("target-parallel", 1, "max targets scanned concurrently, 1-8 (default 1 = sequential)")
 	dryRun := fs.Bool("dry-run", false, "print the effective configuration and exit without running")
 	verbose := fs.Bool("verbose", false, "print stage events to stderr")
 	tuiFlag := fs.Bool("tui", false, "render a live observability frame on stderr")
 	tuiCompact := fs.Bool("tui-compact", false, "condense the --tui frame (requires --tui)")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args[i:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return scanOptions{}, errScanHelp
 		}
@@ -222,10 +276,10 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		if rest[0] == "help" {
 			return scanOptions{}, errScanHelp
 		}
-		return scanOptions{}, fmt.Errorf("scan: unexpected argument(s) %q (usage: ravenrecon scan <target> [options])", rest[0])
+		return scanOptions{}, fmt.Errorf("scan: unexpected argument(s) %q (usage: ravenrecon scan <target> [more targets...] [options])", rest[0])
 	}
 	opts := scanOptions{
-		target:     args[0],
+		targets:    positionals,
 		noCache:    *noCache,
 		verbose:    *verbose,
 		tui:        *tuiFlag,
@@ -234,8 +288,15 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		outputDir:  *outputDir,
 		dryRun:     *dryRun,
 	}
+	targetsSet := false
+	parallelSet := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "targets":
+			targetsSet = true
+		case "target-parallel":
+			parallelSet = true
+			opts.targetParallel = *targetParallel
 		case "stages":
 			opts.stagesSet = true
 		case "sources":
@@ -248,6 +309,45 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			opts.timeoutSet = true
 		}
 	})
+
+	// --targets FILE: read at parse time so an unreadable or empty file is
+	// a usage error before anything runs. An explicitly empty path is a
+	// user error ("not given" and "explicitly empty" are different).
+	if targetsSet && *targetsFile == "" {
+		return scanOptions{}, fmt.Errorf("scan: --targets: empty file path")
+	}
+	if *targetsFile != "" {
+		lines, err := loadTargetsFile(*targetsFile)
+		if err != nil {
+			return scanOptions{}, fmt.Errorf("scan: --targets %s: %w", *targetsFile, err)
+		}
+		opts.targets = append(opts.targets, lines...)
+	}
+	// Exact duplicates across positionals and file entries collapse to the
+	// first occurrence; spellings that normalize identically but differ
+	// textually stay (they simply rescan the same canonical target, which
+	// the per-target cache makes cheap).
+	opts.targets = dedupeStrings(opts.targets)
+	if len(opts.targets) == 0 {
+		return scanOptions{}, fmt.Errorf("scan: missing target argument (usage: ravenrecon scan <target> [more targets...] [options] | --targets <file>)")
+	}
+
+	// --target-parallel bounds (§10: explicit maximum concurrency). The
+	// default of 1 means strictly sequential multi-target execution; only
+	// an EXPLICITLY given value is validated ("not given" and "explicitly
+	// 0" are different — a typed 0 is a user error, never silent
+	// sequential).
+	if parallelSet && (opts.targetParallel < 1 || opts.targetParallel > maxTargetParallel) {
+		return scanOptions{}, fmt.Errorf("scan: --target-parallel: must be between 1 and %d (got %d)", maxTargetParallel, opts.targetParallel)
+	}
+
+	// --tui renders one live frame declaring ONE target and output
+	// directory; interleaving several runs' stage events into it would be
+	// misleading. Multi-target observability is --verbose (stderr lines),
+	// so --tui requires exactly one resolved target.
+	if opts.tui && len(opts.targets) > 1 {
+		return scanOptions{}, fmt.Errorf("scan: --tui requires exactly one target (got %d); use --verbose for multi-target runs", len(opts.targets))
+	}
 
 	if opts.stagesSet {
 		// Empty or all-empty selections are user errors, mirroring the
@@ -343,6 +443,83 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+// maxTargetParallel bounds --target-parallel (§10: every concurrency
+// maximum is explicit and small). Eight concurrent full pipelines each run
+// their own bounded stage pools; more would multiply pool pressure without
+// a realistic use case.
+const maxTargetParallel = 8
+
+// loadTargetsFile reads a --targets file: one domain per line; blank lines
+// and lines whose first non-blank character is '#' are skipped; every
+// other line is trimmed of surrounding whitespace (which also strips a
+// trailing CR from CRLF files). The file is read at parse time so an
+// unreadable or empty result is a usage error before anything runs.
+func loadTargetsFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// dedupeStrings removes exact duplicate strings, keeping the first
+// occurrence's position.
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// targetResult records one target's outcome in a multi-target scan.
+type targetResult struct {
+	domain    asset.Domain
+	outputDir string
+
+	// outcome is the pipeline-level fold for the target's run — or failed
+	// when pipeline.Run itself errored, or cancelled when the target was
+	// never started because the run context was already cancelled. The
+	// fixed outcome vocabulary (completed/partial/failed/cancelled/
+	// incomplete) is used on every path.
+	outcome pipeline.Outcome
+
+	// err carries the run-level error detail (a pipeline.Run failure or a
+	// failed/cancelled/incomplete outcome), nil for completed/partial, and
+	// the context error for a target that never started.
+	err error
+
+	// started reports whether the target's pipeline actually ran (false =
+	// skipped, context cancelled before its turn).
+	started bool
+}
+
+// ranData reports whether the target produced usable data (the multi-target
+// exit-code contract: exit 0 when AT LEAST ONE target did).
+func (r targetResult) ranData() bool {
+	return r.outcome == pipeline.OutcomeCompleted || r.outcome == pipeline.OutcomePartial
+}
+
+// scanTargetOutputDir is the per-target output subdirectory for multi-target
+// runs: <output>/<canonical-target>. Canonical names (lowercase hostnames,
+// no trailing dot, no separators) are filesystem-safe by construction.
+func scanTargetOutputDir(base string, d asset.Domain) string {
+	return filepath.Join(base, d.Name)
 }
 
 // buildScanConfig maps the parsed scan options onto the pipeline run
@@ -529,7 +706,7 @@ func resolveTUIColor(w io.Writer) string {
 	return "off"
 }
 
-// runScan parses the scan arguments, normalizes the target through
+// runScan parses the scan arguments, normalizes EVERY target through
 // asset.NewDomain (the single normalization point), builds the pipeline
 // configuration from the flags, runs the provided stages through
 // pipeline.Run with the real wall clock, prints the run summary to w, and
@@ -539,17 +716,25 @@ func resolveTUIColor(w io.Writer) string {
 //	partial   → nil (exit 0; the summary states the run was partial)
 //	failed / cancelled / incomplete → error (main prints it and exits 1)
 //
-// Usage and validation errors, cache open failures, and run-level errors
-// (pipeline.Run's configuration/resolution errors) return errors too. A
-// run context cancelled mid-run (Ctrl-C/SIGTERM) returns a
-// context-wrapped error AFTER the summary is printed — partial results are
-// never lost, mirroring runDiscover.
+// With more than one resolved target, runScan fans out: each target runs
+// the EXISTING pipeline independently (its own ScanConfig, its own output
+// subdirectory), bounded by --target-parallel (§10), followed by a combined
+// per-target summary; the exit code is 0 when at least one target produced
+// data (completed/partial) and 1 only when every target ended failed or
+// cancelled. An invalid target aborts before anything runs.
+//
+// Usage and validation errors, --targets file errors, cache open failures,
+// and run-level errors (pipeline.Run's configuration/resolution errors)
+// return errors too. A run context cancelled mid-run (Ctrl-C/SIGTERM)
+// returns a context-wrapped error AFTER the summary is printed — partial
+// results are never lost, mirroring runDiscover.
 //
 // The stages parameter is the hermetic test seam: production call sites
 // pass newScanStages; tests inject fake stage sets. Seams are constructor
 // parameters, never environment or globals. tuiNew is the same seam for
 // the live observability layer (--tui): production call sites pass
-// newScanTUI; tests inject fakes.
+// newScanTUI; tests inject fakes. --tui is a single-target feature (the
+// frame declares one run); parseScanArgs rejects it with multiple targets.
 //
 // Verbose events go to os.Stderr directly, independent of w (the summary
 // writer): stage events are diagnostics, the summary is the machine-facing
@@ -564,28 +749,73 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 		}
 		return err
 	}
-	target, err := asset.NewDomain(opts.target, asset.Provenance{})
-	if err != nil {
-		return fmt.Errorf("scan: invalid target %q: %w", opts.target, err)
+
+	// Normalize every target up front through asset.NewDomain — the single
+	// normalization point — so an invalid target aborts the whole
+	// invocation BEFORE any stage runs or any cache is opened, never
+	// halfway through a batch.
+	domains := make([]asset.Domain, 0, len(opts.targets))
+	for _, raw := range opts.targets {
+		d, err := asset.NewDomain(raw, asset.Provenance{})
+		if err != nil {
+			return fmt.Errorf("scan: invalid target %q: %w", raw, err)
+		}
+		domains = append(domains, d)
 	}
-	cfg, err := buildScanConfig(opts, target)
-	if err != nil {
-		return err
-	}
+
 	// NEW-48 (--dry-run): everything above is parse+validate (flag values,
 	// target normalization through asset.NewDomain, config construction).
 	// Dry-run prints the effective configuration — resolved WITHOUT side
 	// effects (the cache directory is resolved but never opened) — and
 	// exits 0 without invoking any stage; the stages seam is never
-	// consulted on this path.
+	// consulted on this path. Multi-target dry-runs print one block per
+	// target (separated by a blank line), each showing that target's
+	// effective output subdirectory; a single-target dry-run is
+	// byte-identical to the historical form.
 	if opts.dryRun {
 		cacheDir, cacheOpen, err := resolveScanCacheDir(config.Default(), opts)
 		if err != nil {
 			return err
 		}
-		return printDryRun(w, cfg, cacheDir, cacheOpen)
+		for i, d := range domains {
+			cfg, err := buildScanConfig(opts, d)
+			if err != nil {
+				return err
+			}
+			if len(domains) > 1 {
+				cfg.OutputDir = scanTargetOutputDir(cfg.OutputDir, d)
+			}
+			if i > 0 {
+				if _, err := fmt.Fprintln(w); err != nil {
+					return err
+				}
+			}
+			if err := printDryRun(w, cfg, cacheDir, cacheOpen); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
+
 	c, err := scanCache(config.Default(), opts)
+	if err != nil {
+		return err
+	}
+
+	// One resolved target: the historical single-target flow, verbatim.
+	if len(domains) == 1 {
+		return runScanSingleTarget(ctx, w, opts, domains[0], c, stages, tuiNew)
+	}
+	return runScanMultiTarget(ctx, w, opts, domains, c, stages)
+}
+
+// runScanSingleTarget is the historical single-target flow, unchanged:
+// build the ScanConfig, wire --verbose/--tui, run pipeline.Run, print the
+// summary, and map the outcome onto the documented exit semantics. Kept as
+// its own function so multi-target fan-out cannot perturb it — single-target
+// invocations behave byte-identically to the pre-multi-target CLI.
+func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, target asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage, tuiNew scanTUIFactory) error {
+	cfg, err := buildScanConfig(opts, target)
 	if err != nil {
 		return err
 	}
@@ -664,6 +894,198 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 	if ctx.Err() != nil {
 		return fmt.Errorf("scan: run interrupted: %w", ctx.Err())
 	}
+	return outcomeError(rep)
+}
+
+// runScanMultiTarget fans the parsed options out over the resolved targets:
+// EXISTING pipeline.Run per target, each with its own ScanConfig (correct
+// canonical Target, output subdirectory <output>/<target>) and the SHARED
+// cache handle (safe across targets: cache operations are mutex-serialized
+// and keys are per-target). Concurrency is bounded by a semaphore of
+// opts.targetParallel workers (§10: explicit maximum; default/unset =
+// strictly sequential in the order given); acquisition selects on
+// ctx.Done so Ctrl-C/SIGTERM can never deadlock a queued target — unstarted
+// targets are recorded cancelled, in-flight ones unwind through the
+// pipeline's own cancellation handling.
+//
+// Per-target detailed summaries print in INPUT ORDER: sequentially they
+// print as each run finishes; under parallelism each renders into its own
+// buffer and the buffers flush in order after every run completes, so
+// concurrent writes never interleave and stdout stays deterministic. The
+// combined summary then lists every target's honest fixed-vocabulary
+// outcome. Exit contract: nil when at least one target produced data
+// (completed/partial); otherwise the interrupt error when the run context
+// was cancelled, else an all-targets-failed error.
+func runScanMultiTarget(ctx context.Context, w io.Writer, opts scanOptions, domains []asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage) error {
+	// One shared verbose observer for the whole fan-out: stage events reach
+	// stderr live regardless of producing target (payloads carry no target
+	// identity; stderr diagnostics tolerate the interleave). The observer
+	// serializes its own writes.
+	var observer event.Observer
+	if opts.verbose {
+		observer = &stageObserver{w: os.Stderr}
+	}
+
+	par := opts.targetParallel
+	if par < 1 {
+		par = 1 // flag unset → sequential
+	}
+	if par > len(domains) {
+		par = len(domains)
+	}
+
+	results := make([]targetResult, len(domains))
+
+	runOne := func(idx int, dst io.Writer) {
+		d := domains[idx]
+		outDir := scanTargetOutputDir(opts.outputDir, d)
+		tr := targetResult{domain: d, outputDir: outDir, started: true}
+		rep, err := runScanTarget(ctx, dst, opts, d, outDir, c, observer, stages)
+		switch {
+		case err != nil:
+			tr.outcome, tr.err = pipeline.OutcomeFailed, err
+		default:
+			tr.outcome = rep.Outcome
+			tr.err = outcomeError(rep)
+		}
+		results[idx] = tr
+	}
+
+	if par == 1 {
+		for i := range domains {
+			if err := ctx.Err(); err != nil {
+				results[i] = targetResult{
+					domain:    domains[i],
+					outputDir: scanTargetOutputDir(opts.outputDir, domains[i]),
+					outcome:   pipeline.OutcomeCancelled,
+					err:       err,
+				}
+				continue
+			}
+			runOne(i, w)
+		}
+	} else {
+		// Bounded fan-out: at most par pipeline runs in flight. Results
+		// land on disjoint indices; summaries buffer per target and flush
+		// in input order below, so no shared-writer race exists.
+		sem := make(chan struct{}, par)
+		buffers := make([]*bytes.Buffer, len(domains))
+		var wg sync.WaitGroup
+		for i := range domains {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					results[idx] = targetResult{
+						domain:    domains[idx],
+						outputDir: scanTargetOutputDir(opts.outputDir, domains[idx]),
+						outcome:   pipeline.OutcomeCancelled,
+						err:       ctx.Err(),
+					}
+					return
+				}
+				defer func() { <-sem }()
+				buf := &bytes.Buffer{}
+				buffers[idx] = buf
+				runOne(idx, buf)
+			}(i)
+		}
+		wg.Wait()
+		for _, buf := range buffers {
+			if buf == nil {
+				continue
+			}
+			if _, err := io.Copy(w, buf); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := printMultiScanSummary(w, results); err != nil {
+		return err
+	}
+
+	ok := 0
+	for _, r := range results {
+		if r.ranData() {
+			ok++
+		}
+	}
+	if ok > 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("scan: run interrupted: %w", err)
+	}
+	return fmt.Errorf("scan: all %d targets ended failed or cancelled: no target produced data (see the summaries)", len(domains))
+}
+
+// runScanTarget executes ONE target's full pipeline — buildScanConfig for
+// the target's canonical Domain, the shared cache handle and shared
+// observer, pipeline.Run with the real wall clock — and prints that run's
+// detailed summary to w. It returns the report; mapping the outcome onto an
+// error is the caller's job (outcomeError). A pipeline.Run failure returns
+// a target-named error, as does a summary write failure (the run's data
+// never reached its writer, which is itself a failure worth naming).
+func runScanTarget(ctx context.Context, w io.Writer, opts scanOptions, target asset.Domain, outputDir string, c cache.Cache, observer event.Observer, stages func(pipeline.ScanConfig) []pipeline.Stage) (pipeline.RunReport, error) {
+	cfg, err := buildScanConfig(opts, target)
+	if err != nil {
+		return pipeline.RunReport{}, fmt.Errorf("scan %s: %w", target.Name, err)
+	}
+	cfg.OutputDir = outputDir
+	if observer != nil {
+		cfg.Observer = observer
+	}
+	rep, err := pipeline.Run(ctx, cfg, c, wallClock{}, stages(cfg))
+	if err != nil {
+		return pipeline.RunReport{}, fmt.Errorf("scan %s: %w", target.Name, err)
+	}
+	if err := printScanSummary(w, rep, cfg.OutputDir, c != nil); err != nil {
+		return pipeline.RunReport{}, fmt.Errorf("scan %s: print summary: %w", target.Name, err)
+	}
+	return rep, nil
+}
+
+// printMultiScanSummary renders the combined multi-target summary: one line
+// per target in input order (canonical name, honest fixed-vocabulary
+// outcome, output subdirectory or error detail), then the produced-data
+// count. Deterministic like the per-run summaries: input order, no
+// timestamps.
+func printMultiScanSummary(w io.Writer, results []targetResult) error {
+	if _, err := fmt.Fprintf(w, "\nRavenRecon scan summary: %d targets\n\n", len(results)); err != nil {
+		return err
+	}
+	for _, r := range results {
+		detail := r.outputDir
+		switch {
+		case !r.started:
+			detail = "not started: " + r.err.Error()
+		case r.err != nil:
+			detail = r.err.Error()
+		}
+		if _, err := fmt.Fprintf(w, "  %-30s %-10s %s\n", r.domain.Name, r.outcome, detail); err != nil {
+			return err
+		}
+	}
+	ok := 0
+	for _, r := range results {
+		if r.ranData() {
+			ok++
+		}
+	}
+	_, err := fmt.Fprintf(w, "\nTargets with data: %d/%d (completed/partial)\n", ok, len(results))
+	return err
+}
+
+// outcomeError maps a finished run's outcome onto the documented exit
+// semantics (shared by the single- and multi-target paths, so both speak
+// the identical error vocabulary):
+//
+//	completed / partial → nil (exit 0)
+//	failed / cancelled / incomplete → error (main exits 1)
+func outcomeError(rep pipeline.RunReport) error {
 	switch rep.Outcome {
 	case pipeline.OutcomeCompleted, pipeline.OutcomePartial:
 		return nil

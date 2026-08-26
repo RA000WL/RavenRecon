@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,6 +52,43 @@ const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
 //	default) rather than passed through: a negative per-request deadline
 //	would otherwise silently disable the engine's slowloris protection, and
 //	the pipeline itself rejects inverted time bounds.
+//
+//	"tls_san_expansion" — TLS SAN host expansion (default ON): after probing,
+//	every DNS name on a returned TLS certificate (the SANs of certificates
+//	the probes already captured — passive observation, zero extra network
+//	cost) that parses as a canonical in-domain Host asset AND is not already
+//	in the corpus becomes an additional Host addition, so later stages — and
+//	subsequent runs over the merged corpus — discover hosts from certificate
+//	data. The exact value "false" (case/space-insensitive) disables it.
+//	Wildcards ("*.example.com"), IP literals, and out-of-domain names are not
+//	Host assets / not in scope: they are dropped at asset.NewHost /
+//	pipeline.FilterHosts (the single normalization point). Expansion output is
+//	deduplicated against the input corpus and the report's own hosts, sorted,
+//	and appended after them; provenance Source "tls-san". A certificate whose
+//	SAN union was CUT at the model's cap carries DNSNamesTruncated — expansion
+//	operates on the retained names only; the existing
+//	probe_tls_dns_names_truncated flag already marks that cut end-to-end, so
+//	no additional marker is raised here.
+//
+//	"port_discovery" — optional naabu port discovery (default OFF; see
+//	ports.go for the full contract). Truthy values ("true"/"1"/"yes"/"on",
+//	case-insensitive — the dnsx_brute spelling convention) enable it: BEFORE
+//	probing begins (i.e. after the dns stage has resolved addresses into
+//	StageInput.Results.IPs), naabu runs over those addresses with -top-ports
+//	100 -silent -rate 300 -c 25, and every open ip:port pair is emitted as a
+//	results-channel addition: an asset.Port (tcp) plus an
+//	asset.RelationshipIPToPort edge from the resolved address to the port.
+//	The feature is inert without resolved IPs (honest zero cost, no flag) and
+//	honestly marked when it cannot honor the request: ports_naabu_missing
+//	(binary absent — decided ONLY by exec.LookPath, never by a failed version
+//	probe), ports_naabu_failed (execution failure; pairs parsed before the
+//	failure still merge), ports_output_truncated (+ Truncated: the captured
+//	stdout hit the stream cap, so the retained pair set is incomplete).
+//	Discovered ports propagate through the results channel rather than
+//	mutating the probe-target list (targets are hostname-built URL forms);
+//	results-channel caps stay runner-side per MaxOutput. Cache op
+//	"ports.discover", keyed on the scope hash of the input IPs, the
+//	result-affecting flags, and the tool version (§11).
 //
 // Outcome mapping (engine host status → pipeline outcome; internal/
 // httpprobe/observe.go "classifyHost"):
@@ -125,6 +163,12 @@ type HTTPProbeStage struct {
 	// transport is the constructor test seam: nil means the engine's bounded
 	// production transport; tests inject hermetic loopback transports.
 	transport http.RoundTripper
+
+	// ports is the optional port-discovery seam (see ports.go): nil selects
+	// the production naabuPortSource (which itself resolves its runner and
+	// LookPath seams lazily). Tests inject a fake portDiscoverer — or a
+	// naabuPortSource built over fake seams — never through StageParams.
+	ports portDiscoverer
 }
 
 // NewHTTPProbeStage constructs the httpprobe stage. A nil transport selects
@@ -146,12 +190,22 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 			fmt.Errorf("stage %s: context must not be nil", s.Name())
 	}
 
+	// Optional port discovery (opt-in via StageParams["port_discovery"]):
+	// runs BEFORE probing — i.e. after the dns stage resolved addresses into
+	// in.Results.IPs — and rides every outcome path below through opts.
+	pd := s.runPortDiscovery(ctx, in)
+
 	// Boundary, input side: the engine validates the whole host list against
 	// the target and rejects the entire call on any out-of-domain host, so
 	// every out-of-domain corpus host is filtered out before the engine sees
 	// the list (canonical names only — the single normalization point stays
 	// in internal/asset).
 	hosts := pipeline.FilterHosts(in.Target, in.Hosts)
+	opts := probeResultOptions{
+		sanExpansion: tlsSANExpansionEnabled(in.Config),
+		corpusHosts:  hosts,
+		ports:        pd,
+	}
 
 	// Empty filtered list: short-circuit with completed and zero additions —
 	// but only for a canonical target. The engine tolerates an empty list
@@ -167,7 +221,7 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 				Err:     fmt.Errorf("stage %s: %w", s.Name(), ctx.Err()),
 			}, nil
 		}
-		return pipeline.StageResult{Outcome: pipeline.OutcomeCompleted}, nil
+		return buildResult(in.Target, httpprobe.Report{}, pipeline.OutcomeCompleted, nil, opts), nil
 	}
 
 	cfg := httpprobe.Config{
@@ -210,7 +264,7 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// the engine also surfaced a shutdown error; the engine error is
 		// joined so nothing is lost.
 		return buildResult(in.Target, report, pipeline.OutcomeCancelled,
-			fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), err))), nil
+			fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), err)), opts), nil
 	}
 	if err != nil {
 		// Any other engine error (invalid config, pool failure, shutdown
@@ -218,19 +272,33 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// observations are still returned as Additions — the runner merges
 		// them even from a failed stage.
 		werr := fmt.Errorf("stage %s: %w", s.Name(), err)
-		return buildResult(in.Target, report, pipeline.OutcomeFailed, werr), werr
+		return buildResult(in.Target, report, pipeline.OutcomeFailed, werr, opts), werr
 	}
 	if ctx.Err() != nil {
 		// The engine drained cleanly but the run was cancelled in flight: the
 		// per-host statuses are cancelled and the stage outcome is cancelled,
 		// with the context error attached.
 		return buildResult(in.Target, report, pipeline.OutcomeCancelled,
-			fmt.Errorf("stage %s: %w", s.Name(), ctx.Err())), nil
+			fmt.Errorf("stage %s: %w", s.Name(), ctx.Err()), opts), nil
 	}
 
 	// Outcome fold over the engine's per-host statuses (mapping table
 	// documented on the type).
-	return buildResult(in.Target, report, foldHostOutcomes(report), nil), nil
+	return buildResult(in.Target, report, foldHostOutcomes(report), nil, opts), nil
+}
+
+// probeResultOptions carries the Run-scoped inputs buildResult needs beyond
+// the engine report: the SAN-expansion gate and its known-corpus seed, and
+// the optional port-discovery output to merge into the results channel.
+type probeResultOptions struct {
+	// sanExpansion enables TLS SAN host expansion (StageParams
+	// "tls_san_expansion" != "false").
+	sanExpansion bool
+	// corpusHosts is the filtered input host list — the corpus this stage
+	// received — used to avoid re-emitting known names from SANs.
+	corpusHosts []asset.Host
+	// ports is the optional port-discovery output; nil = disabled or inert.
+	ports *portDiscoveryOutput
 }
 
 // buildResult maps one engine report onto the pipeline's StageResult shape:
@@ -238,8 +306,10 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 // boundary-filtered Additions (the output-side mandatory filter: out-of-domain
 // hosts and URL hosts are dropped before propagation), and the results-channel
 // additions (the engine report's canonical assets, copied — never rebuilt —
-// per the one-normalization-point rule).
-func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipeline.Outcome, err error) pipeline.StageResult {
+// per the one-normalization-point rule). opts carries the Run-scoped extras:
+// TLS SAN host expansion (Additions.Hosts) and the optional port-discovery
+// merge (Results.Ports / Results.Relationships + its sticky flags).
+func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipeline.Outcome, err error, opts probeResultOptions) pipeline.StageResult {
 	res := pipeline.StageResult{
 		Outcome:        outcome,
 		ItemsProcessed: len(report.Results),
@@ -271,6 +341,12 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		Hosts: pipeline.FilterHosts(declared, report.AllHosts()),
 		URLs:  filterURLs(declared, report.AllURLs()),
 	}
+	// TLS SAN host expansion (default ON): certificate DNS names that are
+	// valid canonical in-domain hosts not already in the corpus become
+	// additional Host additions (see the StageParams documentation).
+	if opts.sanExpansion {
+		res.Additions.Hosts = expandTLSSANHosts(declared, certs, res.Additions.Hosts, opts.corpusHosts)
+	}
 	// Results: IPs, ports, services, TLS certificates, endpoints, and
 	// relationships are not corpus values — the results channel carries
 	// them. IPs/ports/services/TLS certificates need no scope filter: they
@@ -288,7 +364,125 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		TLSCertificates: certs,
 		Relationships:   report.AllRelationships(),
 	}
+	// Optional port discovery (opt-in): naabu's open ports and ip→port
+	// edges merge into the results channel on EVERY path above (success,
+	// engine error, cancellation-with-report), mirroring the corpus/results
+	// merge-even-from-failed semantics; its honesty markers ride the same
+	// StickyFlags/Truncated surface.
+	mergePortDiscovery(&res, opts.ports)
 	return res
+}
+
+// expandTLSSANHosts extracts Host additions from the returned certificates'
+// SAN DNS names: a name qualifies when it parses as a canonical Host asset
+// (wildcards, IP literals, and non-hostname strings do not), is in-domain
+// (mandatory output-side boundary via pipeline.FilterHosts), and is not
+// already known — neither in the corpus this stage received nor among the
+// report's own host additions. The appended names are deduplicated against
+// each other, sorted by canonical name for determinism, and placed after the
+// report's hosts. The input slices are read-only; the result aliases nothing.
+func expandTLSSANHosts(declared asset.Domain, certs []asset.TLSCertificate, additions, corpus []asset.Host) []asset.Host {
+	if len(certs) == 0 {
+		return additions
+	}
+	known := make(map[string]bool, len(additions)+len(corpus))
+	for _, h := range corpus {
+		known[h.Name] = true
+	}
+	for _, h := range additions {
+		known[h.Name] = true
+	}
+	var found []asset.Host
+	for _, c := range certs {
+		for _, n := range c.DNSNames {
+			h, err := asset.NewHost(n, asset.Provenance{Source: tlsSANProvenance})
+			if err != nil {
+				continue // wildcards, IP literals, invalid names: not Host assets
+			}
+			if known[h.Name] {
+				continue // already in the corpus or already reported
+			}
+			known[h.Name] = true
+			found = append(found, h)
+		}
+	}
+	if len(found) == 0 {
+		return additions
+	}
+	found = pipeline.FilterHosts(declared, found)
+	if len(found) == 0 {
+		return additions
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].Name < found[j].Name })
+	return append(additions, found...)
+}
+
+// tlsSANProvenance marks hosts discovered from certificate SAN names.
+const tlsSANProvenance = "tls-san"
+
+// mergePortDiscovery folds the optional port-discovery output into the stage
+// result: ports and relationships are deduplicated (by identity / edge ID)
+// against what probing itself observed, deterministically sorted, and
+// appended; the feature's sticky flags merge into the stage's set; a
+// truncated capture sets Truncated (never swallowed — completed + the
+// ports_output_truncated flag is the §0.6 carve-out). A nil pd is a no-op.
+func mergePortDiscovery(res *pipeline.StageResult, pd *portDiscoveryOutput) {
+	if pd == nil || (len(pd.Ports) == 0 && len(pd.Relationships) == 0 && !pd.Truncated && !pd.MissingTool && !pd.Failed) {
+		return
+	}
+	if len(pd.Ports) > 0 {
+		res.Results.Ports = mergePortAssets(res.Results.Ports, pd.Ports)
+	}
+	if len(pd.Relationships) > 0 {
+		res.Results.Relationships = mergeRelationshipAssets(res.Results.Relationships, pd.Relationships)
+	}
+	extra := pd.flags()
+	if len(extra) == 0 {
+		return
+	}
+	if res.StickyFlags == nil {
+		res.StickyFlags = make(map[string]bool, len(extra))
+	}
+	for k, v := range extra {
+		res.StickyFlags[k] = v
+	}
+	if pd.Truncated {
+		res.Truncated = true
+	}
+}
+
+// mergePortAssets unions two port lists, first-seen dedup by identity,
+// sorted ascending — deterministic regardless of argument order beyond
+// first-seen provenance retention.
+func mergePortAssets(base, add []asset.Port) []asset.Port {
+	seen := make(map[asset.Identity]bool, len(base)+len(add))
+	out := make([]asset.Port, 0, len(base)+len(add))
+	for _, p := range append(append([]asset.Port{}, base...), add...) {
+		if seen[p.Identity()] {
+			continue
+		}
+		seen[p.Identity()] = true
+		out = append(out, p)
+	}
+	sortPorts(out)
+	return out
+}
+
+// mergeRelationshipAssets unions two relationship lists, first-seen dedup by
+// edge ID, sorted deterministically.
+func mergeRelationshipAssets(base, add []asset.Relationship) []asset.Relationship {
+	seen := make(map[string]bool, len(base)+len(add))
+	out := make([]asset.Relationship, 0, len(base)+len(add))
+	for _, r := range append(append([]asset.Relationship{}, base...), add...) {
+		id := r.ID()
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, r)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out
 }
 
 // foldHostOutcomes reduces the engine report's per-host statuses to one stage
@@ -431,4 +625,64 @@ func requestTimeoutFromParams(params map[string]string) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// runPortDiscovery executes the opt-in port-discovery path (ports.go): gated
+// on StageParams["port_discovery"], a non-empty resolved-address list (the
+// dns stage's results channel — without resolved IPs the feature is an honest
+// zero-cost no-op), and a canonical target. The returned output rides every
+// outcome path through buildResult; its flags()/Truncated carry the honesty
+// markers. Cancellation during discovery is NOT flagged: the stage outcome
+// carries it (the engine call that follows sees the same fired context).
+func (s *HTTPProbeStage) runPortDiscovery(ctx context.Context, in pipeline.StageInput) *portDiscoveryOutput {
+	if !portDiscoveryEnabled(in.Config) || len(in.Results.IPs) == 0 || !targetCanonical(in.Target) {
+		return nil
+	}
+	src := s.ports
+	if src == nil {
+		src = newNaabuPortSource(nil, nil)
+	}
+	out, err := src.DiscoverPorts(ctx, in.Target, in.Results.IPs,
+		portDiscoveryConfig{Cache: in.Cache})
+	if err != nil {
+		if isContextError(err) || ctx.Err() != nil {
+			return nil // cancellation: the outcome carries it, never a flag
+		}
+		out.Failed = true // execution failure with any retained pairs kept
+	}
+	return &out
+}
+
+// tlsSANExpansionEnabled reports whether TLS SAN host expansion runs. It is
+// ON by default (passive observation of certificates already captured); the
+// exact value "false" (case/space-insensitive) disables it. Every other
+// value — including absent — leaves it enabled.
+func tlsSANExpansionEnabled(params map[string]string) bool {
+	if params == nil {
+		return true
+	}
+	v, ok := params["tls_san_expansion"]
+	if !ok {
+		return true
+	}
+	return strings.TrimSpace(strings.ToLower(v)) != "false"
+}
+
+// portDiscoveryEnabled reports whether optional naabu port discovery was
+// requested via StageParams["port_discovery"]. OFF by default; truthy values
+// follow the dnsx_brute spelling convention ("true"/"1"/"yes"/"on",
+// case-insensitive).
+func portDiscoveryEnabled(params map[string]string) bool {
+	if params == nil {
+		return false
+	}
+	v, ok := params["port_discovery"]
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
 }
