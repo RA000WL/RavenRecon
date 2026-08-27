@@ -361,6 +361,14 @@ orchestrator; every agent may append or update its own entries.
   (internal/cli itself passes plain AND -race; re-checked after each adapt churn wave).
   Orchestrator to verify both entries together once NEW-110/111 settle.
 
+### NEW-113 (HIGH) — v2.0 Triage pack batch 6 (internal/detect/packs/triage)
+- Status: IN PROGRESS
+- Reporter: builder (orchestrator dispatch, NEW-95 milestone batch 6)
+- Owner: builder (this session)
+- Problem: Most requested feature — URL triage like gf xss/sqli/ssrf etc classifying endpoints by vulnerability class (8 curated wordlists from TRIAGE_RESEARCH.md: XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68). Research precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS required, multi-class flagged but primary reported, all previous batches (Web 5, JS 3, APIs 3, Cloud 3) follow CheckAPIVersion→ValidateRule→Register deepCopy→Seal pattern.
+- Fix: New pack internal/detect/packs/triage (doc.go cites TRIAGE_RESEARCH.md + license attribution MIT/Apache-2.0; rules.go 8 rules triage.redirect/idor/sqli/lfi/ssrf/cmdi/ssti/xss_reflected each CategoryInformation PriorityInfo MethodDetection observed endpoint subjects RequiredAssetTypes endpoint gated Config triage.<class>.disabled stdlib only <100 lines extract param names split on ?& key before =; helpers.go curated lowercased wordlists, precedence-ordered paramPrimary/paramAllClasses init, runTriage bounded 256 deterministic sortedKeys); pipeline seam internal/pipeline/adapt/detect.go LoadTriagePack + NewDetectStageWithTriagePack + AllPacks extended to 22 (5+3+3+3+8). Adapt seam tests updated (detect_seam_test.go expects 22).
+- Verification: gofmt/vet/build green, go test ./... 32/32 green (discovery slow ~112s but pass), go test -race green on detect/packs/triage + adapt; hermetic synthetic fixtures; per-class emission (unique param per class), ConfigDeterministic, MultiParamEndpoint dedup, OverlapPrecedence (url→ssrf, id→idor, exec→cmdi), CacheColdWarmParity, DeterminismGolden byte-stable 2 runs + golden triage_report.golden generated, FailuresIsolated, RequiredAssetTypesSkipHonestly, CheckAPIVersion, LoadsThroughSDK, MetadataDepsCompat; api_v1.golden untouched.
+
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this

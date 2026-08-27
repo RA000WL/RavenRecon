@@ -10,6 +10,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/apis"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/cloud"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/js"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/triage"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/web"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 )
@@ -193,6 +194,31 @@ func LoadCloudPack(registry *detect.Registry) error {
 	return nil
 }
 
+// LoadTriagePack loads the triage pack (v2.0 Batch 6) into registry through
+// the same SDK path as LoadWebPack/LoadJsPack/LoadApisPack/LoadCloudPack:
+// ValidateRule → Register → Validate → Seal. It is the wiring helper for
+// callers that want explicit control over the triage pack. The registry is
+// sealed before returning.
+func LoadTriagePack(registry *detect.Registry) error {
+	if registry == nil {
+		return fmt.Errorf("triage pack: registry must not be nil")
+	}
+	rules, err := triage.Rules()
+	if err != nil {
+		return fmt.Errorf("triage pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return fmt.Errorf("triage pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return err
+	}
+	registry.Seal()
+	return nil
+}
+
 // NewDetectStageWithJsPack returns a detect stage pre-loaded with the JS
 // pack (v2.0 Batch 3). It mirrors NewDetectStageWithPacks but for the JS
 // pack. If registry is nil a fresh registry is created. The registry is
@@ -268,21 +294,47 @@ func NewDetectStageWithCloudPack(registry *detect.Registry) (pipeline.Stage, err
 	return NewDetectStage(registry), nil
 }
 
+// NewDetectStageWithTriagePack returns a detect stage pre-loaded with the
+// triage pack (v2.0 Batch 6). It mirrors NewDetectStageWithCloudPack but for
+// the triage pack. If registry is nil a fresh registry is created. The
+// registry is sealed before returning. AllStages is unchanged — the pack is
+// explicit opt-in, never auto-discovered.
+func NewDetectStageWithTriagePack(registry *detect.Registry) (pipeline.Stage, error) {
+	if registry == nil {
+		registry = detect.NewRegistry()
+	}
+	rules, err := triage.Rules()
+	if err != nil {
+		return nil, fmt.Errorf("triage pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return nil, fmt.Errorf("triage pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return nil, err
+	}
+	registry.Seal()
+	return NewDetectStage(registry), nil
+}
+
 // NewDetectStageWithAllPacks returns a detect stage pre-loaded with the web
-// pack (Batch 2), the JS pack (Batch 3), the APIs pack (Batch 4), and the
-// cloud pack (Batch 5). If
+// pack (Batch 2), the JS pack (Batch 3), the APIs pack (Batch 4), the cloud
+// pack (Batch 5), and the triage pack (Batch 6). If
 // registry is nil a fresh registry is created; otherwise the provided
 // registry is reused. All packs are loaded via ValidateRule → Register →
 // Validate → Seal (startup confinement). AllStages is unchanged — packs are
 // explicit opt-in. The original NewDetectStageWithPacks (web-only),
 // NewDetectStageWithJsPack (js-only), NewDetectStageWithApisPack
-// (apis-only), and NewDetectStageWithCloudPack (cloud-only) remain
-// available for callers that want a single pack.
+// (apis-only), NewDetectStageWithCloudPack (cloud-only), and
+// NewDetectStageWithTriagePack (triage-only) remain available for callers
+// that want a single pack.
 func NewDetectStageWithAllPacks(registry *detect.Registry) (pipeline.Stage, error) {
 	if registry == nil {
 		registry = detect.NewRegistry()
 	}
-	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules} {
+	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules, triage.Rules} {
 		rules, err := load()
 		if err != nil {
 			return nil, err

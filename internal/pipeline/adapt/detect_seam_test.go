@@ -90,8 +90,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks: %v", err)
 	}
-	if reg.Len() != 14 {
-		t.Fatalf("registry len %d, want 14 (5 web + 3 js + 3 apis + 3 cloud)", reg.Len())
+	if reg.Len() != 22 {
+		t.Fatalf("registry len %d, want 22 (5 web + 3 js + 3 apis + 3 cloud + 8 triage)", reg.Len())
 	}
 	if _, ok := reg.Get("web.csp.missing"); !ok {
 		t.Fatalf("web.csp.missing missing (web family not loaded)")
@@ -179,10 +179,10 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run with both packs: %v", err)
 	}
-	if res.ItemsProcessed < 14 {
-		t.Fatalf("ItemsProcessed %d, want 14 (all rules from all packs attempted)", res.ItemsProcessed)
+	if res.ItemsProcessed < 22 {
+		t.Fatalf("ItemsProcessed %d, want 22 (all rules from all packs attempted)", res.ItemsProcessed)
 	}
-	// Also verify nil-registry path still yields 14 and is sealed.
+	// Also verify nil-registry path still yields 22 and is sealed.
 	stage2, err := NewDetectStageWithAllPacks(nil)
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks(nil): %v", err)
