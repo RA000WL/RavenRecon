@@ -34,16 +34,16 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | JavaScript intelligence | 1670-1878 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
 | Secret intelligence | 1879-2105 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
 | Priority engine | 2106-2308 | scoring catalogs, correlation, attack paths, recommendations |
-| Detection framework | 2309-2897 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) incl. triage 8-rule table + per-rule triage details |
-| Detection framework — SDK contract | 2531-2806 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs incl. triage (LoadTriagePack, AllPacks 22) |
-| Detection framework — SDK stability policy | 2807-2897 | versioning contract, reopening criteria |
-| Reporting framework | 2898-3088 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
-| Event bus | 3089-3233 | canonical event model + bounded non-blocking bus; observer-only |
-| Terminal observability (TUI) | 3234-3331 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
-| Universal asset ingestion | 3332-3440 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
-| Configuration precedence | 3441-3454 | CLI flags → environment → config file → defaults |
-| Safety boundary | 3455-3467 | recon-only: what must never be added |
-| v0.3 boundary | 3468-3713 | implemented-vs-planned inventory of every subsystem |
+| Detection framework | 2309-2895 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) incl. triage 8-rule table + per-rule triage details |
+| Detection framework — SDK contract | 2529-2804 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs incl. triage (LoadTriagePack, AllPacks 22) |
+| Detection framework — SDK stability policy | 2805-2895 | versioning contract, reopening criteria |
+| Reporting framework | 2896-3086 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
+| Event bus | 3087-3231 | canonical event model + bounded non-blocking bus; observer-only |
+| Terminal observability (TUI) | 3232-3329 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
+| Universal asset ingestion | 3330-3438 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
+| Configuration precedence | 3439-3452 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3453-3465 | recon-only: what must never be added |
+| v0.3 boundary | 3466-3710 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -2512,13 +2512,11 @@ the same contract, deterministic min/max/mean/median duration summary.
 ### Known limitations
 
 - Library capability only: no `ravenrecon detect` CLI command.
-- The framework package itself still ships no rules; the v2.0 built-in
-  packs live in their own packages under `internal/detect/packs/<family>`
-  and enter strictly through the exported SDK (see the pack story below).
+- The framework package `internal/detect` itself ships no rule definitions; the **distribution** ships 5 packs via frozen SDK — web (5), js (3), apis (3), cloud (3 informational-only per §0.1), triage (8) = 22 rules — under `internal/detect/packs/<family>` strictly through the exported SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal` (see `Built-in packs (v2.0)`); per-rule `Context` clones (`cloneContextForRule` 7956f0d) and per-render report `Model` clones (`cloneModel`) isolate pack rules from each other (see `Reporting framework: Report lifecycle` step 4).
 - Dependencies order execution but do not yet flow data between rules;
   the Context's domains are the fixed pre-run corpus (documented future
   work — the gate that defers the Auth/AuthZ/Business-logic pack
-  families to v2.1+).
+  families to v2.2+/v2.3 via `GraphView`/`PriorFindings`).
 - The detector closure is not fingerprintable; the version-bump contract
   (bump Version when logic changes) is the cache-coherence mechanism.
 - Streaming order across parallel rules is completion order; the REPORT
@@ -3084,7 +3082,7 @@ silently truncated.
   cached render re-materializes in memory during a cache hit (bounded,
   and the cache is optional and off by default).
 - Reports render from the in-memory corpus; there is no persistent asset
-  store to reload a past run's graph from yet (deferred roadmap work).
+  store to reload a past run's graph from yet (deferred to v2.2 — filesystem 0700/0600 crash-safe store with `MaxRecordSize 16 MiB`, schema-versioned keys, and `ravenrecon diff`; see `ROADMAP.md:v2.2` and `ARCHITECTURE.md:v0.3 boundary`).
 
 ## Event bus
 
@@ -3529,12 +3527,11 @@ Implemented:
   library-level Detection Framework & Rule Engine — the canonical
   `asset.Finding` model, rule registration with startup validation,
   dependency-ordered level scheduling on the shared runtime pool,
-  per-rule deadlines with panic isolation, the fixed detection Context,
-  a `detect.rule` cache-before-execute record with strict decode
+  per-rule deadlines with panic isolation, the fixed detection Context
+  (since 7956f0d each rule receives its OWN Context copy via `cloneContextForRule` — `slices.Clone`/`maps.Clone` — so a buggy rule cannot leak mutations into sibling rules), a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
-  (`internal/detect`; since roadmap v2.0 built-in rule packs live beside
-  it under `internal/detect/packs/<family>` — web, js, apis, cloud, triage (5 packs, 22 rules) — and
-  enter only through the frozen SDK; see "Built-in packs (v2.0)" above)
+  (`internal/detect`; framework ships 5 packs via frozen SDK — web, js, apis, cloud, triage (5 packs, 22 rules) under `internal/detect/packs/<family>` and
+  enter only through the frozen SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal`; see "Built-in packs (v2.0)" above)
 * event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
   event model and the concurrent, bounded, non-blocking bus — typed,
   validated, clock-stamped events with sealed payloads, per-subscriber

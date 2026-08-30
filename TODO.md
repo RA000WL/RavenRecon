@@ -54,7 +54,12 @@ orchestrator; every agent may append or update its own entries.
 
 > **2026-08-23 cleanup wave c — VERIFIED:** NEW-91 and both NEW-73 residuals
 > fixed (two builders), merged gates green, orchestrator-verified. NEW-91/73/92
-> archived to TODO.closed.md. Open board now holds only DEFERRED items.
+> archived to TODO.closed.md. Open board at that time held only DEFERRED items.
+>
+> **2026-08-30 docs-wave — board state (orchestrator-owned):** open board now holds
+> **IN PROGRESS** items NEW-96..NEW-109 (deep-pass honesty fixes, IMPLEMENTED awaiting bulk VERIFY),
+> NEW-110/111/112 (TLS SAN / naabu / multi-target follow-ups, landed 2026-08-26, awaiting VERIFY),
+> and NF-7 (README/version skew note) — next free **NEW-114** unchanged; no status flips in this docs-only wave.
 
 > **2026-08-23 cleanup wave (wave b) — VERIFIED:** NEW-3, NEW-14, NEW-60, NEW-73
 > (deferred residuals), NEW-74 (residual docs), NEW-85..NEW-89, and NEW-90

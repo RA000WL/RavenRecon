@@ -335,21 +335,25 @@ hardening → operator experience → future platform work, each with evidence a
 
 - **Evidence:** `ROADMAP.md:v2.0` — frozen SDK `v1 (Core)` API `1.0` `internal/detect/api.go`, surface golden
   `testdata/api_v1.golden` + 9 behavior contracts, `internal/detect/examples` only pack (never auto-loaded).
+  Shipped 2026-08-24: 5 packs `web` 5 + `js` 3 + `apis` 3 + `cloud` 3 informational-only per §0.1 + `triage` 8 = 22 rules via `NewDetectStageWithAllPacks` (`AllPacks` 22, `AllStages` 12) on `APIMajor 1` / `SchemaVersion 2`; per-rule `Context` clone (`cloneContextForRule`) + per-render `Model` clone (`cloneModel`) isolation (7956f0d) — see `ROADMAP.md:v2.0` + `ARCHITECTURE.md:Detection framework`.
 - **Fix:** Pack families (Web, Auth, AuthZ, APIs, JS, Cloud, Business logic) load via `detect.Registry` +
   `CheckAPIVersion(1,0)` without core edits; metadata/dependencies/compat declared, isolated failures,
   same `Evidence` model. Stability policy + reopening criteria already docs-pinned (`ARCHITECTURE.md:2720`).
-- **Verify:** Pack loads through SDK sans special-case core; pack tests + fixtures.
-- **Roadmap:** `v2.0`.
+  Auth/AuthZ/Business-logic families deferred to `v2.1+` → now `v2.2`/`v2.3` with `GraphView` (see `ROADMAP.md:v2.2`/`v2.3`).
+- **Verify:** Pack loads through SDK sans special-case core; pack tests + fixtures (`internal/detect/packs/*/testdata` 5 goldens, `adapt/detect_seam_test.go` expects 22); `AllPacks` 22 / `AllStages` 12 pinned.
+- **Roadmap:** `v2.0` — shipped (7956f0d+7d71aa8+453de88+7c2c3f1+c9e45fa+e678eea); `OPT-P3-4` logger/replay deferred to `v2.1`.
 
 ### OPT-P3-4 — Observability consumers beyond TUI
 
 - **Evidence:** `ARCHITECTURE.md:3141` + `README.md:Eventing` — `internal/event` observer-only bus supports
   multiple consumers; TUI is first (`internal/tui`). Remaining `v1.2` items: structured loggers, replays.
 - **Fix:** `internal/tui` stays `library only` + `scan --tui` wiring; add `internal/log` bus consumer
-  (JSONL per-event file), `internal/replay` deterministic re-render from recorded event stream.
+  (JSONL per-event file at `os.UserCacheDir()/ravenrecon/logs/<runID>.jsonl`, `0600`, `fsync` per batch),
+  `internal/replay` deterministic re-render from recorded event stream (byte-identical frames from same
+  JSONL; `go test ./internal/replay -run TestReplayDeterminism`).
   Contract: consumers never call engines, never mutate state.
-- **Verify:** Hermetic logger/replay tests; `Bus.Drops/Invalid` metrics surfaced in summary.
-- **Roadmap:** Post-`v1.4`.
+- **Verify:** Hermetic logger/replay tests (`internal/log` + `internal/replay`); `Bus.Drops/Invalid` metrics surfaced in summary; `fixtures/triage-fp/` replay produces byte-identical report.
+- **Roadmap:** `v2.1` — Reliability & Observability Closure (no SDK break). Stays **PLANNED**; `v2.0` deferred it as `OPT-P3-4` logger/replay remains open → now correctly mapped to `v2.1` (see `ROADMAP.md:v2.1` and `§8` upgrade tree). No SDK/schema bump; `AllStages` 12 unchanged.
 
 ---
 
@@ -415,12 +419,28 @@ v1.4  scan --tui (NEW-21 fix — stage feed, bounded stage list, sanitized strin
   ├─► v1.8  Universal ingestion (Importer adapters)
   │          OPT-P3-2 — reuses every layer above; streaming, cache, provenance
   │
-  └─► v2.0  Detection packs on frozen SDK v1
-             OPT-P3-3 + OPT-P1-2 Context isolation for third-party packs
+  ├─► v2.0  Detection packs on frozen SDK v1 (22 rules 5 packs, AllStages 12)
+  │          OPT-P3-3 + OPT-P1-2 Context/Model isolation (7956f0d) — cache SchemaVersion 2, APIMajor 1
+  │
+  ├─► v2.0.1 Follow-ups (adapter/CLI only — no SDK/schema change)
+  │          NEW-110 TLS SAN default ON + NEW-111 naabu opt-in + NEW-112 multi-target fan-out
+  │          cache/determinism: no key/schema bump; AllStages 12 / AllPacks 22 unchanged
+  │
+  ├─► v2.1  Reliability & Observability Closure (no SDK break — APIMajor 1, SchemaVersion 2)
+  │          NEW-96..109 → VERIFIED + OPT-P3-4 logger/replay + FP/FN + 10k perf + takeover pack + asnmap adapter
+  │          cache/determinism: keys unchanged; takeover via frozen SDK v1 (AllPacks 22→23); HeapInuse 32 MiB
+  │
+  ├─► v2.2  Graph & Inter-Rule Dataflow (BREAKING: APIMajor 1→2, SchemaVersion 2→3)
+  │          SDK reopening 4-step gate + Context.PriorFindings/GraphView + persistent asset store (0700/0600 fsync) + graph_digest key + ravenrecon diff
+  │          cache/determinism: SchemaVersion bump invalidates detect.rule cache by construction (self-heal); store crash-safe
+  │
+  └─► v2.3  Advanced Hunting Packs (on SDK v2 — non-breaking: APIMajor 2, SchemaVersion 3)
+            AuthZ/IDOR via GraphView + bizlogic workflow + takeover enrichment/bloom + ASN priority scoring
+            honest deferrals: continuous monitoring daemon, browser/screenshots, nuclei/dalfox per §0.1 (leave to RECON_PRO.sh)
 ```
 
-Do **not** land standalone stage CLIs, browser automation, or AI integration before `v1.6`
-hardening — per `AGENTS.md:5` scope policy.
+Do **not** land standalone stage CLIs (`OPT-P2-5`), browser automation, or AI integration before `v1.6`
+hardening — per `AGENTS.md:5` scope policy. Do not land continuous monitoring, `GraphView` packs, or SDK reopening before `v2.1` honesty closure (research round 2026-08-30 ses_fae02a996ffejXX5FX8NZhXORZ).
 
 ---
 
@@ -463,13 +483,14 @@ hardening — per `AGENTS.md:5` scope policy.
 | OPT-P2-6 | Dedup helpers | INFO | `dns/scope.go:15` `discovery/detect.go:215` | — | VERIFIED (4e31f8d + 321c55d, TODO.closed.md NEW-49/53) |
 | OPT-P3-1 | Fixtures/snapshots/bench | — | `ROADMAP.md:v1.7` | v1.7 | VERIFIED (53f2f46 + 2dcdc96 + 9370f3f + 14f61a9 + e043555, TODO.closed.md NEW-56) |
 | OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | VERIFIED (1ede060 + 81785f2 + 3e5ba4e + 5e806fe + 7fd312a + cf0e939 + T14 close-out, TODO.md NEW-59) |
-| OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` | v2.0 | VERIFIED (7956f0d + 7d71aa8 + 453de88 + 7c2c3f1 + c9e45fa, TODO.closed.md NEW-95) |
-| OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` | post-v1.4 | PLANNED |
+| OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` + `internal/detect/packs/*` 5 packs 22 rules | v2.0 | VERIFIED (7956f0d + 7d71aa8 + 453de88 + 7c2c3f1 + c9e45fa + e678eea, TODO.closed.md NEW-95+113; AllPacks 22 / AllStages 12) |
+| OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` + `internal/log`/`internal/replay` | v2.1 | PLANNED |
 
 ---
 
 ## Change log
 
+- `2026-08-30` — docs-wave (ROADMAP v2 split, OPTIMIZATION upgrade tree, ARCHITECTURE sync): split single v2 placeholder into three shippable milestones **v2.1 Reliability & Observability Closure** (no SDK break), **v2.2 Graph & Inter-Rule Dataflow** (SDK v2 breaking: APIMajor 1→2, SchemaVersion 2→3), **v2.3 Advanced Hunting Packs** (non-breaking on SDK v2) per research round `ses_fae02a996ffejXX5FX8NZhXORZ` (2026-08-30) — preserving determinism/caching; recorded v2.0.1 follow-ups NEW-110 (TLS SAN default ON), NEW-111 (naabu opt-in), NEW-112 (multi-target fan-out) as landed `AllStages` 12 / `AllPacks` 22 preserved; added upgrade diagram `v2.0→v2.0.1→v2.1→v2.2→v2.3` with cache/determinism notes in both ROADMAP and OPTIMIZATION §8; `OPT-P3-4` logger/replay stays **PLANNED** correctly mapped to **v2.1** (was post-v1.4) and `OPT-P3-3` 22/12 pinned; ARCHITECTURE Reader's map renumbered against live `^#` grep, Detection framework per-rule `cloneContextForRule` + 5 packs via frozen SDK, v0.3 boundary bullet fixed to “framework ships 5 packs via frozen SDK”, Reporting per-render `cloneModel` noted, persistent store deferred to v2.2; TODO preamble stale “only DEFERRED” corrected to current **IN PROGRESS** board (NEW-96..109 + 110/111/112 + NF-7, next free NEW-114 unchanged); no code/testdata/`version.go` bump; docs-only must not break gates.
 - `2026-08-24` — v2.0 close-out: `OPT-P3-3` detection packs VERIFIED (Web/JS/APIs/Cloud
   packs in `internal/detect/packs/`, 14 rules via frozen SDK v1; commits 7d71aa8, 453de88,
   7c2c3f1, c9e45fa) and `OPT-P1-2` Context/Model isolation VERIFIED (7956f0d). Auth/AuthZ/

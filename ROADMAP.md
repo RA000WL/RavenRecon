@@ -55,7 +55,11 @@ Every phase must satisfy these before it is complete:
 | v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
 | v1.7 | Integration and acceptance testing | ✅ Complete | Closed 2026-08-23 — fixtures/goldens/bench-gate landed (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; NEW-56/57/58): `fixtures/<profile>/` hybrid manifests, per-stage goldens via `internal/golden` (`-update`), `testdata/bench/*.txt` + `cmd/benchgate` stdlib comparator (D4, no `benchstat`), CI bench-gate job, memory guards (C-4 drift + HeapInuse), D6 interaction suite across 12 stages; validated deterministic, `gofmt`/`vet`/`build`/`test`/`-race` green. |
 | v1.8 | Universal Asset Ingestion Framework | ✅ Complete | Closed 2026-08-23 — `internal/importer` (18 importers behind one interface, auto detection, bounded streaming, provenance sidecar, cache integration), pipeline ingest stage + report attribution, `ravenrecon ingest` CLI, benchmarks + memory guards (1ede060, 81785f2, 3e5ba4e, 5e806fe, 7fd312a, cf0e939). Deferred: Common Crawl remote ingestion; Enriched/Generated origin derivation; CIDR report channel. Optimizations: `OPT-P3-2`. |
-| v2.0 | Detection packs | ✅ Complete | Closed 2026-08-24 — OPT-P1-2 per-rule Context + per-render Model isolation (7956f0d); five built-in packs load through frozen SDK v1 via the pipeline seam: Web (7d71aa8), JS (453de88), APIs (7c2c3f1), Cloud informational-only per §0.1 (c9e45fa), Triage 8-class endpoint triage via curated param lists (e678eea) — AllPacks 22, AllStages 12. Deferred to v2.1+: Auth/AuthZ/Business-logic families (need inter-rule data flow / graph traversal not present on SDK v1). `OPT-P3-4` logger/replay remains open. |
+| v2.0 | Detection packs | ✅ Complete | Closed 2026-08-24 — OPT-P1-2 per-rule Context + per-render Model isolation (7956f0d); five built-in packs load through frozen SDK v1 via the pipeline seam: Web (7d71aa8), JS (453de88), APIs (7c2c3f1), Cloud informational-only per §0.1 (c9e45fa), Triage 8-class endpoint triage via curated param lists (e678eea) — AllPacks 22, AllStages 12. Deferred to v2.1+: Auth/AuthZ/Business-logic families (need inter-rule data flow / graph traversal not present on SDK v1). `OPT-P3-4` logger/replay remains open → v2.1. AllPacks 22 / AllStages 12 frozen at this point. |
+| v2.0.1 | Follow-up enhancements | ✅ Complete | Landed 2026-08-26 — TLS SAN host expansion default ON (NEW-110 `StageParams["tls_san_expansion"]` default ON, `false` disables; `tls-san` provenance; dedup + wildcard/IP/out-of-domain drops via `asset.NewHost`/`FilterHosts`), naabu port discovery opt-in (NEW-111 `StageParams["port_discovery"]=="true"` → `naabu -l <ips> -top-ports 100 -silent -rate 300 -c 25`, cache op `ports.discover`, flags `ports_naabu_missing/_failed/_truncated`), multi-target fan-out (NEW-112 `scan --targets FILE` + `--target-parallel 1–8`, per-target `asset.NewDomain` validation, per-target `<output>/<canonical>/`, shared cache + bounded fan-out; `AllStages` stays 12). CLI/pipeline-adapter only — no asset/cache/schema/identity change; cache/determinism preserved. |
+| v2.1 | Reliability & Observability Closure | 🔄 In Progress (deep-pass honesty fixes IMPLEMENTED awaiting bulk VERIFY) | Goal: close honesty gaps that make triage untrustworthy at scale. Scope: NEW-96..NEW-109 → VERIFIED, OPT-P3-4 logger/replay, FP/FN harness, 10k perf harness, takeover pack, ASN adapter. No SDK break. See §v2.1 below. |
+| v2.2 | Graph & Inter-Rule Dataflow | ⏳ Planned (SDK v2, breaking: APIMajor 1→2, SchemaVersion 2→3) | SDK reopening via 4-step gate, Context.PriorFindings+GraphView, persistent asset store, snapshot `graph_digest`, `ravenrecon diff`. See §v2.2. |
+| v2.3 | Advanced Hunting Packs | ⏳ Planned (on SDK v2) | AuthZ/IDOR via GraphView, business-logic workflow mapping, takeover enrichment + bloom diff, ASN priority scoring. Honest deferrals: continuous monitoring, browser/screenshots, nuclei/dalfox per §0.1. See §v2.3. |
 
 ---
 
@@ -618,6 +622,151 @@ Acceptance criteria:
 
 ---
 
+## v2.0.1 — Follow-up enhancements (TLS SAN, naabu, multi-target)
+
+Status: ✅ Complete — landed 2026-08-26 (NEW-110/111/112), docs-wave recorded as v2.0.1; `AllStages` 12 / `AllPacks` 22 unchanged.
+
+Goal: land the three low-risk enhancements that were ready at v2.0 close-out without touching the frozen SDK, asset identities, or cache schema.
+
+Scope:
+
+- [x] **NEW-110 TLS SAN host expansion** — `internal/pipeline/adapt/httpprobe.go:expandTLSSANHosts` wired into `buildResult` via `probeResultOptions{sanExpansion}`; gate `StageParams["tls_san_expansion"]` exact `"false"` (case/space-insensitive) disables, default ON; extracts in-domain SAN DNS names not already in corpus (`asset.NewHost` + `pipeline.FilterHosts` drop wildcards/IP-literals/out-of-domain), dedup vs corpus+report hosts, provenance `Source "tls-san"`, deterministic append-after-report-hosts placement.
+- [x] **NEW-111 naabu port discovery (opt-in)** — `internal/pipeline/adapt/ports.go:naabuPortSource` over `discovery.Runner`/`LookupFunc` seams (separate argv values, target-derived IPs in a temp file named by ONE argv value, `exec.CommandContext` semantics, 4 MiB bounded capture, 2 m per-tool timeout, cancellation honored); cache op `ports.discover` (schema+op+target identity+scope hash of sorted IPs+`top_ports`/`rate`/`concurrency`+tool version; unknown version ⇒ no caching; completed-only serving with scope revalidation + self-heal); wired into `HTTPProbeStage.Run` after DNS resolution via `StageInput.Results.IPs` before probing, gated by `StageParams["port_discovery"]=="true"`; sticky flags `ports_naabu_missing` / `ports_naabu_failed` / `ports_output_truncated` (+`Truncated`); `AllStages` stays 12, no new `StageName`; ports propagate through the results channel — probe-target-list mutation and `host→ip` graph leg deliberately deferred (corpus carries no IPs — mirrors `doc.go` v1.3).
+- [x] **NEW-112 multi-target scan fan-out** — `internal/cli/scan.go:parseScanArgs` peels multiple leading positionals + `--targets FILE` (one domain per line, blanks/`#` skipped, CRLF trimmed, exact dupes collapsed, read at parse time → usage error on file errors) + `--target-parallel N` (0→sequential, 1–8 validated); `runScan` normalizes every target via `asset.NewDomain` up front (any invalid aborts whole invocation before stages/cache); single-target path extracted verbatim into `runScanSingleTarget`; `>1` targets → `runScanMultiTarget`: existing `pipeline.Run` per target, each its own `ScanConfig` + output subdir `<output>/<canonical-target>/`, shared cache handle (mutex-serialized), shared mutex-guarded `stageObserver` for `--verbose`, bounded `WaitGroup`+semaphore fan-out capped at N (§10) with `ctx.Done` escape (cancelled→`cancelled`/`not-started` records), per-target summaries buffered in input order, combined summary (`"RavenRecon scan summary: N targets"` + per-target outcome lines + produced-data count), exit 0 iff ≥1 target `completed`/`partial`; `--tui` restricted to exactly one resolved target at parse time; multi `dry-run` prints one config block per target.
+
+Non-scope: no asset-model, cache-key, or schema change; no new detection packs; no SDK surface change; no new standalone CLIs beyond `scan`/`discover`/`ingest`; no graph/store work.
+
+Dependencies: v2.0 frozen (22/12) — these are adapter/CLI-only follow-ups that reuse existing seams (`httpprobe` TLSMeta, DNS `Results.IPs`, `pipeline.Run`).
+
+Rationale: record what already shipped as v2.0.1 so v2.1 can start from a clean, documented baseline without retroactively reopening v2.0.
+
+---
+
+## v2.1 — Reliability & Observability Closure (no SDK break)
+
+Status: 🔄 In Progress — deep-pass honesty fixes **IMPLEMENTED awaiting bulk VERIFY** (NEW-96..NEW-109, 2026-08-25 builder wave 2; `go test`/`-race` green in wave, orchestrator VERIFY pending); remaining scope PLANNED. No SDK surface change.
+
+Goal: close the honesty gaps that make triage untrustworthy at scale — every retained finding must be reproducible, bounded, and honestly flagged.
+
+Scope:
+
+- **NEW-96..NEW-109 honesty fixes → VERIFIED** (the bulk gate for this milestone): asset UTF-8/identity stability (96), JS-pack re-grading to Information/0.5 with URL-substring heuristic removal (97), techintel cookie name-only matching (98), pack overflow honesty at 256 with `subjects_dropped`+`truncated` metadata + `LevelWarn` (99), sourcemap `HasSuffix(path,".map")` + carrier gating (100), CSP/HSTS per-host correlation (101), graphql split + IDOR year/pagination exclusion (102), `ParseURL` userinfo redaction (103), `Relationship.ID` percent-encoding + `Kind.Valid` vocabulary (104), deriver panic telemetry via `LastPanic()`+`DeriverPanics()` + pool `warning` event (105), fingerprints `Version.Group` bounds vs `NumSubexp` (106), `Parameter.WithValue` back-dates `FirstSeen` to min (107), LOW wave C 15 items (108: `techKey` caps, Ingest cancellation invariant, repeated-indicator cap, `Progress Completed>Total` validation, `TaskCompleted.Result` alias docs, observer-panic symmetry, `CacheAccess.State` vocabulary, stress monotonicity, negative `Timeout` clamp, IPv6 zone strip, scheme policy docs, robots typed carriers, dead `strings.Join` removal, single-kind gate census, `cloneContextForRule` depth pin) + INFO wave D docs (109: `clampProgress` comment, in-flight wording, `Deriving{Observer:nil}` trap, double key build, FNV/`\x1f` notes, `DNSNames` content-hash posture, `NF-7` README unversioned header). All 14 entries flipped `IN PROGRESS` with `Fix note (IMPLEMENTED)`; this milestone flips them `VERIFIED` after orchestrator bulk review (≥ `gofmt`/`vet`/`build`/`test`/`-race` green, fixture regressions pinned).
+- **OPT-P3-4 logger/replay** (`internal/log` JSONL per-event file + `internal/replay` deterministic re-render from recorded event stream): bus consumers only (`event.Observer`); `internal/tui` stays `library only` + `scan --tui` wiring; contract — consumers never call engines, never mutate state; `Bus.Drops`/`Invalid` surfaced in summary; hermetic logger/replay tests.
+- **FP/FN measurement harness** — `fixtures/triage-fp/` curated benign + malicious corpora (mapbox/DOMPurify/protobuf/year-shaped numerics/`mapbox-gl.js`/`blog-date` fixtures from NEW-97/100/102) + `TestTriageFP*` (`TestTriageFPZeroOnBenignCorpus`, `TestTriageFPPrecedenceHonest`) pinning zero false-positive on benign and correct precedence on overlaps; `go test ./internal/detect/packs/triage -run TestTriageFP` is the gate.
+- **Performance harness 10k** — `TARGET_PARALLEL=8` stress + `HeapInuse` delta guard `32 MiB` ceiling (mirroring existing `C-4` 32 MiB guards; `SKIPPED under -race`); `TestTriageParallel10k` (10k distinct endpoints, 8-way parallel, deterministic `AllStages` 12, `AllPacks` 22 accounting); `go test -bench` baselines recorded in `testdata/bench/triage.txt` + `cmd/benchgate` gate (`>25%` `B/op`/`allocs/op` fails).
+- **Takeover detection pack** — `internal/detect/packs/takeover`: `takeover.cname.unclaimed` (+ `takeover.cname.dangling`, `takeover.ns.lame` if needed) — CNAME → unclaimed external target (provider wordlist, NODATA/ NXDOMAIN observation via DNS pipeline seam), Informational/Medium, requires `host`+`dns` evidence; per-rule `Context` clone isolation already covers it (7956f0d); deterministic fixtures + `takeover_report.golden`.
+- **ASN mapping adapter** — `internal/pipeline/adapt/asn.go` over `discovery.Runner` (`asnmap -d <domain>` positional, separate argv, 4 MiB cap, 2 m timeout, cancellation + process-group kill); `StageParams["asn_mapping"]=="true"` opt-in (default off); cache op `asn.map` (`schema`+`op`+normalized target+config+tool version; unknown version ⇒ no caching); honest flags `asn_asnmap_missing`/`asn_failed`/`asn_truncated`; results-channel `IPs`/`Relationships` (`host→ip` already exists, `ip→asn` deferred to `report` enrichment if needed); `AllStages` stays 12.
+
+Non-scope: **no SDK surface change** (APIMajor stays 1, `api_v1.golden` untouched); no Authorization/Business-logic packs (need `GraphView`/`PriorFindings` — deferred to v2.2/ v2.3); no continuous monitoring daemon; no new standalone CLIs beyond `scan`/`discover`/`ingest` (per `AGENTS.md:5` scope policy + `OPT-P2-5`); no browser/screenshots; no nuclei/dalfox live verification (recon-only §0.1 — leave to `RECON_PRO.sh`).
+
+Dependencies: v2.0 + v2.0.1 complete (22/12 frozen, TLS SAN + ports + multi-target stable); `internal/event` bus + `internal/cache` observer seams (already instrumented); `C-1`…`C-5` invariants (§7) preserved; determinism pinned by `internal/golden` + `pipeline/adapt` acceptance goldens.
+
+Rationale: split recommended by 2026-08-30 research round (ses_fae02a996ffejXX5FX8NZhXORZ) — closing honesty before graph prevents building `GraphView` on top of fabricated high-priority XSS/pollution findings and silent 256-cap drops that the current triage packs would propagate at scale.
+
+Acceptance criteria:
+
+- `go test ./... -count=1` + `go test -race ./...` green (discovery 112 s slow but pass); `gofmt`/`vet`/`build` clean.
+- NEW-96..109 `VERIFIED` and archived to `TODO.closed.md`; `fixtures/triage-fp/` + `TestTriageFP*` green, benign corpora produce zero findings.
+- `OPT-P3-4` logger JSONL + replay re-render byte-identical (`internal/log` + `internal/replay` hermetic tests; `Bus.Drops`/`Invalid` in summary).
+- 10k perf harness green at `TARGET_PARALLEL=8` with `HeapInuse <32 MiB` (skipped under `race`).
+- Takeover pack ships via frozen SDK v1 (`CheckAPIVersion(1,0)` → `Register` → `Seal`; `AllPacks` bumps to 23, `AllStages` stays 12) with isolation + determinism goldens.
+- ASN adapter `asnmap -d <domain>` pinned by argv test; cache parity + flags verified via fake-runner.
+
+---
+
+## v2.2 — Graph & Inter-Rule Dataflow (SDK v2, breaking: APIMajor 1→2, SchemaVersion 2→3)
+
+Status: ⏳ Planned — not started; SDK reopening follows the 4-step gate below.
+
+Goal: enable cross-rule reasoning and historical comparison without breaking determinism or caching — the foundation Authorization and Business-logic packs need.
+
+Scope:
+
+- **SDK reopening via 4-step gate** (per `ARCHITECTURE.md:SDK stability policy`): (1) concrete failing need — AuthZ/Business-logic pack inexpressible on SDK v1 (dependencies order execution but never flow data; `Context` has no `PriorFindings`/`GraphView`); (2) proposal naming exact symbols (`Context.PriorFindings`, `Context.GraphView`, `Snapshot.graph_digest` extension, `Report.Diff` helper, `APIMajor` bump, `SchemaVersion` bump); (3) maintainer approval + documented `api.go` reopening decision bumping `APIMajor`; (4) golden regeneration + version bump in the SAME change — `testdata/api_v1.golden` → `api_v2.golden`, `testdata/api_v1_report.golden` → `api_v2_report.golden`, `CheckAPIVersion(2,0)` gate, `AllPacks` loaders gate on new major; `go test ./internal/detect -run TestSDKAPISurfaceSnapshot -update` + 9 behavior contracts + compat golden must pass.
+- **`Context.PriorFindings` + `GraphView`** — `Context` gains `PriorFindings []asset.Finding` (findings from earlier levels in the same run, dependency-ordered) and `GraphView` (read-only traversal over `Snapshot` relationships + `PriorFindings` subjects — `Neighbors(kind, identity)`, `EdgesFrom`, `PathExists`; bounded, no mutation, backed by the normalized `Snapshot` maps; documented as the ONLY inter-rule dataflow; `cloneContextForRule` depth updated to clone the view handle immutably).
+- **Persistent asset store** (v0.2 deferred, now landed) — filesystem store at `os.UserCacheDir()/ravenrecon/store/<target>/<runID>/` (`0700` dirs / `0600` files, crash-safe `tmp+fsync+Rename+fsync(dir)`, `MaxRecordSize 16 MiB` bound, schema-versioned keys like cache); stores `Snapshot` + `RunReport.Results` + `Findings` deterministically (identity-sorted JSON, digest); `ravenrecon scan` writes it atomically after `report` stage; `report` rendering reads it for `diff` without rescanning.
+- **Snapshot fingerprint extension** — `fingerprintSnapshot` gains `graph_digest` (stable hash of sorted `Relationship.ID()` + `PriorFindings` identities) entering `detect.rule` cache keys alongside existing `schemaVersion+ruleID+fingerprintRule+snapshot+config`; a `SchemaVersion 2→3` bump invalidates old `detect.rule` records by construction (self-healing evict+recompute).
+- **`ravenrecon diff <runA> <runB>` (local, deterministic)** — CLI command reading two stored runs from the filesystem store (no network), rendering deterministic `added/removed/changed` Finding sets + `changed` Asset sets (identity-keyed, sorted), with the same `cloneModel` isolation as `report`; exit 0 on diff produced, honest `incomplete` if either run was `incomplete`; `go test` pins determinism (same pair → byte-identical diff).
+
+Non-scope: no new hunting packs beyond the graph foundation (Authorization/Business-logic packs are v2.3); no continuous monitoring daemon; no browser/screenshots; no nuclei/dalfox live verification (§0.1); no new standalone CLIs beyond `diff` (and existing `scan`/`discover`/`ingest`).
+
+Dependencies: v2.1 complete (honesty gaps closed, FP/FN pins green, logger/replay provides observability for graph work); `C-1`…`C-5` invariants; determinism/caching contracts (cache-before-execute, `partial`/`incomplete` never served, flagged `completed+Truncated/Overflow` carve-out with end-to-end flag survival); filesystem permissions + fsync durability (mirrors `OPT-P1-1` `fsync(dir)`).
+
+Rationale: the deep-pass (NEW-96..109) proved triage packs currently fabricate high-priority findings from URL substrings and silently drop at 256 — building `GraphView` on that would amplify false positives across correlated hosts. v2.1 closes honesty first; v2.2 then reopens the SDK once with a clean, tested dataflow seam that v2.3 packs can rely on.
+
+Acceptance criteria:
+
+- 4-step gate documented and followed in a single change (proposal + approval + `APIMajor 1→2` + `SchemaVersion 2→3` + `api_v2.golden` regeneration); `TestSDKAPISurfaceSnapshot` + 9 behavior contracts + compat golden green.
+- `Context.PriorFindings`/`GraphView` unit tests: prior findings flow only from completed dependencies, graph traversal honors `Snapshot` relationships, `PriorFindings` respects `RelatedAssets`/`Evidence` observed-corpus rule; `TestContextIsolation` updated for graph view handle.
+- Persistent store filesystem layout + crash-safety pinned (temp-file + `fsync` + `Rename` + `fsync(dir)`; `0700`/`0600`; `16 MiB` bound; schema-versioned keys).
+- `graph_digest` in `detect.rule` keys pinned (old `SchemaVersion 2` record evicted and recomputed on `3`).
+- `ravenrecon diff` hermetic determinism test (two synthetic stored runs → byte-identical diff; `go test ./internal/cli -run TestDiffDeterminism`).
+
+---
+
+## v2.3 — Advanced Hunting Packs (non-breaking on SDK v2)
+
+Status: ⏳ Planned — not started; depends on v2.2 SDK v2.
+
+Goal: ship the hunting packs that need `GraphView`/`PriorFindings` — the value the graph foundation exists to unlock.
+
+Scope:
+
+- **Authorization/IDOR heuristics via `GraphView`** — `internal/detect/packs/authz`: `authz.idor.insecure-direct-object` (traversal over `host→url→endpoint→parameter` + `GraphView.Neighbors` to correlate same-identity hosts that share `id`-like parameters with divergent auth evidence; requires `PriorFindings` from `triage.idor` as signal, not proof; Informational/Medium, bounded at 256 with `subjects_dropped` metadata like triage; deterministic fixtures).
+- **Business-logic workflow mapping** — `internal/detect/packs/bizlogic`: `bizlogic.workflow.state-transition` (multi-step dataflow across rules: `PriorFindings` from `authz.*` + `apis.*` + `web.*` to map state-transition edges `host→endpoint→endpoint` via `GraphView.PathExists`; Informational, workflow-state labels, never exploitation).
+- **Takeover enrichment + bloom diff** — takeover pack gains provider-specific enrichment (`takeover.cname.provider-confirmed` using `PriorFindings` from `takeover.cname.unclaimed` + `GraphView` CNAME→provider mapping) + bloom-diff for `ravenrecon diff` (added/removed `takeover.*` findings surfaced in diff summary).
+- **ASN in priority scoring** — `internal/priority` gains `asn` signal: `Signal.ASN` (from `asnmap` adapter's `Results.IPs`) contributes to `priority.score` via a new indicator catalog entry (same `score = 1 − ∏(1 − w_g)` combine math, group cap 0.6, level gating unchanged); `Correlate` groups gain `asn` anchor; `AttackPaths` can cite ASN evidence; cache key gains ASN digest; bounded re-validation.
+
+Non-scope / **Honest deferrals** (remain deferred even after v2.3 — documented here so operators know the boundary):
+
+- **Continuous monitoring daemon** — no long-running `ravenrecon watch`/`daemon` mode, no scheduled re-scans, no remote state sync; operators compose `scan` + `diff` + external scheduling (cron/systemd) for now; a daemon would require new `C-1`/`C-2` contracts and is not on this roadmap.
+- **Browser automation / screenshots** — no headless browser, no rendering, no screenshot capture; the JS pipeline stays parse-only (stdlib tokenizer), and `crawl` stays `katana` adapter reuse.
+- **Nuclei/Dalfox live verification** — per §0.1 recon-only boundary, live verification/exploitation stays with `RECON_PRO.sh` (the operator's own `nuclei`/`dalfox` post-processing over RavenRecon's deterministic JSON/CSV outputs); RavenRecon never performs `nuclei -t ...` or `dalfox` execution and never claims `verified`/`exploitable` severity — Cloud pack's `informational-only` precedent applies.
+
+Dependencies: v2.2 complete (`APIMajor 2`, `SchemaVersion 3`, `Context.PriorFindings`+`GraphView`, persistent store, `graph_digest` keys, `ravenrecon diff`).
+
+Rationale: the three-pack sequence (triage 22 → graph 5+ packs via SDK v1 → graph-enabled hunting via SDK v2) keeps each milestone shippable, deterministic, and cache-coherent — per the 2026-08-30 research round — while the honest deferrals preserve the §0.1 recon-only boundary that made Cloud ship informational-only.
+
+Acceptance criteria:
+
+- AuthZ + bizlogic packs load via SDK v2 (`CheckAPIVersion(2,0)`; `AllPacks` bumps from 23 to 25, `AllStages` stays 12) with `GraphView`/`PriorFindings` isolation tests; deterministic goldens per pack (`authz_report.golden`, `bizlogic_report.golden`).
+- Takeover enrichment does not change `takeover.cname.unclaimed` identity (enrichment is a second finding, not a mutation); bloom diff appears in `ravenrecon diff` output.
+- ASN priority scoring determinism + cache round-trip pins (added ASN changes score deterministically, old scores unchanged when ASN absent; `priority.score` cache key includes ASN digest).
+- `go test ./... -count=1` + `go test -race ./...` green; `gofmt`/`vet`/`build` clean; `AllPacks`/`AllStages` counts updated in docs only when packs land.
+
+---
+
+## Upgrade path v2.0 → v2.1 → v2.2 → v2.3
+
+```
+v2.0  Detection packs (SDK v1 frozen, APIMajor 1, SchemaVersion 2; 22 rules 5 packs, AllStages 12)
+  │   cache: detect.rule keys = schemaVersion + ruleID + fingerprintRule + snapshot + config
+  │   determinism: per-rule Context clone (cloneContextForRule) + per-render Model clone (cloneModel)
+  │
+  ├─► v2.0.1  Follow-ups (adapter/CLI only — no SDK/schema change)
+  │           TLS SAN default ON + naabu opt-in + multi-target fan-out
+  │           cache/determinism: no key/schema bump; AllStages 12 / AllPacks 22 unchanged
+  │
+  ├─► v2.1  Reliability & Observability Closure (no SDK break — APIMajor 1, SchemaVersion 2)
+  │         NEW-96..109 → VERIFIED + OPT-P3-4 logger/replay + FP/FN + 10k perf + takeover + asnmap
+  │         cache/determinism: keys unchanged; takeover pack adds rules (AllPacks 22→23) via frozen SDK v1;
+  │         flagged completed+Truncated/Overflow carve-out preserved end-to-end; HeapInuse 32 MiB guard
+  │
+  ├─► v2.2  Graph & Inter-Rule Dataflow (BREAKING: APIMajor 1→2, SchemaVersion 2→3)
+  │         Context.PriorFindings + GraphView, persistent asset store (0700/0600 fsync), graph_digest in key, ravenrecon diff
+  │         cache/determinism: SchemaVersion bump invalidates old detect.rule records by construction (self-heal);
+  │         store is filesystem, crash-safe (tmp+fsync+Rename+fsync(dir)); diff is local, deterministic
+  │
+  └─► v2.3  Advanced Hunting Packs (on SDK v2 — non-breaking: APIMajor 2, SchemaVersion 3)
+            AuthZ/IDOR via GraphView, bizlogic workflow, takeover enrichment + bloom diff, ASN priority scoring
+            cache/determinism: new packs via SDK v2, graph_digest + ASN digest in keys, goldens per pack;
+            honest deferrals remain: continuous monitoring daemon, browser/screenshots, nuclei/dalfox per §0.1
+```
+
+Cache/determinism notes: `v2.0→v2.0.1` and `v2.0.1→v2.1` preserve cache coherence (no schema bump, completed-only serving, `partial`/`incomplete` never served, flagged `completed+Truncated/Overflow` only where the pipeline preserves the truncation flag end-to-end — techintel `Truncated`/`Overflow`, urlintel `Overflow`, triage/web completed+metadata carve-out — otherwise stored `partial`/`incomplete`). `v2.1→v2.2` invalidates `detect.rule` cache by construction via `SchemaVersion 2→3` (self-healing evict+recompute, never served stale). All milestones preserve `C-1`…`C-5` invariants and `AllStages 12` (only `AllPacks` grows as packs land).
+
+---
+
 ## Optimization index
 
 All audit optimizations live in `OPTIMIZATION.md` with `file:line` evidence. Summary mapping:
@@ -629,23 +778,29 @@ All audit optimizations live in `OPTIMIZATION.md` with `file:line` evidence. Sum
 | v1.6 | `OPT-P1-3` fuzzing + `OPT-P1-4`/`OPT-P1-5` + `OPT-P2-4`/`OPT-P2-6` + `C-1`…`C-5` |
 | v1.7 | `OPT-P3-1` fixtures/snapshots/baselines + `OPT-P2-4` bench |
 | v1.8 | `OPT-P3-2` ingestion |
-| v2.0 | `OPT-P3-3` packs + `OPT-P1-2` isolation + `OPT-P3-4` logger/replay |
+| v2.0 | `OPT-P3-3` packs + `OPT-P1-2` isolation (7956f0d) — `OPT-P3-4` logger/replay deferred to v2.1 |
+| v2.0.1 | NEW-110/111/112 adapter/CLI follow-ups — no `OPT-*` (cache/determinism preserved; AllStages 12 / AllPacks 22) |
+| v2.1 | `OPT-P3-4` logger/replay + `C-4` perf harness (HeapInuse 32 MiB) + `NEW-96..109` honesty hardening + takeover pack + asnmap adapter (no SDK break) |
+| v2.2 | SDK v2 reopening (`APIMajor 1→2`, `SchemaVersion 2→3`, `api_v2.golden`) + `Context.PriorFindings`/`GraphView` + persistent asset store + `graph_digest` key + `ravenrecon diff` |
+| v2.3 | AuthZ/IDOR + bizlogic packs on SDK v2 + takeover enrichment/bloom + ASN priority scoring (honest deferrals: continuous monitoring, browser/screenshots, nuclei/dalfox per §0.1) |
 | Cross-cutting | `OPTIMIZATION.md:7` `C-1`…`C-5` concurrency/cache/trust/bounding invariants; `OPTIMIZATION.md:9` metrics |
 
 ---
 
 ## Optional future work
 
-Deferred until the core platform is stable:
+Deferred until the core platform is stable (all items remain **recon-only per §0.1** — any future live verification, exploitation, or credential-access capability would ship **informational-only like Cloud pack** (`cloud.aws.key-indicator`/`cloud.bucket.url`/`cloud.firebase.indicator` per §0.1: shape indicators over the observed corpus only, descriptions explicitly disclaim validity/publicness/exposure claims, no live verification performed or represented) with explicit disclaimers and no claims of exploitability):
 
-- Browser automation
-- Historical comparisons
-- Distributed execution
-- Plugin marketplace
-- Continuous monitoring
-- Graph visualization
-- AI assistant integration
-- Knowledge graph querying
+- Browser automation — deferred; if ever built, fetch/render-only, no exploitation, informational-only per §0.1 like Cloud pack
+- Historical comparisons — deferred; `ravenrecon diff` (v2.2) covers local deterministic run-to-run diff; broader historical trending stays deferred
+- Distributed execution — deferred; single-process bounded pools (`C-1`) remain the contract (no cross-process locking claimed)
+- Plugin marketplace — deferred; packs remain `internal/detect/packs/<family>` via frozen SDK (`CheckAPIVersion` gate), no dynamic loading
+- Continuous monitoring — **honest deferral through v2.3** (see v2.1 Non-scope, v2.3 Honest deferrals): no `ravenrecon watch`/`daemon`, no scheduled re-scans, no remote state sync — operators compose `scan` + `diff` + external scheduling (cron/systemd); would require new `C-1`/`C-2` contracts
+- Graph visualization — deferred; `GraphView` (v2.2) is a read-only traversal seam (no UI), visualization stays future work
+- AI assistant integration — deferred; no AI generation/exploitation, recon-only per §0.1
+- Knowledge graph querying — deferred; `GraphView.Neighbors`/`PathExists` (v2.2) is the bounded traversal primitive, richer querying stays future work
+
+Status overview reflects the current shippable state: **AllPacks 22 / AllStages 12** (`internal/detect/packs/*/testdata` 5 goldens, `internal/pipeline/config.go:64` `pipelineOrder` 12). v2.1 takeover pack will bump `AllPacks 22→23` via frozen SDK v1 when it lands; v2.2 `SchemaVersion 2→3` / `APIMajor 1→2` is the first cache-invalidating bump since v2.0; `AllStages` stays 12 through v2.3 (new capabilities reuse the results channel + `GraphView`, no new `StageName`).
 
 ---
 
