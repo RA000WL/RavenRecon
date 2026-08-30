@@ -54,6 +54,7 @@ var registry = map[string]func(e toolEnv) Source{
 	"assetfinder": func(e toolEnv) Source { return assetfinder{env: e} },
 	"amass":       func(e toolEnv) Source { return amass{env: e} },
 	"chaos":       func(e toolEnv) Source { return chaos{env: e} },
+	"asnmap":      func(e toolEnv) Source { return asnmap{env: e} },
 }
 
 // runAndParse executes one tool invocation and normalizes its stdout. It is

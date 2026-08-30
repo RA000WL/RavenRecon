@@ -7,6 +7,31 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-114 (MEDIUM) — Logger/Replay bus consumers (internal/log, internal/replay) — OPT-P3-4
+- Status: VERIFIED — orchestrator-verified 2026-08-26 (reviewer APPROVE, gates green: gofmt 0, vet 0, build OK, test 32/32, race green, byte-equal replay)
+- Reporter: builder (v2.1 Batch 2, ses_fad981468ffea1)
+- Owner: builder (this session)
+- Problem: `internal/event.Bus` had one consumer (TUI) but no persistent JSONL logger or deterministic replay; field ops lacked `Bus.Drops`/`Invalid` visibility and a byte-identical re-render path — `OPT-P3-4` PLANNED per `ROADMAP.md v2.1` and `OPTIMIZATION.md 6 P3-4`.
+- Fix: `internal/log` (doc.go, log.go): `Bus.Subscribe(64)` → `bufio.Writer(64 KiB)` JSONL (`0600` perms, `0700` dirs, `fsync(dir)` on close per `report/writer.go` precedent), bounded buffer 64, panic-contained per-event marshal/write (Deriver symmetry), `nil` bus → `(nil,nil)` off switch, drain-on-close, `Drops()` passthrough. `internal/replay` (doc.go, replay.go): `Replay`/`ReplayEvents` read JSONL line-delimited, `json.RawMessage` payload typed by `Kind` (29 kinds, `CacheAccess` shared for hit/miss, `SummaryReady` `{}`/`null` handling), `safeObserve` panic containment, `nil` observer → no-op. Tests: `internal/log/log_test.go` `TestLogReplaysDeterministically` (hermetic loopback Bus, synthetic `ScanStarted`..`ScanStopped` 10-event stream, `0600` perm, `Bus.Drops`/`Invalid` dropped, `tui.RenderFinal` compact byte-equal), `internal/replay/replay_test.go` deterministic replay + panic/nil coverage. `go vet`/`build`/`test`/`-race` green.
+- Verification: `go test ./internal/log/... ./internal/replay/... -count=1` and `-race` green; `TestLogReplaysDeterministically` proves `Bus.Subscribe(64)` → JSONL with per-event `At`/`Sequence`/`Kind`/`Payload` and `ReplayEvents` byte-equal summary via `tui.Options{Compact:true}`.
+
+### NEW-115 (MEDIUM) — ASN mapping adapter via discovery.Source (internal/discovery/asn.go)
+- Status: VERIFIED — orchestrator-verified 2026-08-26 (reviewer APPROVE, gates green: gofmt 0, vet 0, build OK, test 32/32, race green, byte-equal replay)
+- Reporter: builder (v2.1 Batch 2, ses_fad981468ffea1)
+- Owner: builder (this session)
+- Problem: no ASN-enriched discovery; `asnmap` not isolated behind `discovery.Source` like `subfinder`/`assetfinder`/`amass`/`chaos` (see `source.go:46` built-ins, `registry`); provenance `asnmap` and `passive-discovery` cache versioning not exercised — `ROADMAP.md v2.1` ASN adapter PLANNED.
+- Fix: `internal/discovery/asn.go`: `asnmap` struct `Name asnmap`, `Detect` via `detectVersioned(..., "-version")`, `Discover` via `runAndParse(..., []string{"-d", target.Name, "-silent"})`, provenance `asnmap` through `toolEnv.provenance()`, shared `parseHostLines` dedup/sort. `internal/discovery/source.go`: registry entry `asnmap` (opt-in via explicit `Sources: []string{"asnmap"}`; default `builtInNames()` stays 4 to preserve T4 determinism pins — explicit selection still validated, `allStages` 12 unchanged). `internal/discovery/asn_test.go`: `TestASNMappingInvocation` (exact argv `-d`/`-silent` passive-only), `TestASNMappingEmits` (fake runner `asnmap -d example.com -silent` → 2 hosts, provenance `asnmap`), `TestASNMappingParseAndDedup`, `TestASNMappingExecutableMissing`, `TestASNMappingBuiltInRegistry` (registry + cache key version separation via `cacheKey` with `ToolInfo` `v1.0.0` vs `v2.0.0`), `TestASNMappingTruncationFlag`.
+- Verification: `go test ./internal/discovery -run TestASN -count=1` green; `go test -race ./internal/discovery` green; hermetic fake-runner + `cacheKey` version pin.
+
+### NEW-116 (MEDIUM) — 10k perf harness TARGET_PARALLEL=8 + 32MiB HeapInuse ceiling (internal/pipeline/adapt/stress_10k_test.go)
+- Status: VERIFIED — orchestrator-verified 2026-08-26 (reviewer APPROVE, gates green: gofmt 0, vet 0, build OK, test 32/32, race green, byte-equal replay)
+- Reporter: builder (v2.1 Batch 2, ses_fad981468ffea1)
+- Owner: builder (this session)
+- Problem: no pinned 10k×10k stress guard; `ROADMAP.md v2.1` and `OPTIMIZATION.md 6` require `TARGET_PARALLEL=8` + `HeapInuse <32 MiB` (mirroring `C-4` 32 MiB guards, `SKIPPED` under `-race`) and bounded-pool proof — PLANNED.
+- Fix: `internal/pipeline/adapt/stress_10k_test.go`: `TestStress10kHeapBounded` builds 10k hosts (`host-%05d.example.com`) + 10k URLs (`https://example.com/p/%05d`) deterministically via `asset.NewHost`/`ParseURL`; `stressSeed` stage seeds corpus, `stressConsumer` stage processes via `rr.NewPool(Concurrency:8, QueueSize:64)` tracking `active`/`maxSeen` with `atomic` (proving no unbounded goroutine-per-host/URL, no unbounded queue) — `maxSeen` never exceeds bound; `runtime.GC()` before/after `HeapInuse` delta guard `32<<20` (order-of-magnitude, not exact-MiB), `NumGoroutine` leak check within `5` slack, `TARGET_PARALLEL=8` fan-out via `sem` channel `8` + `sync.WaitGroup` over `8` concurrent `pipeline.Run` (lexically smaller 1k corpora to keep `8×` heap bounded) proving bounded fan-out without deadlock. `stress_race_test.go`/`stress_norace_test.go` (`//go:build race`/`!race`) define `stressRaceEnabled` to `SKIP` under `-race` (heap meaningless). All hermetic, synthetic values only, `context.Context` propagated, explicit max concurrency everywhere.
+- Verification: `go test ./internal/pipeline/adapt -run TestStress10kHeapBounded -count=1` green (`0.1s`); `go test ./... -count=1` green (`discovery` `112s` but pass); `HeapInuse` delta logged `<32 MiB`, `maxSeen ≤8` bounded.
+
+
 ### NEW-101 (MEDIUM) — CSP/HSTS absence evaluated corpus-globally, applied per-host (internal/detect/packs/web)
 - Status: VERIFIED — verified by orchestrator 2026-08-26 (red→green proven by builder ses_fae135bf5ffeAYpkpykr6lES3D: revert hostHasCSP→hasCSP gives 0 findings, want 1 — exact false-negative scenario; gate race green)
 - Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M3)
