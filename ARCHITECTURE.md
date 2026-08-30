@@ -9,41 +9,41 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 
 | Section | Lines | What's inside |
 |---|---:|---|
-| Purpose | 51-72 | what the framework is: layer split; adapters are not the architecture |
-| Planned architecture | 72-174 | historical target diagram — read only for context on why, never as current state |
-| Asset model | 175-222 | typed asset model, identity/dedup, provenance, merge — the one normalization point |
-| Pipeline requirements | 223-236 | cross-cutting stage requirements: cancellation, bounding, caching, determinism |
-| External tools | 237-252 | adapter rules: structured args, context, safe output capture; no shell interpolation |
-| Concurrency | 253-267 | bounded-concurrency rules; context.Context for long-running operations |
-| Rate limiting | 268-282 | central token-bucket limiter in the runtime; what stages must add themselves |
-| Cache and resume | 283-426 | persistent fs cache: crash-safe writes, self-healing, schema-versioned keys |
-| Cache and resume — keys | 291-312 | key composition: schema version, config, tool version, operation, normalized target |
-| Cache and resume — records | 313-321 | record shape, statuses, strict decode re-validation |
-| Cache and resume — backend | 322-349 | filesystem backend layout, atomic writes, self-healing |
-| Cache and resume — outcomes | 350-358 | per-key outcome vocabulary and metrics |
-| Cache and resume — TTL | 359-364 | expiration semantics |
-| Cache and resume — resume semantics | 365-375 | how cache hits resume runs; partial/incomplete never served from cache |
-| Cache and resume — concurrency model | 376-392 | bounded cache access under the runtime pool |
-| Cache and resume — instrumentation | 393-426 | observer option: exactly one canonical hit/miss event per Get |
-| Runtime engine | 427-505 | bounded pool, central rate limiter, cancellation/shutdown, observer bridge; cache-independent |
-| Passive discovery | 506-735 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
-| DNS pipeline | 736-922 | A/AAAA/CNAME resolution into typed observations; library only |
-| HTTP probing | 923-1263 | root-path probes, TLS metadata capture, observations/relationships; library only |
-| URL intelligence | 1264-1476 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
-| Technology detection | 1477-1668 | fingerprint engine + database, analyzers, confidence scoring |
-| JavaScript intelligence | 1669-1877 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
-| Secret intelligence | 1878-2104 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
-| Priority engine | 2105-2307 | scoring catalogs, correlation, attack paths, recommendations |
-| Detection framework | 2308-2873 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) |
-| Detection framework — SDK contract | 2530-2782 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs |
-| Detection framework — SDK stability policy | 2783-2873 | versioning contract, reopening criteria |
-| Reporting framework | 2874-3064 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
-| Event bus | 3065-3209 | canonical event model + bounded non-blocking bus; observer-only |
-| Terminal observability (TUI) | 3210-3307 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
-| Universal asset ingestion | 3308-3416 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
-| Configuration precedence | 3417-3430 | CLI flags → environment → config file → defaults |
-| Safety boundary | 3431-3443 | recon-only: what must never be added |
-| v0.3 boundary | 3444-3688 | implemented-vs-planned inventory of every subsystem |
+| Purpose | 52-72 | what the framework is: layer split; adapters are not the architecture |
+| Planned architecture | 73-175 | historical target diagram — read only for context on why, never as current state |
+| Asset model | 176-223 | typed asset model, identity/dedup, provenance, merge — the one normalization point |
+| Pipeline requirements | 224-237 | cross-cutting stage requirements: cancellation, bounding, caching, determinism |
+| External tools | 238-253 | adapter rules: structured args, context, safe output capture; no shell interpolation |
+| Concurrency | 254-268 | bounded-concurrency rules; context.Context for long-running operations |
+| Rate limiting | 269-283 | central token-bucket limiter in the runtime; what stages must add themselves |
+| Cache and resume | 284-427 | persistent fs cache: crash-safe writes, self-healing, schema-versioned keys |
+| Cache and resume — keys | 292-313 | key composition: schema version, config, tool version, operation, normalized target |
+| Cache and resume — records | 314-322 | record shape, statuses, strict decode re-validation |
+| Cache and resume — backend | 323-350 | filesystem backend layout, atomic writes, self-healing |
+| Cache and resume — outcomes | 351-359 | per-key outcome vocabulary and metrics |
+| Cache and resume — TTL | 360-365 | expiration semantics |
+| Cache and resume — resume semantics | 366-376 | how cache hits resume runs; partial/incomplete never served from cache |
+| Cache and resume — concurrency model | 377-393 | bounded cache access under the runtime pool |
+| Cache and resume — instrumentation | 394-427 | observer option: exactly one canonical hit/miss event per Get |
+| Runtime engine | 428-506 | bounded pool, central rate limiter, cancellation/shutdown, observer bridge; cache-independent |
+| Passive discovery | 507-736 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
+| DNS pipeline | 737-923 | A/AAAA/CNAME resolution into typed observations; library only |
+| HTTP probing | 924-1264 | root-path probes, TLS metadata capture, observations/relationships; library only |
+| URL intelligence | 1265-1477 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
+| Technology detection | 1478-1669 | fingerprint engine + database, analyzers, confidence scoring |
+| JavaScript intelligence | 1670-1878 | discovery/fetch/parse/analyze of script URLs; adapters; bounded retention |
+| Secret intelligence | 1879-2105 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
+| Priority engine | 2106-2308 | scoring catalogs, correlation, attack paths, recommendations |
+| Detection framework | 2309-2897 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) incl. triage 8-rule table + per-rule triage details |
+| Detection framework — SDK contract | 2531-2806 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs incl. triage (LoadTriagePack, AllPacks 22) |
+| Detection framework — SDK stability policy | 2807-2897 | versioning contract, reopening criteria |
+| Reporting framework | 2898-3088 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
+| Event bus | 3089-3233 | canonical event model + bounded non-blocking bus; observer-only |
+| Terminal observability (TUI) | 3234-3331 | single-goroutine controller, deterministic frames; live stage feed with data-source gating; wired into `scan --tui` (v1.4) |
+| Universal asset ingestion | 3332-3440 | `internal/importer`: 18 importers behind one interface, detection waterfall, streaming bounds, cache keys, provenance sidecar, StageIngest composition, origin attribution; wired as `ravenrecon ingest` (v1.8) |
+| Configuration precedence | 3441-3454 | CLI flags → environment → config file → defaults |
+| Safety boundary | 3455-3467 | recon-only: what must never be added |
+| v0.3 boundary | 3468-3713 | implemented-vs-planned inventory of every subsystem |
 
 **Before Tier C work on package X: read only its section(s) from this map.**
 
@@ -2696,16 +2696,16 @@ never vulnerability detections). A pack's registration pattern is:
 #### Built-in packs (v2.0)
 
 The v2.0 milestone turned the pack story from one demonstration sibling
-into four real packs under `internal/detect/packs/` — `web`, `js`,
-`apis`, and `cloud` — each following the exact registration pattern the
+into five real packs under `internal/detect/packs/` — `web`, `js`,
+`apis`, `cloud`, and `triage` (batch 6, e678eea) — each following the exact registration pattern the
 examples pack proved: its `Rules()` entry point begins with
 `detect.CheckAPIVersion(1, 0)`, rules go through
 `ValidateRule` → `Registry.Register` (deep copy) → `Registry.Validate`
 (dependency graph) → `Registry.Seal()`, so loading is confined to
 startup and a late registration attempt fails. The pipeline seam
 (`internal/pipeline/adapt/detect.go`) owns that sequence per pack
-(`LoadWebPack`, `LoadJsPack`, `LoadApisPack`, `LoadCloudPack`) and composes
-them into the detect stage (`NewDetectStageWithAllPacks`, 14 rules total;
+(`LoadWebPack`, `LoadJsPack`, `LoadApisPack`, `LoadCloudPack`, `LoadTriagePack`) and composes
+them into the detect stage (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`, 22 rules total;
 `AllStages()` stays at 12). The framework package itself remains
 rule-free — the compiler still enforces that a pack can use only what
 `internal/detect` exports.
@@ -2728,15 +2728,38 @@ rule-free — the compiler still enforces that a pack can use only what
   exposure claims, no live verification is performed or represented,
   and candidate values are never copied into pack-authored fields
   (test-enforced).
+- **Triage** (`internal/detect/packs/triage`, commit e678eea) — 8
+  endpoint-triage rules: `triage.redirect`, `triage.idor`, `triage.sqli`,
+  `triage.lfi`, `triage.ssrf`, `triage.cmdi`, `triage.ssti`,
+  `triage.xss_reflected`; curated, lowercased, sorted wordlists —
+  XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68 —
+  from TRIAGE_RESEARCH.md (Gf-Patterns/SecLists/Assetnote/PortSwigger,
+  MIT/Apache-2.0 attributions in `doc.go`); helpers `paramSets`,
+  `paramPrimary`, `paramAllClasses` built at `init()` and applied in
+  `runTriage` (precise param extraction: split on `?`/`&`, key before `=`,
+  lowercased, sorted keys for Config determinism, bounded at 256 findings
+  with deterministic truncation); overlaps resolved under deterministic
+  precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS, multi-class flagged
+  (`multi_class`, `all_classes` metadata) but primary reported — one finding
+  per distinct primary class per endpoint, tested via
+  `OverlapPrecedence` (url→ssrf, id→idor, exec→cmdi) and
+  `MultiParamEndpoint` dedup; follows the Web-pack
+  completed+metadata carve-out (truncated sets stored `completed` with
+  `subjects_dropped`+`truncated` metadata and a `LevelWarn` log) — not the
+  `Finding.Truncated` sticky flag via `adapt/buildDetectResult` (techintel
+  `Truncated`/`Overflow`, urlintel `Overflow`) — because triage triages
+  param names, not retained corpora; Information/PriorityInfo, MethodDetection,
+  `RequiredAssetTypes` endpoint-gated, stdlib-only, <100 lines per detector
+  (`extractParamNames`); deterministic fixtures and `triage_report.golden`.
 
-Every pack ships the same hermetic test contract (13 tests each):
+Every pack ships the same hermetic test contract (13 tests each for web/js/apis/cloud; triage extends it with per-class emission, precedence, multi-param, cache parity, determinism golden `triage_report.golden`):
 CheckAPIVersion gate, loads-through-SDK with deep-copy + Seal,
 metadata/deps/compat declarations, honest `RequiredAssetTypes` skips,
 context-honoring detectors, failure isolation (panic → failed rule, not
 crashed platform), cache cold/warm parity, determinism goldens
 (`internal/detect/packs/<family>/testdata/<family>_report.golden`), and
 sorted-key Config determinism; seam tests live in
-`internal/pipeline/adapt/detect_seam_test.go`. The deferred families —
+`internal/pipeline/adapt/detect_seam_test.go` (now expects 22). The deferred families —
 Authentication, Authorization, Business logic — need inter-rule data
 flow / graph traversal that SDK v1 does not carry; they wait for v2.1+
 behind the stability policy's reopening criteria above.
@@ -3510,7 +3533,7 @@ Implemented:
   a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
   (`internal/detect`; since roadmap v2.0 built-in rule packs live beside
-  it under `internal/detect/packs/<family>` — web, js, apis, cloud — and
+  it under `internal/detect/packs/<family>` — web, js, apis, cloud, triage (5 packs, 22 rules) — and
   enter only through the frozen SDK; see "Built-in packs (v2.0)" above)
 * event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
   event model and the concurrent, bounded, non-blocking bus — typed,

@@ -55,7 +55,7 @@ Every phase must satisfy these before it is complete:
 | v1.6 | Robustness and hostile-input hardening | ✅ Complete | OPT-P1-5 9575e14; OPT-P1-4 d10d719; OPT-P1-3 3b21401 (8 fuzz targets, property tests, sortQuery idempotence crasher fixed); OPT-P2-6 4e31f8d; OPT-P2-4 8c795eb. Remaining migrations NEW-53; httpprobe race-flake family NEW-54. |
 | v1.7 | Integration and acceptance testing | ✅ Complete | Closed 2026-08-23 — fixtures/goldens/bench-gate landed (53f2f46, 2dcdc96, 9370f3f, 14f61a9, e043555; NEW-56/57/58): `fixtures/<profile>/` hybrid manifests, per-stage goldens via `internal/golden` (`-update`), `testdata/bench/*.txt` + `cmd/benchgate` stdlib comparator (D4, no `benchstat`), CI bench-gate job, memory guards (C-4 drift + HeapInuse), D6 interaction suite across 12 stages; validated deterministic, `gofmt`/`vet`/`build`/`test`/`-race` green. |
 | v1.8 | Universal Asset Ingestion Framework | ✅ Complete | Closed 2026-08-23 — `internal/importer` (18 importers behind one interface, auto detection, bounded streaming, provenance sidecar, cache integration), pipeline ingest stage + report attribution, `ravenrecon ingest` CLI, benchmarks + memory guards (1ede060, 81785f2, 3e5ba4e, 5e806fe, 7fd312a, cf0e939). Deferred: Common Crawl remote ingestion; Enriched/Generated origin derivation; CIDR report channel. Optimizations: `OPT-P3-2`. |
-| v2.0 | Detection packs | ✅ Complete | Closed 2026-08-24 — OPT-P1-2 per-rule Context + per-render Model isolation (7956f0d); four built-in packs load through frozen SDK v1 via the pipeline seam: Web (7d71aa8), JS (453de88), APIs (7c2c3f1), Cloud informational-only per §0.1 (c9e45fa). Deferred to v2.1+: Auth/AuthZ/Business-logic families (need inter-rule data flow / graph traversal not present on SDK v1). `OPT-P3-4` logger/replay remains open. |
+| v2.0 | Detection packs | ✅ Complete | Closed 2026-08-24 — OPT-P1-2 per-rule Context + per-render Model isolation (7956f0d); five built-in packs load through frozen SDK v1 via the pipeline seam: Web (7d71aa8), JS (453de88), APIs (7c2c3f1), Cloud informational-only per §0.1 (c9e45fa), Triage 8-class endpoint triage via curated param lists (e678eea) — AllPacks 22, AllStages 12. Deferred to v2.1+: Auth/AuthZ/Business-logic families (need inter-rule data flow / graph traversal not present on SDK v1). `OPT-P3-4` logger/replay remains open. |
 
 ---
 
@@ -573,8 +573,8 @@ Design rule: core packages stay stable. New detection capabilities should be imp
 Landed in `internal/detect/packs/<family>`; every pack enters only through
 the frozen SDK (`Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` →
 `Register` → `Validate` → `Seal`) via the pipeline seam
-(`internal/pipeline/adapt/detect.go`). 14 built-in rules load through
-`NewDetectStageWithAllPacks`; `AllStages()` stays 12.
+(`internal/pipeline/adapt/detect.go`). 22 built-in rules (5+3+3+3+8) load through
+`NewDetectStageWithAllPacks` (`LoadTriagePack`/`NewDetectStageWithTriagePack` for triage); `AllStages()` stays 12.
 
 - **Web** ✅ SHIPPED (7d71aa8) — 5 rules: `web.csp.missing`, `web.hsts.missing`,
   `web.cors.wildcard`, `web.robots.exposed`, `web.sourcemap.exposed`
@@ -590,30 +590,31 @@ the frozen SDK (`Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` →
   rules: `cloud.aws.key-indicator`, `cloud.bucket.url`, `cloud.firebase.indicator`;
   descriptions explicitly disclaim validity/publicness/exposure claims, no live
   verification performed or represented
+- **Triage** ✅ SHIPPED (e678eea) — 8 endpoint-triage rules: `triage.redirect`, `triage.idor`, `triage.sqli`, `triage.lfi`, `triage.ssrf`, `triage.cmdi`, `triage.ssti`, `triage.xss_reflected`; curated lowercased/sorted wordlists — XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68 — precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS, helpers `paramSets` built at `init()`, completed+metadata carve-out (not `Finding.Truncated` sticky flag)
 - **Business logic** ⏳ DEFERRED to v2.1+ — workflow/state-transition analysis needs
   multi-step data flow across rules; not expressible on SDK v1 without a formal
   SDK reopening (stability policy gates apply)
 
 Acceptance criteria:
 
-- [x] Packs load through the SDK without core edits. (`internal/detect/packs/{web,js,apis,cloud}`
+- [x] Packs load through the SDK without core edits. (`internal/detect/packs/{web,js,apis,cloud,triage}`
       compile against only the exported `detect` surface; loaders live in
-      `internal/pipeline/adapt/detect.go`; the framework gained no pack-specific
+      `internal/pipeline/adapt/detect.go` (`LoadTriagePack`/`NewDetectStageWithTriagePack`/`AllPacks` 22); the framework gained no pack-specific
       code paths — the only post-freeze `detect` change is the unexported
-      OPT-P1-2 cloning internals, 7956f0d)
+      OPT-P1-2 cloning internals, 7956f0d; triage e678eea)
 - [x] Packs declare metadata, dependencies, and compatibility versions. (every
-      `Rules()` gates on `CheckAPIVersion(1,0)`; per-pack `MetadataDepsCompat` tests)
+      `Rules()` gates on `CheckAPIVersion(1,0)`; per-pack `MetadataDepsCompat` tests; triage e678eea)
 - [x] Pack output is normalized into the same evidence model as core engines.
       (canonical `asset.Finding` through the shared engine; deterministic per-pack
-      report goldens under `internal/detect/packs/*/testdata/`)
+      report goldens under `internal/detect/packs/*/testdata/` — `triage_report.golden` e678eea)
 - [x] Pack failures are isolated and do not crash the platform. (per-pack
-      `FailuresIsolated` panic→failed-not-crashed tests)
+      `FailuresIsolated` panic→failed-not-crashed tests; triage e678eea)
 - [x] Pack behavior is covered by pack-level tests and fixtures. (13 hermetic tests +
-      golden per pack; seam tests in `internal/pipeline/adapt/detect_seam_test.go`)
+      golden per pack — triage: per-class emission, precedence, multi-param, cache parity, `triage_report.golden` e678eea; seam tests in `internal/pipeline/adapt/detect_seam_test.go` now expects 22)
 - [x] `OPT-P1-2` landed: `detect/context.go:109` `cloneContextForRule` gives every rule
       its own Context copy and `report/model.go:171` `cloneModel` deep-clones the Model
       per render; `TestContextIsolation`/`TestModelIsolation` red→green, `-race` green
-      (7956f0d).
+      (7956f0d; triage e678eea reuses same isolation).
 
 ---
 

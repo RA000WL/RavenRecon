@@ -73,13 +73,17 @@ knowledge graph on the shared runtime pool with dependency-ordered levels,
 per-rule timeouts, panic isolation, a rule result cache, execution metrics,
 and a canonical Finding model; the framework itself detects nothing and no
 vulnerability-specific rules ship (see "Detection framework (library)"
-below). v2.0 adds four built-in detection packs under
-`internal/detect/packs/` — Web (5 rules), JavaScript (3), APIs (3), and
+below). v2.0 adds five built-in detection packs under
+`internal/detect/packs/` — Web (5 rules), JavaScript (3), APIs (3),
 Cloud (3, informational-only indicator shapes per the recon-only
-boundary) — loading through the frozen SDK v1 via the pipeline seam with
-no core edits; per-rule `Context` clones and per-render report `Model`
-deep clones isolate third-party pack bugs from each other and from the
-platform. Authentication, Authorization, and Business-logic pack
+boundary), and Triage (8 endpoint-triage rules via curated param lists
+— XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68 —
+precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS; `AllPacks` 22,
+`AllStages` 12) — loading through the frozen SDK v1 via the pipeline seam
+(`LoadTriagePack`, `NewDetectStageWithTriagePack`, `AllPacks`) with no
+core edits; per-rule `Context` clones (`cloneContextForRule`) and
+per-render report `Model` deep clones (`cloneModel`) isolate third-party
+pack bugs from each other and from the platform. Authentication, Authorization, and Business-logic pack
 families are deferred to v2.1+ (they need inter-rule data flow / graph
 traversal the frozen SDK does not carry). The reporting framework (`internal/report`, phase 11) adds the
 Reporting & Evidence Export engine: a caller-composed run input is
@@ -475,25 +479,37 @@ golden test (`surface_snapshot_test.go` against `testdata/api_v1.golden`)
 and nine behavior contracts; pack loaders gate on `CheckAPIVersion(1, 0)`
 before loading any rule.
 
-Detection packs: since v2.0 the module ships four built-in packs under
+Detection packs: since v2.0 the module ships five built-in packs under
 `internal/detect/packs/` — `web` (5 rules: CSP missing, HSTS missing,
 CORS wildcard, robots exposed, source maps exposed), `js` (3 rules: DOM
 XSS indicators, postMessage without origin check, prototype-pollution
 indicators), `apis` (3 rules: exposed OpenAPI specs, REST IDOR
-indicators, GraphQL introspection enabled), and `cloud` (3
+indicators, GraphQL introspection enabled), `cloud` (3
 INFORMATIONAL-only indicator rules: AWS access-key shapes, bucket URLs,
 Firebase indicators — shape matches over the observed corpus only, with
 explicit disclaimers; no validity, publicness, or exposure claims and no
-live verification, per the recon-only boundary) — plus the `examples`
-demonstration pack (explicitly loaded, never auto-loaded). The framework
-package still contains no rule definitions: every pack enters only
-through the exported SDK (`Rules()` → `CheckAPIVersion(1, 0)` →
+live verification, per the recon-only boundary), and `triage` (8
+endpoint-triage rules: `triage.redirect`, `triage.idor`, `triage.sqli`,
+`triage.lfi`, `triage.ssrf`, `triage.cmdi`, `triage.ssti`,
+`triage.xss_reflected` — Information / PriorityInfo testing assignments
+classifying endpoints whose query-param names match curated, lowercased
+and sorted wordlists: XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62,
+IDOR 37, RCE 32, SSTI 68; overlaps resolved under deterministic
+precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS with multi-class
+metadata, helpers built at `init()` via `paramSets`/`paramPrimary` maps,
+bounded at 256 findings with the Web-pack completed+metadata carve-out —
+not the `Finding.Truncated` sticky flag via
+`adapt/buildDetectResult`) — plus the `examples` demonstration pack
+(explicitly loaded, never auto-loaded). The framework package still
+contains no rule definitions: every pack enters only through the
+exported SDK (`Rules()` → `CheckAPIVersion(1, 0)` →
 `ValidateRule` → `Register` → `Validate` → `Seal`, registration confined
 to startup) via the pipeline seam in `internal/pipeline/adapt/detect.go`
-(`NewDetectStageWithAllPacks` loads all 14 built-in rules). Pack output
-is canonical `asset.Finding` evidence, failures are isolated per rule,
-and every pack ships its own hermetic test suite with determinism
-goldens.
+(`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`
+loads all 22 built-in rules; `AllStages()` stays 12). Pack output is
+canonical `asset.Finding` evidence, failures are isolated per rule, and
+every pack ships its own hermetic test suite with determinism goldens
+(`triage_report.golden`).
 
 Rules: every rule is an immutable descriptor — canonical ID, name,
 description, one of 14 categories, semantic version, declared input and
