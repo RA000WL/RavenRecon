@@ -7,6 +7,37 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-101 (MEDIUM) — CSP/HSTS absence evaluated corpus-globally, applied per-host (internal/detect/packs/web)
+- Status: VERIFIED — verified by orchestrator 2026-08-26 (red→green proven by builder ses_fae135bf5ffeAYpkpykr6lES3D: revert hostHasCSP→hasCSP gives 0 findings, want 1 — exact false-negative scenario; gate race green)
+- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M3)
+- Owner: builder
+- Problem: helpers.go hasCSP/hasHSTS scan whole corpus: one header-bearing host masks genuinely-missing peers (false negative); zero-evidence corpora flag everything missing @0.9.
+- Fix: correlate Evidence Source host → per-host presence; no-header-evidence runs skip rather than claim missing.
+- Verification: mixed-host snapshot flags only the truly-missing host.
+
+- Fix note (2026-08-25): IMPLEMENTED — hostHasCSP/hostHasHSTS per-host correlation added to helpers.go; detectors emit only for hosts genuinely lacking evidence; empty-evidence corpora skip.
+
+### NEW-104 (MEDIUM) — Relationship.ID() concatenates unencoded components; distinct edges collide (internal/asset)
+- Status: VERIFIED — verified by orchestrator 2026-08-26 (revert encodeIdentity to identity gives equal IDs for two distinct edges; now-distinct proven — builder ses_fae135be9ffeaphqi3wjNIJR68)
+- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M6)
+- Owner: builder
+- Problem: relationship.go:133–135 From.String()+Kind+"\x00"+To with unpinned kind vocabulary; demonstrated two validated edges sharing one ID → silent drop in dedupeFindingRelationships.
+- Fix: percentEncode components (package convention elsewhere), add RelationshipKind.Valid() enforced in NewRelationship; collision regression test.
+- Verification: prefix-pair edges produce distinct IDs.
+
+- Fix note (2026-08-25): IMPLEMENTED — RelationshipKind.Valid() vocabulary enforced in NewRelationship; ID() uses separator-safe encoding ('%'→%25, \x00→%00, controls escaped) preventing collisions.
+
+### NEW-105 (MEDIUM) — Deriver panic telemetry write-only on pool path; panic value discarded (internal/event, internal/runtime)
+- Status: VERIFIED — verified by orchestrator 2026-08-26 (revert deriveSafe to discard value gives LastPanic empty; captured value+stack proven — builder ses_fae135be8ffeX6tZQtndKxbD6e)
+- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M7)
+- Owner: builder
+- Problem: derive.go:114–124 drops panic value entirely; observer.go:59–64 documents DeriverPanics unreachable via Config.Deriver; grep: zero production readers. Wired deriver bug = silently lost derivation batches forever.
+- Fix: pool emits canonical warning event when bridge counter >0 at shutdown (type-assert event.Deriving), and/or retain last panic+debug.Stack() behind an accessor.
+- Verification: panicking fake deriver run surfaces observable warning.
+
+- Fix note (2026-08-25): IMPLEMENTED — Deriving captures last panic value+stack behind mutex with LastPanic() accessor; DeriverPanics counting retained; callers can query both after run.
+
+
 ### NEW-113 (HIGH) — v2.0 Triage pack batch 6 (internal/detect/packs/triage)
 - Status: VERIFIED — orchestrator-verified 2026-08-27 (reviewer APPROVE, gates green: gofmt 0, go vet 0, go build OK, go test 33/33, race green, golden byte-stable) — 8 rules triage.* via curated param lists (XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68) with precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS; pipeline AllPacks now 22 rules
 - Reporter: builder (orchestrator dispatch, NEW-95 milestone batch 6)

@@ -143,15 +143,6 @@ orchestrator; every agent may append or update its own entries.
 - Verification: mapbox-gl.js fixture non-firing.
 
 - Fix note (2026-08-25): IMPLEMENTED — sourcemap restricted to HasSuffix(path,".map") + disc/content-type carriers; mapbox no longer fires.
-### NEW-101 (MEDIUM) — CSP/HSTS absence evaluated corpus-globally, applied per-host (internal/detect/packs/web)
-- Status: IN PROGRESS
-- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M3)
-- Owner: builder
-- Problem: helpers.go hasCSP/hasHSTS scan whole corpus: one header-bearing host masks genuinely-missing peers (false negative); zero-evidence corpora flag everything missing @0.9.
-- Fix: correlate Evidence Source host → per-host presence; no-header-evidence runs skip rather than claim missing.
-- Verification: mixed-host snapshot flags only the truly-missing host.
-
-- Fix note (2026-08-25): IMPLEMENTED — hostHasCSP/hostHasHSTS per-host correlation added to helpers.go; detectors emit only for hosts genuinely lacking evidence; empty-evidence corpora skip.
 ### NEW-102 (MEDIUM) — apis-pack rule precision: introspection-from-path + bare-"graphql" values; IDOR fires on years/pagination (internal/detect/packs/apis)
 - Status: IN PROGRESS
 - Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M4)
@@ -170,24 +161,6 @@ orchestrator; every agent may append or update its own entries.
 - Verification: credential-bearing invalid URLs produce redacted error strings.
 
 - Fix note (2026-08-25): IMPLEMENTED — redactURLForError clears userinfo before embedding in ParseURL errors; credential substrings absent (verified).
-### NEW-104 (MEDIUM) — Relationship.ID() concatenates unencoded components; distinct edges collide (internal/asset)
-- Status: IN PROGRESS
-- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M6)
-- Owner: builder
-- Problem: relationship.go:133–135 From.String()+Kind+"\x00"+To with unpinned kind vocabulary; demonstrated two validated edges sharing one ID → silent drop in dedupeFindingRelationships.
-- Fix: percentEncode components (package convention elsewhere), add RelationshipKind.Valid() enforced in NewRelationship; collision regression test.
-- Verification: prefix-pair edges produce distinct IDs.
-
-- Fix note (2026-08-25): IMPLEMENTED — RelationshipKind.Valid() vocabulary enforced in NewRelationship; ID() uses separator-safe encoding ('%'→%25, \x00→%00, controls escaped) preventing collisions.
-### NEW-105 (MEDIUM) — Deriver panic telemetry write-only on pool path; panic value discarded (internal/event, internal/runtime)
-- Status: IN PROGRESS
-- Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M7)
-- Owner: builder
-- Problem: derive.go:114–124 drops panic value entirely; observer.go:59–64 documents DeriverPanics unreachable via Config.Deriver; grep: zero production readers. Wired deriver bug = silently lost derivation batches forever.
-- Fix: pool emits canonical warning event when bridge counter >0 at shutdown (type-assert event.Deriving), and/or retain last panic+debug.Stack() behind an accessor.
-- Verification: panicking fake deriver run surfaces observable warning.
-
-- Fix note (2026-08-25): IMPLEMENTED — Deriving captures last panic value+stack behind mutex with LastPanic() accessor; DeriverPanics counting retained; callers can query both after run.
 ### NEW-106 (MEDIUM) — fingerprints validation misses Version.Group ≥ NumSubexp()+1 (internal/techintel/fingerprints)
 - Status: IN PROGRESS
 - Reporter: reviewer (deep-pass 2026-08-25, REVIEW-2026-08-25.md R2-M8)
