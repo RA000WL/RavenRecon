@@ -2512,7 +2512,7 @@ the same contract, deterministic min/max/mean/median duration summary.
 ### Known limitations
 
 - Library capability only: no `ravenrecon detect` CLI command.
-- The framework package `internal/detect` itself ships no rule definitions; the **distribution** ships 5 packs via frozen SDK — web (5), js (3), apis (3), cloud (3 informational-only per §0.1), triage (8) = 22 rules — under `internal/detect/packs/<family>` strictly through the exported SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal` (see `Built-in packs (v2.0)`); per-rule `Context` clones (`cloneContextForRule` 7956f0d) and per-render report `Model` clones (`cloneModel`) isolate pack rules from each other (see `Reporting framework: Report lifecycle` step 4).
+- The framework package `internal/detect` itself ships no rule definitions; the **distribution** ships 6 packs via frozen SDK — web (5), js (3), apis (3), cloud (3 informational-only per §0.1), triage (8), takeover (3 informational per §0.1) = 25 rules (v2.0 was 22; v2.1 Batch 1 adds takeover 3) — under `internal/detect/packs/<family>` strictly through the exported SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal` (see `Built-in packs (v2.0)` and `Takeover pack (v2.1)`); per-rule `Context` clones (`cloneContextForRule` 7956f0d) and per-render report `Model` clones (`cloneModel`) isolate pack rules from each other (see `Reporting framework: Report lifecycle` step 4).
 - Dependencies order execution but do not yet flow data between rules;
   the Context's domains are the fixed pre-run corpus (documented future
   work — the gate that defers the Auth/AuthZ/Business-logic pack
@@ -2691,7 +2691,7 @@ never vulnerability detections). A pack's registration pattern is:
 `Registry.Validate()` (dependency graph) → optional `Registry.Seal()` →
 `Run` with `DefaultEngineConfig`.
 
-#### Built-in packs (v2.0)
+#### Built-in packs (v2.0) and Takeover pack (v2.1 Batch 1)
 
 The v2.0 milestone turned the pack story from one demonstration sibling
 into five real packs under `internal/detect/packs/` — `web`, `js`,
@@ -2707,6 +2707,14 @@ them into the detect stage (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `N
 `AllStages()` stays at 12). The framework package itself remains
 rule-free — the compiler still enforces that a pack can use only what
 `internal/detect` exports.
+
+v2.1 Batch 1 adds the takeover pack — `takeover` (3 rules, inform recon per §0.1):
+`takeover.cname.unclaimed`, `takeover.cname.dangling`, `takeover.s3.bucket`
+— reusing host→CNAME depth-1 relationships (ARCHITECTURE.md:752) + endpoint
+shape without new asset kinds or SDK surface; `LoadTakeoverPack` /
+`NewDetectStageWithTakeoverPack` follow the same SDK path, and
+`NewDetectStageWithAllPacks` now loads 25 rules total (22→25) with
+`AllStages()` still 12 (packs are explicit opt-in, never auto-discovered).
 
 - **Web** (`internal/detect/packs/web`, commit 7d71aa8) — 5 rules:
   `web.csp.missing`, `web.hsts.missing`, `web.cors.wildcard`,
@@ -2749,17 +2757,31 @@ rule-free — the compiler still enforces that a pack can use only what
   param names, not retained corpora; Information/PriorityInfo, MethodDetection,
   `RequiredAssetTypes` endpoint-gated, stdlib-only, <100 lines per detector
   (`extractParamNames`); deterministic fixtures and `triage_report.golden`.
+- **Takeover** (`internal/detect/packs/takeover`, v2.1 Batch 1) — 3
+  informational recon rules: `takeover.cname.unclaimed` (dangling CNAME to
+  curated unclaimed provider suffix — github.io, herokuapp.com, amazonaws.com,
+  azurewebsites.net, cloudfront.net, etc — with no A/AAAA for the target at
+  depth 1), `takeover.cname.dangling` (generic dangling CNAME excluding
+  provider-matched hosts), `takeover.s3.bucket` (S3 bucket endpoint shape
+  via endpoint host `.s3.amazonaws.com`); per-host/per-endpoint, Category
+  Information, PriorityInfo, confidence 0.6, MethodDetection, RequiredAssetTypes
+  host/endpoint-gated, bounded at 256, stdlib-only, <100 lines per detector,
+  hermetic fixtures, and `takeover_report.golden`. FP/FN harness for triage
+  (`TestTriageFP*` with 500 benign endpoints + mapbox/dompurify/protobuf
+  hosts, rate <1%) lives in `triage_fp_test.go` beside the pack (chosen over
+  top-level fixtures/triage-fp for co-location/hermetic/golden-parity
+  reasons); no regression on existing triage golden byte-stability.
 
-Every pack ships the same hermetic test contract (13 tests each for web/js/apis/cloud; triage extends it with per-class emission, precedence, multi-param, cache parity, determinism golden `triage_report.golden`):
+Every pack ships the same hermetic test contract (13 tests each for web/js/apis/cloud; triage extends it with per-class emission, precedence, multi-param, cache parity, determinism golden `triage_report.golden`; takeover adds 3-rule contract with cname/s3 goldens):
 CheckAPIVersion gate, loads-through-SDK with deep-copy + Seal,
 metadata/deps/compat declarations, honest `RequiredAssetTypes` skips,
 context-honoring detectors, failure isolation (panic → failed rule, not
 crashed platform), cache cold/warm parity, determinism goldens
 (`internal/detect/packs/<family>/testdata/<family>_report.golden`), and
 sorted-key Config determinism; seam tests live in
-`internal/pipeline/adapt/detect_seam_test.go` (now expects 22). The deferred families —
+`internal/pipeline/adapt/detect_seam_test.go` (now expects 25, AllStages 12 unchanged). The deferred families —
 Authentication, Authorization, Business logic — need inter-rule data
-flow / graph traversal that SDK v1 does not carry; they wait for v2.1+
+flow / graph traversal that SDK v1 does not carry; they wait for v2.2+
 behind the stability policy's reopening criteria above.
 
 #### Executable documentation

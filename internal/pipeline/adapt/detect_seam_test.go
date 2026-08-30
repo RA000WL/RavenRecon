@@ -90,8 +90,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks: %v", err)
 	}
-	if reg.Len() != 22 {
-		t.Fatalf("registry len %d, want 22 (5 web + 3 js + 3 apis + 3 cloud + 8 triage)", reg.Len())
+	if reg.Len() != 25 {
+		t.Fatalf("registry len %d, want 25 (5 web + 3 js + 3 apis + 3 cloud + 8 triage + 3 takeover)", reg.Len())
 	}
 	if _, ok := reg.Get("web.csp.missing"); !ok {
 		t.Fatalf("web.csp.missing missing (web family not loaded)")
@@ -119,6 +119,12 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	}
 	if _, ok := reg.Get("cloud.firebase.indicator"); !ok {
 		t.Fatalf("cloud.firebase.indicator missing")
+	}
+	if _, ok := reg.Get("takeover.cname.unclaimed"); !ok {
+		t.Fatalf("takeover.cname.unclaimed missing (takeover family not loaded)")
+	}
+	if _, ok := reg.Get("takeover.s3.bucket"); !ok {
+		t.Fatalf("takeover.s3.bucket missing")
 	}
 	// Validate graph still passes after both packs.
 	if err := reg.Validate(); err != nil {
@@ -179,8 +185,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run with both packs: %v", err)
 	}
-	if res.ItemsProcessed < 22 {
-		t.Fatalf("ItemsProcessed %d, want 22 (all rules from all packs attempted)", res.ItemsProcessed)
+	if res.ItemsProcessed < 25 {
+		t.Fatalf("ItemsProcessed %d, want 25 (all rules from all packs attempted)", res.ItemsProcessed)
 	}
 	// Also verify nil-registry path still yields 22 and is sealed.
 	stage2, err := NewDetectStageWithAllPacks(nil)

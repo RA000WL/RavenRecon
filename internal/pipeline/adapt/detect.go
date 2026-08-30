@@ -10,6 +10,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/apis"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/cloud"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/js"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/takeover"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/triage"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/web"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
@@ -219,6 +220,31 @@ func LoadTriagePack(registry *detect.Registry) error {
 	return nil
 }
 
+// LoadTakeoverPack loads the takeover pack (v2.1 Batch 1) into registry
+// through the same SDK path as LoadWebPack/LoadJsPack/LoadApisPack/
+// LoadCloudPack/LoadTriagePack: ValidateRule → Register → Validate → Seal.
+// It is the wiring helper for callers that want explicit control over the
+// takeover pack. The registry is sealed before returning.
+func LoadTakeoverPack(registry *detect.Registry) error {
+	if registry == nil {
+		return fmt.Errorf("takeover pack: registry must not be nil")
+	}
+	rules, err := takeover.Rules()
+	if err != nil {
+		return fmt.Errorf("takeover pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return fmt.Errorf("takeover pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return err
+	}
+	registry.Seal()
+	return nil
+}
+
 // NewDetectStageWithJsPack returns a detect stage pre-loaded with the JS
 // pack (v2.0 Batch 3). It mirrors NewDetectStageWithPacks but for the JS
 // pack. If registry is nil a fresh registry is created. The registry is
@@ -319,22 +345,48 @@ func NewDetectStageWithTriagePack(registry *detect.Registry) (pipeline.Stage, er
 	return NewDetectStage(registry), nil
 }
 
+// NewDetectStageWithTakeoverPack returns a detect stage pre-loaded with the
+// takeover pack (v2.1 Batch 1). It mirrors NewDetectStageWithTriagePack but
+// for the takeover pack. If registry is nil a fresh registry is created. The
+// registry is sealed before returning. AllStages is unchanged — the pack is
+// explicit opt-in, never auto-discovered.
+func NewDetectStageWithTakeoverPack(registry *detect.Registry) (pipeline.Stage, error) {
+	if registry == nil {
+		registry = detect.NewRegistry()
+	}
+	rules, err := takeover.Rules()
+	if err != nil {
+		return nil, fmt.Errorf("takeover pack: %w", err)
+	}
+	for _, r := range rules {
+		if err := registry.Register(r); err != nil {
+			return nil, fmt.Errorf("takeover pack register %q: %w", r.ID, err)
+		}
+	}
+	if err := registry.Validate(); err != nil {
+		return nil, err
+	}
+	registry.Seal()
+	return NewDetectStage(registry), nil
+}
+
 // NewDetectStageWithAllPacks returns a detect stage pre-loaded with the web
 // pack (Batch 2), the JS pack (Batch 3), the APIs pack (Batch 4), the cloud
-// pack (Batch 5), and the triage pack (Batch 6). If
-// registry is nil a fresh registry is created; otherwise the provided
-// registry is reused. All packs are loaded via ValidateRule → Register →
-// Validate → Seal (startup confinement). AllStages is unchanged — packs are
-// explicit opt-in. The original NewDetectStageWithPacks (web-only),
+// pack (Batch 5), the triage pack (Batch 6), and the takeover pack (Batch
+// v2.1). If registry is nil a fresh registry is created; otherwise the
+// provided registry is reused. All packs are loaded via ValidateRule →
+// Register → Validate → Seal (startup confinement). AllStages is unchanged —
+// packs are explicit opt-in. The original NewDetectStageWithPacks (web-only),
 // NewDetectStageWithJsPack (js-only), NewDetectStageWithApisPack
-// (apis-only), NewDetectStageWithCloudPack (cloud-only), and
-// NewDetectStageWithTriagePack (triage-only) remain available for callers
+// (apis-only), NewDetectStageWithCloudPack (cloud-only),
+// NewDetectStageWithTriagePack (triage-only), and
+// NewDetectStageWithTakeoverPack (takeover-only) remain available for callers
 // that want a single pack.
 func NewDetectStageWithAllPacks(registry *detect.Registry) (pipeline.Stage, error) {
 	if registry == nil {
 		registry = detect.NewRegistry()
 	}
-	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules, triage.Rules} {
+	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules, triage.Rules, takeover.Rules} {
 		rules, err := load()
 		if err != nil {
 			return nil, err
