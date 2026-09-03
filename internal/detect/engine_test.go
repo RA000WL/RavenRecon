@@ -734,7 +734,8 @@ func TestRunTamperedCacheRecordRecomputed(t *testing.T) {
 		t.Fatalf("fingerprintSnapshot: %v", err)
 	}
 	rule, _ := reg.Get("a.x")
-	key, err := ruleKey(rule, fp, nil)
+	graphHash := fingerprintGraph(corpus.context.Relationships)
+	key, err := ruleKey(rule, fp, graphHash, nil)
 	if err != nil {
 		t.Fatalf("ruleKey: %v", err)
 	}

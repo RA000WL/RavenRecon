@@ -1,11 +1,11 @@
 // TestSDKAPISurfaceSnapshot pins the frozen Level-1 SDK surface of package
-// detect (the "SDK v1 (Core)" freeze of milestone v1.2.5; see api.go for
-// the three-layer versioning and the Level-1 stability policy). It
-// serializes the package's exported surface from its own Go source
-// (go/parser + go/ast over the non-test files, no compiled export data),
-// diffs it against testdata/api_v1.golden, and fails on ANY drift: added or
-// removed exported symbol, changed signature, changed struct fields/tags,
-// or changed constant value.
+// detect (the "SDK v2 (Core)" freeze of milestone v2.2 — APIMajor 1→2; see
+// api.go for the three-layer versioning, the Level-1 stability policy, and
+// the SDK v2 reopening note). It serializes the package's exported surface
+// from its own Go source (go/parser + go/ast over the non-test files, no
+// compiled export data), diffs it against testdata/api_v2.golden, and fails
+// on ANY drift: added or removed exported symbol, changed signature,
+// changed struct fields/tags, or changed constant value.
 //
 // The golden pins ONLY the exported Go contract: unexported struct fields
 // (a type's internals) and parameter/result names (and receiver names,
@@ -70,7 +70,9 @@ import (
 // with identical flag-name behavior.
 
 // goldenFile is the snapshot file, relative to this package's directory.
-const goldenFile = "testdata/api_v1.golden"
+// SDK v2: api_v1.golden → api_v2.golden in the same change as the
+// APIMajor 1→2 bump (4-step gate, see api.go).
+const goldenFile = "testdata/api_v2.golden"
 
 // excludedSurface names the package's Level-2/Level-3 surface: exported
 // symbols deliberately NOT part of the frozen Level-1 contract (see the
@@ -86,12 +88,13 @@ var excludedSurface = map[string]string{
 
 // surfaceGoldenHeader is the fixed, deterministic header of the golden file:
 // no timestamps, no absolute paths, no toolchain versions.
-const surfaceGoldenHeader = `# api_v1.golden — frozen Level-1 SDK surface of package detect ("SDK v1
-# Core", milestone v1.2.5; see api.go for the stability policy). Pinned by
-# TestSDKAPISurfaceSnapshot: any drift — added/removed exported symbol,
-# changed signature, changed struct fields/tags, changed constant value —
-# fails the test. Only the exported contract is pinned: unexported fields
-# and parameter/result names are never rendered. Regenerate ONLY with:
+const surfaceGoldenHeader = `# api_v2.golden — frozen Level-1 SDK surface of package detect ("SDK v2
+# Core", milestone v2.2; see api.go for the stability policy and the SDK v2
+# reopening note). Pinned by TestSDKAPISurfaceSnapshot: any drift —
+# added/removed exported symbol, changed signature, changed struct
+# fields/tags, changed constant value — fails the test. Only the exported
+# contract is pinned: unexported fields and parameter/result names are never
+# rendered. Regenerate ONLY with:
 #
 #   go test ./internal/detect/ -run TestSDKAPISurfaceSnapshot -update
 #

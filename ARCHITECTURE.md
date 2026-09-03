@@ -2366,7 +2366,7 @@ it.
 
 ### Dependency model
 
-Dependencies order execution; they do not (yet) flow data. Layered Kahn
+Dependencies order execution and (SDK v2) flow read-only data. Layered Kahn
 elimination computes deterministic dependency levels in O(V log V + E)
 (no quadratic scheduling): level 0 holds every dependency-free rule,
 level n+1 every rule whose dependencies all live in earlier levels, IDs
@@ -2374,8 +2374,13 @@ sorted within each level. Cycles and missing references are rejected
 (before every run, and by `Registry.Validate` at startup) with the
 smallest offending rule named. At execution, a rule runs only after every
 dependency COMPLETED; a failed, cancelled, or skipped dependency cascades
-an honest skipped result naming the dependency and its status. Extending
-the Context with prior-rule outputs is documented future work.
+an honest skipped result naming the dependency and its status.
+SDK v2 adds the ONLY read-only inter-rule dataflow:
+`Context.PriorFindings []asset.Finding` (findings from completed levels,
+deterministically sorted by finding identity) and `Context.GraphView
+GraphQuerier` (Neighbors/Path over Snapshot relationships+assets, map index
+built once per Run) — the 4-step gate that reopened APIMajor 1→2
+(see `internal/detect/api.go`).
 
 ### Detection context and execution
 
@@ -2390,12 +2395,16 @@ over-bound input is REJECTED, never silently truncated, because
 truncating input would silently change findings), deduplicates through
 the Phase 2 merge primitives, sorts by identity, and derives the observed
 identity set plus the per-kind census. The `Context` handed to detectors
-carries exactly: the seven corpus domains, the bounded configuration map
-(64 entries), a bounded Logger (256 retained entries, oversized messages
-truncated, excess counted), and the injected Clock — nothing else; the
-cancellation context is the detector's first argument. Rules operate only
-on these structured domains: no raw HTTP parsing, no JS parsing, no URL
-parsing (those phases are complete).
+carries exactly: the seven corpus domains, plus (SDK v2) `PriorFindings
+[]asset.Finding` (findings from completed levels, deterministically
+sorted) and `GraphView GraphQuerier` (Neighbors/Path over the snapshot
+graph) — the ONLY read-only inter-rule dataflow (dependencies order
+execution; PriorFindings/GraphView now flow data, see api.go), the bounded
+configuration map (64 entries), a bounded Logger (256 retained entries,
+oversized messages truncated, excess counted), and the injected Clock —
+nothing else; the cancellation context is the detector's first argument.
+Rules operate only on these structured domains: no raw HTTP parsing, no JS
+parsing, no URL parsing (those phases are complete).
 
 The engine builds ONE normalized Context per run and hands every rule its
 OWN copy: since the v2.0 prerequisite (`OPT-P1-2`, commit 7956f0d), each
@@ -2403,10 +2412,11 @@ per-rule job receives a clone produced by `cloneContextForRule`
 (`context.go`) — slices re-backed via `slices.Clone`, the Config map via
 `maps.Clone` — so a buggy or hostile rule that mutates its view can no
 longer leak mutations into sibling rules executing in parallel on the
-shared runtime pool (barrier test: `TestContextIsolation`). The contract
-still forbids mutation; the difference is that a violation is now
-contained per rule instead of being a cross-rule data race by
-definition.
+shared runtime pool (barrier test: `TestContextIsolation`). SDK v2 extends
+the clone to `PriorFindings` (slice header cloned) and `GraphView`
+(read-only handle shared immutably, not the index). The contract still
+forbids mutation; the difference is that a violation is now contained per
+rule instead of being a cross-rule data race by definition.
 
 One bounded `runtime.Pool` per run owns all scheduling (no new
 scheduler): exactly one job per rule, per-job deadline = the rule's own
@@ -2455,8 +2465,8 @@ any contract-violating finding, fails with a structured error.
 One `detect.rule` record per rule per run, cache-before-execute composed
 around pool jobs exactly like the other consumer stages (the runtime pool
 stays cache-independent). The key (`cache.NewKey`) carries: the
-operation; the detect `SchemaVersion` (`2` today — records written under
-version 1 are refused at decode and self-invalidate); the rule ID (the
+operation; the detect `SchemaVersion` (`3` today — records written under
+version 2 are refused at decode and self-invalidate); the rule ID (the
 target) plus the
 fingerprint of the rule's full declared metadata — version included; the
 documented contract is that a rule's Version is bumped whenever its
@@ -2512,11 +2522,13 @@ the same contract, deterministic min/max/mean/median duration summary.
 ### Known limitations
 
 - Library capability only: no `ravenrecon detect` CLI command.
-- The framework package `internal/detect` itself ships no rule definitions; the **distribution** ships 6 packs via frozen SDK — web (5), js (3), apis (3), cloud (3 informational-only per §0.1), triage (8), takeover (3 informational per §0.1) = 25 rules (v2.0 was 22; v2.1 Batch 1 adds takeover 3) — under `internal/detect/packs/<family>` strictly through the exported SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal` (see `Built-in packs (v2.0)` and `Takeover pack (v2.1)`); per-rule `Context` clones (`cloneContextForRule` 7956f0d) and per-render report `Model` clones (`cloneModel`) isolate pack rules from each other (see `Reporting framework: Report lifecycle` step 4).
-- Dependencies order execution but do not yet flow data between rules;
-  the Context's domains are the fixed pre-run corpus (documented future
-  work — the gate that defers the Auth/AuthZ/Business-logic pack
-  families to v2.2+/v2.3 via `GraphView`/`PriorFindings`).
+- The framework package `internal/detect` itself ships no rule definitions; the **distribution** ships 6 packs via frozen SDK — web (5), js (3), apis (3), cloud (3 informational-only per §0.1), triage (8), takeover (3 informational per §0.1) = 25 rules (v2.0 was 22; v2.1 Batch 1 adds takeover 3) — under `internal/detect/packs/<family>` strictly through the exported SDK `Rules()` → `CheckAPIVersion(2,0)` → `ValidateRule` → `Register` → `Seal` (see `Built-in packs (v2.0)` and `Takeover pack (v2.1)`); per-rule `Context` clones (`cloneContextForRule` 7956f0d) and per-render report `Model` clones (`cloneModel`) isolate pack rules from each other (see `Reporting framework: Report lifecycle` step 4).
+- Dependencies order execution; since the SDK v2 flow (APIMajor 1→2),
+  completed levels flow read-only data via `Context.PriorFindings
+  []asset.Finding` and `Context.GraphView GraphQuerier` (see `Dependency
+  model` and `internal/detect/api.go`). The remaining limit is that the
+  graph view is in-memory only — built once per Run over the snapshot's
+  relationships+assets with no persistent store backing it.
 - The detector closure is not fingerprintable; the version-bump contract
   (bump Version when logic changes) is the cache-coherence mechanism.
 - Streaming order across parallel rules is completion order; the REPORT
@@ -2529,11 +2541,16 @@ the same contract, deterministic min/max/mean/median duration summary.
 ### SDK contract
 
 Milestone v1.2.5 freezes the rule-author surface as "SDK v1 (Core)" at
-API level 1.0 (`APIMajor = 1`, `APIMinor = 0`). The freeze itself is
-documented in `internal/detect/api.go` (three-layer versioning and the
-Level-1 stability policy) and `internal/detect/doc.go`; this subsection
-is the pack-author guide: the lifecycle, the rule contract, the finding
-contract, the pack story, and the tests that are the executable
+API level 1.0 (`APIMajor = 1`, `APIMinor = 0`); milestone v2.2 reopens it
+as "SDK v2 (Core)" at API level 2.0 (`APIMajor = 2`, `APIMinor = 0`) via
+the 4-step gate (concrete failing need — authz.idor inexpressible on v1
+because dependencies order but do not flow data and Context has no
+PriorFindings/GraphView — plus proposal, maintainer approval, and golden
+regeneration in the same change; see `internal/detect/api.go`). The freeze
+itself is documented in `internal/detect/api.go` (three-layer versioning
+and the Level-1 stability policy) and `internal/detect/doc.go`; this
+subsection is the pack-author guide: the lifecycle, the rule contract, the
+finding contract, the pack story, and the tests that are the executable
 documentation. Every claim below is verifiable against the code it names.
 
 #### Lifecycle
@@ -2551,15 +2568,16 @@ Run(ctx, EngineConfig{Registry, ...}, Snapshot)
   v
 one bounded pool job per rule, dependency levels in order
   |   cache-before-execute per rule:            <- findings cached per
-  |     key = Operation "detect.rule"             (rule, snapshot, config):
-  |         + detect SchemaVersion (= 2)          SchemaVersion=2 enters the
+  |     key = Operation "detect.rule"             (rule, snapshot, config, graph):
+  |         + detect SchemaVersion (= 3)          SchemaVersion=3 enters the
   |         + fingerprintRule(rule)                key and the stored payload;
   |             (full declared metadata,          fingerprintRule covers the
   |              Description included)            full declared metadata;
   |         + rule Version                        a Version bump invalidates
   |         + snapshot fingerprint                the rule's cached results;
-  |         + every cfg:* config entry            only COMPLETED executions
-  |                                               are stored, never partial
+  |         + graph_digest (GraphView hash +       only COMPLETED executions
+  |            PriorFindings digest)              are stored, never partial
+  |         + every cfg:* config entry
   v
 Detector(ctx, Context) -> []asset.Finding
   |   validateFinding: canonical round-trip; denormalized RuleID/RuleName/
@@ -2676,7 +2694,7 @@ only what `internal/detect` exports, it proves by construction that a
 pack loads, validates, and runs without special-case code in the
 framework (the Go compiler enforces this; `TestPackUsesOnlyExportedSurface`
 carries it into the suite). The pack gates itself at load time: its
-`Rules()` entry point begins with `detect.CheckAPIVersion(1, 0)`
+`Rules()` entry point begins with `detect.CheckAPIVersion(2, 0)`
 (`requiredAPIMajor`/`requiredAPIMinor` constants), so an incompatible
 SDK level surfaces as a structured load-time error before any rule is
 registered. Its six rules exercise every Context domain, the dependency
@@ -2697,7 +2715,7 @@ The v2.0 milestone turned the pack story from one demonstration sibling
 into five real packs under `internal/detect/packs/` — `web`, `js`,
 `apis`, `cloud`, and `triage` (batch 6, e678eea) — each following the exact registration pattern the
 examples pack proved: its `Rules()` entry point begins with
-`detect.CheckAPIVersion(1, 0)`, rules go through
+`detect.CheckAPIVersion(2, 0)`, rules go through
 `ValidateRule` → `Registry.Register` (deep copy) → `Registry.Validate`
 (dependency graph) → `Registry.Seal()`, so loading is confined to
 startup and a late registration attempt fails. The pipeline seam
@@ -2898,8 +2916,7 @@ A Level-1 change requires all four steps, in order:
    documented reopening decision that bumps APIMajor — never a silent
    alteration of the contract."
 4. **Golden regeneration and version bump in the SAME change** —
-   regeneration of `testdata/api_v1.golden` and
-   `testdata/api_v1_report.golden` plus a `CheckAPIVersion` bump
+   regeneration of `testdata/api_v2.golden` plus a `CheckAPIVersion` bump
    (`APIMajor` for breaking changes, `APIMinor` for compatible
    additions) land in the same change as the surface edit, never in a
    follow-up.
@@ -3553,7 +3570,7 @@ Implemented:
   (since 7956f0d each rule receives its OWN Context copy via `cloneContextForRule` — `slices.Clone`/`maps.Clone` — so a buggy rule cannot leak mutations into sibling rules), a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
   (`internal/detect`; framework ships 5 packs via frozen SDK — web, js, apis, cloud, triage (5 packs, 22 rules) under `internal/detect/packs/<family>` and
-  enter only through the frozen SDK `Rules()` → `CheckAPIVersion(1,0)` → `ValidateRule` → `Register` → `Seal`; see "Built-in packs (v2.0)" above)
+  enter only through the frozen SDK `Rules()` → `CheckAPIVersion(2,0)` → `ValidateRule` → `Register` → `Seal`; see "Built-in packs (v2.0)" above)
 * event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
   event model and the concurrent, bounded, non-blocking bus — typed,
   validated, clock-stamped events with sealed payloads, per-subscriber

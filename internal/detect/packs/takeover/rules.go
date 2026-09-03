@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	requiredAPIMajor = 1
+	requiredAPIMajor = 2
 	requiredAPIMinor = 0
 
 	ruleCNAMEUnclaimed = "takeover.cname.unclaimed"

@@ -90,7 +90,6 @@ orchestrator; every agent may append or update its own entries.
 ### NEW-113 (HIGH) — v2.0 Triage pack batch 6 (internal/detect/packs/triage)
 - Status: VERIFIED — orchestrator-verified 2026-08-27 and archived to TODO.closed.md (8 rules via curated param lists; reviewer APPROVE; gates green). Full record in TODO.closed.md.
 
-
 ## Operational warnings (all agents)
 
 - **`go test ./...` is safe to run** — verified green with `-count=1` on this

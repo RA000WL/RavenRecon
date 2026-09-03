@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -23,7 +24,15 @@ import (
 // asset.JavaScript field (legacy hash, canonical host name, content type,
 // ETag, last-modified, discovery source, status code, final URL) and the
 // provenance source of evidence/endpoints and reference of secrets.
-const SchemaVersion = 2
+//
+// Version 3 (SDK v2): the snapshot fingerprint gains GraphDigest — the
+// stable hash of sorted Relationship.ID() (the read-only GraphView edge
+// set) — and ruleKey gains graph_digest — the hash of GraphDigest plus
+// the digest of PriorFindings (deterministically sorted finding
+// identities). Old detect.rule records with version 2 are decode-rejected
+// by construction (see decodeStoredFindings), and old keys are unreachable
+// via the schema part. See api.go SDK v2 reopening note.
+const SchemaVersion = 3
 
 // Operation is the stable cache operation name for rule results.
 const Operation = "detect.rule"
@@ -101,6 +110,12 @@ type fingerprintEndp struct {
 // fingerprint digests. All lists are sorted by identity (normalizeSnapshot
 // guarantees it), so the fingerprint is a deterministic function of the
 // input corpus.
+//
+// SDK v2 adds GraphDigest: the stable hash of the sorted
+// Relationship.ID() edge set (the read-only GraphView edge set). It is
+// included alongside Relationships for cache coherence — Relationships
+// already carries the edge IDs, but GraphDigest names the graph view's
+// hash explicitly so ruleKey can combine it with PriorFindings.
 type snapshotFingerprint struct {
 	Assets        []string              `json:"assets,omitempty"`
 	Relationships []string              `json:"relationships,omitempty"`
@@ -109,6 +124,7 @@ type snapshotFingerprint struct {
 	Secrets       []fingerprintSecret   `json:"secrets,omitempty"`
 	JavaScript    []fingerprintScript   `json:"javascript,omitempty"`
 	Endpoints     []fingerprintEndp     `json:"endpoints,omitempty"`
+	GraphDigest   string                `json:"graph_digest,omitempty"`
 }
 
 // fingerprintSnapshot digests the normalized corpus: every result-relevant
@@ -194,12 +210,68 @@ func fingerprintSnapshot(c *corpus) (string, error) {
 			Confidence: e.Prov.Confidence,
 		})
 	}
+	// SDK v2: graph_digest — stable hash of the sorted Relationship.ID()
+	// edge set (the read-only GraphView). Relationships are already
+	// ID-sorted and deduplicated, so the hash is deterministic.
+	fp.GraphDigest = fingerprintGraph(c.context.Relationships)
 	buf, err := json.Marshal(fp)
 	if err != nil {
 		return "", fmt.Errorf("detect: fingerprint snapshot: %w", err)
 	}
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// fingerprintGraph returns the stable hex SHA-256 of the sorted
+// Relationship.ID() edge set — the read-only GraphView hash. Relationships
+// are assumed ID-sorted and deduplicated (the corpus contract). The hash
+// is deterministic and hermetic: the same edge set always yields the same
+// hex, and the empty set hashes to SHA-256 of an empty JSON array.
+func fingerprintGraph(rels []asset.Relationship) string {
+	ids := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		ids = append(ids, rel.ID())
+	}
+	sort.Strings(ids)
+	buf, err := json.Marshal(ids)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
+}
+
+// fingerprintPriorFindings returns the stable hex SHA-256 of the deterministically
+// sorted PriorFindings identity set. Findings are sorted by Finding.Identity()
+// (the same order Report uses). Empty yields SHA-256 of an empty JSON array.
+func fingerprintPriorFindings(findings []asset.Finding) string {
+	ids := make([]string, 0, len(findings))
+	for _, f := range findings {
+		ids = append(ids, f.Identity().String())
+	}
+	sort.Strings(ids)
+	buf, err := json.Marshal(ids)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
+}
+
+// graphDigest combines the graph hash and the prior findings hash into the
+// single graph_digest value that enters ruleKey. When prior is empty the
+// graph hash alone is the digest; otherwise SHA-256 hex of
+// graphHash + "|" + priorHash. The combination is deterministic and
+// hermetic, and changes whenever either the edge set or the prior findings
+// set changes.
+func graphDigest(graphHash string, prior []asset.Finding) string {
+	if len(prior) == 0 {
+		return graphHash
+	}
+	priorHash := fingerprintPriorFindings(prior)
+	combined := graphHash + "|" + priorHash
+	sum := sha256.Sum256([]byte(combined))
+	return hex.EncodeToString(sum[:])
 }
 
 // ruleFingerprint is the canonical form of a rule's declared metadata. The
@@ -252,21 +324,32 @@ func fingerprintRule(r Rule) string {
 //
 //   - the operation constant "detect.rule" and the cache schema version
 //     (inside every cache key by construction);
-//   - the detect SchemaVersion;
+//   - the detect SchemaVersion (3 today — old 2 records are unreachable and
+//     decode-rejected);
 //   - the rule identity: the rule ID (the target) plus the fingerprint of
 //     the rule's full declared metadata, including its version — any edit
 //     that bumps the version invalidates the rule's cached results;
-//   - the fingerprint of the normalized snapshot (the rule's inputs);
+//   - the fingerprint of the normalized snapshot (the rule's inputs,
+//     including GraphDigest);
+//   - the graph_digest — the stable hash of the read-only GraphView edge
+//     set plus the digest of PriorFindings (deterministically sorted
+//     finding identities) visible to this rule's level. A rule whose prior
+//     findings change (because a dependency's findings changed) gets a
+//     different graph_digest and misses the cache, so cross-rule reasoning
+//     stays coherent. The part is unconditional — it always enters the key,
+//     even when empty — so two different digests (including empty vs
+//     non-empty) can never collapse to the same key (fail closed);
 //   - every run configuration entry (prefixed "cfg:") delivered to rules.
 //
 // Timings, concurrency, rate limits, and the pool's knobs never enter the
 // key.
-func ruleKey(r Rule, snapshotFP string, cfg map[string]string) (cache.Key, error) {
+func ruleKey(r Rule, snapshotFP string, graphDigest string, cfg map[string]string) (cache.Key, error) {
 	parts := map[string]string{
-		"schema":  strconv.Itoa(SchemaVersion),
-		"rule":    fingerprintRule(r),
-		"inputs":  snapshotFP,
-		"version": r.Version,
+		"schema":       strconv.Itoa(SchemaVersion),
+		"rule":         fingerprintRule(r),
+		"inputs":       snapshotFP,
+		"version":      r.Version,
+		"graph_digest": graphDigest,
 	}
 	for k, v := range cfg {
 		parts["cfg:"+k] = v

@@ -18,6 +18,35 @@
 // API (APIMajor, APIMinor). Any change that would break a pack compiled
 // against it must be a deliberate, documented reopening decision that bumps
 // APIMajor — never a silent alteration of the contract.
+//
+// SDK v2 reopening (APIMajor 1→2, SchemaVersion 2→3, 2026-08-30 — 4-step gate):
+//
+//  1. Concrete failing need — AuthZ/Business-logic families (e.g.
+//     authz.idor.insecure-direct-object) inexpressible on SDK v1:
+//     dependencies order execution but never flow data (detect.go:187-188,
+//     ARCHITECTURE.md:2369); a rule cannot see findings from its
+//     dependencies nor traverse the asset graph — the gate that blocked
+//     auth.jwt.none-alg and similar cross-rule reasoning since v0.2.
+//  2. Proposal — add Context.PriorFindings []asset.Finding (findings from
+//     completed levels only, deterministically sorted by finding identity)
+//     and Context.GraphView GraphQuerier (Neighbors(Identity)
+//     []Relationship; Path(Identity, Identity) []Identity) as read-only
+//     views over Snapshot.Relationships+Assets; engine level barrier
+//     collects findings, GraphView wraps snapshot relationships with a map
+//     index built once per Run; fingerprintSnapshot gains graph_digest and
+//     ruleKey gains graph_digest; SchemaVersion 2→3 invalidates old
+//     detect.rule records by construction.
+//  3. Maintainer approval — documented here as the deliberate reopening
+//     decision that bumps APIMajor (this file) — never a silent alteration.
+//  4. Golden regeneration in the SAME change — testdata/api_v1.golden →
+//     testdata/api_v2.golden via `go test -update` (same commit as this
+//     bump), plus CheckAPIVersion(2,0) gate; AllStages stays 12, AllPacks
+//     grows only when packs opt into SDK v2.
+//
+// Dependencies order execution; they do not flow data — now
+// PriorFindings/GraphView are the ONLY read-only inter-rule dataflow
+// (SDK v2). See Context.PriorFindings and Context.GraphView for the
+// contract.
 package detect
 
 import "fmt"
@@ -27,8 +56,12 @@ import "fmt"
 // Rule.Version (rule content): a pack compiled against this build's SDK
 // surface carries the API level it was built against and verifies it
 // through CheckAPIVersion before loading.
+//
+// SDK v2 is APIMajor 2, APIMinor 0 — the first breaking reopening since
+// the v1.2.5 freeze. Packs compiled against v1 (CheckAPIVersion(1,0))
+// must be recompiled against v2.
 const (
-	APIMajor = 1
+	APIMajor = 2
 	APIMinor = 0
 )
 

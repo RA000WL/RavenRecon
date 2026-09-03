@@ -463,14 +463,14 @@ func TestRuleKeyInputs(t *testing.T) {
 	}
 	rule := makeRule(t, "a.b", nil)
 
-	base, err := ruleKey(rule, fp, nil)
+	base, err := ruleKey(rule, fp, "", nil)
 	if err != nil {
 		t.Fatalf("ruleKey: %v", err)
 	}
 
 	// Different rule → different key.
 	other := makeRule(t, "c.d", nil)
-	k2, _ := ruleKey(other, fp, nil)
+	k2, _ := ruleKey(other, fp, "", nil)
 	if base == k2 {
 		t.Fatalf("different rules share a key")
 	}
@@ -478,13 +478,13 @@ func TestRuleKeyInputs(t *testing.T) {
 	// Different version → different key (the bump contract).
 	bumped := rule
 	bumped.Version = "1.0.1"
-	k3, _ := ruleKey(bumped, fp, nil)
+	k3, _ := ruleKey(bumped, fp, "", nil)
 	if base == k3 {
 		t.Fatalf("version bump must change the key")
 	}
 
 	// Different configuration → different key.
-	k4, _ := ruleKey(rule, fp, map[string]string{"threshold": "0.5"})
+	k4, _ := ruleKey(rule, fp, "", map[string]string{"threshold": "0.5"})
 	if base == k4 {
 		t.Fatalf("configuration must enter the key")
 	}
@@ -494,15 +494,27 @@ func TestRuleKeyInputs(t *testing.T) {
 	snap2.Technologies[0].Version = "1.25.3"
 	corpus2, _ := normalizeSnapshot(snap2)
 	fp2, _ := fingerprintSnapshot(corpus2)
-	k5, _ := ruleKey(rule, fp2, nil)
+	k5, _ := ruleKey(rule, fp2, "", nil)
 	if base == k5 {
 		t.Fatalf("snapshot change must change the key")
 	}
 
 	// Same input → same key (determinism).
-	k6, _ := ruleKey(rule, fp, nil)
+	k6, _ := ruleKey(rule, fp, "", nil)
 	if base != k6 {
 		t.Fatalf("key is not deterministic")
+	}
+
+	// Different graph_digest → different key (fail closed: the part is
+	// unconditional, so distinct digests — including empty vs non-empty —
+	// can never collapse to the same key).
+	kd1, _ := ruleKey(rule, fp, "deadbeef", nil)
+	kd2, _ := ruleKey(rule, fp, "feedface", nil)
+	if kd1 == kd2 {
+		t.Fatalf("different graph digests share a key")
+	}
+	if base == kd1 {
+		t.Fatalf("empty graph digest must not collide with a non-empty one")
 	}
 
 	// A changed technology Prov.Confidence is a changed rule input → a
@@ -520,7 +532,7 @@ func TestRuleKeyInputs(t *testing.T) {
 	if fp == fpConf {
 		t.Fatalf("technology provenance confidence must change the fingerprint")
 	}
-	kConf, _ := ruleKey(rule, fpConf, nil)
+	kConf, _ := ruleKey(rule, fpConf, "", nil)
 	if base == kConf {
 		t.Fatalf("technology provenance confidence must change the key")
 	}
@@ -541,7 +553,7 @@ func TestRuleKeyInputs(t *testing.T) {
 	if fp == fpRef {
 		t.Fatalf("provenance reference must change the fingerprint")
 	}
-	kRef, _ := ruleKey(rule, fpRef, nil)
+	kRef, _ := ruleKey(rule, fpRef, "", nil)
 	if base == kRef {
 		t.Fatalf("provenance reference must change the key")
 	}
@@ -556,7 +568,7 @@ func TestRuleKeyInputs(t *testing.T) {
 	if fp != fp3 {
 		t.Fatalf("provenance timestamps must not change the fingerprint")
 	}
-	k7, _ := ruleKey(rule, fp3, nil)
+	k7, _ := ruleKey(rule, fp3, "", nil)
 	if base != k7 {
 		t.Fatalf("provenance timestamps must not change the key")
 	}

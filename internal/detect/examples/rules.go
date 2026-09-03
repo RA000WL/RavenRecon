@@ -21,7 +21,7 @@ import (
 // recompiled, and a too-new required minor means this build predates the
 // pack. The check runs on every call, so a load always validates the level.
 const (
-	requiredAPIMajor = 1
+	requiredAPIMajor = 2
 	requiredAPIMinor = 0
 )
 

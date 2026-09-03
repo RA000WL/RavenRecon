@@ -676,7 +676,7 @@ Acceptance criteria:
 
 ## v2.2 — Graph & Inter-Rule Dataflow (SDK v2, breaking: APIMajor 1→2, SchemaVersion 2→3)
 
-Status: ⏳ Planned — not started; SDK reopening follows the 4-step gate below.
+Status: ⏳ In progress — Batch 1 (SDK reopening: APIMajor 1→2, PriorFindings+GraphView, SchemaVersion 2→3, api_v2.golden, auth probe) landed and verified; persistent store + `ravenrecon diff` pending. SDK reopening follows the 4-step gate below.
 
 Goal: enable cross-rule reasoning and historical comparison without breaking determinism or caching — the foundation Authorization and Business-logic packs need.
 

@@ -118,7 +118,7 @@ func fingerprintOf(t testing.TB, s Snapshot) string {
 
 func ruleKeyOf(t testing.TB, r Rule, fp string) cache.Key {
 	t.Helper()
-	key, err := ruleKey(r, fp, nil)
+	key, err := ruleKey(r, fp, "", nil)
 	if err != nil {
 		t.Fatalf("ruleKey: %v", err)
 	}

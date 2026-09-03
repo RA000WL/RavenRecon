@@ -139,8 +139,8 @@ func registerCloudPack(t testing.TB) *detect.Registry {
 }
 
 func TestCloudPackCheckAPIVersion(t *testing.T) {
-	if err := detect.CheckAPIVersion(1, 0); err != nil {
-		t.Fatalf("CheckAPIVersion(1,0): %v", err)
+	if err := detect.CheckAPIVersion(2, 0); err != nil {
+		t.Fatalf("CheckAPIVersion(2,0): %v", err)
 	}
 	rules, err := Rules()
 	if err != nil {

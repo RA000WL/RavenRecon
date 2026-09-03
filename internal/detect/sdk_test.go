@@ -447,16 +447,16 @@ func TestNewRegistryUnsealed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCheckAPIVersion(t *testing.T) {
-	if APIMajor != 1 || APIMinor != 0 {
-		t.Fatalf("frozen SDK API level is %d.%d, want 1.0", APIMajor, APIMinor)
+	if APIMajor != 2 || APIMinor != 0 {
+		t.Fatalf("frozen SDK API level is %d.%d, want 2.0", APIMajor, APIMinor)
 	}
 
 	// Same major, minor at or below this build's minor: compatible.
-	if err := CheckAPIVersion(1, 0); err != nil {
-		t.Fatalf("CheckAPIVersion(1,0): %v", err)
+	if err := CheckAPIVersion(2, 0); err != nil {
+		t.Fatalf("CheckAPIVersion(2,0): %v", err)
 	}
-	if err := CheckAPIVersion(1, -1); err != nil {
-		t.Fatalf("CheckAPIVersion(1,-1) must pass per the exact semantics: %v", err)
+	if err := CheckAPIVersion(2, -1); err != nil {
+		t.Fatalf("CheckAPIVersion(2,-1) must pass per the exact semantics: %v", err)
 	}
 
 	// Incompatible pairs: major mismatch or a too-new required minor.
@@ -465,11 +465,12 @@ func TestCheckAPIVersion(t *testing.T) {
 		maj  int
 		min  int
 	}{
-		{"future minor", 1, 1},
-		{"future major", 2, 0},
+		{"future minor", 2, 1},
+		{"old major", 1, 0},
+		{"future major", 3, 0},
 		{"zero major", 0, 0},
 		{"zero major future minor", 0, 99},
-		{"future major and minor", 2, 5},
+		{"future major and minor", 3, 5},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {

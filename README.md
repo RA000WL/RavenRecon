@@ -477,7 +477,11 @@ Detector, Registry, Context, the canonical Finding model, Snapshot, Run,
 and the run-contract surface. The freeze is enforced by an API-shape
 golden test (`surface_snapshot_test.go` against `testdata/api_v1.golden`)
 and nine behavior contracts; pack loaders gate on `CheckAPIVersion(1, 0)`
-before loading any rule.
+before loading any rule. Milestone v2.2 reopened the surface as "SDK v2
+(Graph)" (`APIMajor` 2 — `Context.PriorFindings` + read-only
+`Context.GraphView`, `SchemaVersion` 3 with `graph_digest` cache keys,
+`testdata/api_v2.golden`); pack loaders for the new surface gate on
+`CheckAPIVersion(2, 0)`.
 
 Detection packs: since v2.0 the module ships five built-in packs under
 `internal/detect/packs/` — `web` (5 rules: CSP missing, HSTS missing,
@@ -506,7 +510,10 @@ exported SDK (`Rules()` → `CheckAPIVersion(1, 0)` →
 `ValidateRule` → `Register` → `Validate` → `Seal`, registration confined
 to startup) via the pipeline seam in `internal/pipeline/adapt/detect.go`
 (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`
-loads all 22 built-in rules; `AllStages()` stays 12). Pack output is
+loads all 22 built-in rules; `AllStages()` stays 12). A minimal `auth`
+probe pack (`auth.jwt.none-alg`) demonstrates the SDK v2 dataflow
+(`PriorFindings`/`GraphView`) and is intentionally not wired into the
+pipeline (`AllPacks` unchanged). Pack output is
 canonical `asset.Finding` evidence, failures are isolated per rule, and
 every pack ships its own hermetic test suite with determinism goldens
 (`triage_report.golden`).

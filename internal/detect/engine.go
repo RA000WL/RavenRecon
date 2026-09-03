@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -248,8 +249,16 @@ type env struct {
 	metrics    *Metrics
 	emit       func(context.Context, asset.Finding) error
 	snapshotFP string
-	config     map[string]string
-	logger     *boundedLogger
+	graphHash  string
+	// graphDigest is the per-level cache key component — the stable hash
+	// of the read-only GraphView edge set plus the digest of PriorFindings
+	// visible to this level. It is written only between levels while no
+	// worker is active, and read concurrently within a level, so the
+	// level-barrier's happens-before (resolved channel) makes the access
+	// race-free.
+	graphDigest string
+	config      map[string]string
+	logger      *boundedLogger
 
 	errMu  sync.Mutex
 	diags  []error
@@ -438,18 +447,27 @@ func Run(ctx context.Context, cfg EngineConfig, snap Snapshot) (Report, error) {
 		dctx.Logger = logger
 	}
 	dctx.Clock = c.Clock
+	// SDK v2: build the read-only GraphView index once per Run and install
+	// it on the Context. PriorFindings starts empty for level 0; the level
+	// barrier collects completed findings into it.
+	gv := newGraphView(corpus.context.Assets, corpus.context.Relationships)
+	dctx.GraphView = gv
+	dctx.PriorFindings = nil
+	graphHash := fingerprintGraph(corpus.context.Relationships)
 
 	internal := &Metrics{}
 	e := &env{
-		dctx:       &dctx,
-		observed:   corpus.observed,
-		cache:      c.Cache,
-		clock:      c.Clock,
-		metrics:    internal,
-		emit:       c.Emit,
-		snapshotFP: snapshotFP,
-		config:     c.Config,
-		logger:     logger,
+		dctx:        &dctx,
+		observed:    corpus.observed,
+		cache:       c.Cache,
+		clock:       c.Clock,
+		metrics:     internal,
+		emit:        c.Emit,
+		snapshotFP:  snapshotFP,
+		graphHash:   graphHash,
+		graphDigest: graphHash,
+		config:      c.Config,
+		logger:      logger,
 	}
 
 	pool, err := runtime.NewPool(ctx, runtime.Config{
@@ -493,10 +511,28 @@ func Run(ctx context.Context, cfg EngineConfig, snap Snapshot) (Report, error) {
 	}
 	levels = pruneLevels(levels, ruleByID)
 
+	// SDK v2: inter-rule dataflow — PriorFindings and GraphView.
+	// PriorFindings is empty for level 0 and grows level by level as the
+	// barrier collects completed findings (deterministically sorted). The
+	// graphDigest for each level combines the stable GraphView hash with
+	// the digest of PriorFindings visible to that level, so a rule's cache
+	// key changes when its dependencies' findings change.
+	prior := []asset.Finding{}
 levelsLoop:
 	for _, level := range levels {
 		if ctx.Err() != nil {
 			break
+		}
+		// Install the read-only views for this level's rules. The clone
+		// in runDetector copies the slice header, so mutating the Context
+		// between levels is safe — workers already received their per-rule
+		// clones for the previous level and the barrier guarantees no
+		// concurrent read/write on PriorFindings/graphDigest.
+		e.dctx.PriorFindings = slices.Clone(prior)
+		if len(prior) == 0 {
+			e.graphDigest = e.graphHash
+		} else {
+			e.graphDigest = graphDigest(e.graphHash, prior)
 		}
 		resolved := make(chan struct{}, len(level))
 		submitted := 0
@@ -536,6 +572,11 @@ levelsLoop:
 				break levelsLoop
 			}
 		}
+		// Collect completed findings for the next level's PriorFindings.
+		// acc.snapshot returns deterministically sorted findings, so the
+		// PriorFindings view is deterministically sorted (pinned).
+		_, findings, _ := acc.snapshot()
+		prior = slices.Clone(findings)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout(c.Timeout))
@@ -663,13 +704,17 @@ func buildReport(acc *resultAccumulator, e *env, levels int) Report {
 // validates every finding against the framework's output contract, and
 // stores the completed record. A tampered or contradictory record is
 // evicted and recomputed in the same run, never served.
+//
+// SDK v2: the cache key includes graph_digest (GraphView hash plus the
+// digest of PriorFindings visible to this rule's level), so a rule whose
+// dependencies' findings changed misses the cache and recomputes.
 func processRule(ctx context.Context, r Rule, e *env) (RuleResult, []asset.Finding) {
 	if err := ctx.Err(); err != nil {
 		return RuleResult{RuleID: r.ID, RuleVersion: r.Version, Status: RuleStatusCancelled}, nil
 	}
 
 	if e.cache != nil {
-		key, err := ruleKey(r, e.snapshotFP, e.config)
+		key, err := ruleKey(r, e.snapshotFP, e.graphDigest, e.config)
 		if err != nil {
 			e.recordErr(fmt.Errorf("detect: cache key rule %q: %w", r.ID, err))
 		} else if served, hit := lookupFindings(ctx, key, r, e); hit {
@@ -797,6 +842,8 @@ var errPanicked = errors.New("detector panicked")
 // storeFindings persists one rule's completed, validated findings. When the
 // run context was already cancelled, the write runs under a fresh short
 // budget (a completed result deserves persistence even during teardown).
+//
+// SDK v2: the key includes graph_digest (see processRule).
 func storeFindings(ctx context.Context, r Rule, findings []asset.Finding, e *env) {
 	storeCtx := ctx
 	if ctx.Err() != nil {
@@ -809,7 +856,7 @@ func storeFindings(ctx context.Context, r Rule, findings []asset.Finding, e *env
 		e.recordErr(fmt.Errorf("detect: rule %q encode: %w", r.ID, err))
 		return
 	}
-	key, err := ruleKey(r, e.snapshotFP, e.config)
+	key, err := ruleKey(r, e.snapshotFP, e.graphDigest, e.config)
 	if err != nil {
 		e.recordErr(fmt.Errorf("detect: cache key rule %q: %w", r.ID, err))
 		return

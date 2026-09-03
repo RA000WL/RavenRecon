@@ -61,13 +61,41 @@ type Snapshot struct {
 	Endpoints []asset.Endpoint `json:"endpoints,omitempty"`
 }
 
+// GraphQuerier is the read-only graph view over the snapshot's asset
+// graph (SDK v2). It is the ONLY inter-rule dataflow beyond
+// PriorFindings: dependencies order execution, but now PriorFindings and
+// GraphView flow read-only data (see Context.PriorFindings and
+// Context.GraphView). The view is built once per Run from the normalized
+// Snapshot.Relationships+Assets, is deterministically sorted, and never
+// mutates — a rule cannot add or remove nodes/edges, only traverse the
+// observed graph the earlier phases produced. Hermetic and deterministic:
+// the same snapshot always yields the same Neighbors/Path results, and
+// traversal never performs I/O.
+type GraphQuerier interface {
+	// Neighbors returns every relationship incident to id (outgoing edges
+	// where From == id, deterministically sorted by Relationship.ID).
+	// An unknown identity yields nil (never an empty non-nil slice — the
+	// canonical empty-set representation).
+	Neighbors(id asset.Identity) []asset.Relationship
+	// Path returns the directed shortest path from → to as a list of
+	// identities (inclusive, from as first element, to as last), or nil
+	// when no directed path exists or either endpoint was never observed.
+	// The result is deterministically sorted: BFS explores adjacencies in
+	// Relationship.ID order, so the same graph always yields the same path.
+	Path(from, to asset.Identity) []asset.Identity
+}
+
 // Context is the detection context every rule receives: the normalized
 // snapshot domains, the run's bounded configuration, a bounded Logger, and
-// the injected Clock — nothing else. The cancellation context is passed
+// the injected Clock — plus (SDK v2) the read-only inter-rule views
+// PriorFindings and GraphView. The cancellation context is passed
 // separately (it is the detector's first argument). "Immutable" here was a
 // convention until OPT-P1-2: the engine now clones the Context per rule job
 // (cloneContextForRule) so a buggy or hostile rule that mutates its view
-// cannot affect peers running in parallel.
+// cannot affect peers running in parallel. Dependencies order execution;
+// they do not flow data — now PriorFindings/GraphView are the ONLY
+// read-only dataflow (SDK v2, see GraphQuerier and the api.go reopening
+// note).
 type Context struct {
 	// Assets is the deduplicated, identity-sorted core asset list.
 	Assets []asset.Identity `json:"assets"`
@@ -89,6 +117,26 @@ type Context struct {
 
 	// Endpoints is the identity-sorted, merged endpoints.
 	Endpoints []asset.Endpoint `json:"endpoints"`
+
+	// PriorFindings holds findings from completed dependency levels only,
+	// deterministically sorted by finding identity (asset.Finding.Identity).
+	// It is empty for level-0 rules and grows level by level as the
+	// engine's level barrier collects completed findings. See GraphQuerier
+	// for the companion view. A rule that declares dependencies can read
+	// the findings its dependencies produced through this view; a rule
+	// without dependencies sees an empty or nil slice. The slice is a
+	// per-rule clone — a rule mutating it cannot affect peers — and its
+	// contents obey the same observed-corpus contract as the snapshot
+	// domains (findings cite only observed assets).
+	PriorFindings []asset.Finding `json:"-"`
+
+	// GraphView is the read-only traversal view over
+	// Snapshot.Relationships+Assets (see GraphQuerier). Built once per Run
+	// with a map index and shared immutably across rules; a per-rule clone
+	// copies the handle, not the index. Never nil in a real Run — the
+	// engine always installs it; a hand-constructed Context outside the
+	// engine may carry nil (callers must nil-check).
+	GraphView GraphQuerier `json:"-"`
 
 	// Config is the run's bounded configuration map (typed strings only).
 	Config map[string]string `json:"config,omitempty"`
@@ -116,10 +164,21 @@ type Context struct {
 //     a rule mutating cp.Evidence[i].Value or appending to cp.Evidence
 //     cannot affect siblings or the engine's original corpus;
 //   - Logger and Clock are shared interfaces (they are documented
-//     concurrency-safe seams, not per-rule state).
+//     concurrency-safe seams, not per-rule state);
+//   - PriorFindings is the SDK v2 inter-rule view: the slice header is
+//     cloned via slices.Clone into a fresh backing array, and each
+//     element's Metadata map layer is deep-cloned via maps.Clone into a
+//     fresh map (maps.Clone is nil-safe: a nil Metadata stays nil). The
+//     Finding values' inner Evidence/RelatedAssets/Relationships slice
+//     elements remain shared read-only, like the other corpus domains —
+//     a rule mutating cp.PriorFindings[i].Metadata cannot affect peers,
+//     while the shared inner slices must only be read, never written;
+//   - GraphView is the SDK v2 graph handle: it is a read-only index built
+//     once per Run and shared immutably — the clone copies the interface
+//     handle, not the index.
 //
 // Unexported: per-job cloning is an internal isolation mechanism; the
-// exported Context type and its API remain frozen (SDK v1 golden).
+// exported Context type and its API remain frozen (SDK v2 golden).
 func cloneContextForRule(src *Context) *Context {
 	if src == nil {
 		return nil
@@ -132,8 +191,127 @@ func cloneContextForRule(src *Context) *Context {
 	cp.Secrets = slices.Clone(src.Secrets)
 	cp.JavaScript = slices.Clone(src.JavaScript)
 	cp.Endpoints = slices.Clone(src.Endpoints)
+	cp.PriorFindings = slices.Clone(src.PriorFindings)
+	for i := range cp.PriorFindings {
+		cp.PriorFindings[i].Metadata = maps.Clone(src.PriorFindings[i].Metadata)
+	}
+	cp.GraphView = src.GraphView
 	cp.Config = maps.Clone(src.Config)
 	return &cp
+}
+
+// graphView is the engine's one-per-Run read-only graph index backing
+// Context.GraphView. It is built once in Run from the normalized
+// Snapshot.Relationships+Assets, is deterministically sorted, and never
+// mutates after construction — a per-rule clone shares the handle.
+type graphView struct {
+	// adj maps From identity → outgoing relationships, each list sorted
+	// by Relationship.ID(). The map and its slices are immutable after
+	// newGraphView returns.
+	adj map[asset.Identity][]asset.Relationship
+	// nodes is the observed node set (Assets plus every relationship
+	// endpoint) for Path endpoint validation.
+	nodes map[asset.Identity]struct{}
+}
+
+var _ GraphQuerier = (*graphView)(nil)
+
+// newGraphView builds the read-only index over the normalized corpus.
+// Relationships are assumed ID-sorted and deduplicated (the corpus contract);
+// outgoing lists are resorted by ID for determinism even if the input was
+// already sorted.
+func newGraphView(assets []asset.Identity, rels []asset.Relationship) *graphView {
+	gv := &graphView{
+		adj:   make(map[asset.Identity][]asset.Relationship, len(rels)),
+		nodes: make(map[asset.Identity]struct{}, len(assets)+2*len(rels)),
+	}
+	for _, id := range assets {
+		gv.nodes[id] = struct{}{}
+	}
+	for _, rel := range rels {
+		gv.nodes[rel.From] = struct{}{}
+		gv.nodes[rel.To] = struct{}{}
+		gv.adj[rel.From] = append(gv.adj[rel.From], rel)
+	}
+	for from, list := range gv.adj {
+		sort.Slice(list, func(i, j int) bool { return list[i].ID() < list[j].ID() })
+		gv.adj[from] = list
+	}
+	return gv
+}
+
+// Neighbors implements GraphQuerier.
+func (g *graphView) Neighbors(id asset.Identity) []asset.Relationship {
+	if g == nil {
+		return nil
+	}
+	list, ok := g.adj[id]
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]asset.Relationship, len(list))
+	copy(out, list)
+	return out
+}
+
+// Path implements GraphQuerier via deterministic BFS over the directed
+// graph. Adjacencies are explored in Relationship.ID order, so the same
+// graph always yields the same shortest path for the same endpoints.
+// Returns nil when no directed path exists or either endpoint was never
+// observed. The returned slice is a fresh copy; the caller may mutate it.
+func (g *graphView) Path(from, to asset.Identity) []asset.Identity {
+	if g == nil || from.IsZero() || to.IsZero() {
+		return nil
+	}
+	if _, ok := g.nodes[from]; !ok {
+		return nil
+	}
+	if _, ok := g.nodes[to]; !ok {
+		return nil
+	}
+	if from == to {
+		return []asset.Identity{from}
+	}
+	// BFS.
+	queue := []asset.Identity{from}
+	visited := map[asset.Identity]bool{from: true}
+	parent := make(map[asset.Identity]asset.Identity)
+	found := false
+	for len(queue) > 0 && !found {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, rel := range g.adj[cur] {
+			nxt := rel.To
+			if visited[nxt] {
+				continue
+			}
+			visited[nxt] = true
+			parent[nxt] = cur
+			if nxt == to {
+				found = true
+				break
+			}
+			queue = append(queue, nxt)
+		}
+	}
+	if !found {
+		return nil
+	}
+	// Reconstruct reverse.
+	path := []asset.Identity{to}
+	for cur := to; cur != from; {
+		p, ok := parent[cur]
+		if !ok {
+			return nil
+		}
+		path = append(path, p)
+		cur = p
+	}
+	// Reverse.
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path
 }
 
 // LogLevel is the severity of one rule log entry.

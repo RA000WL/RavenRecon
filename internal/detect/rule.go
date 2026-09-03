@@ -182,9 +182,11 @@ type Rule struct {
 	Outputs []RuleOutput `json:"outputs"`
 
 	// Dependencies lists the IDs of rules that must complete before this
-	// rule executes. Dependencies order execution; they do not (yet) flow
-	// data: the Context's domains are the fixed pre-run corpus. Cycles are
-	// rejected at validation.
+	// rule executes. Dependencies order execution and (SDK v2) flow
+	// read-only data: the Context's PriorFindings carries findings from
+	// completed levels and GraphView exposes the snapshot graph. See
+	// Context.PriorFindings and Context.GraphView. Cycles are rejected at
+	// validation.
 	Dependencies []string `json:"dependencies,omitempty"`
 
 	// RequiredAssetTypes lists the asset kinds the rule needs in the
