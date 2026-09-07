@@ -208,25 +208,32 @@ func (s *KatanaSource) Crawl(ctx context.Context, domain asset.Domain, hosts []a
 		if kerr == nil {
 			out := cfg.Cache.Get(ctx, key)
 			if out.IsHit() && out.Record != nil && out.Record.Status == cache.StatusCompleted {
-				var sc storedCrawl
-				if jerr := json.Unmarshal(out.Record.Data, &sc); jerr == nil {
-					// Re-validate URLs through single normalization point before serving.
-					valid := true
-					for _, u := range sc.URLs {
-						if _, perr := asset.ParseURL(u.String(), asset.Provenance{}); perr != nil {
-							valid = false
-							break
-						}
-						if h, ok := urlHost(u); !ok || !asset.InDomain(h.Name, domain.Name) {
-							valid = false
-							break
-						}
-					}
-					if valid && sc.Domain == domain.Identity().String() {
-						return Result{URLs: sc.URLs, Diagnostics: sc.Diagnostics, Truncated: sc.Truncated}, nil
-					}
-					// Self-heal: delete corrupt record best-effort and fall through.
+				// Envelope check (mirrors httpprobe lookupProbe): a record
+				// found under this key with different operation or target
+				// fields could only be tampered with — delete and re-execute.
+				if out.Record.Operation != Operation || out.Record.Target != domain.Identity().String() {
 					_ = cfg.Cache.Delete(ctx, key)
+				} else {
+					var sc storedCrawl
+					if jerr := json.Unmarshal(out.Record.Data, &sc); jerr == nil {
+						// Re-validate URLs through single normalization point before serving.
+						valid := true
+						for _, u := range sc.URLs {
+							if _, perr := asset.ParseURL(u.String(), asset.Provenance{}); perr != nil {
+								valid = false
+								break
+							}
+							if h, ok := urlHost(u); !ok || !asset.InDomain(h.Name, domain.Name) {
+								valid = false
+								break
+							}
+						}
+						if valid && sc.Domain == domain.Identity().String() {
+							return Result{URLs: sc.URLs, Diagnostics: sc.Diagnostics, Truncated: sc.Truncated}, nil
+						}
+						// Self-heal: delete corrupt record best-effort and fall through.
+						_ = cfg.Cache.Delete(ctx, key)
+					}
 				}
 			}
 		}

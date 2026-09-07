@@ -411,7 +411,10 @@ Composition is the same combine math as the confidence engines:
 score = 1 − ∏(1 − w_g) over groups, where each group's weight is
 1 − ∏(1 − w_f) capped at 0.6 per indicator category and 0.5 for the
 confidence group; levels are gated (high needs score ≥ 0.8 and at least
-two independent indicator categories). Confidence is composed only from
+two independent indicator categories — or score ≥ 0.8 with one category
+backed by a recorded ≥ 0.9 secret/technology detection, the
+single-structural-high escape, so one leaked credential pages without a
+second category). Confidence is composed only from
 confidences the earlier phases actually recorded — never invented. Every
 indicator factor also carries a rendered reconnaissance recommendation
 (guidance language only), and the catalogs enforce compile-time template
@@ -562,8 +565,9 @@ findings merged by identity and sorted, counts, aggregate outcome in the
 house vocabulary (skips for disabled rules or absent required asset kinds
 are honest observations, never failures; a run whose retained findings
 were cut at the 4096-finding cap reports incomplete — truncated results
-are never completed). Identical runs are identical up to the findings
-cap; above it, the retained findings are the completion-order prefix.
+are never completed). Identical runs are identical including above the
+cap: retention keeps the deterministic top by finding rank (confidence,
+then category/priority/rule/subject), never completion order.
 
 Cache and metrics: one `detect.rule` record per rule per run,
 cache-before-execute composed around pool jobs exactly like the other
@@ -855,7 +859,8 @@ go run ./cmd/ravenrecon discover example.com --sources subfinder,amass
 ```
 
 `discover` options (after the domain): `--sources <a,b>` restricts the
-sources, `--no-cache` disables the cache for the run.
+sources, `--no-cache` disables the cache for the run, `--config <file>`
+overlays a JSON config file (flags > env > file > defaults).
 
 Run the full end-to-end pipeline:
 
@@ -869,21 +874,26 @@ writes the report into the output directory (default `ravenrecon-report`),
 and exits 0 on completed and partial runs and 1 on failed, cancelled, and
 incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources
 <a,b>` (discovery sources), `--request-timeout <d>`, `--concurrency <n>`,
-`--timeout <d>`, `--cache <dir>`, `--no-cache`, `--output <dir>`,
+`--stage-timeout <d>` (`--timeout` is its deprecated alias),
+`--cache <dir>`, `--no-cache`, `--output <dir>`, `--config <file>`,
 `--verbose` (one line per stage event on stderr), `--tui` (live
 observability frame on stderr — mutually exclusive with `--verbose`), and
-`--tui-compact` (condensed `--tui` frame; requires `--tui`). The default
-run carries no detection rules and no exploitation, credential attacks,
+`--tui-compact` (condensed `--tui` frame; requires `--tui`). Multi-target
+runs exit 0 when at least one target produced data (`--strict` exits 1
+unless every target did — use in CI); spellings that normalize to the
+same canonical target collapse to the first occurrence (no double scan).
+The default run carries no detection rules and no exploitation, credential attacks,
 or vulnerability verification exists (discovery is passive; crawling is
 same-site link exploration of already-discovered live hosts; DNS brute
 force exists solely behind the dns stage's opt-in `dnsx_brute`
 parameter, off by default). See `ravenrecon scan --help` for the full
 contract. Argument order differs between the two commands: `scan` takes
-the target BEFORE any flags (`ravenrecon scan <target> [options]` — a
-flag after the target is rejected as an unexpected argument), while
+the target BEFORE any flags (`ravenrecon scan <target> [options]` — flags
+come after the target; a flag before the target is rejected as an
+unexpected argument), while
 `ingest` takes flags FIRST (`ravenrecon ingest [options] <target>
 <paths>`); both orders are deliberate, but the asymmetry means options
-are not interchangeable between them.
+are not interchangeable between them. `diff` likewise takes flags first.
 
 Ingest external artifacts through the pipeline:
 
@@ -900,6 +910,63 @@ Options mirror `scan`: `--stages <a,b>` (downstream only — `discover` and
 `ingest` are rejected), `--cache <dir>`, `--no-cache`, `--output <dir>`,
 `--verbose`, `--tui`, `--tui-compact`. Flags must come before the target
 and paths.
+
+Compare two report exports:
+
+```bash
+go run ./cmd/ravenrecon diff old-report.json new-report.json
+go run ./cmd/ravenrecon diff --output deltas/ old.json new.json
+```
+
+`diff` answers "what changed" between two runs of the same target:
+per-dataset added/removed identities (domains, hosts, IPs, URLs,
+endpoints, parameters, technologies, secrets, findings, JavaScript,
+source maps, ports, services, TLS certificates) plus priority surface
+movements, written as `delta.json` (the complete record) and `delta.md`
+(human lists capped at 1000 entries per list with an explicit "+N more"
+marker) with a counts summary on stdout. Comparing runs of different
+targets or schema versions is rejected, never coerced; an empty delta
+exits 0 (nothing changed is a finding). Digests are recorded-as-input
+(carried from the exports, not recomputed). Options come before the two
+paths. Baseline retention is an explicit operator concern (keep prior
+report JSONs); no baseline store exists yet.
+
+Feed external scanners from a report:
+
+```bash
+go run ./cmd/ravenrecon handoff report.json
+go run ./cmd/ravenrecon handoff --output feed/ report.json
+```
+
+`handoff` writes `targets.txt` (observed root URLs, one per line — as
+recorded in the report, never re-verified, possibly stale) and
+`handoff.json` (targets plus per-host technology attribution plus
+per-finding severity ordering hints) for nuclei/httpx/katana. It restates
+the report — it never re-verifies reachability and never claims a finding
+is a vulnerability. Technology attribution is host-only
+(`host_to_technology` edges); URL/endpoint technology edges are out of
+scope by design. Options come before the report path.
+
+Configuration file and environment (all commands):
+
+```bash
+go run ./cmd/ravenrecon scan example.com --config ravenrecon.json
+RAVENRECON_CACHE_ENABLED=yes go run ./cmd/ravenrecon discover example.com
+```
+
+Effective configuration is CLI flags > environment (`RAVENRECON_*`) >
+JSON file (`--config`) > defaults. The file carries scalars, cache, and
+discovery tuning (durations are Go strings like `"30s"`; unknown keys
+fail closed; explicit nulls count as absent); the environment covers
+concurrency, timeout, rate, user-agent, cache, discovery sources,
+timeout, detect-timeout, and max-output-size (set-but-empty fails
+closed). Explicit flags always win (`--no-cache` beats everything);
+`scan` additionally folds non-default file/env concurrency, timeout, and
+rate into its per-stage bounds when the matching flag is unset
+(`user_agent` is display/reserved — shown by `doctor`, never wired into
+scan/discover traffic). `doctor` shows defaults overlaid with the
+environment (it takes no `--config` flag).
+
 
 Build:
 

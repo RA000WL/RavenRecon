@@ -35,6 +35,8 @@ type Document struct {
 // already appeared (first-seen wins, stable order — identical to the corpus
 // and results merges), then enforces the per-stage cap: after the merge the
 // channel holds at most cap entries, first-seen order kept, tail dropped.
+// Sentinel-per-file honesty is best-effort under that tail-cut; the
+// run-level documents_truncated flag stays authoritative.
 // Cut entries remain first-seen — the run-wide seen map is never pruned —
 // so they cannot re-enter the channel, even through a later stage with a
 // larger cap; a smaller later cap re-cuts (mirror mergeChannel exactly).

@@ -7,7 +7,27 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 )
+
+// confirmations indexes HTTP-confirmation evidence (MethodHTML +
+// "takeover_page:<provider>") by subject host identity string. Only
+// decided confirmations ever enter the channel — absence means
+// "unconfirmed", and rules treat it exactly as before (fail-open).
+func confirmations(evs []asset.Evidence) map[string]string {
+	out := make(map[string]string)
+	for _, ev := range evs {
+		provider, ok := httpprobe.ParseTakeoverEvidence(ev)
+		if !ok {
+			continue
+		}
+		src := ev.Source.String()
+		if _, dup := out[src]; !dup {
+			out[src] = provider
+		}
+	}
+	return out
+}
 
 func cnameUnclaimedDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) {
 	if err := ctx.Err(); err != nil {
@@ -18,6 +38,7 @@ func cnameUnclaimedDetector(ctx context.Context, dctx *detect.Context) ([]asset.
 	}
 	hostsIP := hostsWithIP(dctx)
 	// Collect candidate subjects: hosts with CNAME to unclaimed provider and no IP for target.
+	confirmed := confirmations(dctx.Evidence)
 	seen := make(map[asset.Identity]struct{})
 	var subjects []asset.Identity
 	metaFor := make(map[asset.Identity]map[string]string)
@@ -51,6 +72,10 @@ func cnameUnclaimedDetector(ctx context.Context, dctx *detect.Context) ([]asset.
 			"cname_target": tgtHost,
 			"provider":     provider,
 			"category":     "unclaimed_provider",
+		}
+		if confirmer, ok := confirmed[src.String()]; ok {
+			metaFor[src]["confirmed"] = "true"
+			metaFor[src]["confirmed_provider"] = confirmer
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
@@ -95,6 +120,7 @@ func cnameDanglingDetector(ctx context.Context, dctx *detect.Context) ([]asset.F
 		return nil, nil
 	}
 	hostsIP := hostsWithIP(dctx)
+	confirmed := confirmations(dctx.Evidence)
 	seen := make(map[asset.Identity]struct{})
 	var subjects []asset.Identity
 	metaFor := make(map[asset.Identity]map[string]string)
@@ -124,6 +150,10 @@ func cnameDanglingDetector(ctx context.Context, dctx *detect.Context) ([]asset.F
 			"signal":       "takeover_cname_dangling",
 			"cname_target": tgtHost,
 			"category":     "dangling_cname",
+		}
+		if confirmer, ok := confirmed[src.String()]; ok {
+			metaFor[src]["confirmed"] = "true"
+			metaFor[src]["confirmed_provider"] = confirmer
 		}
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })

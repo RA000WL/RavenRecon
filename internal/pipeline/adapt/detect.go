@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
@@ -407,6 +409,9 @@ func NewDetectStageWithAllPacks(registry *detect.Registry) (pipeline.Stage, erro
 // Name implements pipeline.Stage.
 func (s *detectStage) Name() pipeline.StageName { return pipeline.StageDetect }
 
+// Level implements pipeline.LeveledStage: detection needs scored surfaces.
+func (s *detectStage) Level() int { return 7 }
+
 // Run implements pipeline.Stage.
 //
 // Engine config is derived from StageInput only:
@@ -437,8 +442,12 @@ func (s *detectStage) Name() pipeline.StageName { return pipeline.StageDetect }
 // Phase 2 values the earlier stages produced (T3d): relationships,
 // evidence, technologies, secrets, JavaScript, and endpoints are copied
 // into the snapshot channels as-is — the engine's own normalization
-// deduplicates and sorts them. Findings are NOT inputs (the engine's own
-// output, never re-consumed); the remaining results channels
+// deduplicates and sorts them. Retained script bodies ride the document
+// channel (in.Documents, produced by the jsintel stage) into the
+// snapshot's JavaScriptContent channel (SDK v2.1, NEW-118): complete,
+// valid-UTF-8 bodies for snapshot scripts only, deterministically
+// trimmed to the SDK caller bounds. Findings are NOT inputs (the
+// engine's own output, never re-consumed); the remaining results channels
 // (IPs/ports/services/URLs/parameters/TLS certificates/source maps/
 // surfaces/groups/attack paths) have no snapshot counterpart. The adapter
 // never fabricates snapshot entries.
@@ -564,7 +573,192 @@ func (s *detectStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		JavaScript:    in.Results.JavaScript,
 		Endpoints:     in.Results.Endpoints,
 	}
-	return s.runDetect(ctx, in, reg, snap)
+	// Retained script bodies (SDK v2.1 content channel, NEW-118): the
+	// document channel's complete bodies for the snapshot's scripts. The
+	// trim is bounding, not silent: a cut head marks the result truncated
+	// with the flag below (the engine would have REJECTED the over-bound
+	// set outright — the adapter must not launder that loud rejection
+	// into a silent subset).
+	snapContents, contentsTruncated, contentsIncomplete := buildJSContents(in.Documents, snap.JavaScript)
+	snap.JavaScriptContent = snapContents
+	res, runErr := s.runDetect(ctx, in, reg, snap)
+	return withContentsFlag(res, runErr, contentsTruncated, contentsIncomplete)
+}
+
+// detectJSContentsTruncatedFlag marks a run whose snapshot content set
+// was cut at the SDK caller bounds (1024 entries / 64 MiB): only the
+// sorted head was analyzed.
+const detectJSContentsTruncatedFlag = "detect_js_contents_truncated"
+
+// detectJSContentsIncompleteFlag marks a run whose snapshot content set
+// is missing bodies for observed scripts: attributed documents skipped
+// upstream (truncated prefixes, nil contents, non-UTF-8 bodies, or
+// over-bound bodies dropped whole). It is distinct from
+// detectJSContentsTruncatedFlag (the SDK-bounds cut on the retained
+// head): filtering is not a cut, but rules treat missing bodies as "not
+// retained" (no finding), so the run must never claim coverage it lacks.
+const detectJSContentsIncompleteFlag = "detect_js_contents_incomplete_input"
+
+// withContentsFlag applies the content-trim honesty markers to every
+// outcome path: a cut or gapped input set is never silently completed,
+// even when the engine itself fails or is cancelled.
+func withContentsFlag(res pipeline.StageResult, err error, truncated, incomplete bool) (pipeline.StageResult, error) {
+	if truncated {
+		res.Truncated = true
+		if res.StickyFlags == nil {
+			res.StickyFlags = map[string]bool{}
+		}
+		res.StickyFlags[detectJSContentsTruncatedFlag] = true
+	}
+	if incomplete {
+		res.Truncated = true
+		if res.StickyFlags == nil {
+			res.StickyFlags = map[string]bool{}
+		}
+		res.StickyFlags[detectJSContentsIncompleteFlag] = true
+	}
+	return res, err
+}
+
+// buildJSContents maps the pipeline document channel onto the detection
+// snapshot's retained-body channel: documents sorted by canonical
+// identity; only complete (non-truncated, non-nil), valid-UTF-8,
+// within-per-body-bound bodies for scripts in the snapshot JavaScript
+// set enter. It returns the retained head, whether the SDK caller bounds
+// cut anything (the caller marks that cut, never silent), and whether
+// any attributed document was skipped upstream (truncated, nil,
+// non-UTF-8, or over-bound — the caller marks that gap with the
+// distinct incomplete-input flag, never silent). The deterministic
+// sorted head within the SDK caller bounds (MaxSnapshotJSContents
+// entries, MaxSnapshotJSContentBytes total) is kept.
+//
+// Chunk windows (NEW-129 Slice 3) map like file bodies: a chunk
+// document's identity hits the set directly when the snapshot carries
+// the chunk's script (the jsintel stage emits one chunk script per
+// window), and otherwise links via its FILE — parsed through
+// asset.ParseChunkIdentity, never split ad hoc — when the file script
+// is present (the runner's first-seen corpus merge keeps the file and
+// drops the chunk scripts sharing its Identity, so detect-stage
+// snapshots in production carry files only). Either way the content
+// entry cites the CHUNK identity with the window bytes: chunks are
+// ≤512 KiB, so they never trip the per-body bound (the over-bound
+// branch below stays as defense and stays dead for constructor-built
+// chunks, whose spans are capped at 1 MiB). The file sentinel (file
+// identity, truncated, nil) still marks the windowed file's gap.
+//
+// Displacement budget (accept-with-flag, not a silent cut): one fully
+// windowed file contributes ~5 chunk bodies of ~512 KiB ≈ 2.5 MiB
+// toward the 64 MiB total budget, so ~25 such files saturate bytes
+// (25×2.5 MiB = 62.5 MiB) and ~200 saturate the 1024-entry count
+// (1024/5 ≈ 204). Past either bound the sorted head is analyzed and
+// the cut rides Truncated plus detect_js_contents_truncated —
+// deterministic, never a silent subset.
+//
+// Skipped documents stay silent HERE — but their producers already
+// surface their own honesty signals (jsintel's js_fetch_truncated, the
+// channel's documents_truncated flag), and rules treat missing bodies as
+// "not retained" (no finding), so the detection outcome never claims
+// coverage it lacks.
+func buildJSContents(docs []pipeline.Document, scripts []asset.JavaScript) ([]detect.JavaScriptContent, bool, bool) {
+	jsSet := make(map[string]struct{}, len(scripts))
+	for _, js := range scripts {
+		jsSet[js.Identity().String()] = struct{}{}
+		if cid, ok := detect.ChunkIdentityOfScript(js); ok {
+			jsSet[cid.String()] = struct{}{}
+		}
+	}
+	type candidate struct {
+		key  string
+		id   asset.Identity
+		body string
+		// Chunk order key, parsed once (NEW-129 Slice 3 review F2):
+		// chunk documents sort by (file, window index) NUMERIC, file
+		// documents by their own identity with index -1 so a file
+		// sorts ahead of its windows. String order would misorder
+		// multi-digit windows ("10/.." before "2/..").
+		file  string
+		index int
+	}
+	var cands []candidate
+	incomplete := false
+	for _, d := range docs {
+		if d.Identity.Kind != asset.KindJavaScript {
+			continue
+		}
+		key := d.Identity.String()
+		if _, ok := jsSet[key]; !ok {
+			// Chunk documents link via their file when the snapshot
+			// carries no chunk script for them (see above): the file
+			// part parses through the single chunk parser and must be
+			// an observed script, or the document stays silent.
+			file, _, _, _, _, _, _, perr := asset.ParseChunkIdentity(d.Identity)
+			if perr != nil {
+				continue
+			}
+			fileKey := asset.Identity{Kind: asset.KindJavaScript, Value: file.String()}.String()
+			if _, ok := jsSet[fileKey]; !ok {
+				continue
+			}
+		}
+		if d.Truncated || d.Content == nil {
+			incomplete = true
+			continue
+		}
+		if !utf8.Valid(d.Content) {
+			incomplete = true
+			continue
+		}
+		// Over-bound bodies are dropped whole toward the incomplete-input
+		// honesty signal: the engine would REJECT an over-bound body
+		// outright (never truncate it into a prefix that could silently
+		// change findings), so the adapter must not launder one into the
+		// channel either.
+		if len(d.Content) > detect.MaxSnapshotJSContentBodyBytes {
+			incomplete = true
+			continue
+		}
+		c := candidate{key: key, id: d.Identity, body: string(d.Content), file: key, index: -1}
+		if file, index, _, _, _, _, _, err := asset.ParseChunkIdentity(d.Identity); err == nil {
+			c.file, c.index = asset.Identity{Kind: asset.KindJavaScript, Value: file.String()}.String(), index
+		}
+		cands = append(cands, c)
+	}
+	// Stable sort with a body tie-break: duplicate documents for one
+	// script identity always resolve to the same (smallest) body
+	// regardless of channel order.
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].file != cands[j].file {
+			return cands[i].file < cands[j].file
+		}
+		if cands[i].index != cands[j].index {
+			return cands[i].index < cands[j].index
+		}
+		if cands[i].key != cands[j].key {
+			return cands[i].key < cands[j].key
+		}
+		return cands[i].body < cands[j].body
+	})
+	var out []detect.JavaScriptContent
+	seen := make(map[string]struct{}, len(cands))
+	total := 0
+	truncated := false
+	for _, c := range cands {
+		if _, dup := seen[c.key]; dup {
+			continue
+		}
+		if len(out) >= detect.MaxSnapshotJSContents {
+			truncated = true
+			break
+		}
+		if total+len(c.body) > detect.MaxSnapshotJSContentBytes {
+			truncated = true
+			break
+		}
+		seen[c.key] = struct{}{}
+		total += len(c.body)
+		out = append(out, detect.JavaScriptContent{Identity: c.id, Body: c.body})
+	}
+	return out, truncated, incomplete
 }
 
 // resultsSnapshotEmpty reports whether every results channel that feeds the
@@ -606,6 +800,9 @@ func (s *detectStage) runDetect(ctx context.Context, in pipeline.StageInput, reg
 		// clock; the engine tolerates nil either way.
 		Clock: in.Clock,
 		Cache: in.Cache,
+		// Observer forwards the run's shared instrumentation sink into the
+		// engine's worker pool (nil = off, zero behavior change).
+		Observer: in.Observer,
 	}
 
 	rep, engineErr := detect.Run(ctx, cfg, snap)

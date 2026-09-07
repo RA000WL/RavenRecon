@@ -6,6 +6,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/importer"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
@@ -101,6 +102,13 @@ type StageInput struct {
 	// Cache is the caller-owned cache; nil means caching is disabled for
 	// the run and stages must treat it as a no-op.
 	Cache cache.Cache
+
+	// Observer is the run's shared instrumentation sink (nil = off, zero
+	// behavior change). Stages forward it to engine configs and worker
+	// pools so task/cache/progress events reach the run's observer (the
+	// live TUI frame); engines must never fabricate events, only forward
+	// the sink. A stage invoked outside the runner leaves it nil.
+	Observer event.Observer
 
 	// OutputDir is the configured output directory (report stage).
 	OutputDir string

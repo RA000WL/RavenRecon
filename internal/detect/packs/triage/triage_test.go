@@ -12,6 +12,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/detect"
 	"github.com/RA000WL/RavenRecon/internal/golden"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 )
 
 // fixedClock pins Now to a constant for deterministic reports.
@@ -734,5 +735,249 @@ func TestTriagePackBoundedAt256(t *testing.T) {
 	}
 	if !foundTrunc {
 		t.Fatalf("no truncated metadata found for bounded test")
+	}
+}
+
+// mustReflectEvidence builds one urllive canary-reflection evidence record
+// for tests: verdict for param on the endpoint's URL identity.
+func mustReflectEvidence(t testing.TB, ep asset.Endpoint, param string, v httpprobe.ReflectVerdict) asset.Evidence {
+	t.Helper()
+	ev, err := httpprobe.ReflectEvidence(ep.URL.Identity(), param, v)
+	if err != nil {
+		t.Fatalf("ReflectEvidence: %v", err)
+	}
+	return ev
+}
+
+// mustReflectPostEvidence builds one POST canary-reflection evidence record
+// for tests: verdict for param on the endpoint's URL identity under scope.
+func mustReflectPostEvidence(t testing.TB, ep asset.Endpoint, param string, v httpprobe.ReflectVerdict, scope httpprobe.ReflectScope) asset.Evidence {
+	t.Helper()
+	ev, err := httpprobe.ReflectPostEvidence(ep.URL.Identity(), param, v, scope)
+	if err != nil {
+		t.Fatalf("ReflectPostEvidence: %v", err)
+	}
+	return ev
+}
+
+func triageFindingsForRule(t testing.TB, snap detect.Snapshot, ruleID string) []asset.Finding {
+	t.Helper()
+	reg := registerTriagePack(t)
+	cfg := detect.DefaultEngineConfig(reg)
+	cfg.Clock = testClock
+	rep, err := detect.Run(context.Background(), cfg, snap)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var out []asset.Finding
+	for _, f := range rep.Findings {
+		if f.RuleID == ruleID {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// TestTriageReflectionDropsSilentKeepsMissing pins the NEW-120 gate: a
+// subject whose every flagged param verdicts not-reflected is dropped,
+// while a subject with no reflection evidence is kept (fail-open —
+// behavior without enrichment is unchanged).
+func TestTriageReflectionDropsSilentKeepsMissing(t *testing.T) {
+	silent := mustEndpoint(t, "GET", "https://www.example.com/silent?id=1")
+	missing := mustEndpoint(t, "GET", "https://www.example.com/missing?id=1")
+	snap := detect.Snapshot{
+		Endpoints: []asset.Endpoint{silent, missing},
+		Evidence:  []asset.Evidence{mustReflectEvidence(t, silent, "id", httpprobe.ReflectAbsent)},
+	}
+	got := triageFindingsForRule(t, snap, ruleIDOR)
+	if len(got) != 1 {
+		t.Fatalf("idor findings = %d, want 1 (silent dropped, missing kept)", len(got))
+	}
+	if got[0].Subject != missing.Identity() {
+		t.Fatalf("kept subject = %s, want the missing-evidence endpoint %s", got[0].Subject, missing.Identity())
+	}
+	if _, ok := got[0].Metadata["reflection"]; ok {
+		t.Errorf("kept finding carries reflection meta %q without verdicts", got[0].Metadata["reflection"])
+	}
+	// NEW-127: no verdicts, no scope marker (nothing to scope).
+	if _, ok := got[0].Metadata["reflection_scope"]; ok {
+		t.Errorf("kept finding carries reflection_scope without verdicts: %v", got[0].Metadata)
+	}
+}
+
+// TestTriageReflectionKeepsReflected pins the keep path: a reflected
+// flagged param keeps the subject and cites its verdicts in meta. (Both
+// q and year are XSS-primary under precedence; page would belong to the
+// SSRF rule, so it is not cited here.)
+func TestTriageReflectionKeepsReflected(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term&year=2024")
+	snap := detect.Snapshot{
+		Endpoints: []asset.Endpoint{ep},
+		Evidence: []asset.Evidence{
+			mustReflectEvidence(t, ep, "q", httpprobe.ReflectUnencoded),
+			mustReflectEvidence(t, ep, "year", httpprobe.ReflectAbsent),
+		},
+	}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1 (reflected q keeps despite silent year)", len(got))
+	}
+	meta := got[0].Metadata["reflection"]
+	if !strings.Contains(meta, "q:reflected-unencoded") || !strings.Contains(meta, "year:not-reflected") {
+		t.Errorf("reflection meta = %q, want both verdicts cited", meta)
+	}
+	// NEW-127: cited verdicts carry their scope — GET query params
+	// only; POST/body/header input was not tested.
+	if got[0].Metadata["reflection_scope"] != "query-get-only" {
+		t.Errorf("reflection_scope = %q, want query-get-only", got[0].Metadata["reflection_scope"])
+	}
+}
+
+// TestTriageReflectionForeignEvidenceIgnored pins no cross-talk: evidence
+// with a foreign method or indicator never gates and never leaks into meta.
+func TestTriageReflectionForeignEvidenceIgnored(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term")
+	foreign, err := asset.NewEvidence(asset.MethodJS, "reflect:q", string(httpprobe.ReflectAbsent), ep.URL.Identity(), asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	snap := detect.Snapshot{Endpoints: []asset.Endpoint{ep}, Evidence: []asset.Evidence{foreign}}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1 (foreign evidence must not drop)", len(got))
+	}
+	if _, ok := got[0].Metadata["reflection"]; ok {
+		t.Errorf("reflection meta present from foreign evidence: %q", got[0].Metadata["reflection"])
+	}
+}
+
+// TestTriageReflectionMetaBounded pins the metadata bound: many flagged
+// reflected params still build a valid finding with a ≤256-byte value.
+func TestTriageReflectionMetaBounded(t *testing.T) {
+	var q strings.Builder
+	for i, p := range xssParams {
+		if i > 0 {
+			q.WriteByte('&')
+		}
+		q.WriteString(p + "=1")
+	}
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?"+q.String())
+	var evs []asset.Evidence
+	for _, p := range extractParamNames(ep) {
+		evs = append(evs, mustReflectEvidence(t, ep, p, httpprobe.ReflectUnencoded))
+	}
+	snap := detect.Snapshot{Endpoints: []asset.Endpoint{ep}, Evidence: evs}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1", len(got))
+	}
+	if len(got[0].Metadata["reflection"]) > 256 {
+		t.Fatalf("reflection meta = %d bytes, want ≤256 (finding would fail validation)", len(got[0].Metadata["reflection"]))
+	}
+}
+
+// TestTriagePostReflectedRescuesGetSilent pins the POST-aware gate: a
+// GET-silent subject with a POST reflected verdict for the same source is
+// kept, cited under the distinct reflection_post key with its scope, while
+// the GET citation and its scope marker survive un-conflated.
+func TestTriagePostReflectedRescuesGetSilent(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term")
+	snap := detect.Snapshot{
+		Endpoints: []asset.Endpoint{ep},
+		Evidence: []asset.Evidence{
+			mustReflectEvidence(t, ep, "q", httpprobe.ReflectAbsent),
+			mustReflectPostEvidence(t, ep, "q", httpprobe.ReflectUnencoded, httpprobe.ReflectScopePostForm),
+		},
+	}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1 (POST reflected rescues GET-silent)", len(got))
+	}
+	if rm := got[0].Metadata["reflection"]; !strings.Contains(rm, "q:not-reflected") {
+		t.Errorf("reflection meta = %q, want the GET verdict cited separately", rm)
+	}
+	if rpm := got[0].Metadata["reflection_post"]; !strings.Contains(rpm, "q:reflected-unencoded") {
+		t.Errorf("reflection_post meta = %q, want the POST verdict under its distinct key", rpm)
+	}
+	if got[0].Metadata["reflection_scope"] != "query-get-only" {
+		t.Errorf("reflection_scope = %q, want query-get-only (GET scope survives the POST rescue)", got[0].Metadata["reflection_scope"])
+	}
+	if got[0].Metadata["reflection_post_scope"] != "post-form" {
+		t.Errorf("reflection_post_scope = %q, want post-form", got[0].Metadata["reflection_post_scope"])
+	}
+	if strings.Contains(got[0].Metadata["reflection"], "reflected-unencoded") {
+		t.Errorf("GET reflection meta conflates POST: %q", got[0].Metadata["reflection"])
+	}
+}
+
+func TestTriageReflectionBackedConfidence(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term")
+	backed := detect.Snapshot{
+		Endpoints: []asset.Endpoint{ep},
+		Evidence:  []asset.Evidence{mustReflectEvidence(t, ep, "q", httpprobe.ReflectUnencoded)},
+	}
+	got := triageFindingsForRule(t, backed, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1", len(got))
+	}
+	if got[0].Confidence != 0.8 {
+		t.Errorf("backed confidence = %v, want 0.8 (probe saw the input return)", got[0].Confidence)
+	}
+	if got[0].Metadata["reflection_backed"] != "true" {
+		t.Errorf("reflection_backed marker missing: %q", got[0].Metadata)
+	}
+	plain := detect.Snapshot{Endpoints: []asset.Endpoint{ep}}
+	got = triageFindingsForRule(t, plain, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1 (fail-open without enrichment)", len(got))
+	}
+	if got[0].Confidence != 0.6 {
+		t.Errorf("unenriched confidence = %v, want 0.6 (name-only heuristic)", got[0].Confidence)
+	}
+	if _, ok := got[0].Metadata["reflection_backed"]; ok {
+		t.Errorf("reflection_backed marker on unenriched finding: %q", got[0].Metadata)
+	}
+}
+
+// TestTriagePostSilentStillDrops pins that POST silence rescues nothing: a
+// GET-silent subject with POST-silent evidence is still dropped.
+func TestTriagePostSilentStillDrops(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term")
+	snap := detect.Snapshot{
+		Endpoints: []asset.Endpoint{ep},
+		Evidence: []asset.Evidence{
+			mustReflectEvidence(t, ep, "q", httpprobe.ReflectAbsent),
+			mustReflectPostEvidence(t, ep, "q", httpprobe.ReflectAbsent, httpprobe.ReflectScopePostForm),
+		},
+	}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 0 {
+		t.Fatalf("xss findings = %d, want 0 (GET-silent + POST-silent still drops)", len(got))
+	}
+}
+
+// TestTriagePostUnknownFailOpen pins that unknown carries no gate weight:
+// an endpoint with only unknown POST evidence (hand-crafted — builders
+// never emit it) is kept fail-open with no POST citation, exactly as an
+// endpoint with no evidence at all.
+func TestTriagePostUnknownFailOpen(t *testing.T) {
+	ep := mustEndpoint(t, "GET", "https://www.example.com/search?q=term")
+	unk, err := asset.NewEvidence(asset.MethodEndpoint, "reflect-post-form:q", string(httpprobe.ReflectUnknown), ep.URL.Identity(), asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEvidence unknown: %v", err)
+	}
+	snap := detect.Snapshot{Endpoints: []asset.Endpoint{ep}, Evidence: []asset.Evidence{unk}}
+	got := triageFindingsForRule(t, snap, ruleXSSReflected)
+	if len(got) != 1 {
+		t.Fatalf("xss findings = %d, want 1 (unknown is not silence — fail-open kept)", len(got))
+	}
+	if _, ok := got[0].Metadata["reflection_post"]; ok {
+		t.Errorf("kept finding cites reflection_post %q from unknown (unknown carries no citation)", got[0].Metadata["reflection_post"])
+	}
+	// All-unknown (no decided evidence at all) is kept today and stays kept.
+	bare := detect.Snapshot{Endpoints: []asset.Endpoint{ep}}
+	gotBare := triageFindingsForRule(t, bare, ruleXSSReflected)
+	if len(gotBare) != 1 {
+		t.Fatalf("bare xss findings = %d, want 1 (no evidence is fail-open kept)", len(gotBare))
 	}
 }

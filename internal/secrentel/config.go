@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
@@ -46,6 +47,13 @@ type Config struct {
 	Emit func(context.Context, DocumentRef, ReportEntry) error
 	// Metrics, when non-nil, accumulates the run's work counters.
 	Metrics *Metrics
+	// Observer is the optional pool instrumentation sink (an
+	// internal/event Observer; the Bus satisfies it). When non-nil, the
+	// worker pool emits canonical pool-boundary events (scan start/stop,
+	// worker start/stop, task submitted/started/running/terminal,
+	// progress, shutdown). Nil (the default) is the off switch: zero
+	// behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns the documented default Ingest configuration.

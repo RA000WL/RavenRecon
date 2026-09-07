@@ -269,12 +269,21 @@ func decodeStoredScan(rec cache.Record, sd scannedDocument, limits scanLimits) (
 		// can never exceed the cap the contract derives from the stored
 		// candidate's own type, family, FP flags, and factor count (the
 		// pair factor counts as a supporting factor — it is in the stored
-		// list). A higher score means a tampered record or an engine bug;
-		// reject it, never silently re-clamp. The tolerance only absorbs
-		// float round-trip noise: an engine-capped score lands exactly on
-		// the cap constant after round4 + JSON round-trip.
+		// list), plus the marker-driven expired-JWT companion cap. A higher
+		// score means a tampered record or an engine bug; reject it, never
+		// silently re-clamp. The tolerance only absorbs float round-trip
+		// noise: an engine-capped score lands exactly on the cap constant
+		// after round4 + JSON round-trip.
+		//
+		// The expired-JWT cap is enforced from the jwt_expired marker
+		// alone — deliberately never re-derived from the stored value:
+		// expiry is clock-dependent (a token valid at scan time may expire
+		// before its cached record is re-decoded), so requiring or
+		// re-checking the marker against the value would reject legitimate
+		// records. A tampered score above the marker's cap still fails
+		// here, and the recomposition check below pins the exact score.
 		nonPattern := countNonPattern(ss.Factors)
-		expCap := expectedCapFor(ss.Candidate.Type, string(ss.Family), ss.FPFlags, nonPattern)
+		expCap := math.Min(expectedCapFor(ss.Candidate.Type, string(ss.Family), ss.FPFlags, nonPattern), expiredCapFor(ss.Factors))
 		if ss.Score > expCap+capTolerance {
 			return nil, fmt.Errorf("secret %d (%s) score %.3f exceeds the derived cap %.3f for its type/family/flags",
 				i, redactedCandidateID(ss.Candidate), ss.Score, expCap)
@@ -314,16 +323,18 @@ func decodeStoredScan(rec cache.Record, sd scannedDocument, limits scanLimits) (
 		}
 		// Score-composition re-validation: every engine-produced score is
 		// round4(recomputeCapped(storedFactors, …)) — deriveConfidence
-		// stores exactly round4(min(combine, expectedCapFor)) and
-		// applyPairFactor stores round4(recomputeCapped(...)) with the
-		// identical factor list, and recomputeCapped is pure (the same
-		// expectedCapFor/countNonPattern/combineFactors every confidence
-		// path shares). A factor list whose recomposed score diverges from
-		// the stored score (e.g. an invented "pair" factor with a valid
-		// weight) contradicts the record it rides on; reject it. The
-		// weight-0 url_type_cap marker multiplies as ×1 and is excluded
-		// from the factor count, so the marker-presence checks above remain
-		// necessary for the marker's honesty.
+		// stores exactly round4(min(combine, expectedCapFor,
+		// expiredCapFor)) and applyPairFactor stores
+		// round4(recomputeCapped(...)) with the identical factor list, and
+		// recomputeCapped is pure (the same expectedCapFor/expiredCapFor/
+		// countNonPattern/combineFactors every confidence path shares). A
+		// factor list whose recomposed score diverges from the stored score
+		// (e.g. an invented "pair" factor with a valid weight) contradicts
+		// the record it rides on; reject it. The weight-0 url_type_cap and
+		// jwt_expired markers multiply as ×1 and are excluded from the
+		// factor count, so the marker-presence checks above remain
+		// necessary for the url_type_cap marker's honesty (the jwt_expired
+		// marker is clock-dependent and stays presence-unchecked by design).
 		recomposed := round4(recomputeCapped(ss.Factors, ss.Candidate.Type, string(ss.Family), ss.FPFlags))
 		if math.Abs(ss.Score-recomposed) > capTolerance {
 			return nil, fmt.Errorf("secret %d (%s) score %.3f does not match the recomposed score %.3f from its factors",

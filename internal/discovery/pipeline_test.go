@@ -3,12 +3,13 @@ package discovery
 import (
 	"context"
 	"errors"
+	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/RA000WL/RavenRecon/internal/asset"
 )
 
 func fullScript() map[string]func(Cmd) (RunResult, error) {
@@ -76,6 +77,60 @@ func TestRunAllSources(t *testing.T) {
 	}
 	if r.discoverCallCount() != 4 {
 		t.Fatalf("discover calls = %d, want 4", r.discoverCallCount())
+	}
+}
+
+func TestRunOnSourceNotifiesPerExecutedSource(t *testing.T) {
+	t.Setenv("PDCP_API_KEY", "testkey")
+	r := newFakeRunner(t, fullScript())
+	cfg := testConfig(r, newFakeLookup())
+	var mu sync.Mutex
+	var seen []SourceResult
+	cfg.OnSource = func(res SourceResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, res)
+	}
+	rep := mustRun(t, mustDomain(t, "example.com"), cfg)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != len(rep.Results) {
+		t.Fatalf("OnSource fired %d times for %d results, want exactly once per executed source", len(seen), len(rep.Results))
+	}
+	names := map[string]bool{}
+	for _, res := range seen {
+		if res.Status != OutCompleted {
+			t.Errorf("streamed %s status = %s, want completed", res.Source, res.Status)
+		}
+		names[res.Source] = true
+	}
+	for _, want := range []string{"subfinder", "assetfinder", "amass", "chaos"} {
+		if !names[want] {
+			t.Errorf("OnSource never fired for %s", want)
+		}
+	}
+}
+
+func TestDeriverDerivesHosts(t *testing.T) {
+	at := time.Now().UTC()
+	term := event.New(event.KindTaskCompleted, at, event.NewTaskCompleted(event.NewTaskTerminal(1, 0, at, "", ""), nil))
+	gotUnknown := Deriver{}.Derive(term, "nope")
+	if gotUnknown != nil {
+		t.Fatalf("unknown result derived %d events, want nil", len(gotUnknown))
+	}
+	h, err := asset.NewHost("www.example.com", asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Deriver{}.Derive(term, SourceResult{Source: "subfinder", Status: OutCompleted, Hosts: []asset.Host{h}})
+	if len(got) != 1 {
+		t.Fatalf("derived = %d events, want 1", len(got))
+	}
+	if got[0].Kind != event.KindAssetDiscovered {
+		t.Fatalf("kind = %s, want asset_discovered", got[0].Kind)
+	}
+	if err := got[0].Validate(); err != nil {
+		t.Fatalf("invalid event: %v", err)
 	}
 }
 

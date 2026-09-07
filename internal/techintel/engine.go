@@ -10,6 +10,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 	"github.com/RA000WL/RavenRecon/internal/techintel/fingerprints"
 )
@@ -70,6 +71,13 @@ type Config struct {
 	// Metrics, when non-nil, accumulates the run's work counters (see
 	// Metrics.Snapshot).
 	Metrics *Metrics
+	// Observer is the optional pool instrumentation sink (an
+	// internal/event Observer; the Bus satisfies it). When non-nil, the
+	// worker pool emits canonical pool-boundary events (scan start/stop,
+	// worker start/stop, task submitted/started/running/terminal,
+	// progress, shutdown). Nil (the default) is the off switch: zero
+	// behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns the documented default Ingest configuration.
@@ -353,6 +361,11 @@ func Ingest(ctx context.Context, cfg Config, src ObservationSource) (Report, err
 		Timeout:     c.Timeout,
 		Rate:        c.Rate,
 		Burst:       c.Burst,
+		Observer:    c.Observer,
+		// Deriver converts each job's ReportEntry into derived canonical
+		// events at the pool-job boundary (see derive.go). With a nil
+		// Observer the bridge is inert, so the off switch is unchanged.
+		Deriver: Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("techintel: pool: %w", err)
@@ -406,7 +419,10 @@ func Ingest(ctx context.Context, cfg Config, src ObservationSource) (Report, err
 							e.recordErr(fmt.Errorf("techintel: emit: %w", err))
 						}
 					}
-					return nil, nil
+					// The accumulator merge above stays the report path; the
+					// returned entry is the pool-job-boundary hand-off the
+					// Deriver converts into derived events.
+					return entry, nil
 				},
 			}); err != nil {
 				if errors.Is(err, runtime.ErrPoolClosed) || ctx.Err() != nil {

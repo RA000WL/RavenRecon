@@ -448,3 +448,48 @@ func BenchmarkExtractSecrets(b *testing.B) {
 		benchSinkInt = len(out.secrets)
 	}
 }
+
+// BenchmarkSplitWindows measures tiling a 2 MiB prefix (NEW-124): the
+// bound every over-cap streamed body pays before analysis.
+func BenchmarkSplitWindows(b *testing.B) {
+	body := genLargeBundle()
+	body = append(body, []byte(strings.Repeat("\n", 2<<20-len(body)))...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		windows := splitWindows(body, maxFetchWindowBytes, fetchWindowOverlapBytes)
+		if len(windows) != 5 {
+			b.Fatalf("windows = %d, want 5", len(windows))
+		}
+		benchSinkInt = len(windows)
+	}
+}
+
+// BenchmarkAnalyzeWindowsMerge measures the NEW-124 Phase 1 merge: five
+// parsed windows unioned by identity (endpoint in the deep window must
+// survive the merge).
+func BenchmarkAnalyzeWindowsMerge(b *testing.B) {
+	body := genLargeBundle()
+	body = append(body, []byte(strings.Repeat("\n", 2<<20-len(body)))...)
+	prefix := append([]byte(nil), body[:2<<20]...)
+	marker := []byte(`var deep = "/api/bench-deep";`)
+	copy(prefix[1500000:], marker)
+	windows := splitWindows(prefix, maxFetchWindowBytes, fetchWindowOverlapBytes)
+	js, err := asset.NewJavaScript("https://bench.example.com/bundle.js", asset.Provenance{})
+	if err != nil {
+		b.Fatalf("NewJavaScript: %v", err)
+	}
+	res := FetchResult{Windows: windows}
+	cfg := DefaultConfig()
+	cfg.Clock = wallClock{}
+	e := &env{parser: NewParser(), cfg: cfg, metrics: &Metrics{}, clock: wallClock{}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		data, resolved := e.analyzeWindows(context.Background(), js, res)
+		if len(data.Endpoints) == 0 || len(resolved) == 0 {
+			b.Fatal("windowed analysis extracted nothing")
+		}
+		benchSinkInt = len(data.Endpoints) + len(resolved)
+	}
+}

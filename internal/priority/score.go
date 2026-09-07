@@ -117,9 +117,18 @@ const (
 	lowThreshold    = 0.2
 
 	// Level gates: high needs >= 2 independent indicator categories,
-	// medium >= 1.
+	// medium >= 1 — except the single-structural-high escape: one category
+	// at score >= highThreshold backed by a recorded high-confidence
+	// detection (a confidence:secret or confidence:technology factor at or
+	// above singleHighStructuralConfidence) also reaches high. One leaked
+	// credential must page the hunter without needing a second category.
 	highCategoryGate   = 2
 	mediumCategoryGate = 1
+	// singleHighStructuralConfidence is the minimum recorded-detection
+	// confidence that lifts a single-category surface to high. It sits
+	// above the secrentel high bar so only strongly attributed detections
+	// (never header keywords, never counts) can trigger the escape.
+	singleHighStructuralConfidence = 0.9
 
 	// maxFactors bounds the emitted factor list; a pathological signal
 	// matching more groups keeps the highest-weight factors (ties by name).
@@ -132,6 +141,24 @@ const (
 // and reports an explicit truncation signal instead of handing the engine
 // an input its validation must reject.
 const MaxParamsPerSignal = maxSignalParams
+
+// Adapter-visible mirrors of the remaining fixed per-signal bounds, for
+// adapters that derive bounded signal input (NEW-119): a derivation that
+// would exceed one retains a deterministic head (overlong header lines
+// truncate to the line bound) and reports an explicit truncation signal
+// instead of handing the engine an input its validation must reject.
+const (
+	// MaxSignalTechnologies mirrors maxSignalTechs.
+	MaxSignalTechnologies = maxSignalTechs
+	// MaxSignalSecrets mirrors maxSignalSecrets.
+	MaxSignalSecrets = maxSignalSecrets
+	// MaxSignalHeaders mirrors maxSignalHeaders.
+	MaxSignalHeaders = maxSignalHeaders
+	// MaxSignalHeaderBytes mirrors maxSignalHeaderBytes.
+	MaxSignalHeaderBytes = maxSignalHeaderBytes
+	// MaxSignalMethodBytes mirrors maxSignalMethodBytes.
+	MaxSignalMethodBytes = maxSignalMethodBytes
+)
 
 // Signal bounds (fixed constants; violations are input errors).
 const (
@@ -175,8 +202,11 @@ type match struct {
 //
 // with perCategoryCap on indicator categories, confidenceGroupCap on the
 // confidence group, and level gates: high requires score >= 0.8 AND at
-// least two distinct indicator categories; medium requires score >= 0.5
-// AND at least one; low >= 0.2; else unknown.
+// least two distinct indicator categories, OR score >= 0.8 with exactly
+// one category backed by recorded detection confidence at or above
+// singleHighStructuralConfidence (the single-structural-high escape);
+// medium requires score >= 0.5 AND at least one; low >= 0.2; else
+// unknown.
 func ScoreSurface(sig Signal, interesting, risk *Catalog) (SurfaceAsset, error) {
 	if interesting == nil || risk == nil {
 		return SurfaceAsset{}, fmt.Errorf("priority: both catalogs are required")
@@ -218,7 +248,7 @@ func ScoreSurface(sig Signal, interesting, risk *Catalog) (SurfaceAsset, error) 
 		FirstSeen:       sig.FirstSeen,
 		ScoredAt:        sig.ScoredAt,
 	}
-	out.Level = levelFor(out.Score, indicatorCategories)
+	out.Level = levelFor(out.Score, indicatorCategories, structuralConfidence(factors))
 	return out, nil
 }
 
@@ -264,10 +294,18 @@ func compose(factors []Factor) (score, interestingness, confidence float64, indi
 	return round4(1 - totalProduct), round4(1 - interestingProduct), round4(1 - confidenceProduct), indicatorCategories
 }
 
-// levelFor applies the threshold and gate rules.
-func levelFor(score float64, indicatorCategories int) PriorityLevel {
+// levelFor applies the threshold and gate rules. The single-structural
+// exception lets one high-value category (a leaked credential type, an
+// internal-exposure label) reach high when a recorded detection —
+// confidence:secret or confidence:technology at or above
+// singleHighStructuralConfidence — backs it. Header keywords, service
+// names, and observation counts can never trigger the escape: they are
+// not recorded detections.
+func levelFor(score float64, indicatorCategories int, structural float64) PriorityLevel {
 	switch {
 	case score >= highThreshold && indicatorCategories >= highCategoryGate:
+		return LevelHigh
+	case score >= highThreshold && indicatorCategories >= mediumCategoryGate && structural >= singleHighStructuralConfidence:
 		return LevelHigh
 	case score >= mediumThreshold && indicatorCategories >= mediumCategoryGate:
 		return LevelMedium
@@ -276,6 +314,24 @@ func levelFor(score float64, indicatorCategories int) PriorityLevel {
 	default:
 		return LevelUnknown
 	}
+}
+
+// structuralConfidence is the strongest recorded-detection confidence in a
+// factor list: the maximum weight among confidence:secret and
+// confidence:technology factors. Confidence from observation counts and
+// technology factors below the bar contribute nothing here — the escape
+// hatch opens only for detections the intel phases attributed strongly.
+func structuralConfidence(factors []Factor) float64 {
+	best := 0.0
+	for _, f := range factors {
+		if f.Name != "confidence:secret" && f.Name != "confidence:technology" {
+			continue
+		}
+		if f.Weight > best {
+			best = f.Weight
+		}
+	}
+	return best
 }
 
 // combineFactors is 1 − ∏(1 − wᵢ) over the factors' weights — the same

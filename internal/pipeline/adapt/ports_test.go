@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -485,7 +486,9 @@ func TestNaabuSourceTruncatedOutput(t *testing.T) {
 }
 
 // TestParseNaabuOutputShapes pins the parser: canonical IPv4, bracketed IPv6
-// literals resolve, junk lines count as malformed, duplicates collapse.
+// literals resolve, junk lines count as malformed, duplicates collapse,
+// and each edge attributes exactly its own line's address (per-IP, never
+// the cross-product).
 func TestParseNaabuOutputShapes(t *testing.T) {
 	known := []asset.IP{portsMustIP(t, "198.51.100.10"), portsMustIP(t, "2001:db8::1")}
 	stdout := "" +
@@ -495,12 +498,317 @@ func TestParseNaabuOutputShapes(t *testing.T) {
 		"not-an-address:80\n" + // unparseable address
 		"[2001:db8::1]:443\n" + // duplicate
 		"\n"
-	ports, malformed := parseNaabuOutput([]byte(stdout), known)
+	ports, rels, malformed := parseNaabuOutput([]byte(stdout), known)
 	if malformed != 2 {
 		t.Fatalf("malformed = %d, want 2", malformed)
 	}
 	if len(ports) != 2 || ports[0].Number != 80 || ports[1].Number != 443 {
 		t.Fatalf("ports = %v, want 80 then 443", ports)
+	}
+	if len(rels) != 2 {
+		t.Fatalf("relationships = %d, want 2 (one per distinct ip:port pair)", len(rels))
+	}
+}
+
+// --- port-target synthesis (NEW-121) ----------------------------------------
+
+// synthRel links two identities for synthesis tests.
+func synthRel(t testing.TB, from asset.Identity, kind asset.RelationshipKind, to asset.Identity) asset.Relationship {
+	t.Helper()
+	r, err := asset.NewRelationship(from, kind, to)
+	if err != nil {
+		t.Fatalf("NewRelationship: %v", err)
+	}
+	return r
+}
+
+// synthPorts builds a portDiscoveryOutput for synthesis tests: the given
+// ports (tcp) on the given IP with ip→port edges.
+func synthPorts(t testing.TB, ip asset.IP, numbers ...int) portDiscoveryOutput {
+	t.Helper()
+	var ports []asset.Port
+	var rels []asset.Relationship
+	for _, n := range numbers {
+		p, err := asset.NewPort(n, "tcp", asset.Provenance{Source: "naabu"})
+		if err != nil {
+			t.Fatalf("NewPort(%d): %v", n, err)
+		}
+		ports = append(ports, p)
+		rels = append(rels, synthRel(t, ip.Identity(), asset.RelationshipIPToPort, p.Identity()))
+	}
+	return portDiscoveryOutput{Ports: ports, Relationships: rels}
+}
+
+// TestSynthesizePortTargetsJoins pins the host→IP→port join: each
+// in-scope host receives the sorted ports open on its own addresses,
+// and nothing else.
+func TestSynthesizePortTargetsJoins(t *testing.T) {
+	www := httpProbeMustHost(t, "www.example.com")
+	api := httpProbeMustHost(t, "api.example.com")
+	ip10 := portsMustIP(t, "198.51.100.10")
+	ip11 := portsMustIP(t, "198.51.100.11")
+	rels := []asset.Relationship{
+		synthRel(t, www.Identity(), asset.RelationshipHostToIP, ip10.Identity()),
+		synthRel(t, api.Identity(), asset.RelationshipHostToIP, ip11.Identity()),
+	}
+	pd10 := synthPorts(t, ip10, 8443, 443)
+	pd11 := synthPorts(t, ip11, 8080)
+	pd := portDiscoveryOutput{
+		Ports:         append(pd10.Ports, pd11.Ports...),
+		Relationships: append(pd10.Relationships, pd11.Relationships...),
+	}
+	got, truncated := synthesizePortTargets([]asset.Host{www, api}, rels, &pd)
+	if truncated {
+		t.Fatal("truncated = true, want false (well under the cap)")
+	}
+	if len(got) != 2 || len(got["www.example.com"]) != 2 || len(got["api.example.com"]) != 1 {
+		t.Fatalf("targets = %v, want www:[443 8443] api:[8080]", got)
+	}
+	if got["www.example.com"][0] != 443 || got["www.example.com"][1] != 8443 {
+		t.Errorf("www ports = %v, want sorted [443 8443]", got["www.example.com"])
+	}
+	if got["api.example.com"][0] != 8080 {
+		t.Errorf("api ports = %v, want [8080]", got["api.example.com"])
+	}
+}
+
+// TestSynthesizePortTargetsCNAMETransitive pins the one-hop CNAME
+// closure: a host behind a CNAME inherits its target's address ports
+// (the vhost is served from that infrastructure under the host's name).
+func TestSynthesizePortTargetsCNAMETransitive(t *testing.T) {
+	www := httpProbeMustHost(t, "www.example.com")
+	cdn := httpProbeMustHost(t, "cdn.example.net")
+	ip := portsMustIP(t, "203.0.113.7")
+	rels := []asset.Relationship{
+		synthRel(t, www.Identity(), asset.RelationshipHostToCNAME, cdn.Identity()),
+		synthRel(t, cdn.Identity(), asset.RelationshipHostToIP, ip.Identity()),
+	}
+	pd := synthPorts(t, ip, 8443)
+	got, truncated := synthesizePortTargets([]asset.Host{www}, rels, &pd)
+	if truncated {
+		t.Fatal("truncated = true, want false")
+	}
+	if len(got["www.example.com"]) != 1 || got["www.example.com"][0] != 8443 {
+		t.Fatalf("www ports = %v, want [8443] via the CNAME hop", got)
+	}
+}
+
+// TestSynthesizePortTargetsCap pins the per-host bound: beyond
+// maxProbePortsPerHost the sorted head is kept and the cut is reported
+// (never silent).
+func TestSynthesizePortTargetsCap(t *testing.T) {
+	www := httpProbeMustHost(t, "www.example.com")
+	ip := portsMustIP(t, "198.51.100.10")
+	var numbers []int
+	for i := 0; i < 20; i++ {
+		numbers = append(numbers, 8000+i)
+	}
+	pd := synthPorts(t, ip, numbers...)
+	rels := []asset.Relationship{
+		synthRel(t, www.Identity(), asset.RelationshipHostToIP, ip.Identity()),
+	}
+	got, truncated := synthesizePortTargets([]asset.Host{www}, rels, &pd)
+	if !truncated {
+		t.Fatal("truncated = false, want true (20 ports over the per-host cap)")
+	}
+	ports := got["www.example.com"]
+	if len(ports) != maxProbePortsPerHost {
+		t.Fatalf("ports = %d, want %d (sorted head)", len(ports), maxProbePortsPerHost)
+	}
+	for i, p := range ports {
+		if p != 8000+i {
+			t.Fatalf("ports not the sorted head: [%d] = %d", i, p)
+		}
+	}
+}
+
+// TestSynthesizePortTargetsNil pins the inert paths: no discovery
+// output (or an empty one) yields no targets and no flag.
+func TestSynthesizePortTargetsNil(t *testing.T) {
+	www := httpProbeMustHost(t, "www.example.com")
+	if got, truncated := synthesizePortTargets([]asset.Host{www}, nil, nil); got != nil || truncated {
+		t.Fatalf("nil discovery = %v/%v, want nil/false", got, truncated)
+	}
+	empty := portDiscoveryOutput{}
+	if got, truncated := synthesizePortTargets([]asset.Host{www}, nil, &empty); got != nil || truncated {
+		t.Fatalf("empty discovery = %v/%v, want nil/false", got, truncated)
+	}
+}
+
+// TestSynthesizePortTargetsProductionEdges is the cross-product regression
+// proof through the production edges: naabu output "1.1.1.1:80 /
+// 2.2.2.2:443" over both addresses must attribute 80 to the first host
+// only and 443 to the second — never every port to every host.
+func TestSynthesizePortTargetsProductionEdges(t *testing.T) {
+	runner := &fakeNaabuRunner{versionOut: "v2.3.7", scanOut: "1.1.1.1:80\n2.2.2.2:443\n"}
+	src := newNaabuPortSource(runner, okLookPath)
+	target := portsMustDomain(t, "example.com")
+	ip1 := portsMustIP(t, "1.1.1.1")
+	ip2 := portsMustIP(t, "2.2.2.2")
+	out, err := src.DiscoverPorts(context.Background(), target, []asset.IP{ip1, ip2}, portDiscoveryConfig{})
+	if err != nil {
+		t.Fatalf("DiscoverPorts: %v", err)
+	}
+	if len(out.Ports) != 2 {
+		t.Fatalf("ports = %d, want 2 (80 + 443 union)", len(out.Ports))
+	}
+	if len(out.Relationships) != 2 {
+		t.Fatalf("relationships = %d, want 2 (per-IP, never the 4-edge cross-product)", len(out.Relationships))
+	}
+	h1 := httpProbeMustHost(t, "www.example.com")
+	h2 := httpProbeMustHost(t, "api.example.com")
+	rels := []asset.Relationship{
+		synthRel(t, h1.Identity(), asset.RelationshipHostToIP, ip1.Identity()),
+		synthRel(t, h2.Identity(), asset.RelationshipHostToIP, ip2.Identity()),
+	}
+	got, truncated := synthesizePortTargets([]asset.Host{h1, h2}, rels, &out)
+	if truncated {
+		t.Fatal("truncated = true, want false")
+	}
+	if len(got["www.example.com"]) != 1 || got["www.example.com"][0] != 80 {
+		t.Fatalf("www ports = %v, want [80] (per-host isolation)", got["www.example.com"])
+	}
+	if len(got["api.example.com"]) != 1 || got["api.example.com"][0] != 443 {
+		t.Fatalf("api ports = %v, want [443] (per-host isolation)", got["api.example.com"])
+	}
+}
+
+// stubPortSource is a hermetic portDiscoverer returning a canned output
+// without executing anything (synthesis tests control discovery output
+// exactly, including over-cap sets the real naabu seam cannot produce).
+type stubPortSource struct{ out portDiscoveryOutput }
+
+func (s *stubPortSource) DiscoverPorts(context.Context, asset.Domain, []asset.IP, portDiscoveryConfig) (portDiscoveryOutput, error) {
+	return s.out, nil
+}
+
+// TestHTTPProbeStagePortTargetsProbed pins NEW-121 end to end: discovered
+// ports become full probe targets — requested, completed, edged, and
+// added to the corpus — when both port_discovery and probe_ports are on.
+func TestHTTPProbeStagePortTargetsProbed(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	cannedHostPath(tr, "www.example.com:8443", "http", "/", cannedResponse{status: 200, body: "admin"})
+	cannedHostPath(tr, "www.example.com:8443", "https", "/", cannedResponse{status: 200, body: "admin"})
+	ip := portsMustIP(t, "198.51.100.10")
+	host := httpProbeMustHost(t, "www.example.com")
+	stage := &HTTPProbeStage{transport: tr, ports: &stubPortSource{out: synthPorts(t, ip, 8443)}}
+	in := portsStageInput(t, []asset.Host{host},
+		map[string]string{"port_discovery": "true", "probe_ports": "true"},
+		[]asset.IP{ip})
+	in.Results.Relationships = []asset.Relationship{
+		synthRel(t, host.Identity(), asset.RelationshipHostToIP, ip.Identity()),
+	}
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	if !tr.served("http", "www.example.com:8443") || !tr.served("https", "www.example.com:8443") {
+		t.Fatal("port targets never requested (synthesis did not fire)")
+	}
+	// The served port URL joins the corpus additions and the graph.
+	foundURL, foundEdge := false, false
+	for _, u := range res.Additions.URLs {
+		if u.String() == "http://www.example.com:8443/" {
+			foundURL = true
+		}
+	}
+	wantEdge := "host:www.example.com" + "\x00" + "host_to_url\x00" + "url:http://www.example.com:8443/"
+	for _, r := range res.Results.Relationships {
+		if r.ID() == wantEdge {
+			foundEdge = true
+		}
+	}
+	if !foundURL {
+		t.Error("http://www.example.com:8443/ missing from corpus additions (port surface must flow downstream)")
+	}
+	if !foundEdge {
+		t.Error("host->url edge for the served port URL missing from results")
+	}
+	if res.Truncated || len(res.StickyFlags) != 0 {
+		t.Fatalf("Truncated/flags = %v/%v, want clean (nothing cut)", res.Truncated, res.StickyFlags)
+	}
+}
+
+// TestHTTPProbeStagePortTargetsNeedProbeParam pins the two-knob gate:
+// port_discovery alone inventories ports without probing them —
+// synthesis (and its traffic) requires probe_ports.
+func TestHTTPProbeStagePortTargetsNeedProbeParam(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	ip := portsMustIP(t, "198.51.100.10")
+	host := httpProbeMustHost(t, "www.example.com")
+	stage := &HTTPProbeStage{transport: tr, ports: &stubPortSource{out: synthPorts(t, ip, 8443)}}
+	in := portsStageInput(t, []asset.Host{host},
+		map[string]string{"port_discovery": "true"},
+		[]asset.IP{ip})
+	in.Results.Relationships = []asset.Relationship{
+		synthRel(t, host.Identity(), asset.RelationshipHostToIP, ip.Identity()),
+	}
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, u := range res.Additions.URLs {
+		if strings.Contains(u.HostPort, ":") {
+			t.Fatalf("port URL %s probed without probe_ports (discovery must not imply probing)", u)
+		}
+	}
+	if tr.served("http", "www.example.com:8443") || tr.served("https", "www.example.com:8443") {
+		t.Fatal("port targets requested without probe_ports")
+	}
+	// Discovery inventory itself still flows.
+	found := false
+	for _, p := range res.Results.Ports {
+		if p.Number == 8443 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("discovered port 8443 missing from results (discovery-only path broke)")
+	}
+}
+
+// TestHTTPProbeStagePortTargetsOverflowFlag pins the per-host synthesis
+// bound at stage level: beyond maxProbePortsPerHost the sorted head is
+// probed and the cut rides the flag on a completed-or-partial result.
+func TestHTTPProbeStagePortTargetsOverflowFlag(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	ip := portsMustIP(t, "198.51.100.10")
+	host := httpProbeMustHost(t, "www.example.com")
+	var numbers []int
+	for i := 0; i < 20; i++ {
+		numbers = append(numbers, 9000+i)
+	}
+	stage := &HTTPProbeStage{transport: tr, ports: &stubPortSource{out: synthPorts(t, ip, numbers...)}}
+	in := portsStageInput(t, []asset.Host{host},
+		map[string]string{"port_discovery": "true", "probe_ports": "true"},
+		[]asset.IP{ip})
+	in.Results.Relationships = []asset.Relationship{
+		synthRel(t, host.Identity(), asset.RelationshipHostToIP, ip.Identity()),
+	}
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.StickyFlags[httpprobePortTargetsTruncatedFlag] {
+		t.Fatalf("flags = %v, want %q (the cut tail is honestly flagged)", res.StickyFlags, httpprobePortTargetsTruncatedFlag)
+	}
+	var portURLs int
+	for _, u := range res.Additions.URLs {
+		if strings.Contains(u.HostPort, ":") {
+			portURLs++
+		}
+	}
+	if portURLs != 2*maxProbePortsPerHost {
+		t.Fatalf("port-target URLs = %d, want %d (per-host head, both schemes)", portURLs, 2*maxProbePortsPerHost)
 	}
 }
 
@@ -676,6 +984,42 @@ func TestHTTPProbeStagePortDiscoveryTruncatedFlag(t *testing.T) {
 	if !res.Truncated || !res.StickyFlags[portsOutputTruncatedFlag] {
 		t.Fatalf("Truncated=%v flags=%v, want Truncated with %q",
 			res.Truncated, res.StickyFlags, portsOutputTruncatedFlag)
+	}
+}
+
+// TestNaabuSourceMismatchedEnvelopeSelfHeals pins the self-healing boundary
+// for tampered cache envelopes: a completed record stored under this key but
+// carrying a different Operation or Target must be deleted and re-executed,
+// never served (mirrors httpprobe lookupProbe envelope check).
+func TestNaabuSourceMismatchedEnvelopeSelfHeals(t *testing.T) {
+	runner := &fakeNaabuRunner{versionOut: "v2.3.7", scanOut: "198.51.100.10:443\n"}
+	c := newPortsStaticCache()
+	src := newNaabuPortSource(runner, okLookPath)
+	target := portsMustDomain(t, "example.com")
+	ips := []asset.IP{portsMustIP(t, "198.51.100.10")}
+	cfg := portDiscoveryConfig{Cache: c}
+
+	if _, err := src.DiscoverPorts(context.Background(), target, ips, cfg); err != nil {
+		t.Fatalf("seed DiscoverPorts: %v", err)
+	}
+	if runner.scanCount() != 1 {
+		t.Fatalf("seed scan executions = %d, want 1", runner.scanCount())
+	}
+	// Tamper every stored record's envelope (operation + target).
+	for k, rec := range c.recs {
+		rec.Operation = "tampered.operation"
+		rec.Target = "domain:evil.example"
+		c.recs[k] = rec
+	}
+	out, err := src.DiscoverPorts(context.Background(), target, ips, cfg)
+	if err != nil {
+		t.Fatalf("re-run after envelope tamper: %v", err)
+	}
+	if len(out.Ports) != 1 || out.Ports[0].Number != 443 {
+		t.Fatalf("ports = %v, want freshly executed 443", out.Ports)
+	}
+	if runner.scanCount() != 2 {
+		t.Fatalf("scan executions = %d, want 2 (tampered envelope must re-execute, never serve)", runner.scanCount())
 	}
 }
 

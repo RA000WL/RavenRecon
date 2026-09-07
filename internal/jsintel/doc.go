@@ -78,10 +78,28 @@
 // bounded by FetchConfig.MaxJSBytes (default 2 MiB, clamped to 64 KiB .. 8
 // MiB). Redirect policy: cross-host http(s) redirects ARE followed — jsintel
 // has no declared-scope concept, fetch targets come from the operator's own
-// corpus — but a redirect to a NON-http(s) scheme (ftp:, file:, ...) is
-// observed, never followed: the walk ends with the redirect response as the
-// final observation, so one scheme-incompatible redirect can never wedge the
-// URL into permanent failures. Every outcome is classified with a typed
+// corpus — but a redirect to a NON-http(s) scheme (ftp:, file:, ...) or to
+// an IP literal on a DIFFERENT host than the current request is observed,
+// never followed: the walk ends with the redirect response as the final
+// observation, so one scheme-incompatible redirect can never wedge the URL
+// into permanent failures and a hostile 302 can never drive the fetcher
+// onto link-local/loopback addresses (e.g. cloud instance metadata).
+// Same-host redirects (relative hops and absolute URLs on the request's own
+// host, including IP-literal bases) are still followed. A second,
+// dial-time gate covers DNS-name hops to a DIFFERENT host
+// (redirectDialSafe, review wave 2026-09-03): the target hostname must
+// resolve (FetchConfig.ResolveIP, system DNS by default) to at least one
+// address and every resolved address must be public — loopback,
+// link-local, private, multicast, and unspecified all refuse the hop,
+// as do resolver errors and empty answers (fail-closed: hostile DNS can
+// only deny fetches, never steer them). Non-canonical IP spellings
+// (leading-zero octets, decimal, 0x-hex) refuse at the string layer
+// (isNumericHost). DNS-following contract: the initial dial — and every
+// followed hop — requests whatever the target's DNS returns at request
+// time, with no rebinding pin between the gate check and the
+// transport's own dial (short TTLs can swap answers); operators scanning
+// hostile domains must still run from isolated egress with metadata
+// disabled. Every outcome is classified with a typed
 // FetchStatus and FetchReason; failures are retried immediately up to
 // cfg.Retries times (bounded 1..3); completed negative observations
 // (conn_refused, tls) are legitimate observations, never failures. The
@@ -91,15 +109,91 @@
 //
 // # Truncation honesty
 //
-// A response whose content exceeds MaxJSBytes — whether declared up front by
-// Content-Length (the body is closed without reading a byte) or discovered
-// while streaming — is truncated: Content stays nil, Size 0, Truncated
+// A response whose content exceeds MaxJSBytes — discovered by streaming
+// up to MaxJSBytes+1 bytes (the declared Content-Length is never
+// trusted) — is truncated: Content stays nil, Size 0, Truncated
 // true, Status FetchTruncated ("incomplete"). A partial prefix is NEVER
-// retained: it would be a misleading partial observation, and the pipeline
-// must never serve partial content as if it were the file. Truncated
-// observations are stored as cache.StatusIncomplete records (never served
-// as hits; a later run re-fetches), and a re-fetch under a lowered cap
-// simply truncates again — cap changes never invalidate entries.
+// retained as content: it would be a misleading partial observation, and
+// the pipeline must never serve partial content as if it were the file.
+// Truncated observations are stored as cache.StatusIncomplete records
+// (never served as hits; a later run re-fetches), and a re-fetch under a
+// lowered cap simply truncates again — cap changes never invalidate
+// entries.
+//
+// Windowed analysis (NEW-124 Phase 1) softens the over-cap path without
+// touching any of the above: an over-cap body retains
+// deterministic overlapped windows over the bounded prefix (512 KiB
+// windows, 8 KiB overlap, first 2 MiB; same memory ceiling), analyzed
+// per window and unioned by identity for endpoints, secrets,
+// technologies, evidence, imports, and expansion. The entry stays
+// Incomplete, nothing is cached or retained as content, and the windowed
+// JS asset carries Size 0 / empty hash ("not observed" — never the
+// prefix length/hash). Bodies
+// truncated for any other reason (read failure) and
+// non-JS observations analyze nothing, exactly as before. Windows are
+// tiled before JS classification (accepted waste, bounded by MaxJSBytes);
+// cancellation between windows stops the merge, keeping the retained
+// union with the entry Incomplete. Tiling snaps to UTF-8 rune boundaries
+// (OD-5, deterministic pure function of bytes) and carries the tiling tag
+// "w512-o8-v1" (OD-4: 8 KiB overlap covers the 800-byte secrentel maximum
+// with margin, no resize).
+//
+// Chunk identities + windowed fetch manifest + chunk documents (NEW-129
+// Slice 1) light up secrentel for free without touching the above: a
+// cap-truncated fetch retains a manifest (tiling tag, prefix length,
+// per-window index/start/end/SHA-256, cause "cap"; read-error truncations
+// carry none) stored incomplete under the same js.fetch key (never served;
+// a complete Put overwrites it away for shrink-recovery); a retained run
+// exposes windows through Report.RetainedChunks with file-citing chunk
+// identities (javascript:<file-url>#rr-chunk=i/n/span=start-end/ph=<8hex>/t=w512-o8-v1,
+// built and parsed ONLY through asset.ChunkJavaScriptIdentity /
+// ParseChunkIdentity); the pipeline emits one chunk document per window
+// (aliased, Truncated false, SourceAsset the FILE identity) plus a file
+// sentinel (nil, Truncated true). Chunk JS observations stay sizeless,
+// entries stay Incomplete, memory stays aliased under maxWindowedChunks
+// (16; pipeline path 5 for the default cap, no per-file cut).
+//
+// Per-chunk analyze cache (NEW-129 Slice 2, OD-3a implemented) skips
+// parsing on warm windowed runs without touching any of the above: every
+// window runs cache-before-execute under js.analyze.chunk (fresh namespace,
+// zero legacy) keyed by the chunk identity + parser tag ("1:eimst", same
+// contract versioning as js.analyze) + tiling tag ("w512-o8-v1") + session
+// digest iff present (NEW-125 parity) — caps/timings/concurrency excluded
+// like file-level, so cap changes never invalidate. The payload reuses the
+// storedAnalyze shape with AnalyzedHash = SHA-256 of the CHUNK bytes (never
+// the file hash; the file stays sizeless) and the same decode gates
+// (identity re-derivation, canonical URLs, fixed bounds, timestamp order;
+// secret/evidence sources stay the FILE JavaScript identity). Lookup
+// cross-validates against the fresh chunk bytes (the windowed fetch is
+// never served, so bytes are always available): a mismatch deletes under
+// the SAME key and recomputes (self-healing). Warm merges union per-chunk
+// payloads in index order via the existing union* helpers, then
+// applyAnalysis caps ONCE (never cap-per-chunk then re-cap). OD-3a: a
+// complete Put over a prior cap manifest deletes exactly the listed chunk
+// keys (shrink-to-complete heals in one run). Remaining orphans
+// (big→big content change moving the hash prefix, tiling-tag change) are
+// bounded — ≤ maxWindowedChunks (pipeline path 5) findings-only records per
+// file version, tens of KiB — and reclaimed by the existing TTL/Clear
+// policy (operator advisory: configure cache TTL or Clear on rotation;
+// truncated-never-completed holds throughout).
+//
+// Snapshot chunk assets + detect-JS findings (NEW-129 Slice 3) close the
+// loop without touching any of the above: a retained run exposes one
+// sizeless chunk script per window through Report.AllChunkJavaScript (the
+// chunk URL parsed from the constructor-built chunk identity — fragment
+// cites the window, Identity() stays the file; AllJavaScript stays
+// file-only), the pipeline's jsintel stage appends them after the file
+// asset in Results.JavaScript (files first, so the runner's first-seen
+// corpus merge keeps the file linkage), and the detect stage maps chunk
+// documents to retained bodies citing chunk identities (linked directly
+// by chunk script, else via the file — the sentinel still marks the
+// incomplete-input gap; ~25 fully-windowed files saturate the 64 MiB
+// budget and ~200 the 1024-entry count, sorted-head cut, flagged). The
+// JS pack normalizes every finding subject to the FILE identity with
+// file-relative offsets (chunk-local first-sink index + span start via
+// ParseChunkIdentity), so overlap-identical signals share finding
+// identity and merge to one (rules 1.2.0; predicates unchanged,
+// NEW-123 still gated).
 //
 // # Content retention (T3d)
 //

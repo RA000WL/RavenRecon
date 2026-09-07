@@ -772,6 +772,53 @@ func TestKatanaMixedHealthyAndMalformedHostsStoresIncomplete(t *testing.T) {
 	}
 }
 
+// TestKatanaMismatchedEnvelopeSelfHeals pins the self-healing boundary for
+// tampered cache envelopes: a completed record stored under this key but
+// carrying a different Operation or Target must be deleted and re-executed,
+// never served (mirrors httpprobe lookupProbe envelope check).
+func TestKatanaMismatchedEnvelopeSelfHeals(t *testing.T) {
+	var mu sync.Mutex
+	crawlCalls := 0
+	script := katanaScript("v1.0.0", func(cmd discovery.Cmd) (discovery.RunResult, error) {
+		mu.Lock()
+		crawlCalls++
+		mu.Unlock()
+		return discovery.RunResult{Stdout: goodOutput("https://example.com/ok")}, nil
+	})
+	src := NewKatanaSource(newFakeRunner(script), fakeLookupOK)
+	mem := newRecordingCache()
+	domain := mustDomain(t, "example.com")
+	hosts := []asset.Host{mustHost(t, "www.example.com")}
+	cfg := Config{Depth: 2, Cache: mem}
+
+	if _, err := src.Crawl(context.Background(), domain, hosts, cfg); err != nil {
+		t.Fatalf("seed Crawl: %v", err)
+	}
+	mu.Lock()
+	if crawlCalls != 1 {
+		mu.Unlock()
+		t.Fatalf("seed crawl calls = %d, want 1", crawlCalls)
+	}
+	mu.Unlock()
+	recs, _ := mem.snapshot()
+	for k, rec := range recs {
+		rec.Operation = "tampered.operation"
+		rec.Target = "domain:evil.example"
+		mem.mu.Lock()
+		mem.recs[k] = rec
+		mem.mu.Unlock()
+	}
+	if _, err := src.Crawl(context.Background(), domain, hosts, cfg); err != nil {
+		t.Fatalf("re-run after envelope tamper: %v", err)
+	}
+	mu.Lock()
+	got := crawlCalls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("runner crawl calls = %d, want 2 (tampered envelope must re-execute, never serve)", got)
+	}
+}
+
 // TestKatanaEmptyAndOutOfDomainOnlyStayCompleted guards the NEW-86
 // semantic's other edge: a completed-empty cache store stays reachable when
 // every host truly produced zero output AND zero malformed lines — katana

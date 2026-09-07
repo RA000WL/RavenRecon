@@ -94,6 +94,27 @@
 // the current single-job-per-host design stays below the cap (one request at
 // a time per host). Body content is never retained.
 //
+// # Canary reflection (NEW-120)
+//
+// ReflectURLs probes canary reflection for corpus URLs carrying query
+// parameters: one GET per parameterized URL with every targeted parameter
+// (decoded, lowercased, sorted, capped at maxReflectParams with the
+// remainder counted Skipped) substituted by a deterministic per-(URL,
+// param) canary, redirects observed never followed, body read bounded by
+// reflectMaxBodyBytes (128 KiB). Each parameter verdicts
+// reflected-unencoded (raw canary in body), reflected-encoded (only the
+// percent-encoded form — flow through an encoder), not-reflected (complete
+// read, neither form), or unknown (transport error, timeout, or truncated
+// read without an observed canary — absence under truncation proves
+// nothing, so it is never not-reflected). This is liveness observation,
+// not exploitation: no payload is sent, only a benign canary token. The
+// cache operation is url.reflect (key: URL identity, domain, parameter
+// list hash, canary scheme); truncated records store incomplete and are
+// never served. Decided verdicts are attributable downstream as evidence
+// (MethodEndpoint, "reflect:<param>", sourced at the URL identity — see
+// ReflectEvidence/ParseReflectEvidence); the triage pack gates silent
+// subjects on them, fail-open without enrichment.
+//
 // # Known limitations
 //
 // The caller-provided resolved-address map attaches at most one address per

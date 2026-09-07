@@ -116,6 +116,7 @@ func TestParseScanArgs(t *testing.T) {
 				concurrencySet:    true,
 				timeout:           5 * time.Minute,
 				timeoutSet:        true,
+				legacyTimeout:     true,
 				cacheDir:          "/tmp/rcache",
 				noCache:           true,
 				outputDir:         "out/",
@@ -303,6 +304,83 @@ func TestParseScanArgs(t *testing.T) {
 	}
 }
 
+func TestParseScanArgsConfigFlag(t *testing.T) {
+	opts, err := parseScanArgs([]string{"example.com", "--config", "/tmp/r.json"})
+	if err != nil {
+		t.Fatalf("parseScanArgs: %v", err)
+	}
+	if opts.configPath != "/tmp/r.json" {
+		t.Fatalf("configPath = %q, want /tmp/r.json", opts.configPath)
+	}
+}
+
+func TestParseScanArgsStageTimeout(t *testing.T) {
+	opts, err := parseScanArgs([]string{"example.com", "--stage-timeout", "5m"})
+	if err != nil {
+		t.Fatalf("parseScanArgs: %v", err)
+	}
+	if !opts.timeoutSet || opts.timeout != 5*time.Minute || opts.legacyTimeout {
+		t.Fatalf("canonical parse = %+v, want 5m non-legacy", opts)
+	}
+	opts, err = parseScanArgs([]string{"example.com", "--timeout", "5m"})
+	if err != nil {
+		t.Fatalf("parseScanArgs: %v", err)
+	}
+	if !opts.timeoutSet || opts.timeout != 5*time.Minute || !opts.legacyTimeout {
+		t.Fatalf("alias parse = %+v, want 5m legacy", opts)
+	}
+	opts, err = parseScanArgs([]string{"example.com", "--timeout", "5m", "--stage-timeout", "5m"})
+	if err != nil {
+		t.Fatalf("agreeing spellings must both be accepted: %v", err)
+	}
+	if opts.timeout != 5*time.Minute || opts.legacyTimeout {
+		t.Fatalf("agreeing parse = %+v, want canonical 5m", opts)
+	}
+	if _, err := parseScanArgs([]string{"example.com", "--timeout", "5m", "--stage-timeout", "6m"}); err == nil ||
+		!strings.Contains(err.Error(), "disagree") {
+		t.Fatalf("disagreeing spellings must fail loudly, got %v", err)
+	}
+	if _, err := parseScanArgs([]string{"example.com", "--stage-timeout", "soon"}); err == nil {
+		t.Fatal("invalid canonical duration must fail")
+	}
+}
+
+func TestResolveBaseConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ravenrecon.json")
+	if err := os.WriteFile(path, []byte(`{"concurrency": 4, "cache": {"enabled": true, "dir": "/file-cache"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RAVENRECON_CONCURRENCY", "8")
+	got, err := resolveBaseConfig(path)
+	if err != nil {
+		t.Fatalf("resolveBaseConfig: %v", err)
+	}
+	if got.Concurrency != 8 {
+		t.Errorf("concurrency = %d, want 8 (env beats file)", got.Concurrency)
+	}
+	if !got.Cache.Enabled || got.Cache.Dir != "/file-cache" {
+		t.Errorf("cache = %+v, want file values", got.Cache)
+	}
+	if _, err := resolveBaseConfig(filepath.Join(dir, "missing.json")); err == nil {
+		t.Error("missing config file must fail")
+	}
+	t.Setenv("RAVENRECON_CONCURRENCY", "0")
+	if _, err := resolveBaseConfig(path); err == nil {
+		t.Error("invalid env must fail")
+	}
+}
+
+func TestRunScanBadConfigPath(t *testing.T) {
+	var buf bytes.Buffer
+	err := runScan(context.Background(), &buf,
+		[]string{"example.com", "--config", filepath.Join(t.TempDir(), "missing.json"), "--stages", "discover"},
+		func(pipeline.ScanConfig) []pipeline.Stage { return nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing.json") {
+		t.Fatalf("want missing-file error, got %v", err)
+	}
+}
+
 func TestBuildScanConfigDefaults(t *testing.T) {
 	target, err := asset.NewDomain("example.com", asset.Provenance{})
 	if err != nil {
@@ -388,10 +466,57 @@ func TestBuildScanConfigSelections(t *testing.T) {
 	}
 }
 
+// TestBuildScanConfigSessionHeaders pins NEW-125 CLI wiring:
+// --session-headers fans the session FILE PATH (never secret material)
+// out to every fetching stage's session_headers param.
+func TestBuildScanConfigSessionHeaders(t *testing.T) {
+	target, err := asset.NewDomain("example.com", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewDomain: %v", err)
+	}
+	opts := scanOptions{
+		targets:           []string{"example.com"},
+		sessionHeaders:    "/tmp/operator-session.txt",
+		sessionHeadersSet: true,
+	}
+	cfg, err := buildScanConfig(opts, target)
+	if err != nil {
+		t.Fatalf("buildScanConfig: %v", err)
+	}
+	for _, stage := range []pipeline.StageName{pipeline.StageHTTPProbe, pipeline.StageJSIntel, pipeline.StageURLLive} {
+		params, ok := cfg.StageParams[stage]
+		if !ok {
+			t.Fatalf("StageParams missing %q (session must fan out to every fetching stage)", stage)
+		}
+		if got := params["session_headers"]; got != "/tmp/operator-session.txt" {
+			t.Fatalf("%s session_headers = %q, want the file path", stage, got)
+		}
+	}
+	if len(cfg.StageParams) != 3 {
+		t.Fatalf("StageParams = %v, want exactly the three fetching stages", cfg.StageParams)
+	}
+}
+
+// TestParseScanArgsSessionHeaders pins flag parsing: the value passes
+// through verbatim (a path, validated for emptiness only — content
+// validation belongs to the stage parser with precise errors).
+func TestParseScanArgsSessionHeaders(t *testing.T) {
+	opts, err := parseScanArgs([]string{"example.com", "--session-headers", "/tmp/s.txt"})
+	if err != nil {
+		t.Fatalf("parseScanArgs: %v", err)
+	}
+	if !opts.sessionHeadersSet || opts.sessionHeaders != "/tmp/s.txt" {
+		t.Fatalf("sessionHeaders = %q/%v, want /tmp/s.txt/true", opts.sessionHeaders, opts.sessionHeadersSet)
+	}
+	if _, err := parseScanArgs([]string{"example.com", "--session-headers", ""}); err == nil {
+		t.Fatal("empty --session-headers accepted (want usage error)")
+	}
+}
+
 func TestScanCache(t *testing.T) {
 	// Caching is disabled by default: no --cache, no config → nil.
 	def := config.Default()
-	if c, err := scanCache(def, scanOptions{}); err != nil || c != nil {
+	if c, err := scanCache(def, scanOptions{}, nil); err != nil || c != nil {
 		t.Fatalf("default scanCache = (%v, %v), want (nil, nil)", c, err)
 	}
 
@@ -401,26 +526,80 @@ func TestScanCache(t *testing.T) {
 	cfg.Cache.Enabled = true
 	cfg.Cache.Dir = dir
 	cfg.Cache.TTL = time.Hour
-	if c, err := scanCache(cfg, scanOptions{}); err != nil {
+	if c, err := scanCache(cfg, scanOptions{}, nil); err != nil {
 		t.Fatalf("config-enabled scanCache: %v", err)
 	} else if c == nil {
 		t.Fatal("config-enabled scanCache must open a cache")
 	}
 
 	// An explicit --cache dir opens regardless of configuration.
-	if c, err := scanCache(def, scanOptions{cacheDir: t.TempDir()}); err != nil {
+	if c, err := scanCache(def, scanOptions{cacheDir: t.TempDir()}, nil); err != nil {
 		t.Fatalf("--cache scanCache: %v", err)
 	} else if c == nil {
 		t.Fatal("--cache must open a cache even when configuration disables it")
 	}
 
 	// --no-cache forces the cache off on every path.
-	if c, err := scanCache(cfg, scanOptions{noCache: true}); err != nil || c != nil {
+	if c, err := scanCache(cfg, scanOptions{noCache: true}, nil); err != nil || c != nil {
 		t.Fatalf("--no-cache with config enabled = (%v, %v), want (nil, nil)", c, err)
 	}
-	if c, err := scanCache(def, scanOptions{cacheDir: t.TempDir(), noCache: true}); err != nil || c != nil {
+	if c, err := scanCache(def, scanOptions{cacheDir: t.TempDir(), noCache: true}, nil); err != nil || c != nil {
 		t.Fatalf("--no-cache with --cache = (%v, %v), want (nil, nil)", c, err)
 	}
+}
+
+func TestForwardingObserver(t *testing.T) {
+	fwd := &forwardingObserver{}
+	rec := &recordingEvents{}
+	// Nil target drops without a sink.
+	fwd.Observe(testEvent("a"))
+	if len(rec.events()) != 0 {
+		t.Fatal("nil target must drop")
+	}
+	fwd.set(rec)
+	fwd.Observe(testEvent("b"))
+	fwd.set(nil)
+	fwd.Observe(testEvent("c"))
+	got := rec.events()
+	if len(got) != 1 || got[0] != "b" {
+		t.Fatalf("forwarded = %v, want [b]", got)
+	}
+}
+
+func TestScanCacheWithObserver(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Cache.Enabled = true
+	cfg.Cache.Dir = dir
+	rec := &recordingEvents{}
+	fwd := &forwardingObserver{}
+	fwd.set(rec)
+	c, err := scanCache(cfg, scanOptions{}, fwd)
+	if err != nil || c == nil {
+		t.Fatalf("scanCache = (%v, %v), want open cache", c, err)
+	}
+}
+
+// recordingEvents is a mutex-guarded event sink for observer tests.
+type recordingEvents struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (r *recordingEvents) Observe(ev event.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.got = append(r.got, string(ev.Kind))
+}
+
+func (r *recordingEvents) events() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.got...)
+}
+
+func testEvent(kind string) event.Event {
+	return event.Event{Kind: event.Kind(kind)}
 }
 
 // TestStageObserver pins the --verbose rendering: one compact line per
@@ -1714,4 +1893,93 @@ func TestParseScanArgsHelpAfterOption(t *testing.T) {
 	if len(opts.targets) != 0 {
 		t.Fatalf("help request must not produce options, got %+v", opts)
 	}
+}
+
+// TestRunScanDryRunConfigFileFold is the NEW-132 HIGH regression: a temp
+// JSON config file's non-default concurrency/timeout/rate/sources fold
+// into the --dry-run rendering (flags > env > file > defaults) with the
+// stages seam never consulted; an explicit flag beats the file value; and
+// an empty file renders byte-identical to no --config at all. Hermetic:
+// --dry-run resolves the cache directory but never opens it, and no stage
+// (hence no tool, no network) ever runs.
+func TestRunScanDryRunConfigFileFold(t *testing.T) {
+	writeCfg := func(content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "ravenrecon.json")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	full := writeCfg(`{
+		"concurrency": 7,
+		"timeout": "77s",
+		"rate": 3.5,
+		"discovery": {"sources": ["subfinder", "amass"]}
+	}`)
+
+	run := func(args []string) (string, int) {
+		t.Helper()
+		var calls int
+		seam := func(pipeline.ScanConfig) []pipeline.Stage {
+			calls++
+			return nil
+		}
+		var buf bytes.Buffer
+		if err := runScan(context.Background(), &buf, args, seam, nil); err != nil {
+			t.Fatalf("runScan(%v): %v", args, err)
+		}
+		return buf.String(), calls
+	}
+
+	t.Run("file values render, stages never run", func(t *testing.T) {
+		got, calls := run([]string{"example.com", "--dry-run", "--config", full})
+		if calls != 0 {
+			t.Fatalf("stages seam consulted %d times on a dry run; want 0", calls)
+		}
+		for _, want := range []string{
+			"RavenRecon scan (dry run): example.com",
+			"Target: example.com (canonical)",
+			"Cache: disabled",
+			"concurrency=7",
+			"timeout=1m17s",
+			"rate=3.5/s",
+			"discover.sources=subfinder,amass",
+			"Nothing was run",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("dry-run output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("explicit flag wins over the file", func(t *testing.T) {
+		got, calls := run([]string{"example.com", "--dry-run", "--config", full,
+			"--concurrency", "9", "--stage-timeout", "5s"})
+		if calls != 0 {
+			t.Fatalf("stages seam consulted %d times on a dry run; want 0", calls)
+		}
+		for _, want := range []string{
+			"concurrency=9",
+			"timeout=5s",
+			"rate=3.5/s",
+			"discover.sources=subfinder,amass",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("dry-run output missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "concurrency=7") || strings.Contains(got, "timeout=1m17s") {
+			t.Errorf("file values must not survive an explicit flag:\n%s", got)
+		}
+	})
+
+	t.Run("empty file is byte-identical to no config", func(t *testing.T) {
+		empty := writeCfg(`{}`)
+		withFile, _ := run([]string{"example.com", "--dry-run", "--config", empty})
+		without, _ := run([]string{"example.com", "--dry-run"})
+		if withFile != without {
+			t.Errorf("empty-file dry run differs from no-config dry run\nfile:\n%s\nbare:\n%s", withFile, without)
+		}
+	})
 }

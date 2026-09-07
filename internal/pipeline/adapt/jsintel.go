@@ -245,6 +245,11 @@ func jsCollectURLs(report jsintel.Report, target asset.Domain, incoming []asset.
 //	(the default per-run cap). The cap is enforced after in-domain
 //	filtering, dedup, and sorting; excess beyond the cap is truncated and
 //	reported with Truncated=true and the jsintel_url_overflow sticky flag.
+//	"session_headers" — filesystem path to operator session headers
+//	(default absent = anonymous; NEW-125). Read at stage start; a broken
+//	file fails the stage (fail-closed). Headers ride same-host fetches
+//	only and bind cache keys by digest — values never enter logs,
+//	errors, reports, or cache records.
 //
 // Health gate (engine → adapter sticky flag, not a StageParam): the jsintel
 // engine aborts remaining fetches when the first 50 fetches had >90% failure
@@ -358,6 +363,9 @@ func NewJSIntelStage(transport http.RoundTripper) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *jsIntelStage) Name() pipeline.StageName { return pipeline.StageJSIntel }
 
+// Level implements pipeline.LeveledStage: script intel needs the post-crawl URL corpus.
+func (s *jsIntelStage) Level() int { return 4 }
+
 // Run implements pipeline.Stage.
 func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	// Boundary filter, input side (adapt/doc.go): the engine has no scope
@@ -367,6 +375,16 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 	// label-aware and operates on canonical names only (pipeline.InDomain);
 	// the single normalization point stays in internal/asset.
 	urls := filterURLs(in.Target, in.URLs)
+
+	// Operator session headers (NEW-125): resolved before the
+	// short-circuit below so a broken session file fails the stage even
+	// on an empty corpus — fail-closed, never scan anonymously when
+	// authentication was asked for (mirrors the httpprobe stage).
+	sessionHeaders, err := sessionHeadersFromParams(in.Config)
+	if err != nil {
+		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
+		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped}, wrapped
+	}
 
 	// Empty filtered input: short-circuit with completed and zero work — but
 	// only for a canonical target. The engine tolerates an empty source
@@ -390,6 +408,8 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 	for _, u := range urls {
 		items = append(items, jsintel.Item{Kind: jsintel.ItemLine, Line: u.String()})
 	}
+
+	// Operator session headers (NEW-125): resolved above (fail-closed).
 
 	cfg := jsintel.Config{
 		// Bounds pass-through: 0 = engine default/disabled per the engine's
@@ -418,6 +438,8 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 		// the shared httpprobe helper — the key name and semantics are
 		// consistent with the httpprobe stage.
 		RequestTimeout: requestTimeoutFromParams(in.Config),
+		// Operator session headers (nil = anonymous fetching).
+		RequestHeaders: sessionHeaders,
 		// Constructor test seam: nil = the engine's bounded production
 		// transport. MaxJSBytes stays 0 = the engine's 2 MiB default (the
 		// adapter never configures the content cap; its bounded-fetch
@@ -430,6 +452,9 @@ func (s *jsIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipelin
 		// to pipeline.MaxDocumentBytes, so the pipeline's hostile-producer
 		// guard never fires on engine output.
 		RetainContent: true,
+		// Observer forwards the run's shared instrumentation sink into the
+		// engine's worker pool (nil = off, zero behavior change).
+		Observer: in.Observer,
 	}
 
 	report, engineErr := jsintel.Run(ctx, cfg, jsintel.SliceSource(items))
@@ -585,9 +610,18 @@ func buildJSResult(report jsintel.Report, outcome pipeline.Outcome, err error) p
 // to the urlintel stage's producer and the report exposes no merged URL
 // accessor for them (documented). Nothing is rebuilt — every value is the
 // engine's canonical Phase 2 asset, copied.
+//
+// Windowed files (NEW-129 Slice 3) contribute their file asset AND one
+// chunk asset per retained window (Report.AllChunkJavaScript): the file
+// first, then its chunks in chunk-identity order. The two groups share
+// Identity() by construction (a chunk URL's fragment is excluded from the
+// canonical form), so downstream first-seen merges keep the file — the
+// ordering is load-bearing, never cosmetic: the file observation must win
+// the corpus merge or the detect stage loses its file linkage. The detect
+// stage recovers each chunk's window through asset.ParseChunkIdentity.
 func jsResults(report jsintel.Report) pipeline.Results {
 	res := pipeline.Results{
-		JavaScript:    report.AllJavaScript(),
+		JavaScript:    append(report.AllJavaScript(), report.AllChunkJavaScript()...),
 		SourceMaps:    report.AllSourceMaps(),
 		Relationships: report.AllRelationships(),
 	}
@@ -609,36 +643,128 @@ func jsResults(report jsintel.Report) pipeline.Results {
 }
 
 // jsDocuments builds the stage's document-channel additions from the engine
-// report's retained bodies: one pipeline.Document per fully retained body,
-// in canonical-URL order (Report.RetainedContent is already sorted and
-// deduplicated by URL). The document identity is the canonical JavaScript
-// asset identity of the URL — asset.Identity{Kind: KindJavaScript, Value:
-// the canonical URL string}, exactly what the engine's JS asset Identity()
-// produces — so a document and its JavaScript asset share one identity by
-// construction. The identity is keyed to the URL, not to the retained
-// body's classification: the engine keeps the bytes of every completed
-// positive observation (engine.go classify), so a fully-retained body that
-// is not itself JS-classified (e.g. fetched HTML) still yields a document
-// carrying the JavaScript-kind identity of its URL — a document identity
-// without a corresponding Results.JavaScript asset (the engine records JS
-// assets only for JS-classified observations) is therefore a documented
-// contract, not a surprise. Truncated is always false: retention only ever
-// carries complete bodies (jsintel/doc.go), and the pipeline's
-// hostile-producer guard re-binds over-cap content at the merge anyway.
-// Content is passed by reference — the report owns the bytes (pipeline
-// document-merge semantics).
+// report's retained bodies and windows (NEW-129 Slice 1): one
+// pipeline.Document per fully retained body plus, per windowed file, one
+// document per retained window and a trailing file sentinel.
+//
+// Complete files (Report.RetainedContent, already sorted/deduped by URL):
+// one Document per body with the canonical JavaScript asset identity of the
+// URL — asset.Identity{Kind: KindJavaScript, Value: the canonical URL
+// string}, exactly what the engine's JS asset Identity() produces — so a
+// document and its JavaScript asset share one identity by construction. The
+// identity is keyed to the URL, not to the retained body's classification:
+// the engine keeps the bytes of every completed positive observation
+// (engine.go classify), so a fully-retained body that is not itself
+// JS-classified (e.g. fetched HTML) still yields a document carrying the
+// JavaScript-kind identity of its URL — a document identity without a
+// corresponding Results.JavaScript asset (the engine records JS assets only
+// for JS-classified observations) is therefore a documented contract, not a
+// surprise. Truncated is always false: retention only ever carries complete
+// bodies (jsintel/doc.go), and the pipeline's hostile-producer guard
+// re-binds over-cap content at the merge anyway.
+//
+// Windowed files (Report.RetainedChunks, canonical-URL order, index order
+// within a file): one Document per window with the chunk identity built
+// through asset.ChunkJavaScriptIdentity (the single normalization point —
+// this adapter never formats chunk strings itself), Content aliased to the
+// window bytes (no copy — shared backing array with the retained prefix),
+// Truncated false; plus one trailing sentinel per file with the file JS
+// identity, nil Content, Truncated true (the honest truncation marker that
+// lets buildJSContents raise incomplete_input). Ordering is grouped-by-file
+// in index order plus sentinel, files in canonical-URL order with complete
+// files interleaved by URL — deterministic, so the runner's MaxOutput
+// tail-cut is deterministic. No per-file chunk cut is applied below the
+// produced windows: every produced window is emitted. Content is passed by
+// reference — the report owns the bytes (pipeline document-merge
+// semantics).
 func jsDocuments(report jsintel.Report) []pipeline.Document {
 	ret := report.RetainedContent()
-	if len(ret) == 0 {
+	chunks := report.RetainedChunks()
+	if len(ret) == 0 && len(chunks) == 0 {
 		return nil
 	}
-	out := make([]pipeline.Document, 0, len(ret))
+	// Index complete docs by file URL string for interleaved emission.
+	completeByURL := make(map[string]jsintel.RetainedContent, len(ret))
 	for _, rc := range ret {
-		u := rc.URL
+		completeByURL[rc.URL.String()] = rc
+	}
+	// Group chunks by file URL string (RetainedChunks is already sorted by
+	// URL then index, so groups arrive in order).
+	type chunkGroup struct {
+		url    string
+		file   jsintel.RetainedChunk
+		chunks []jsintel.RetainedChunk
+	}
+	var groups []chunkGroup
+	groupIdx := make(map[string]int, len(chunks))
+	for _, c := range chunks {
+		k := c.URL.String()
+		if gi, ok := groupIdx[k]; ok {
+			groups[gi].chunks = append(groups[gi].chunks, c)
+		} else {
+			groupIdx[k] = len(groups)
+			groups = append(groups, chunkGroup{url: k, file: c, chunks: []jsintel.RetainedChunk{c}})
+		}
+	}
+	// File order: union of complete and windowed file URLs, sorted.
+	seen := make(map[string]struct{}, len(ret)+len(groups))
+	var order []string
+	for _, rc := range ret {
+		k := rc.URL.String()
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			order = append(order, k)
+		}
+	}
+	for _, g := range groups {
+		if _, ok := seen[g.url]; !ok {
+			seen[g.url] = struct{}{}
+			order = append(order, g.url)
+		}
+	}
+	sort.Strings(order)
+	// Fast lookup of groups by URL.
+	byGroup := make(map[string][]jsintel.RetainedChunk, len(groups))
+	for _, g := range groups {
+		byGroup[g.url] = g.chunks
+	}
+	var out []pipeline.Document
+	for _, k := range order {
+		if rc, ok := completeByURL[k]; ok {
+			u := rc.URL
+			out = append(out, pipeline.Document{
+				Identity: asset.Identity{Kind: asset.KindJavaScript, Value: u.String()},
+				URL:      &u,
+				Content:  rc.Content,
+			})
+			continue
+		}
+		cs := byGroup[k]
+		if len(cs) == 0 {
+			continue
+		}
+		for _, c := range cs {
+			cid, cerr := asset.ChunkJavaScriptIdentity(c.URL, c.Index, c.Total, c.Start, c.End, c.HashPrefix, c.TilingTag)
+			if cerr != nil {
+				// Defensive (engine-produced chunks always construct):
+				// skip the malformed window, never emit a zero identity.
+				continue
+			}
+			fu := c.URL
+			out = append(out, pipeline.Document{
+				Identity: cid,
+				URL:      &fu,
+				Content:  c.Content,
+			})
+		}
+		// File sentinel: the honest truncation marker (nil content,
+		// Truncated true) citing the file JS identity.
+		fu := cs[0].URL
 		out = append(out, pipeline.Document{
-			Identity: asset.Identity{Kind: asset.KindJavaScript, Value: u.String()},
-			URL:      &u,
-			Content:  rc.Content,
+			Identity:  asset.Identity{Kind: asset.KindJavaScript, Value: fu.String()},
+			URL:       &fu,
+			Content:   nil,
+			Truncated: true,
 		})
 	}
 	return out

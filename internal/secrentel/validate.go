@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"regexp"
+	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
@@ -93,6 +94,66 @@ func validJWTShape(value string) bool {
 	}
 	_, hasAlg := obj["alg"]
 	return hasAlg
+}
+
+// jwtExpiry is the offline expiry reading of a JWT candidate's "exp" claim:
+// a pure function of the matched value (no clock injection — the comparison
+// point is the scan-time wall clock; fixtures use epoch-edge exp values so
+// tests stay deterministic for decades).
+type jwtExpiry int
+
+const (
+	// jwtExpiryNone: no usable "exp" claim (absent, non-numeric, or the
+	// payload does not decode) — expiry says nothing about this token.
+	jwtExpiryNone jwtExpiry = iota
+	// jwtExpiryValid: "exp" is present and in the future.
+	jwtExpiryValid
+	// jwtExpiryExpired: "exp" is present and in the past (now >= exp, the
+	// standard exp boundary: the token MUST NOT be accepted at or after
+	// its expiry).
+	jwtExpiryExpired
+)
+
+// jwtExpiryState decodes the JWT payload's "exp" claim (base64url, JSON
+// number — the only "exp" form RFC 7519 allows). It returns the expiry
+// reading and whether an "exp" claim was usable: ok is false exactly when
+// the reading is jwtExpiryNone. Malformed tokens, undecodable payloads,
+// and non-numeric "exp" members all report (jwtExpiryNone, false) — never
+// an error, never a panic. The Validator contract is untouched:
+// runValidator still reports shape as a bool; expiry only labels and caps
+// downstream confidence.
+func jwtExpiryState(value string) (jwtExpiry, bool) {
+	_, payload, _, ok := split3(value)
+	if !ok || payload == "" {
+		return jwtExpiryNone, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(payload); err != nil {
+			return jwtExpiryNone, false
+		}
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return jwtExpiryNone, false
+	}
+	exp, ok := obj["exp"].(float64)
+	if !ok {
+		return jwtExpiryNone, false
+	}
+	if float64(time.Now().Unix()) >= exp {
+		return jwtExpiryExpired, true
+	}
+	return jwtExpiryValid, true
+}
+
+// isJWTExpired reports whether value is a JWT-shaped token carrying a past
+// "exp" claim. It is the confidence layer's only expiry query: expired
+// tokens prove history, not live access, so they are labeled and capped —
+// never boosted.
+func isJWTExpired(value string) bool {
+	st, ok := jwtExpiryState(value)
+	return ok && st == jwtExpiryExpired
 }
 
 // split3 splits s on "." into exactly three parts.

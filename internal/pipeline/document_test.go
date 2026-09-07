@@ -388,3 +388,43 @@ func TestRunDocumentsDeterministic(t *testing.T) {
 		t.Errorf("report.Documents aliased the stage's slice: %+v", report.Documents)
 	}
 }
+
+// TestMergeDocumentsChunkNoCollisions pins Slice 1: chunk identities plus the
+// file sentinel merge without collisions (distinct dedup keys, all retained),
+// and a MaxOutput tail-cut keeps the deterministic head.
+func TestMergeDocumentsChunkNoCollisions(t *testing.T) {
+	fileURL, err := asset.ParseURL("https://cdn.example.com/bundle.js", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	// Build two chunk identities through the single constructor (no manual
+	// formatting here — the asset layer owns the strings).
+	c0, err := asset.ChunkJavaScriptIdentity(fileURL, 0, 2, 0, 524288, "aaaaaaaa", "w512-o8-v1")
+	if err != nil {
+		t.Fatalf("chunk 0: %v", err)
+	}
+	c1, err := asset.ChunkJavaScriptIdentity(fileURL, 1, 2, 516096, 600000, "bbbbbbbb", "w512-o8-v1")
+	if err != nil {
+		t.Fatalf("chunk 1: %v", err)
+	}
+	j := mustJavaScript(t, "https://cdn.example.com/bundle.js")
+	docs := []Document{
+		{Identity: c0, Content: []byte("w0")},
+		{Identity: c1, Content: []byte("w1")},
+		{Identity: j.Identity(), Content: nil, Truncated: true},
+	}
+	seen := make(map[string]struct{})
+	got, cut := mergeDocuments(nil, docs, seen, 100000)
+	if cut != nil || len(got) != 3 {
+		t.Fatalf("merged = %d cut %v, want 3/nil (no collisions)", len(got), cut)
+	}
+	// Tail-cut keeps the head deterministically.
+	seen2 := make(map[string]struct{})
+	got2, cut2 := mergeDocuments(nil, docs, seen2, 2)
+	if len(got2) != 2 || cut2 == nil {
+		t.Fatalf("tail-cut = %d/%v, want 2/documents", len(got2), cut2)
+	}
+	if got2[0].Identity != c0 || got2[1].Identity != c1 {
+		t.Fatalf("tail-cut head = %q/%q, want chunk 0/1", got2[0].Identity, got2[1].Identity)
+	}
+}

@@ -41,6 +41,9 @@ func NewReportStage(registry *report.Registry) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *reportStage) Name() pipeline.StageName { return pipeline.StageReport }
 
+// Level implements pipeline.LeveledStage: reporting closes the run last.
+func (s *reportStage) Level() int { return 8 }
+
 // Run implements pipeline.Stage.
 //
 // Engine config is derived from StageInput only:
@@ -374,6 +377,11 @@ func (s *reportStage) runReport(ctx context.Context, in pipeline.StageInput, reg
 		// clock; the engine tolerates nil either way.
 		Clock: in.Clock,
 		Cache: in.Cache,
+		// Observer passes through: nil = pool instrumentation off (zero
+		// behavior change); the runner's StageInput.Observer carries the
+		// run's shared sink, so the concurrent render fan-out is visible
+		// as one task per report.
+		Observer: in.Observer,
 	}
 
 	res, engineErr := report.Run(ctx, cfg, rctx)

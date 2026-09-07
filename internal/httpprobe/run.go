@@ -2,19 +2,25 @@ package httpprobe
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 	"github.com/RA000WL/RavenRecon/internal/version"
 )
@@ -56,8 +62,10 @@ const (
 
 	// MaxConcurrentPerHost bounds how many requests one host may have in
 	// flight concurrently. The current design submits exactly one job per
-	// host and probes its two targets sequentially, so at most 1 concurrent
-	// request per host is ever observed — below this cap. The constant is
+	// host and probes its targets sequentially — the two roots, then one
+	// http+https pair per HostPorts port, then one target per
+	// WellKnownPaths entry — so at most 1 concurrent request per host is
+	// ever observed — below this cap. The constant is
 	// the contract for future multi-target-per-host work: the actual bound
 	// must never exceed it (the per-host concurrency test pins this).
 	MaxConcurrentPerHost = 2
@@ -115,6 +123,14 @@ type Config struct {
 	// aggregate request dispatch rate is bounded regardless of
 	// concurrency. Rate <= 0 disables pacing; Burst < 1 means 1.
 	//
+	// Rate-note (review wave 2026-09-03): each engine entry point
+	// (Probe, ProbeURLs, ReflectURLs, ConfirmTakeoverHosts) builds its
+	// own limiter from the same Config, and pipeline stages call them
+	// SEQUENTIALLY — so the sustained dispatch rate always honors Rate
+	// (only one limiter gates at any instant), while the burst allowance
+	// refills at each phase boundary (effective burst ≈ phases × Burst).
+	// Operators pacing fragile targets should size Burst, not just Rate.
+	//
 	// The pool's own job-start rate limiting is disabled (Rate 0): per-
 	// request pacing subsumes job-start pacing — every outbound operation
 	// is individually gated — and the two would otherwise double-throttle
@@ -144,6 +160,60 @@ type Config struct {
 	// request limiter. Nil means the wall clock; tests inject a fake clock
 	// for deterministic assertions.
 	Clock runtime.Clock
+
+	// RequestHeaders carries operator-supplied session headers (NEW-125):
+	// added to every in-scope request (host probes, port targets,
+	// liveness, reflection, and confirmation probes). Nil or empty means
+	// anonymous probing. Cross-host redirect hops NEVER inherit them —
+	// only hops on the probe target's own host do (fail-closed
+	// direction: credentials stay where the operator aimed them).
+	// Values never enter logs, errors, reports, or cache records — only
+	// the SessionDigest below enters cache keys.
+	RequestHeaders http.Header
+
+	// HostPorts optionally extends each host's probe surface with extra
+	// ports (NEW-121): a map from canonical hostname to TCP port numbers
+	// probed IN ADDITION to the two root targets, as http://host:port/
+	// and https://host:port/ pairs. Nil or empty means root-only probing
+	// (byte-identical behavior to a map without the host). Ports whose
+	// canonical identity duplicates a root target (80, 443) probe once.
+	// Callers bound the lists themselves — the pipeline adapter caps at
+	// 16 ports per host with an honest overflow flag; the pool queue and
+	// the per-job deadline backstop direct callers — and every target
+	// still enjoys cache-before-execute under its own URL identity.
+	HostPorts map[string][]int
+
+	// WellKnownPaths optionally extends each host's probe surface with
+	// mistake-path targets: bare absolute paths ("/robots.txt") fetched
+	// IN ADDITION to the root and port targets, one GET per path. Nil or
+	// empty means root-only probing (byte-identical behavior). Paths run
+	// only on hosts whose root probe proved an HTTP server (a root
+	// target completed with an HTTP response), on the responding scheme
+	// (https preferred) — dead hosts cost zero extra requests. Every
+	// path enjoys cache-before-execute under its own URL identity, and
+	// the standard redirect/header/body bounds apply per target. The
+	// pipeline adapter ships the curated default set; see wellknown.go.
+	//
+	// Tuning requirement: Timeout must cover the whole sequential
+	// surface — 2 roots + port pairs + one request per path, at most 1
+	// in flight — because one job probes every target in order. A
+	// Timeout sized for roots alone expires mid-surface: the in-flight
+	// target records failed/timeout, every unattempted target records
+	// cancelled, and the cancelled-first host vocabulary folds the host
+	// to Cancelled. That outcome is contractual, not surprising (pinned
+	// by TestProbeWellKnownPathsShortTimeoutCancelsContractually).
+	// Enablement is programmatic-only in this milestone: this Config
+	// field (or the pipeline stage parameter that feeds it) — no scan
+	// CLI flag or global config key exists for it.
+	WellKnownPaths []string
+
+	// Observer is the optional instrumentation sink (internal/event
+	// Observer; the Bus satisfies it). When non-nil, the run's
+	// runtime.Pool emits canonical pool-boundary events (scan
+	// start/stop, worker start/stop, task submitted/started/running/
+	// terminal, phase transitions, progress, shutdown). Nil (the
+	// default) disables emission with zero behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns a Config with documented defaults. Concurrency and
@@ -177,6 +247,13 @@ type env struct {
 	// address (a DNS-pipeline observation). Probing itself observes no
 	// addresses; the map only feeds ip->port relationship edges.
 	ips map[string]asset.IP
+	// reqHeaders carries validated operator session headers (NEW-125),
+	// sent on in-scope requests (see applySessionHeaders). Nil means
+	// anonymous probing.
+	reqHeaders http.Header
+	// session is the digest bound into every cache key when headers are
+	// configured ("" when anonymous — keys stay byte-identical).
+	session string
 }
 
 // Probe probes hosts within the declared target domain and returns the typed
@@ -231,6 +308,23 @@ func Probe(ctx context.Context, domain asset.Domain, hosts []asset.Host, ips map
 	if err != nil {
 		return Report{}, err
 	}
+	// Per-host extra ports (NEW-121): keys must be canonical hostnames
+	// and every port 1..65535, or the whole call is rejected before any
+	// pool or limiter exists (caller bug, mirroring the host/IP
+	// boundary). Keys for hosts outside the input list are ignored —
+	// subset probing with a shared map must not fail — and out-of-scope
+	// keys are harmless (only input hosts are ever looked up, and inputs
+	hostPorts, err := normalizeHostPorts(cfg.HostPorts)
+	if err != nil {
+		return Report{}, err
+	}
+	// Mistake-path surface: validated once up front (caller bug on
+	// violation, mirroring the host/port boundary); the normalized list
+	// is shared read-only by every host job.
+	wellKnown, err := normalizeWellKnownPaths(cfg.WellKnownPaths)
+	if err != nil {
+		return Report{}, err
+	}
 	if len(hosts) == 0 {
 		// Nothing to probe: return an empty report without starting a
 		// pool.
@@ -251,6 +345,11 @@ func Probe(ctx context.Context, domain asset.Domain, hosts []asset.Host, ips map
 		// job-start pacing (see Config.Rate).
 		Rate:  0,
 		Burst: 0,
+		// Forward the instrumentation sink; nil disables pool events.
+		// The stateless Deriver converts completed job results into
+		// canonical derived events at the pool-job boundary.
+		Observer: cfg.Observer,
+		Deriver:  Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("httpprobe: create worker pool: %w", err)
@@ -268,8 +367,8 @@ func Probe(ctx context.Context, domain asset.Domain, hosts []asset.Host, ips map
 	for i, h := range hosts {
 		h := h
 		if _, err := pool.Submit(ctx, runtime.Job{Func: func(jctx context.Context) (any, error) {
-			results[i] = probeHost(jctx, h, domain, e)
-			return nil, nil
+			results[i] = probeHost(jctx, h, domain, e, hostPorts[h.Name], wellKnown)
+			return results[i], nil
 		}}); err != nil {
 			results[i] = HostResult{
 				Host:   h,
@@ -336,6 +435,14 @@ func buildEnv(cfg Config, ips map[string]asset.IP) (env, error) {
 		rt = cfg.Timeout
 	}
 	e := env{transport: transport, cache: cfg.Cache, clock: clock, requestTimeout: rt, ips: ips}
+	if len(cfg.RequestHeaders) > 0 {
+		validated, digest, err := normalizeRequestHeaders(cfg.RequestHeaders)
+		if err != nil {
+			return env{}, err
+		}
+		e.reqHeaders = validated
+		e.session = digest
+	}
 	if cfg.Rate > 0 {
 		burst := cfg.Burst
 		if burst < 1 {
@@ -498,38 +605,350 @@ func normalizeInputIPs(ips map[string]asset.IP, domain asset.Domain) (map[string
 	return out, nil
 }
 
-// probeHost probes one input host's two targets — http://host/ and
-// https://host/ — in stable order, then derives the typed assets and
-// relationships via assemble. A target never attempted because the job
-// context was already done is recorded cancelled (the runtime's convention
-// for work that never started); the probe target URL itself is always
-// recorded on the result regardless of outcome.
-func probeHost(ctx context.Context, host asset.Host, domain asset.Domain, e env) HostResult {
-	var probes []ProbeResult
-	for _, scheme := range []string{"http", "https"} {
-		target, err := probeTargetURL(host, scheme, e.clock)
-		if err != nil {
-			// Cannot happen with a canonical host and a fixed scheme;
-			// record the defensive failure rather than dropping the
-			// target.
-			probes = append(probes, ProbeResult{
-				Host: host, Scheme: scheme, Status: ProbeFailed,
-				FailureReason: ReasonOther, Executed: true, Err: err,
-			})
+// Session header bounds (NEW-125, fixed constants — never result
+// semantics, never cache keys beyond the digest).
+const (
+	// maxSessionHeaderCount bounds configured session headers.
+	maxSessionHeaderCount = 32
+	// maxSessionHeaderNameBytes bounds one header name.
+	maxSessionHeaderNameBytes = 256
+	// maxSessionHeaderValueBytes bounds one header value (session
+	// cookies are long, but bounded).
+	maxSessionHeaderValueBytes = 8 << 10
+	// maxSessionHeaderValues bounds the total number of header values
+	// across all keys (a single key may carry many values).
+	maxSessionHeaderValues = 64
+	// maxSessionHeaderTotalBytes bounds the total session header value
+	// bytes across all keys (Σ len(values)).
+	maxSessionHeaderTotalBytes = 64 << 10
+)
+
+// forbiddenSessionHeaders are headers the operator must never set via
+// the session file: Host (the transport would ignore it — silent
+// confusion), the framing headers Content-Length / Transfer-Encoding /
+// Connection (the transport owns framing — an operator value would
+// desync or smuggle requests), and User-Agent (the engines set their
+// own fixed identifier; a session override would silently impersonate
+// a different client rather than authenticate this one).
+func forbiddenSessionHeader(canon string) bool {
+	switch canon {
+	case "Host", "Content-Length", "Transfer-Encoding", "Connection", "User-Agent":
+		return true
+	}
+	return false
+}
+
+// normalizeRequestHeaders validates operator session headers at the
+// boundary (fail-closed: any invalid entry rejects the whole run before
+// any request — a half-authed scan is worse than none) and returns the
+// canonical form plus its cache-key digest. Canonical form: keys in
+// net/textproto canonical MIME form, values verbatim, sorted by key for
+// determinism. Rejected: empty maps (nil = anonymous, handled by the
+// caller — this function assumes non-empty), empty names or values,
+// non-token names, the Host / framing / User-Agent headers (see
+// forbiddenSessionHeader), over-long entries, non-printable value bytes
+// (CR/LF injection), over-count maps, over-count total values, and
+// over-budget total value bytes.
+func normalizeRequestHeaders(h http.Header) (http.Header, string, error) {
+	if len(h) == 0 {
+		return nil, "", fmt.Errorf("httpprobe: no session headers")
+	}
+	if len(h) > maxSessionHeaderCount {
+		return nil, "", fmt.Errorf("httpprobe: %d session headers over bound %d", len(h), maxSessionHeaderCount)
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(http.Header, len(h))
+	totalValues := 0
+	totalBytes := 0
+	for _, k := range keys {
+		// Token validity is checked on the operator's spelling (garbage
+		// is garbage in any case); storage is canonical, with
+		// case-variants merged in sorted order (deterministic).
+		if !validHeaderToken(k) {
+			return nil, "", fmt.Errorf("httpprobe: invalid session header name %q", k)
+		}
+		canon := textproto.CanonicalMIMEHeaderKey(k)
+		if len(canon) > maxSessionHeaderNameBytes {
+			return nil, "", fmt.Errorf("httpprobe: session header name over bound %d", maxSessionHeaderNameBytes)
+		}
+		if forbiddenSessionHeader(canon) {
+			return nil, "", fmt.Errorf("httpprobe: session headers must not set %s", canon)
+		}
+		for _, v := range h[k] {
+			if v == "" {
+				return nil, "", fmt.Errorf("httpprobe: session header %q has an empty value", k)
+			}
+			if len(v) > maxSessionHeaderValueBytes {
+				return nil, "", fmt.Errorf("httpprobe: session header %q value over bound %d", k, maxSessionHeaderValueBytes)
+			}
+			for i := 0; i < len(v); i++ {
+				if v[i] < 0x20 || v[i] > 0x7e {
+					return nil, "", fmt.Errorf("httpprobe: session header %q value carries control bytes", k)
+				}
+			}
+			totalValues++
+			totalBytes += len(v)
+		}
+		out[canon] = append(out[canon], h[k]...)
+	}
+	if totalValues > maxSessionHeaderValues {
+		return nil, "", fmt.Errorf("httpprobe: %d session header values over bound %d", totalValues, maxSessionHeaderValues)
+	}
+	if totalBytes > maxSessionHeaderTotalBytes {
+		return nil, "", fmt.Errorf("httpprobe: session header values total %d bytes over bound %d", totalBytes, maxSessionHeaderTotalBytes)
+	}
+	return out, sessionDigest(out), nil
+}
+
+// validHeaderToken reports whether name is an HTTP token.
+func validHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
 			continue
 		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sessionDigest binds session headers into cache keys WITHOUT carrying
+// values: hex SHA-256 over sorted "name\x00value" lines. Callers omit
+// the key component when empty, so anonymous runs keep byte-identical
+// keys (no cache invalidation on upgrade). Key order is normalized
+// (sorted); value order within one key is significant (duplicate values
+// in different orders digest differently — a miss, never stale).
+func sessionDigest(h http.Header) string {
+	if len(h) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(sessionDigestInput(h, keys)))
+	return hex.EncodeToString(sum[:])
+}
+
+// sessionDigestInput renders the canonical digest input.
+func sessionDigestInput(h http.Header, keys []string) string {
+	var b strings.Builder
+	for _, k := range keys {
+		for _, v := range h[k] {
+			b.WriteString(k)
+			b.WriteByte(0)
+			b.WriteString(v)
+			b.WriteByte(0)
+		}
+	}
+	return b.String()
+}
+
+// hostOfURL returns the bare hostname of a canonical URL asset (no
+// port, no IPv6 brackets) for same-host session scoping.
+func hostOfURL(u asset.URL) string {
+	hp := u.HostPort
+	if host, _, err := net.SplitHostPort(hp); err == nil {
+		hp = host
+	}
+	hp = strings.TrimPrefix(hp, "[")
+	hp = strings.TrimSuffix(hp, "]")
+	return hp
+}
+
+// applySessionHeaders sets validated session headers on an outbound
+// request. Callers gate scope themselves (same-host only for redirect
+// walks — see roundTrip); single-URL observations call it directly.
+func applySessionHeaders(req *http.Request, headers http.Header) {
+	for k, vs := range headers {
+		req.Header[k] = append([]string(nil), vs...)
+	}
+}
+
+// normalizeHostPorts validates the caller-provided per-host extra-port
+// map at the boundary: every key must be a canonical hostname and every
+// port 1..65535, or the whole call is rejected before any request —
+// caller bug, mirroring the host/IP boundary. Keys for hosts outside
+// the input list (or outside the scope) are ignored, never an error:
+// subset probing with a shared map must not fail, and only input hosts
+// are ever looked up. A nil map normalizes to nil (root-only probing).
+func normalizeHostPorts(m map[string][]int) (map[string][]int, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	// Sorted keys: with several bad entries the reported error is
+	// deterministic (map iteration order is not).
+	keys := make([]string, 0, len(m))
+	for name := range m {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	out := make(map[string][]int, len(m))
+	for _, name := range keys {
+		ports := m[name]
+		canon, err := asset.NewHost(name, asset.Provenance{})
+		if err != nil || canon.Name != name {
+			return nil, fmt.Errorf("httpprobe: invalid HostPorts key %q: not a canonical hostname", name)
+		}
+		cp := append([]int(nil), ports...)
+		sort.Ints(cp)
+		for _, p := range cp {
+			if p < 1 || p > 65535 {
+				return nil, fmt.Errorf("httpprobe: invalid port %d for host %q: must be 1..65535", p, name)
+			}
+		}
+		out[canon.Name] = dedupeInts(cp)
+	}
+	return out, nil
+}
+
+// dedupeInts drops adjacent duplicates from a sorted list.
+func dedupeInts(in []int) []int {
+	out := in[:0]
+	for i, v := range in {
+		if i == 0 || v != in[i-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// probeHost probes one input host's targets — http://host/ and
+// https://host/ first, then one http+https pair per HostPorts port in
+// ascending port order (canonical-identity duplicates of the roots probe
+// once), then one target per WellKnownPaths entry on the responding root
+// scheme (only when a root proved an HTTP server; see wellknown.go) — in
+// stable order, then derives the typed assets and relationships via
+// assemble. A target never attempted because the job context was already
+// done is recorded cancelled (the runtime's convention for work that never
+// started); the probe target URL itself is always recorded on the result
+// regardless of outcome.
+func probeHost(ctx context.Context, host asset.Host, domain asset.Domain, e env, ports []int, paths []string) HostResult {
+	specs, err := probeTargetSpecs(host, ports, e.clock)
+	if err != nil {
+		// Unreachable: Probe pre-validated the host and every port, so
+		// target construction cannot fail. Record the defensive failure
+		// rather than probing a partial surface.
+		return HostResult{
+			Host: host, Status: StatusFailed,
+			Err: fmt.Errorf("httpprobe: build probe targets for %s: %w", host.Name, err),
+		}
+	}
+	var probes []ProbeResult
+	probe := func(spec probeTargetSpec) {
 		if ctx.Err() != nil {
 			// Cancelled before this target could be attempted: report
 			// cancelled, never success, and never issue a request.
 			probes = append(probes, ProbeResult{
-				Host: host, URL: target, Scheme: scheme, Status: ProbeCancelled,
+				Host: host, URL: spec.url, Scheme: spec.scheme, Status: ProbeCancelled,
 				Executed: true, Err: ctx.Err(),
 			})
-			continue
+			return
 		}
-		probes = append(probes, probeTarget(ctx, host, target, domain, e, scheme))
+		probes = append(probes, probeTarget(ctx, host, spec.url, domain, e, spec.scheme))
+	}
+	for _, spec := range specs {
+		probe(spec)
+	}
+	// Mistake paths (see wellknown.go): only a root that proved an HTTP
+	// server enables them, on the responding scheme (https preferred).
+	// Roots are rebuilt for identity matching — construction cannot fail
+	// on a canonical host (mirroring probeTargetSpecs' own guarantee).
+	if len(paths) > 0 {
+		httpRoot, herr := probeTargetURL(host, "http", e.clock)
+		httpsRoot, serr := probeTargetURL(host, "https", e.clock)
+		if herr == nil && serr == nil {
+			if scheme := respondingScheme(probes, httpRoot.Identity().String(), httpsRoot.Identity().String()); scheme != "" {
+				seen := make(map[string]bool, len(specs))
+				for _, spec := range specs {
+					seen[spec.url.Identity().String()] = true
+				}
+				pathSpecs, err := wellKnownSpecs(host, scheme, paths, e.clock, seen)
+				if err != nil {
+					return HostResult{
+						Host: host, Status: StatusFailed, Probes: probes,
+						Err: fmt.Errorf("httpprobe: build well-known targets for %s: %w", host.Name, err),
+					}
+				}
+				for _, spec := range pathSpecs {
+					probe(spec)
+				}
+			}
+		}
 	}
 	return assemble(host, probes, &e)
+}
+
+// probeTargetSpec is one probe target: the canonical URL plus the scheme
+// that requested it (schemes select the TLS handshake path; the URL is
+// the probe's identity and cache-key target).
+type probeTargetSpec struct {
+	url    asset.URL
+	scheme string
+}
+
+// probeTargetSpecs builds one host's stable probe target list: the two
+// root targets first (http, then https — the historical order every
+// existing test pins), then one http+https pair per port in ascending
+// order. Targets whose canonical identity duplicates an earlier target
+// (port 80/443 repeat the roots — ParseURL strips default ports) are
+// planned once: the same observation is never probed twice.
+func probeTargetSpecs(host asset.Host, ports []int, clock runtime.Clock) ([]probeTargetSpec, error) {
+	var specs []probeTargetSpec
+	seen := make(map[string]bool)
+	add := func(scheme, raw string) error {
+		u, err := asset.ParseURL(raw, asset.Provenance{
+			Source:       "http-probe",
+			DiscoveredAt: clock.Now().UTC(),
+		})
+		if err != nil {
+			return err
+		}
+		if seen[u.Identity().String()] {
+			return nil
+		}
+		seen[u.Identity().String()] = true
+		specs = append(specs, probeTargetSpec{url: u, scheme: scheme})
+		return nil
+	}
+	for _, scheme := range []string{"http", "https"} {
+		target, err := probeTargetURL(host, scheme, clock)
+		if err != nil {
+			// Cannot happen with a canonical host and a fixed scheme;
+			// record the defensive failure rather than dropping the
+			// target (mirrors the historical inline path).
+			return nil, err
+		}
+		if seen[target.Identity().String()] {
+			continue
+		}
+		seen[target.Identity().String()] = true
+		specs = append(specs, probeTargetSpec{url: target, scheme: scheme})
+	}
+	cp := append([]int(nil), ports...)
+	sort.Ints(cp)
+	for _, port := range cp {
+		for _, scheme := range []string{"http", "https"} {
+			raw := scheme + "://" + host.Name + ":" + strconv.Itoa(port) + "/"
+			if err := add(scheme, raw); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return specs, nil
 }
 
 // probeTargetURL builds the canonical probe target URL for one scheme:
@@ -636,7 +1055,7 @@ func doProbe(ctx context.Context, host asset.Host, target asset.URL, domain asse
 		// completed observations (conn_refused / tls / timeout) to be
 		// re-validated and served as cache hits.
 		finalURL = cur
-		resp, err := roundTrip(reqCtx, cur, e)
+		resp, err := roundTrip(reqCtx, host, cur, e)
 		if err != nil {
 			st, fr := classifyProbeError(ctx, err)
 			pr.Status = st
@@ -755,13 +1174,19 @@ func waitForToken(ctx context.Context, e env) error {
 // must outlive this call so the response body can be drained); the request
 // carries the canonical target URL and a fixed RavenRecon user agent; the
 // transport resolves and dials (or, in tests, routes to a hermetic server).
-func roundTrip(ctx context.Context, target asset.URL, e env) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+func roundTrip(ctx context.Context, origin asset.Host, cur asset.URL, e env) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cur.String(), nil)
 	if err != nil {
 		// A canonical asset URL always builds; keep the defensive path.
-		return nil, fmt.Errorf("httpprobe: build request for %s: %w", target, err)
+		return nil, fmt.Errorf("httpprobe: build request for %s: %w", cur.String(), err)
 	}
 	req.Header.Set("User-Agent", userAgent)
+	// Session headers ride only same-host hops (NEW-125): the origin is
+	// the probe target's host; a followed redirect to another host —
+	// even in-domain — never inherits credentials (fail-closed).
+	if hostOfURL(cur) == origin.Name {
+		applySessionHeaders(req, e.reqHeaders)
+	}
 	return e.transport.RoundTrip(req)
 }
 

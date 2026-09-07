@@ -9,14 +9,18 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 )
 
 // triageFinding builds one canonical triage-pack finding. Subject must be
 // observed; evidence is a MethodDetection record on the subject with
 // provenance Source "triage". Category is information, priority info,
-// confidence 0.6 (heuristic testing assignment, not a vulnerability claim),
-// status open, timestamps from injected Clock for determinism.
-func triageFinding(dctx *detect.Context, ruleID, ruleName string, subject asset.Identity, meta map[string]string) (asset.Finding, error) {
+// status open, timestamps from injected Clock for determinism. Confidence
+// is 0.8 when live reflection evidence backs a flagged param (the probe
+// saw the input come back — a second signal beyond the param name) and
+// 0.6 for unenriched name-only matches (heuristic testing assignments,
+// never vulnerability claims).
+func triageFinding(dctx *detect.Context, ruleID, ruleName string, subject asset.Identity, confidence float64, meta map[string]string) (asset.Finding, error) {
 	ev, err := asset.NewEvidence(asset.MethodDetection, ruleID, "triage pack signal: "+ruleID, subject, asset.Provenance{Source: "triage"})
 	if err != nil {
 		return asset.Finding{}, err
@@ -26,7 +30,7 @@ func triageFinding(dctx *detect.Context, ruleID, ruleName string, subject asset.
 		RuleName:   ruleName,
 		Category:   detect.CategoryInformation.String(),
 		Subject:    subject,
-		Confidence: 0.6,
+		Confidence: confidence,
 		Evidence:   []asset.Evidence{ev},
 		Metadata:   meta,
 		Priority:   detect.PriorityInfo.String(),
@@ -207,10 +211,211 @@ type triageSubjects struct {
 	multi      bool
 }
 
+// reflectionIndex groups canary-reflection verdicts (urllive evidence:
+// MethodEndpoint + "reflect:<param>") by source URL identity string. Only
+// decided verdicts ever enter the channel — unknown is fail-open at the
+// reader — so every entry here is actionable.
+func reflectionIndex(evs []asset.Evidence) map[string]map[string]string {
+	out := make(map[string]map[string]string)
+	for _, ev := range evs {
+		param, verdict, ok := httpprobe.ParseReflectEvidence(ev)
+		if !ok {
+			continue
+		}
+		src := ev.Source.String()
+		m := out[src]
+		if m == nil {
+			m = make(map[string]string)
+			out[src] = m
+		}
+		if _, dup := m[param]; !dup {
+			m[param] = string(verdict)
+		}
+	}
+	return out
+}
+
+// reflectionPostIndex groups POST canary-reflection verdicts (urllive
+// evidence: MethodEndpoint + "reflect-post-form:<param>" or
+// "reflect-post-json:<param>") by source URL identity string. It resolves
+// the channel via httpprobe.ReflectEvidenceScope and strips the
+// scope-namespaced indicator to the param — it never parses POST as query,
+// so GET and POST verdicts never conflate. Only decided verdicts enter
+// (unknown claims no scope at the reader); every entry here is actionable.
+func reflectionPostIndex(evs []asset.Evidence) map[string]map[string]string {
+	out := make(map[string]map[string]string)
+	for _, ev := range evs {
+		scope, ok := httpprobe.ReflectEvidenceScope(ev)
+		if !ok {
+			continue
+		}
+		if scope != httpprobe.ReflectScopePostForm && scope != httpprobe.ReflectScopePostJSON {
+			continue
+		}
+		var param string
+		if p, ok := strings.CutPrefix(ev.Indicator, httpprobe.ReflectPostFormIndicatorPrefix); ok {
+			param = p
+		} else if p, ok := strings.CutPrefix(ev.Indicator, httpprobe.ReflectPostJSONIndicatorPrefix); ok {
+			param = p
+		} else {
+			continue
+		}
+		if param == "" {
+			continue
+		}
+		param = strings.ToLower(strings.TrimSpace(param))
+		if param == "" {
+			continue
+		}
+		src := ev.Source.String()
+		m := out[src]
+		if m == nil {
+			m = make(map[string]string)
+			out[src] = m
+		}
+		if _, dup := m[param]; !dup {
+			m[param] = ev.Value
+		}
+	}
+	return out
+}
+
+// reflectionPostScopes groups the POST body kinds observed per source URL
+// identity string, for the reflection_post_scope citation. Keys are scope
+// values ("post-form", "post-json"); the caller renders them sorted.
+func reflectionPostScopes(evs []asset.Evidence) map[string]map[string]struct{} {
+	out := make(map[string]map[string]struct{})
+	for _, ev := range evs {
+		scope, ok := httpprobe.ReflectEvidenceScope(ev)
+		if !ok {
+			continue
+		}
+		if scope != httpprobe.ReflectScopePostForm && scope != httpprobe.ReflectScopePostJSON {
+			continue
+		}
+		src := ev.Source.String()
+		m := out[src]
+		if m == nil {
+			m = make(map[string]struct{})
+			out[src] = m
+		}
+		m[string(scope)] = struct{}{}
+	}
+	return out
+}
+
+// reflectionMeta renders the cited verdicts for one subject's flagged
+// params as sorted "param:verdict" pairs, bounded to
+// maxReflectionMetaBytes with an honest ",+N more" marker: finding
+// metadata values must fit 256 bytes, and an unbounded join would fail
+// finding validation on wide endpoints.
+const maxReflectionMetaBytes = 256
+
+func reflectionMeta(params []string, verdicts map[string]string) string {
+	var pairs []string
+	for _, p := range params {
+		if v, ok := verdicts[p]; ok {
+			pairs = append(pairs, p+":"+v)
+		}
+	}
+	if len(pairs) == 0 {
+		return ""
+	}
+	sort.Strings(pairs)
+	joined := strings.Join(pairs, ",")
+	if len(joined) <= maxReflectionMetaBytes {
+		return joined
+	}
+	// Greedy deterministic fit: keep the longest head whose exact
+	// rendering (head + exact remainder marker) fits the bound.
+	const markerFmt = ",+%d more"
+	for n := len(pairs); n >= 1; n-- {
+		marker := fmt.Sprintf(markerFmt, len(pairs)-n)
+		head := strings.Join(pairs[:n], ",")
+		if len(head)+len(marker) <= maxReflectionMetaBytes {
+			return head + marker
+		}
+	}
+	// A single pair never fits (a >256-byte param name cannot happen —
+	// reflection caps names at 64 bytes — so this is defensive): cite
+	// the count honestly.
+	return fmt.Sprintf("+%d verdicts", len(pairs))
+}
+
+// dropSilent reports whether a subject's flagged params are all
+// verdict-ed not-reflected on the GET channel with no POST rescue: every
+// flagged param carries a GET verdict, none is GET-reflected, and none is
+// POST-reflected for the same source identity. Missing verdicts (no
+// evidence, unknown probes, or params the reflection pass never covered)
+// keep the subject — fail-open, so output without enrichment is unchanged.
+// POST verdicts never parse as query (separate index); a POST reflected
+// verdict rescues a GET-silent subject, cited under reflection_post.
+func dropSilent(flagged map[string]struct{}, verdicts map[string]string, postVerdicts map[string]string) bool {
+	if len(verdicts) == 0 && len(postVerdicts) == 0 {
+		return false
+	}
+	considered := 0
+	for p := range flagged {
+		v, ok := verdicts[p]
+		if !ok {
+			return false
+		}
+		considered++
+		if isReflected(v) {
+			return false
+		}
+	}
+	if considered == 0 {
+		return false
+	}
+	// GET demands a drop (all flagged GET-absent): rescue when any flagged
+	// param reflected via POST for the same source.
+	for p := range flagged {
+		if v, ok := postVerdicts[p]; ok {
+			if isReflected(v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isReflected reports a decided reflected verdict on either channel: the
+// canary came back unencoded or encoded. Absent/unknown verdicts are not
+// reflected — and missing verdicts never reach here (fail-open upstream).
+func isReflected(v string) bool {
+	return v == string(httpprobe.ReflectUnencoded) || v == string(httpprobe.ReflectEncoded)
+}
+
+// reflectBacked reports whether live reflection evidence backs any flagged
+// param on either the GET or the POST channel: the probe saw attacker-
+// controlled input return, a second signal beyond the param name. Backed
+// findings carry confidence 0.8; unenriched name-only matches stay 0.6.
+func reflectBacked(params []string, verdicts, postVerdicts map[string]string) bool {
+	for _, p := range params {
+		if isReflected(verdicts[p]) || isReflected(postVerdicts[p]) {
+			return true
+		}
+	}
+	return false
+}
+
 // runTriage is the shared bounded, deterministic detector core for all
 // eight triage rules. It extracts param names, applies overlap precedence
 // (primary only), flags multi-class, sorts, caps at 256, and builds
 // findings with MethodDetection evidence.
+//
+// Reflection gate (NEW-120, POST-aware NEW-127): subjects whose every
+// flagged param verdicts not-reflected on GET with no POST rescue are
+// dropped — an inert input is not worth a researcher's click. Any
+// GET- or POST-reflected verdict keeps the subject and is cited in meta
+// under a distinct key (reflection for GET, reflection_post for POST, so
+// channels never conflate); missing or unknown verdicts keep it too
+// (fail-open): without enrichment the output is byte-identical to the
+// pre-gate behavior. Cited GET verdicts carry reflection_scope
+// (query-get-only); cited POST verdicts carry reflection_post_scope
+// (post-form and/or post-json). POST bodies, headers, and fragments
+// outside the probed channels were not tested.
 func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName string) ([]asset.Finding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -218,7 +423,16 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 	if dctx.Config[ruleID+".disabled"] == "true" {
 		return nil, nil
 	}
+	refl := reflectionIndex(dctx.Evidence)
+	postRefl := reflectionPostIndex(dctx.Evidence)
+	postScopes := reflectionPostScopes(dctx.Evidence)
 	seen := make(map[asset.Identity]*triageSubjects)
+	// verdictsBySubject carries each kept subject's URL-identity verdict
+	// map for meta rendering: the reflection index is keyed by URL
+	// identity while findings are keyed by endpoint identity.
+	verdictsBySubject := make(map[asset.Identity]map[string]string)
+	postVerdictsBySubject := make(map[asset.Identity]map[string]string)
+	postScopesBySubject := make(map[asset.Identity]map[string]struct{})
 	var subjects []asset.Identity
 	for _, ep := range dctx.Endpoints {
 		if err := ctx.Err(); err != nil {
@@ -247,11 +461,18 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 		if !matched {
 			continue
 		}
+		srcKey := ep.URL.Identity().String()
+		if dropSilent(info.params, refl[srcKey], postRefl[srcKey]) {
+			continue
+		}
 		id := ep.Identity()
 		if _, ok := seen[id]; ok {
 			continue
 		}
 		seen[id] = info
+		verdictsBySubject[id] = refl[srcKey]
+		postVerdictsBySubject[id] = postRefl[srcKey]
+		postScopesBySubject[id] = postScopes[srcKey]
 		subjects = append(subjects, id)
 	}
 	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
@@ -272,6 +493,31 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 		}
 		sort.Strings(plist)
 		meta := map[string]string{"signal": "triage_" + shortName(ruleID), "triage_class": shortName(ruleID), "params": strings.Join(plist, ",")}
+		if rm := reflectionMeta(plist, verdictsBySubject[s]); rm != "" {
+			meta["reflection"] = rm
+			// Scope marker (NEW-127): cited verdicts cover GET query
+			// parameters only — endpoints accepting POST bodies,
+			// headers, or fragments were not tested, and silence
+			// about them must never be read as clean. Silence itself
+			// produces no finding, so the marker rides the verdicts
+			// it scopes (absent without evidence, by construction).
+			meta["reflection_scope"] = "query-get-only"
+		}
+		if rpm := reflectionMeta(plist, postVerdictsBySubject[s]); rpm != "" {
+			meta["reflection_post"] = rpm
+			// POST scope marker rides the POST verdicts it scopes, so
+			// a POST-rescued finding never loses its channel claim.
+			if sc, ok := postScopesBySubject[s]; ok && len(sc) > 0 {
+				kinds := make([]string, 0, len(sc))
+				for k := range sc {
+					kinds = append(kinds, k)
+				}
+				sort.Strings(kinds)
+				meta["reflection_post_scope"] = strings.Join(kinds, ",")
+			} else {
+				meta["reflection_post_scope"] = "post-body"
+			}
+		}
 		if info.multi {
 			meta["multi_class"] = "true"
 			clist := make([]string, 0, len(info.allClasses))
@@ -283,11 +529,19 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 		} else {
 			meta["multi_class"] = "false"
 		}
+		// Reflection-backed confidence: a flagged param the probe saw
+		// return carries 0.8; unenriched name-only matches stay 0.6.
+		// The marker makes the promotion auditable in the finding itself.
+		confidence := 0.6
+		if reflectBacked(plist, verdictsBySubject[s], postVerdictsBySubject[s]) {
+			confidence = 0.8
+			meta["reflection_backed"] = "true"
+		}
 		if dropped > 0 {
 			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
 			meta["truncated"] = "true"
 		}
-		f, err := triageFinding(dctx, ruleID, ruleName, s, meta)
+		f, err := triageFinding(dctx, ruleID, ruleName, s, confidence, meta)
 		if err != nil {
 			return nil, err
 		}

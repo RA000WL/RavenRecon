@@ -485,11 +485,198 @@ hardening — per `AGENTS.md:5` scope policy. Do not land continuous monitoring,
 | OPT-P3-2 | Universal ingestion | — | `ROADMAP.md:v1.8` `internal/importer` | v1.8 | VERIFIED (1ede060 + 81785f2 + 3e5ba4e + 5e806fe + 7fd312a + cf0e939 + T14 close-out, TODO.md NEW-59) |
 | OPT-P3-3 | Detection packs | — | `ROADMAP.md:v2.0` `detect/api.go` + `internal/detect/packs/*` 5 packs 22 rules | v2.0 | VERIFIED (7956f0d + 7d71aa8 + 453de88 + 7c2c3f1 + c9e45fa + e678eea, TODO.closed.md NEW-95+113; AllPacks 22 / AllStages 12) |
 | OPT-P3-4 | Logger/replay consumers | — | `ARCHITECTURE.md:3141` `internal/event` + `internal/log`/`internal/replay` | v2.1 | PLANNED |
+| W2-1 | Silent snapshot-content trim | CRITICAL | `adapt/detect.go:buildJSContents` | — | FIXED (WAVE-2026-09-03) |
+| W2-2 | Per-URL errors silently completed | CRITICAL | `adapt/urllive.go`, `adapt/httpprobe.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-3 | JS 3× parse amplification | HIGH | `packs/js/*.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-4 | Nondeterministic validation order | MEDIUM | `httpprobe/run.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-5 | Shared-backing header mutation | MEDIUM | `adapt/priority.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-6 | Redirect IP spelling bypasses | MEDIUM | `jsintel/fetch.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-7 | DNS-name→private redirect follow | HIGH | `jsintel/fetch.go` | — | FIXED (WAVE-2026-09-03) |
+| W2-8 | JS predicate precision | HIGH | `packs/js/*.go` | — | OPEN (NEW-123) |
+| W2-9 | Chunked big-bundle scan | HIGH | `pipeline/document.go` | — | OPEN (NEW-124) |
+| W2-10 | Session headers | HIGH | `httpprobe/jsintel` configs | — | OPEN (NEW-125) |
+| W2-11 | DNS record types | HIGH | `internal/dns` | — | OPEN (NEW-126) |
+| W2-12 | POST reflection scope | MEDIUM | `httpprobe/reflect.go` | — | OPEN (NEW-127) |
+| W2-13 | Takeover table + S3 confirm | MEDIUM | `httpprobe/takeover.go` | — | OPEN (NEW-128) |
+
+---
+
+## 11. Review wave 2026-09-03 (post-NEW-118..122 + P0 hardening)
+
+Three parallel passes (hostile-target security of new code, hunter
+effectiveness, reliability interactions) over the uncommitted wave
+(~56 files, +4019/−232) plus lead verification of every headline claim.
+Full report: `REVIEW-2026-09-03.md`. Items fixed in-session carry the
+fix commit pointer `WAVE-2026-09-03` (uncommitted at writing —
+orchestrator VERIFY pending on NEW-118..122); deferred items map to
+TODO board entries.
+
+### W2-1 (CRITICAL) — Silent snapshot-content trim — FIXED
+
+- **Evidence:** `internal/pipeline/adapt/detect.go:buildJSContents` cut to
+  `MaxSnapshotJSContents`/`MaxSnapshotJSContentBytes` with no flag —
+  completed detect over an unanalyzed prefix at >1024 bodies/64 MiB.
+- **Fix:** returns `(out, truncated)`; stage sets `Truncated` +
+  `detect_js_contents_truncated` on every outcome path.
+- **Verify:** `TestDetectStageJSContentsOverflowFlag` (1025 docs) watched
+  FAIL→PASS; full suite green.
+
+### W2-2 (CRITICAL) — Per-URL transport errors silently completed — FIXED
+
+- **Evidence:** `adapt/urllive.go:addReflection` and `adapt/httpprobe.go:
+  confirmTakeover` flagged only body-cap truncation; timeout/refused/
+  submit-failure records (unknown verdicts, zero evidence) completed
+  silently.
+- **Fix:** `rec.Err != nil` / `v.Err != nil` set the truncated flags.
+- **Verify:** `TestUrlliveStageReflectionTransportErrorFlag`,
+  `TestConfirmTakeoverTransportErrorFlag` FAIL→PASS.
+
+### W2-3 (HIGH) — JS per-rule 3× parse amplification — FIXED
+
+- **Evidence:** 3 detectors parsed every retained body per rule then
+  discarded `Parsed` (`_ = parsed`); hostile bundles suppress findings
+  via 2 s rule timeouts.
+- **Fix:** Parse calls removed — snapshot bodies are pre-bounded ≤2 MiB
+  (parser cap 8 MiB), so parsing was infallible pure overhead; verdicts
+  byte-identical (full js-pack suite green unchanged).
+- **Verify:** `go test ./internal/detect/packs/js/` + `-race` green.
+
+### W2-4 (MEDIUM) — Nondeterministic multi-error validation order — FIXED
+
+- **Evidence:** `internal/httpprobe/run.go:normalizeHostPorts` ranged a
+  Go map; multi-bad inputs varied error text run to run.
+- **Fix:** sorted keys before validating.
+- **Verify:** `TestNormalizeHostPortsDeterministicError` (5 iterations).
+
+### W2-5 (MEDIUM) — Shared-backing header mutation — FIXED
+
+- **Evidence:** `adapt/priority.go:enrichURLSignal` truncated header
+  lines in the shared enrichment map's backing array.
+- **Fix:** copy-before-truncate.
+- **Verify:** full adapt suite + `-race` green.
+
+### W2-6 (MEDIUM) — Redirect IP-literal spelling bypasses — FIXED
+
+- **Evidence:** `jsintel/fetch.go:isIPLiteralHostPort` passed
+  `010.0.0.1`, `2130706433`, `0x7f000001`, trailing-dot forms to DNS.
+- **Fix:** dot-trim + `isNumericHost` (decimal/hex/dotted-numeric
+  refusal; real names `db2`/`cafe` still pass).
+- **Verify:** spelling table test green.
+
+### W2-7 (HIGH) — DNS-name→private-IP redirect follow (TOCTOU) — FIXED
+
+- **Evidence:** `jsintel/fetch.go` followed cross-host DNS names with no
+  dial-time check — hostile 302 to attacker DNS answering
+  `169.254.169.254` fetched and retained bodies.
+- **Fix:** `redirectDialSafe` fail-closed gate (same-host exempt,
+  resolver error/empty/non-public → observed-never-followed) via
+  `FetchConfig.ResolveIP` seam (nil = system DNS); residual rebinding
+  documented + egress guidance in `doc.go`.
+- **Verify:** private/timeout/DNS-error end-to-end tests green; public
+  cross-host still follows; full `jsintel` suite + `-race` green.
+
+### W2-8 (IN PROGRESS) — JS predicate precision needs FP measurement
+
+- **Evidence:** string-contains predicates on real bodies fire on
+  comments/strings/dead code (`packs/js/*.go`).
+- **Measurement landed 2026-09-03** (`packs/js/js_fp_test.go`,
+  triage-harness pattern): recall 100% on 6 labeled vuln bodies
+  (gates tightening), clean-safe quiet, 5 trap baselines pinned
+  exactly (4 FP traps fire as predicted incl. click+`"message"` and
+  `e.origin`-in-comment FN trap quiet as predicted), benign-bundle
+  baseline pinned at 2 findings.
+- **Remaining:** token-aware filtering over `Parsed` output — only
+  against these baselines (blind redesign risks regressions).
+- **Board:** NEW-123 (OPEN, harness landed).
+
+### W2-9 (DEFERRED → PHASE 1 DONE) — Chunked >2 MiB bundle scanning
+
+- **Evidence:** `pipeline/document.go:MaxDocumentBytes`, jsintel 2 MiB
+  cap, `buildJSContents` skip, snapshot 2 MiB bound — big webpack
+  bundles invisible to all JS rules, silently.
+- **Phase 1 landed 2026-09-03 (jsintel-internal):** streamed over-cap
+  bodies tile the bounded prefix (512 KiB/8 KiB, same memory ceiling;
+  declared-huge fast-fail preserved windowless); per-window
+  parse+extract merged by identity; entries stay Incomplete, nothing
+  cached/retained (truncated contract byte-identical); warm runs
+  recompute; non-JS untouched. Acceptance: hostile `huge.js` yields
+  its JS asset (+1, filler body → no candidates); nothing else
+  drifted. Full gates + `-race` green.
+- **Phase 2 (NEW-129):** chunk documents + snapshot bodies + detect-JS
+  findings need chunk-identity design (per-window documents keyed by
+  derived identities, windowed fetch-cache records never served as
+  complete, per-chunk analyze records).
+- **Board:** NEW-124 (Phase 1 IN PROGRESS) + NEW-129 (Phase 2 OPEN).
+
+### W2-10 (DEFERRED) — Operator session headers (no acquisition)
+
+- **Evidence:** no cookie/header/session plumbing anywhere; all
+  findings pre-auth.
+- **Fix:** opt-in operator-supplied header/jar + redaction + cache-key
+  bind. Login/brute-force stays §0.1.
+- **Board:** NEW-125.
+
+### W2-11 (DEFERRED) — DNS MX/TXT/NS/SOA/SRV/CAA records
+
+- **Evidence:** `internal/dns/run.go` A/AAAA/CNAME only; takeover pack
+  sees depth-1 CNAME shape.
+- **Fix:** parallel `TypeResult`s, same caps/cache; needs results
+  channels + rules to deliver value (multi-milestone).
+- **Board:** NEW-126.
+
+### W2-12 (DEFERRED) — POST/body/header reflection scope
+
+- **Evidence:** reflection covers GET query params only; POST-only
+  endpoints never flagged; silence on POST untrustworthy.
+- **Fix:** POST form/JSON canary reflection (still benign liveness) or
+  explicit `reflection_scope=query-get-only` meta.
+- **Board:** NEW-127.
+
+### W2-13 (DEFERRED) — Takeover table expansion + S3 confirmation
+
+- **Evidence:** 3 HTTP providers vs 13 DNS suffixes; S3 rule
+  shape-only (often out-of-domain endpoints).
+- **Fix:** curated strings for the 13 + S3-endpoint fetch path.
+- **Board:** NEW-128.
+
+### Dispositions (investigated, kept by design)
+
+- Reflection `Absent` evidence kept: dropping it kills the triage DROP
+  path; volume bounded (16×512), merge-capped with `evidence_truncated`
+  honesty.
+- `priority` jsSize/methods joins rarely hit (URL-identity mismatch):
+  harmless zero-fields; endpoint correlation is future work.
+- Detect clone shares inner finding slices read-only by contract.
+- Takeover uncached by design (freshness-critical claims).
+- Knob philosophy: cheap enrichment defaults ON, traffic multipliers
+  opt-in (`port_discovery`, `probe_ports`) — documented in
+  `adapt/ports.go:portProbeEnabled`.
+- Limiter multiplier is burst-only (sequential phases); documented in
+  `httpprobe/run.go:Config.Rate`.
+- 30 s job vs 34-target hosts: documented timeout guidance in
+  `adapt/ports.go:maxProbePortsPerHost`.
 
 ---
 
 ## Change log
 
+- `2026-09-03` — implementation wave (autonomous): NEW-124 Phase 1
+  windowed big-bundle analysis (jsintel prefix windows + merged
+  analysis; hostile `huge.js` yields its asset, nothing else drifted),
+  NEW-123 JS precision harness (recall 100%, trap baselines, benign
+  bundle pinned at 2), NEW-127 `reflection_scope` marking, NEW-128
+  analysis (no safe code delta — documented per-provider reasons),
+  benchmarks for new hot paths (`BenchmarkSplitWindows`,
+  `BenchmarkAnalyzeWindowsMerge`, `BenchmarkMatchTakeoverProvider`,
+  `BenchmarkSubstituteCanaries` — CI-safe: missing baselines report
+  MISSING, never fail). Full gates + `-race` green throughout.
+- `2026-09-03` — review wave (REVIEW-2026-09-03.md): three parallel
+  passes over the uncommitted NEW-118..122 + P0 wave found 7 fixable
+  items (W2-1..W2-7, all fixed in-session with RED→GREEN tests) and 6
+  deferred backlog items (W2-8..W2-13 → NEW-123..128); dispositions
+  recorded for investigated-no-change items (Absent evidence, rare-hit
+  joins, clone sharing, uncached takeover, knob philosophy, limiter
+  burst, job-budget guidance). Full gates green.
 - `2026-08-30` — docs-wave (ROADMAP v2 split, OPTIMIZATION upgrade tree, ARCHITECTURE sync): split single v2 placeholder into three shippable milestones **v2.1 Reliability & Observability Closure** (no SDK break), **v2.2 Graph & Inter-Rule Dataflow** (SDK v2 breaking: APIMajor 1→2, SchemaVersion 2→3), **v2.3 Advanced Hunting Packs** (non-breaking on SDK v2) per research round `ses_fae02a996ffejXX5FX8NZhXORZ` (2026-08-30) — preserving determinism/caching; recorded v2.0.1 follow-ups NEW-110 (TLS SAN default ON), NEW-111 (naabu opt-in), NEW-112 (multi-target fan-out) as landed `AllStages` 12 / `AllPacks` 22 preserved; added upgrade diagram `v2.0→v2.0.1→v2.1→v2.2→v2.3` with cache/determinism notes in both ROADMAP and OPTIMIZATION §8; `OPT-P3-4` logger/replay stays **PLANNED** correctly mapped to **v2.1** (was post-v1.4) and `OPT-P3-3` 22/12 pinned; ARCHITECTURE Reader's map renumbered against live `^#` grep, Detection framework per-rule `cloneContextForRule` + 5 packs via frozen SDK, v0.3 boundary bullet fixed to “framework ships 5 packs via frozen SDK”, Reporting per-render `cloneModel` noted, persistent store deferred to v2.2; TODO preamble stale “only DEFERRED” corrected to current **IN PROGRESS** board (NEW-96..109 + 110/111/112 + NF-7, next free NEW-114 unchanged); no code/testdata/`version.go` bump; docs-only must not break gates.
 - `2026-08-24` — v2.0 close-out: `OPT-P3-3` detection packs VERIFIED (Web/JS/APIs/Cloud
   packs in `internal/detect/packs/`, 14 rules via frozen SDK v1; commits 7d71aa8, 453de88,

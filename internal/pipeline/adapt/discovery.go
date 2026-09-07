@@ -166,6 +166,9 @@ func NewDiscoveryStage(runner discovery.Runner, lookPath discovery.LookupFunc) p
 // Name implements pipeline.Stage.
 func (s *discoveryStage) Name() pipeline.StageName { return pipeline.StageDiscover }
 
+// Level implements pipeline.LeveledStage: discovery roots the corpus.
+func (s *discoveryStage) Level() int { return 0 }
+
 // Run implements pipeline.Stage.
 func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	cfg := discovery.Config{
@@ -182,6 +185,10 @@ func (s *discoveryStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 			return in.Clock.Now()
 		},
 		Quality: qualityConfigFromParams(in.Config),
+		// The run's shared instrumentation sink (nil = off): task/cache/progress
+		// events reach the live TUI frame. Engines never invent events, only
+		// forward the sink.
+		Observer: in.Observer,
 	}
 
 	report, err := discovery.Run(ctx, in.Target, cfg)

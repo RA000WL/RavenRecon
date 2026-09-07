@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
+	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/techintel"
 	"github.com/RA000WL/RavenRecon/internal/techintel/fingerprints"
@@ -60,6 +62,9 @@ func NewTechIntelStage(db *fingerprints.DB) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIntel }
 
+// Level implements pipeline.LeveledStage: fingerprints need the post-crawl corpus.
+func (s *techIntelStage) Level() int { return 4 }
+
 // Run implements pipeline.Stage.
 //
 // Engine config is derived from StageInput only:
@@ -91,15 +96,21 @@ func (s *techIntelStage) Name() pipeline.StageName { return pipeline.StageTechIn
 // StageParams: none. in.Config is never read — the stage has no documented
 // parameter keys, and unknown keys are ignored by construction.
 //
-// Observations: the pipeline corpus carries URL assets only (no status
-// codes, headers, bodies, cookies, TLS, or DNS observations — those channels
-// are filled by the httpprobe/dns stages in a later milestone), so each
-// in-scope URL becomes exactly one techintel.Observation carrying only its
-// URL identity. All other observation fields are zero, which the engine
-// treats as "not observed" (legal). The adapter never fabricates observations
-// and the pipeline never fetches bodies (adapt/doc.go D3): only fingerprint
-// kinds matchable from a URL's path (IndicatorEndpointPath) can fire through
-// this adapter today.
+// Observations: each in-scope URL becomes exactly one
+// techintel.Observation carrying its URL identity plus the host-level TLS
+// observation resolved from the results channel (NEW-119): the httpprobe
+// stage reports leaf certificates (Results.TLSCertificates) linked to
+// hosts (host_to_tls_certificate relationships), and the adapter attaches
+// the certificate's issuer, subject CN, and SAN DNS names as the
+// observation's TLSInfo. ALPN is honestly absent — it is handshake-level
+// data the certificate channel does not carry — so tls_alpn indicators
+// stay silent through this adapter. Headers, bodies, cookies, and DNS
+// observations have no results-channel carrier at this stage position
+// (headers/status live in urllive LiveRecords, which run later; DNS CNAME
+// edges are not published by the dns stage), so those fields stay zero
+// ("not observed", legal) and their indicator families stay silent here.
+// The adapter never fabricates observations: a URL whose host carries no
+// certificate is analyzed URL-only, exactly as before.
 //
 // Boundary (mandatory, both sides): input URLs are pre-filtered with
 // filterURLs (in-domain canonical hosts; IP literals and zero URLs dropped)
@@ -217,14 +228,88 @@ func (s *techIntelStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		return pipeline.StageResult{Outcome: pipeline.OutcomeCompleted}, nil
 	}
 
-	// One observation per in-scope URL, carrying only its URL identity.
-	// Every other observation field stays zero ("not observed") — the corpus
-	// has nothing else to offer and the adapter never fabricates data.
+	// One observation per in-scope URL: the URL identity plus the
+	// host-level TLS observation resolved from the results channel
+	// (NEW-119). URLs whose host carries no certificate stay URL-only —
+	// the adapter never fabricates data.
+	tlsIdx := newTLSCertIndex(in.Results.TLSCertificates, in.Results.Relationships)
 	obs := make(techintel.SliceObservationSource, 0, len(urls))
 	for _, u := range urls {
-		obs = append(obs, techintel.Observation{URL: u})
+		o := techintel.Observation{URL: u}
+		if h, ok := urlHost(u); ok {
+			o.TLS = tlsIdx.infoForHost(h)
+		}
+		obs = append(obs, o)
 	}
 	return s.runIngest(ctx, in, obs)
+}
+
+// tlsCertIndex resolves host-level TLS observations from the results
+// channel: leaf certificates by identity plus host_to_tls_certificate
+// edges by host identity, both deterministically ordered. It is built
+// once per stage run; per-URL lookups are map reads.
+type tlsCertIndex struct {
+	byID   map[string]asset.TLSCertificate
+	byHost map[string][]string
+}
+
+// newTLSCertIndex builds the index. Edges pointing at certificates absent
+// from the set are ignored (no observation can be composed for them).
+func newTLSCertIndex(certs []asset.TLSCertificate, rels []asset.Relationship) *tlsCertIndex {
+	idx := &tlsCertIndex{
+		byID:   make(map[string]asset.TLSCertificate, len(certs)),
+		byHost: make(map[string][]string),
+	}
+	for _, c := range certs {
+		idx.byID[c.Identity().String()] = c
+	}
+	for _, r := range rels {
+		if r.Kind != asset.RelationshipHostToTLSCertificate {
+			continue
+		}
+		id := r.To.String()
+		if _, ok := idx.byID[id]; !ok {
+			continue
+		}
+		h := r.From.String()
+		idx.byHost[h] = append(idx.byHost[h], id)
+	}
+	for h := range idx.byHost {
+		sort.Strings(idx.byHost[h])
+	}
+	return idx
+}
+
+// infoForHost returns the TLS observation for one host: the sorted-first
+// certificate's issuer, subject CN, and SAN DNS names. It returns nil
+// when the host carries no certificate — or no usable certificate
+// fields — so the observation stays honestly URL-only.
+//
+// Multi-certificate hosts (more than one host_to_tls_certificate edge):
+// sorted-first wins and the rest are ignored by design. Host→certificate
+// edges are normally 1:1 (one leaf per host per run); a multi-cert set is
+// ambiguous (which handshake's issuer describes the host?), and merging
+// distinct issuers/subjects into one TLSInfo would fabricate an
+// observation no handshake produced. The deterministic sorted-first pick
+// keeps the signal honest and reproducible; pinned by
+// TestTLSInfoForHostDeterministic.
+func (x *tlsCertIndex) infoForHost(host asset.Host) *techintel.TLSInfo {
+	if x == nil {
+		return nil
+	}
+	ids := x.byHost[host.Identity().String()]
+	if len(ids) == 0 {
+		return nil
+	}
+	c := x.byID[ids[0]]
+	if c.Issuer == "" && c.Subject == "" && len(c.DNSNames) == 0 {
+		return nil
+	}
+	return &techintel.TLSInfo{
+		Issuer:   c.Issuer,
+		Subject:  c.Subject,
+		DNSNames: append([]string(nil), c.DNSNames...),
+	}
 }
 
 // runIngest derives the engine config from the StageInput, calls
@@ -250,6 +335,10 @@ func (s *techIntelStage) runIngest(ctx context.Context, in pipeline.StageInput, 
 		// clock; the engine tolerates nil either way.
 		Clock: in.Clock,
 		Cache: in.Cache,
+		// Observer passes through: nil = pool instrumentation off (zero
+		// behavior change); the runner's StageInput.Observer carries the
+		// run's shared sink.
+		Observer: in.Observer,
 		// Constructor test seam: nil = the engine's production database
 		// (fingerprints.Load). The analysis caps stay at their engine
 		// defaults (128 technologies, 512 indicators) — deliberately NOT

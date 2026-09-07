@@ -12,6 +12,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/detect"
 	"github.com/RA000WL/RavenRecon/internal/golden"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 )
 
 // fixedClock pins Now to a constant for deterministic reports.
@@ -693,5 +694,134 @@ func TestTakeoverBoundedAt256(t *testing.T) {
 	}
 	if !foundTrunc {
 		t.Fatalf("no truncated metadata found for bounded test")
+	}
+}
+
+// mustConfirmEvidence builds one confirmation evidence record for tests:
+// the github-pages fingerprint observed on the subject host.
+func mustConfirmEvidence(t testing.TB, subject asset.Identity) asset.Evidence {
+	t.Helper()
+	ev, err := httpprobe.TakeoverEvidence(subject, "github-pages", "There isn't a GitHub Pages site here.")
+	if err != nil {
+		t.Fatalf("TakeoverEvidence: %v", err)
+	}
+	return ev
+}
+
+func takeoverFindingsForRule(t testing.TB, snap detect.Snapshot, ruleID string) []asset.Finding {
+	t.Helper()
+	reg := registerTakeoverPack(t)
+	cfg := detect.DefaultEngineConfig(reg)
+	cfg.Clock = testClock
+	rep, err := detect.Run(context.Background(), cfg, snap)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var out []asset.Finding
+	for _, f := range rep.Findings {
+		if f.RuleID == ruleID {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// TestTakeoverCNAMEConfirmedMeta pins NEW-122: a confirmed subject cites
+// it (confirmed=true + provider), while an unconfirmed subject keeps
+// its DNS-shape finding without confirmation keys (fail-open).
+func TestTakeoverCNAMEConfirmedMeta(t *testing.T) {
+	src := mustHost(t, "sub.example.com")
+	tgt := mustHost(t, "unclaimed.github.io")
+	cname := mustRelationship(t, src.Identity(), asset.RelationshipHostToCNAME, tgt.Identity())
+	base := detect.Snapshot{
+		Assets:        []asset.Identity{src.Identity(), tgt.Identity()},
+		Relationships: []asset.Relationship{cname},
+	}
+	confirmed := base
+	confirmed.Evidence = []asset.Evidence{mustConfirmEvidence(t, src.Identity())}
+	got := takeoverFindingsForRule(t, confirmed, ruleCNAMEUnclaimed)
+	if len(got) != 1 {
+		t.Fatalf("unclaimed findings = %d, want 1", len(got))
+	}
+	if got[0].Metadata["confirmed"] != "true" || got[0].Metadata["confirmed_provider"] != "github-pages" {
+		t.Errorf("meta = %v, want confirmed=true + confirmed_provider=github-pages", got[0].Metadata)
+	}
+	// The DNS-suffix provider attribution must survive alongside.
+	if got[0].Metadata["provider"] != "github.io" {
+		t.Errorf("meta provider = %q, want github.io (DNS attribution preserved)", got[0].Metadata["provider"])
+	}
+
+	plain := takeoverFindingsForRule(t, base, ruleCNAMEUnclaimed)
+	if len(plain) != 1 {
+		t.Fatalf("unconfirmed findings = %d, want 1 (fail-open preserved)", len(plain))
+	}
+	if _, ok := plain[0].Metadata["confirmed"]; ok {
+		t.Errorf("unconfirmed finding carries confirmed meta: %v", plain[0].Metadata)
+	}
+}
+
+// TestTakeoverCNAMEConfirmedDangling pins the gate on the generic
+// dangling rule (no provider suffix involved).
+func TestTakeoverCNAMEConfirmedDangling(t *testing.T) {
+	src := mustHost(t, "legacy.example.com")
+	tgt := mustHost(t, "old-service.example.net")
+	cname := mustRelationship(t, src.Identity(), asset.RelationshipHostToCNAME, tgt.Identity())
+	ev, err := httpprobe.TakeoverEvidence(src.Identity(), "heroku", "No such app")
+	if err != nil {
+		t.Fatalf("TakeoverEvidence: %v", err)
+	}
+	snap := detect.Snapshot{
+		Assets:        []asset.Identity{src.Identity(), tgt.Identity()},
+		Relationships: []asset.Relationship{cname},
+		Evidence:      []asset.Evidence{ev},
+	}
+	got := takeoverFindingsForRule(t, snap, ruleCNAMEDangling)
+	if len(got) != 1 {
+		t.Fatalf("dangling findings = %d, want 1", len(got))
+	}
+	if got[0].Metadata["confirmed"] != "true" || got[0].Metadata["confirmed_provider"] != "heroku" {
+		t.Errorf("meta = %v, want confirmed=true + confirmed_provider=heroku", got[0].Metadata)
+	}
+}
+
+// TestTakeoverConfirmationForeignIgnored pins no cross-talk: foreign
+// evidence never gates and never leaks confirmation keys.
+func TestTakeoverConfirmationForeignIgnored(t *testing.T) {
+	snap := buildUnclaimedSnapshot(t)
+	foreign, err := asset.NewEvidence(asset.MethodEndpoint, "reflect:q", "reflected-unencoded",
+		mustHost(t, "sub.example.com").Identity(), asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	snap.Evidence = []asset.Evidence{foreign}
+	got := takeoverFindingsForRule(t, snap, ruleCNAMEUnclaimed)
+	if len(got) != 1 {
+		t.Fatalf("findings = %d, want 1 (foreign evidence must not drop)", len(got))
+	}
+	if _, ok := got[0].Metadata["confirmed"]; ok {
+		t.Errorf("confirmed meta present from foreign evidence: %v", got[0].Metadata)
+	}
+}
+
+// TestTakeoverCNAMEVersions pins the content-bump contract: the gating
+// meta changes findings, so both CNAME rules bump to 1.1.0 (old cached
+// findings never replay); the untouched S3 rule stays 1.0.0.
+func TestTakeoverCNAMEVersions(t *testing.T) {
+	rules, err := Rules()
+	if err != nil {
+		t.Fatalf("Rules: %v", err)
+	}
+	want := map[string]string{
+		ruleCNAMEUnclaimed: "1.1.0",
+		ruleCNAMEDangling:  "1.1.0",
+		ruleS3Bucket:       "1.0.0",
+	}
+	if len(rules) != len(want) {
+		t.Fatalf("pack carries %d rules, want %d", len(rules), len(want))
+	}
+	for _, r := range rules {
+		if want[r.ID] != r.Version {
+			t.Errorf("rule %q version %q, want %q", r.ID, r.Version, want[r.ID])
+		}
 	}
 }

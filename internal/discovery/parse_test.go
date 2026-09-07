@@ -63,6 +63,12 @@ func TestParseHostLines(t *testing.T) {
 			out:       "WWW.Example.COM\nwww.example.com\n",
 			wantHosts: []string{"www.example.com"},
 		},
+		{
+			name:      "bare words rejected (NEW-130 amass log leak)",
+			out:       "no\nwww.example.com\nYES\napi.example.com\n",
+			wantHosts: []string{"api.example.com", "www.example.com"},
+			wantMal:   2,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

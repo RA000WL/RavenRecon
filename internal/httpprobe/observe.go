@@ -2,8 +2,10 @@ package httpprobe
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 )
@@ -270,22 +272,24 @@ type HostResult struct {
 	Status Status
 
 	// Probes holds the per-target observations in stable order: the http
-	// probe, then the https probe. It is safe to read after Probe returns.
+	// root probe, then the https root probe, then one http+https pair per
+	// configured extra port in ascending port order (canonical-identity
+	// duplicates planned once). It is safe to read after Probe returns.
 	Probes []ProbeResult
 
-	// URLs are the probe target URL assets (http://host/ and https://host/),
-	// deduplicated by Phase 2 identity, sorted by canonical URL.
+	// URLs are the probe target URL assets (roots plus configured port
+	// targets), deduplicated by Phase 2 identity, sorted by canonical URL.
 	URLs []asset.URL
 
-	// Ports are the ports observed open on the host (80/tcp for a served or
-	// TLS-failed http/https probe, 443/tcp likewise), deduplicated by
-	// identity, sorted. Ports that were refused, timed out, or never probed
-	// are not included.
+	// Ports are the ports observed open on the host (a served probe or a
+	// TLS-failed probe proves a listener on the TARGET's port),
+	// deduplicated by identity, sorted. Ports that were refused, timed
+	// out, or never probed are not included.
 	Ports []asset.Port
 
-	// Services are the services confirmed on the host (http on 80, https on
-	// 443 — only when a probe completed with an HTTP response),
-	// deduplicated by identity, sorted.
+	// Services are the services confirmed on the host (the probe scheme
+	// on the target's port — only when a probe completed with an HTTP
+	// response), deduplicated by identity, sorted.
 	Services []asset.Service
 
 	// TLSCertificates are the leaf TLS certificates observed serving the
@@ -582,6 +586,25 @@ func classifyHost(probes []ProbeResult) Status {
 	}
 }
 
+// portForTarget returns the TCP port asset for a probe target: the
+// target URL's explicit port, or the scheme default (80/443) when the
+// canonical URL carries none. Port observations therefore always name
+// the port that was actually probed — never a scheme guess — which is
+// what makes synthesized host:port targets attribute correctly. It is
+// nil only for unknown schemes or unparseable ports (defensive: the
+// engine only builds http/https targets with validated ports).
+func portForTarget(pr ProbeResult) *asset.Port {
+	if _, portStr, err := net.SplitHostPort(pr.URL.HostPort); err == nil {
+		if n, cerr := strconv.Atoi(portStr); cerr == nil {
+			if p, perr := asset.NewPort(n, "tcp", asset.Provenance{}); perr == nil {
+				return &p
+			}
+		}
+		return nil
+	}
+	return portForScheme(pr.Scheme)
+}
+
 // portForScheme returns the TCP port asset for a probe scheme, or nil for an
 // unknown scheme.
 func portForScheme(scheme string) *asset.Port {
@@ -677,18 +700,18 @@ func assemble(host asset.Host, probes []ProbeResult, e *env) HostResult {
 			// port->tls_certificate edges. A completed handshake exists
 			// only on an https probe (validateStoredTLS enforces the same
 			// rule for stored records), so the port is the https probe's
-			// own port and is always among the open ports above. A
+			// own target port and is always among the open ports above. A
 			// metadata-only capture (chain deeper than the model cap)
 			// contributes no asset and no edges.
 			c := pr.TLSMeta.Certificate
 			certs = append(certs, c)
 			addRel(host.Identity(), asset.RelationshipHostToTLSCertificate, c.Identity())
-			if p := portForScheme(pr.Scheme); p != nil {
+			if p := portForTarget(pr); p != nil {
 				addRel(p.Identity(), asset.RelationshipPortToTLSCertificate, c.Identity())
 			}
 		}
 		if open {
-			if p := portForScheme(pr.Scheme); p != nil {
+			if p := portForTarget(pr); p != nil {
 				ports = append(ports, *p)
 				if ip, ok := e.ips[host.Name]; ok {
 					addRel(ip.Identity(), asset.RelationshipIPToPort, p.Identity())

@@ -146,6 +146,10 @@ func parseChaosLines(stdout []byte, domain string, prov asset.Provenance) ([]ass
 	seen := make(map[asset.Identity]struct{})
 	malformed := 0
 	add := func(candidate string) {
+		if !strings.Contains(candidate, ".") {
+			malformed++ // bare word: tool chatter, never a subdomain (NEW-130)
+			return
+		}
 		h, err := asset.NewHost(candidate, prov)
 		if err != nil {
 			malformed++

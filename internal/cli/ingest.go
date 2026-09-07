@@ -75,6 +75,7 @@ Options:
                           served from cache without re-parsing).
   --no-cache              Disable the cache for this run even if --cache was
                           given (or caching is enabled in configuration).
+  --config <file>         JSON config file (flags > env > file > defaults).
   --verbose               Print one line per stage event (stage_started /
                           stage_finished) to stderr as the run progresses.
                           Mutually exclusive with --tui.
@@ -150,6 +151,10 @@ type ingestOptions struct {
 	verbose    bool
 	tui        bool
 	tuiCompact bool
+
+	// configPath is --config: JSON config file (flags > env > file >
+	// defaults). Empty means defaults + environment only.
+	configPath string
 }
 
 // parseIngestArgs parses "ingest" arguments. The contract differs from
@@ -178,6 +183,7 @@ func parseIngestArgs(args []string) (ingestOptions, error) {
 	cacheDir := fs.String("cache", "", "cache directory")
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	outputDir := fs.String("output", "", "report output directory")
+	configPath := fs.String("config", "", "JSON config file (flags > env > file > defaults)")
 	verbose := fs.Bool("verbose", false, "print stage events to stderr")
 	tuiFlag := fs.Bool("tui", false, "render a live observability frame on stderr")
 	tuiCompact := fs.Bool("tui-compact", false, "condense the --tui frame (requires --tui)")
@@ -216,6 +222,7 @@ func parseIngestArgs(args []string) (ingestOptions, error) {
 		tuiCompact: *tuiCompact,
 		cacheDir:   *cacheDir,
 		outputDir:  *outputDir,
+		configPath: *configPath,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "stages" {
@@ -303,7 +310,7 @@ func buildIngestConfig(opts ingestOptions, target asset.Domain) (pipeline.ScanCo
 // off on every path) with ingest-prefixed error wrapping — the resolution
 // logic is duplicated rather than shared so the error messages name the
 // command the user actually ran.
-func ingestCache(cfg config.Config, opts ingestOptions) (cache.Cache, error) {
+func ingestCache(cfg config.Config, opts ingestOptions, obs event.Observer) (cache.Cache, error) {
 	if opts.noCache {
 		return nil, nil
 	}
@@ -321,7 +328,11 @@ func ingestCache(cfg config.Config, opts ingestOptions) (cache.Cache, error) {
 			dir = d
 		}
 	}
-	c, err := cache.Open(dir, cache.WithTTL(cfg.Cache.TTL))
+	openOpts := []cache.Option{cache.WithTTL(cfg.Cache.TTL)}
+	if obs != nil {
+		openOpts = append(openOpts, cache.WithObserver(obs))
+	}
+	c, err := cache.Open(dir, openOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: open cache at %s: %w", dir, err)
 	}
@@ -388,14 +399,22 @@ func runIngest(ctx context.Context, w io.Writer, args []string, stages func(pipe
 	if err != nil {
 		return err
 	}
-	c, err := ingestCache(config.Default(), opts)
+	base, err := resolveBaseConfig(opts.configPath)
+	if err != nil {
+		return err
+	}
+	fwd := &forwardingObserver{}
+	c, err := ingestCache(base, opts, fwd)
 	if err != nil {
 		return err
 	}
 	if opts.verbose {
 		// Same sink as scan --verbose: one compact line per stage event,
-		// synchronously, in stage order.
-		cfg.Observer = &stageObserver{w: os.Stderr}
+		// synchronously, in stage order. The shared cache handle joins
+		// it via the forwarder.
+		so := &stageObserver{w: os.Stderr}
+		cfg.Observer = so
+		fwd.set(so)
 	}
 	if opts.tui {
 		// Identical wiring to runScan's --tui block: one bus, one bounded
@@ -427,6 +446,7 @@ func runIngest(ctx context.Context, w io.Writer, args []string, stages func(pipe
 			return fmt.Errorf("ingest: --tui: %w", err)
 		}
 		cfg.Observer = bus
+		fwd.set(bus)
 		tuiDone := make(chan error, 1)
 		go func() { tuiDone <- ctl.Run(ctx) }()
 		defer func() {

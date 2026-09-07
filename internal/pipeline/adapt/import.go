@@ -115,10 +115,11 @@ import (
 // a dedicated channel is deferred (recorded in TODO.md NEW-59).
 //
 // Events: stage_started/stage_finished flow through the runner's standard
-// Observer automatically once "ingest" is selected. Per-record progress
-// events would require an Observer seam on StageInput, which does not exist
-// yet (no adapter has one); ImportEnv.Observer therefore stays nil — the
-// documented off switch — until that seam exists.
+// Observer automatically once "ingest" is selected. The stage-level
+// observer (in.Observer, nil = off) is forwarded to BOTH the file-job pool
+// (task submitted/started/running/terminal per file) and the per-file
+// ImportEnv (per-record progress events) — the StageInput.Observer seam
+// exists, so both stay wired to the run's shared sink.
 
 // ingestTruncatedFlag is the importer engine's own truncation marker
 // (importer.ImportStats.StickyFlags["import_truncated"], locked decision D2).
@@ -164,6 +165,9 @@ func NewIngestStage() pipeline.Stage {
 
 // Name implements pipeline.Stage.
 func (s *ingestStage) Name() pipeline.StageName { return pipeline.StageIngest }
+
+// Level implements pipeline.LeveledStage: ingestion roots the corpus.
+func (s *ingestStage) Level() int { return 0 }
 
 // ingestFileStatus is one file's coarse terminal status.
 type ingestFileStatus int
@@ -265,6 +269,10 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		Rate:        in.Bounds.Rate,
 		Burst:       in.Bounds.Burst,
 		Clock:       in.Clock,
+		Observer:    in.Observer,
+		// The stateless Deriver converts completed per-file outcomes
+		// into canonical asset/finding events at the pool-job boundary.
+		Deriver: ingestDeriver{},
 	})
 	if err != nil {
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},
@@ -272,8 +280,9 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 	}
 
 	env := importer.ImportEnv{
-		Clock:  ingestEnvClock(in.Clock),
-		Bounds: bounds,
+		Clock:    ingestEnvClock(in.Clock),
+		Observer: in.Observer,
+		Bounds:   bounds,
 	}
 
 	outcomes := make([]ingestFileOutcome, len(files))
@@ -288,7 +297,7 @@ func (s *ingestStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline
 		idx := i
 		if _, err := pool.Submit(ctx, runtime.Job{Func: func(jobCtx context.Context) (any, error) {
 			outcomes[idx] = s.importOne(jobCtx, env, in.Cache, path, bounds)
-			return nil, nil
+			return outcomes[idx], nil
 		}}); err != nil {
 			// Submission refused (context cancelled or pool closing): this
 			// file and everything after it never ran — record them

@@ -66,9 +66,35 @@ import (
 // corpus carries no IP assets, so the host→ip leg of the graph remains
 // deferred; this adapter emits the ip→port leg over the addresses the dns
 // stage already reported. Discovered ports propagate through the results
-// channel rather than mutating the engine's probe-target list (probe targets
-// are hostname-built URL forms); consumers treat flagged entries as an
+// channel; since NEW-121 they ALSO become probe targets when the operator
+// opts into probing them (StageParams "probe_ports" alongside
+// "port_discovery" — a separate knob, because inventory traffic and
+// probing traffic are different budgets): the httpprobe stage resolves
+// each in-scope host's ports through the host→IP edges the dns stage
+// publishes (plus one CNAME hop) and probes scheme://host:port/ pairs
+// through the standard engine path. Consumers treat flagged entries as an
 // incomplete retained set.
+
+// Port-target synthesis bounds (NEW-121).
+const (
+	// maxProbePortsPerHost caps synthesized probe ports per host: worst
+	// case twice that many probes per host job, inside pool/queue
+	// budgets, with the per-job deadline bounding slow ones honestly. Cut
+	// hosts set httpprobePortTargetsTruncatedFlag — never silent.
+	//
+	// Timeout guidance (review wave 2026-09-03): the engine's per-job
+	// deadline (30 s default) covers a host's whole target list, so a
+	// port-dense host with several slow handshakes exhausts it and
+	// records the tail cancelled (honest partial, retried next run
+	// since failures never cache). Port-dense scopes should raise the
+	// stage deadline (--timeout well above 30 s); refused ports fail in
+	// milliseconds and never approach the budget.
+	maxProbePortsPerHost = 16
+	// httpprobePortTargetsTruncatedFlag marks a run whose per-host port
+	// set exceeded maxProbePortsPerHost: only the sorted head was
+	// probed.
+	httpprobePortTargetsTruncatedFlag = "httpprobe_port_targets_truncated"
+)
 
 const (
 	// portsOperation is the cache operation name for naabu port discovery.
@@ -190,11 +216,15 @@ var _ portDiscoverer = (*naabuPortSource)(nil)
 // hash binds the record to the exact input address list (§11: every
 // result-affecting input participates in the key AND is re-verified at
 // replay); Truncated rides the record end-to-end so a warm run re-derives
-// the §0.6 marker from replayed data.
+// the §0.6 marker from replayed data. Relationships carry the per-IP
+// attribution (which address each port was observed on): without them a
+// warm replay could only rebuild a cross-product join, misattributing
+// every port to every address.
 type storedPorts struct {
-	Scope     string       `json:"scope"`
-	Ports     []asset.Port `json:"ports"`
-	Truncated bool         `json:"truncated,omitempty"`
+	Scope         string               `json:"scope"`
+	Ports         []asset.Port         `json:"ports"`
+	Relationships []asset.Relationship `json:"relationships,omitempty"`
+	Truncated     bool                 `json:"truncated,omitempty"`
 }
 
 // DiscoverPorts implements portDiscoverer.
@@ -244,19 +274,28 @@ func (s *naabuPortSource) DiscoverPorts(ctx context.Context, target asset.Domain
 		if key, kerr := portsCacheKey(target, scope, version); kerr == nil {
 			out := cfg.Cache.Get(ctx, key)
 			if out.IsHit() && out.Record != nil && out.Record.Status == cache.StatusCompleted {
-				var sp storedPorts
-				if jerr := json.Unmarshal(out.Record.Data, &sp); jerr == nil && sp.Scope == scope {
-					if ports, valid := validStoredPorts(sp.Ports); valid {
-						return portDiscoveryOutput{
-							Ports:         ports,
-							Relationships: ipPortRelationships(ips, ports),
-							Truncated:     sp.Truncated,
-						}, nil
+				// Envelope check (mirrors httpprobe lookupProbe): a record
+				// found under this key with different operation or target
+				// fields could only be tampered with — delete and re-execute.
+				if out.Record.Operation != portsOperation || out.Record.Target != target.Identity().String() {
+					_ = cfg.Cache.Delete(ctx, key)
+				} else {
+					var sp storedPorts
+					if jerr := json.Unmarshal(out.Record.Data, &sp); jerr == nil && sp.Scope == scope {
+						if ports, valid := validStoredPorts(sp.Ports); valid {
+							if rels, rok := validStoredPortRelationships(sp.Relationships, ips, ports); rok {
+								return portDiscoveryOutput{
+									Ports:         ports,
+									Relationships: rels,
+									Truncated:     sp.Truncated,
+								}, nil
+							}
+						}
 					}
+					// Corrupt or scope-mismatched record: self-heal by deletion
+					// and fall through to execution (best-effort delete).
+					_ = cfg.Cache.Delete(ctx, key)
 				}
-				// Corrupt or scope-mismatched record: self-heal by deletion
-				// and fall through to execution (best-effort delete).
-				_ = cfg.Cache.Delete(ctx, key)
 			}
 		}
 	}
@@ -309,9 +348,9 @@ func (s *naabuPortSource) DiscoverPorts(ctx context.Context, target asset.Domain
 		return out, fmt.Errorf("ports.discover: run %s: %w", naabuBinary, rerr)
 	}
 
-	pairs, malformed := parseNaabuOutput(res.Stdout, ips)
+	pairs, rels, malformed := parseNaabuOutput(res.Stdout, ips)
 	out.Ports = pairs
-	out.Relationships = ipPortRelationships(ips, pairs)
+	out.Relationships = rels
 	if res.ExitCode != 0 && len(pairs) == 0 {
 		// Non-zero exit with NOTHING usable: a genuine failure (the
 		// malformed counter, when present, explains why parsing yielded
@@ -332,7 +371,7 @@ func (s *naabuPortSource) DiscoverPorts(ctx context.Context, target asset.Domain
 	// marker — the documented §0.6 carve-out.
 	if cfg.Cache != nil && version != "" {
 		if key, kerr := portsCacheKey(target, scope, version); kerr == nil {
-			sp := storedPorts{Scope: scope, Ports: out.Ports, Truncated: out.Truncated}
+			sp := storedPorts{Scope: scope, Ports: out.Ports, Relationships: out.Relationships, Truncated: out.Truncated}
 			if data, merr := json.Marshal(sp); merr == nil {
 				rec := cache.Record{
 					Operation: portsOperation,
@@ -402,18 +441,26 @@ func portsCacheKey(target asset.Domain, scope, version string) (cache.Key, error
 }
 
 // parseNaabuOutput parses naabu's silent stdout ("ip:port" lines) into
-// validated tcp Port assets. Lines are bounded by the runner's capture cap;
+// validated tcp Port assets plus per-IP ip→port relationships. Each line's
+// address attributes exactly one edge: 1.1.1.1:80 and 2.2.2.2:443 yield
+// 1.1.1.1→80 and 2.2.2.2→443 — never the cross-product (every address to
+// every port). Lines are bounded by the runner's capture cap;
 // unparseable lines are counted as malformed (diagnostic material, never a
 // panic or a silent drop of the whole capture). Bracketed IPv6 literals
 // ("[2001:db8::1]:443") resolve through net.SplitHostPort; bare IPv6 without
 // a bracket cannot be disambiguated from ip:port and counts as malformed.
-func parseNaabuOutput(stdout []byte, known []asset.IP) ([]asset.Port, int) {
+// Lines for addresses outside the scanned set keep their port (union
+// inventory) but yield no edge: an unattributed port is never joined to a
+// host it was not observed on.
+func parseNaabuOutput(stdout []byte, known []asset.IP) ([]asset.Port, []asset.Relationship, int) {
 	byAddr := make(map[string]asset.IP, len(known))
 	for _, ip := range known {
 		byAddr[ip.String()] = ip
 	}
 	var ports []asset.Port
-	seen := make(map[asset.Identity]bool)
+	seenPort := make(map[asset.Identity]bool)
+	var rels []asset.Relationship
+	seenRel := make(map[string]bool)
 	malformed := 0
 	for _, raw := range bytes.Split(stdout, []byte{'\n'}) {
 		line := strings.TrimSpace(string(raw))
@@ -439,50 +486,36 @@ func parseNaabuOutput(stdout []byte, known []asset.IP) ([]asset.Port, int) {
 			continue
 		}
 		prov := asset.Provenance{Source: "naabu"}
+		var srcIP asset.IP
+		srcOK := false
 		if ip, ok := byAddr[canonical]; ok {
 			prov = asset.Provenance{Source: "naabu", DiscoveredAt: ip.Prov.DiscoveredAt}
+			srcIP, srcOK = ip, true
 		}
 		p, err := asset.NewPort(n, "tcp", prov)
 		if err != nil {
 			malformed++
 			continue
 		}
-		if seen[p.Identity()] {
+		if !seenPort[p.Identity()] {
+			seenPort[p.Identity()] = true
+			ports = append(ports, p)
+		}
+		if !srcOK {
 			continue
 		}
-		seen[p.Identity()] = true
-		ports = append(ports, p)
-	}
-	sortPorts(ports)
-	return ports, malformed
-}
-
-// ipPortRelationships links every input address identity to every discovered
-// port (asset.RelationshipIPToPort), deduplicated by edge identity and
-// sorted deterministically. Edges are built from the DNS-stage address
-// assets themselves so identities match the rest of the graph.
-func ipPortRelationships(ips []asset.IP, ports []asset.Port) []asset.Relationship {
-	if len(ips) == 0 || len(ports) == 0 {
-		return nil
-	}
-	var rels []asset.Relationship
-	seen := make(map[string]bool)
-	for _, ip := range ips {
-		for _, p := range ports {
-			r, err := asset.NewRelationship(ip.Identity(), asset.RelationshipIPToPort, p.Identity())
-			if err != nil {
-				continue // both endpoints are validated assets; defensive
-			}
-			id := r.ID()
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
+		r, err := asset.NewRelationship(srcIP.Identity(), asset.RelationshipIPToPort, p.Identity())
+		if err != nil {
+			continue // both endpoints are validated assets; defensive
+		}
+		if id := r.ID(); !seenRel[id] {
+			seenRel[id] = true
 			rels = append(rels, r)
 		}
 	}
+	sortPorts(ports)
 	sort.SliceStable(rels, func(i, j int) bool { return rels[i].ID() < rels[j].ID() })
-	return rels
+	return ports, rels, malformed
 }
 
 // validStoredPorts revalidates every decoded port through the asset model
@@ -498,6 +531,47 @@ func validStoredPorts(in []asset.Port) ([]asset.Port, bool) {
 		out = append(out, v)
 	}
 	sortPorts(out)
+	return out, true
+}
+
+// validStoredPortRelationships revalidates stored ip→port edges before a
+// cached record may be served: every edge must be an IPToPort relationship
+// whose endpoints re-parse through the asset model and whose source is one
+// of the current input addresses and whose target is one of the validated
+// ports. Any invalid edge refuses the WHOLE record (self-heal by
+// re-execution). Old records without relationships (pre-per-IP shape) are
+// refused as well — they can only rebuild a cross-product join.
+func validStoredPortRelationships(in []asset.Relationship, ips []asset.IP, ports []asset.Port) ([]asset.Relationship, bool) {
+	if len(ports) > 0 && len(in) == 0 {
+		return nil, false
+	}
+	byIP := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		byIP[ip.Identity().String()] = true
+	}
+	byPort := make(map[string]bool, len(ports))
+	for _, p := range ports {
+		byPort[p.Identity().String()] = true
+	}
+	out := make([]asset.Relationship, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, r := range in {
+		if r.Kind != asset.RelationshipIPToPort {
+			return nil, false
+		}
+		v, err := asset.NewRelationship(r.From, r.Kind, r.To)
+		if err != nil {
+			return nil, false
+		}
+		if !byIP[v.From.String()] || !byPort[v.To.String()] {
+			return nil, false
+		}
+		if id := v.ID(); !seen[id] {
+			seen[id] = true
+			out = append(out, v)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out, true
 }
 
@@ -530,4 +604,122 @@ func sortPorts(ports []asset.Port) {
 		}
 		return ports[i].Protocol < ports[j].Protocol
 	})
+}
+
+// portProbeEnabled reports whether discovered ports are additionally
+// probed as scheme://host:port/ targets (NEW-121), via
+// StageParams["probe_ports"]. OFF by default; truthy values follow the
+// port_discovery spelling convention ("true"/"1"/"yes"/"on",
+// case-insensitive). It is a SEPARATE knob from port_discovery on
+// purpose — knob philosophy (review wave 2026-09-03): cheap,
+// usually-zero-traffic enrichment defaults ON (urllive reflection,
+// takeover confirmation), while traffic-multiplying features default
+// OFF (naabu discovery, port probing). Operators opt into budgets,
+// never out of surprises.
+func portProbeEnabled(params map[string]string) bool {
+	if params == nil {
+		return false
+	}
+	v, ok := params["probe_ports"]
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// synthesizePortTargets resolves each in-scope host's probe ports
+// (NEW-121): the union of ports open on the host's own addresses plus
+// the addresses reachable through one CNAME hop (a vhost behind a CNAME
+// is served from that infrastructure under the host's name), joined from
+// the dns stage's host→IP/host→CNAME edges through naabu's ip→port
+// edges. The join is per-IP, never the cross-product: only ports with an
+// ip→port edge on the host's own (or CNAME-hop) addresses are attributed.
+// Only TCP ports validated port assets carry are honored (naabu
+// emits TCP exclusively; anything else is skipped, never probed).
+// Output is one ascending-sorted list per host name; hosts without ports
+// are absent. Beyond maxProbePortsPerHost the sorted head is kept and
+// the second return reports the cut (never silent).
+func synthesizePortTargets(hosts []asset.Host, rels []asset.Relationship, pd *portDiscoveryOutput) (map[string][]int, bool) {
+	if pd == nil || len(pd.Ports) == 0 {
+		return nil, false
+	}
+	portByID := make(map[string]int, len(pd.Ports))
+	for _, p := range pd.Ports {
+		if p.Protocol != "tcp" {
+			continue
+		}
+		portByID[p.Identity().String()] = int(p.Number)
+	}
+	// Address ownership: direct host->IP edges, plus one CNAME hop
+	// (host->CNAME-target, then the target's own host->IP edges).
+	direct := make(map[string][]string)
+	cnames := make(map[string][]string)
+	for _, r := range rels {
+		switch r.Kind {
+		case asset.RelationshipHostToIP:
+			h := r.From.String()
+			direct[h] = append(direct[h], r.To.String())
+		case asset.RelationshipHostToCNAME:
+			h := r.From.String()
+			cnames[h] = append(cnames[h], r.To.String())
+		}
+	}
+	ipPorts := make(map[string][]int)
+	for _, r := range pd.Relationships {
+		if r.Kind != asset.RelationshipIPToPort {
+			continue
+		}
+		n, ok := portByID[r.To.String()]
+		if !ok {
+			continue
+		}
+		ip := r.From.String()
+		ipPorts[ip] = append(ipPorts[ip], n)
+	}
+	var out map[string][]int
+	truncated := false
+	for _, h := range hosts {
+		key := h.Identity().String()
+		seen := make(map[int]bool)
+		var ports []int
+		addrs := append(append([]string(nil), direct[key]...), transitiveAddrs(cnames, direct, key)...)
+		for _, ip := range addrs {
+			for _, n := range ipPorts[ip] {
+				if !seen[n] {
+					seen[n] = true
+					ports = append(ports, n)
+				}
+			}
+		}
+		if len(ports) == 0 {
+			continue
+		}
+		sort.Ints(ports)
+		if len(ports) > maxProbePortsPerHost {
+			ports = ports[:maxProbePortsPerHost]
+			truncated = true
+		}
+		if out == nil {
+			out = make(map[string][]int)
+		}
+		out[h.Name] = ports
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, truncated
+}
+
+// transitiveAddrs returns the addresses owned through one CNAME hop:
+// every address owned by the host's CNAME targets.
+func transitiveAddrs(cnames map[string][]string, direct map[string][]string, host string) []string {
+	var out []string
+	for _, target := range cnames[host] {
+		out = append(out, direct[target]...)
+	}
+	return out
 }

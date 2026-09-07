@@ -42,8 +42,9 @@ package adapt
 // the injected failure stays where the retry contract puts it: the dns
 // per-host resolver failure for ONE host. The dns engine classifies a
 // plain error as TypeFailed (dns.applyAnswers default branch,
-// internal/dns/run.go), so all three of the host's record types
-// (A/AAAA/CNAME — dns.hostTypes) fail -> the host is dns.StatusFailed
+// internal/dns/run.go), so all seven of the host's record types
+// (NEW-126 T1 A/AAAA/CNAME/MX/TXT/NS/SRV — dns.hostTypes) fail -> the host
+// is dns.StatusFailed
 // ("no usable observations", classifyHost: failed && !completed) -> the
 // adapter's per-host fold yields partial (anyFailed && anyCompleted) with
 // ItemsFailed = 1, and the runner's foldOutcome over partial + 10 completed
@@ -67,7 +68,7 @@ package adapt
 // never skipped — while a completed job is served with zero queries. The
 // retry tests count resolver invocations to prove both halves: the
 // succeeded hosts perform zero additional queries on the warm run, and
-// the failed host's queries are re-issued (exactly its 3 types).
+// the failed host's queries are re-issued (exactly its 7 types).
 //
 // What the tests prove:
 //
@@ -87,7 +88,7 @@ package adapt
 //     on run 2 (stateful resolver fixture). Run 2 over the SAME cache
 //     serves every succeeded unit from cache (zero re-execution — no
 //     resolver calls for the healed hosts, zero http probes, zero jsintel
-//     fetches), RE-ATTEMPTS exactly the failed work (the failed host's 3
+//     fetches), RE-ATTEMPTS exactly the failed work (the failed host's 7
 //     queries), and completes — DeepEqual against a fresh cold run of the
 //     same healed state.
 //
@@ -222,12 +223,15 @@ func (h *t5Harness) discoveryExecutions() int {
 }
 
 // t5ScriptedDNSFailure scripts a persistent typed resolution failure for
-// one host on every record type the engine queries (dns.hostTypes:
-// A/AAAA/CNAME). A plain error classifies as TypeFailed (dns.applyAnswers
-// default branch), so every type fails -> the host is StatusFailed and
+// one host on every record type the engine queries (NEW-126 T1 dns.hostTypes:
+// A/AAAA/CNAME/MX/TXT/NS/SRV). A plain error classifies as TypeFailed
+// (dns.applyAnswers default branch), so every type fails -> the host is
+// StatusFailed (classifyHost: failed without completed → failed,
+// internal/dns/run.go; scripting only 3 types would leave 4 completed-empty
+// types and flip the host to incomplete) and
 // the stage folds partial with ItemsFailed = 1.
 func t5ScriptedDNSFailure(resolver *fakeResolver, host string) {
-	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME} {
+	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT, dns.TypeNS, dns.TypeSRV} {
 		resolver.setErr(host, rt, errors.New("synthetic resolver failure (hermetic fixture)"))
 	}
 }
@@ -313,6 +317,30 @@ func t5stageEventKinds(events []event.Event) []event.Kind {
 	return kinds
 }
 
+// t5stageEvents filters a recorded stream to stage lifecycle events
+// (started/finished), in emission order. Worker/task/cache events from
+// engine pools share the same observer since execution levels forward
+// the run sink — they prove instrumentation flows end to end, but only
+// the stage lifecycle has an order contract.
+func t5stageEvents(events []event.Event) []event.Event {
+	out := make([]event.Event, 0, len(events))
+	for _, ev := range events {
+		if ev.Kind == event.KindStageStarted || ev.Kind == event.KindStageFinished {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// t5countKinds counts events per kind (order-independent).
+func t5countKinds(events []event.Event) map[event.Kind]int {
+	out := map[event.Kind]int{}
+	for _, ev := range events {
+		out[ev.Kind]++
+	}
+	return out
+}
+
 // t5ipValues renders the IP results channel as address strings.
 func t5ipValues(ips []asset.IP) []string {
 	out := make([]string, len(ips))
@@ -329,8 +357,15 @@ func t5ipValues(ips []asset.IP) []string {
 // exactly ONE of the three discovered hosts (admin.example.com, on every
 // record type). It proves, evidence-based:
 //
-//   - the run folds PARTIAL (partial + 9 completed — never failed, never
-//     completed; pipeline foldOutcome precedence);
+//   - stage events fired for every stage: exactly one started + one
+//     finished per stage entry in stage order (grouped emission for
+//     same-level pairs), the dns finished payload mirroring the recorded
+//     StageRecord field for field; engine pool task events share the
+//     observer and must flow (presence + cross-run count stability —
+//     completion order across pools is timing, never asserted);
+//   - the run is REPRODUCIBLE: a second identical run (fresh dirs, same
+//     fixtures) DeepEquals the first, including the stage-event
+//     subsequence and the task-event counts.
 //   - the discovery stage genuinely ran and completed (ItemsProcessed 5 =
 //     the three tools' per-source host lists; three discovery executions;
 //     no failures; hosts-only additions with the injected-clock
@@ -352,11 +387,6 @@ func t5ipValues(ips []asset.IP) []string {
 //   - the captured report model is complete and internally consistent
 //     (every channel reaches the report, the failing stage's absence is
 //     reflected as IPs = 2, never a corrupt or partial model);
-//   - stage events fired for every stage: exactly one started + one
-//     finished per stage entry in stage order, the dns finished payload
-//     mirroring the recorded StageRecord field for field;
-//   - the run is REPRODUCIBLE: a second identical run (fresh dirs, same
-//     fixtures) DeepEquals the first, including the event stream.
 func TestT5FullRunPartialFailure(t *testing.T) {
 	h := newT5Harness(t)
 
@@ -665,33 +695,64 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 
 	// --- Stage events: exactly one started + one finished per stage in
 	// stage order; the failing stage's finished payload mirrors its
-	// StageRecord field for field (T3a contract). ---
+	// StageRecord field for field (T3a contract). The shared observer
+	// also carries engine pool task events (execution levels forward the
+	// run sink) — those prove instrumentation flows end to end and are
+	// asserted for presence below, but only the stage lifecycle has an
+	// order contract, so every positional assertion filters to it. ---
 	events := obs.snapshot()
-	if len(events) != 24 {
-		t.Fatalf("events = %d, want 24 (12 stages x started+finished)", len(events))
+	stageEvents := t5stageEvents(events)
+	if len(stageEvents) != 24 {
+		t.Fatalf("stage events = %d, want 24 (12 stages x started+finished)", len(stageEvents))
 	}
-	wantKinds := make([]event.Kind, 0, 24)
-	for i := 0; i < 12; i++ {
-		wantKinds = append(wantKinds, event.KindStageStarted, event.KindStageFinished)
+	// Grouped emission (execution levels): singleton stages emit
+	// started,finished; each same-level pair emits
+	// started,started,finished,finished — per stage, in selection order:
+	// discover | dns | httpprobe+urlintel | crawl | techintel+jsintel |
+	// secrentel+urllive | priority | detect | report.
+	wantKinds := []event.Kind{
+		event.KindStageStarted, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageStarted, event.KindStageFinished, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageStarted, event.KindStageFinished, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageStarted, event.KindStageFinished, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageFinished,
+		event.KindStageStarted, event.KindStageFinished,
 	}
-	if got := t5stageEventKinds(events); !reflect.DeepEqual(got, wantKinds) {
-		t.Fatalf("event kinds = %v, want %v", got, wantKinds)
+	if got := t5stageEventKinds(stageEvents); !reflect.DeepEqual(got, wantKinds) {
+		t.Fatalf("stage event kinds = %v, want %v", got, wantKinds)
 	}
-	for i, ev := range events {
+	for i, ev := range stageEvents {
 		if ev.Sequence != 0 {
-			t.Errorf("events[%d].Sequence = %d, want 0 (the bus assigns on publish)", i, ev.Sequence)
+			t.Errorf("stageEvents[%d].Sequence = %d, want 0 (the bus assigns on publish)", i, ev.Sequence)
 		}
 		if !ev.At.Equal(fixedTime) {
-			t.Errorf("events[%d].At = %v, want %v (injected clock)", i, ev.At, fixedTime)
+			t.Errorf("stageEvents[%d].At = %v, want %v (injected clock)", i, ev.At, fixedTime)
 		}
 		if ev.Phase != "stage" {
-			t.Errorf("events[%d].Phase = %q, want \"stage\"", i, ev.Phase)
+			t.Errorf("stageEvents[%d].Phase = %q, want \"stage\"", i, ev.Phase)
 		}
 	}
+	// Engine pool task events must flow: at least one submitted and one
+	// terminal task event across the run's engine pools. Counts (not
+	// order) are the reproducible property — asserted across runs below.
+	taskCounts := t5countKinds(events)
+	if taskCounts[event.KindTaskSubmitted] == 0 {
+		t.Error("no task_submitted events: engine pools are not publishing through the run observer")
+	}
+	submitted := taskCounts[event.KindTaskSubmitted]
+	terminal := taskCounts[event.KindTaskCompleted] + taskCounts[event.KindTaskCancelled] +
+		taskCounts[event.KindTaskFailed] + taskCounts[event.KindTaskTimedOut]
+	if terminal == 0 {
+		t.Error("no terminal task events: engine pools are not publishing through the run observer")
+	}
+	_ = submitted
 	// The dns finished event mirrors the recorded dns StageRecord.
-	fin, ok := events[3].Payload.(event.StageFinished)
+	fin, ok := stageEvents[3].Payload.(event.StageFinished)
 	if !ok {
-		t.Fatalf("events[3] payload type = %T, want event.StageFinished", events[3].Payload)
+		t.Fatalf("stageEvents[3] payload type = %T, want event.StageFinished", stageEvents[3].Payload)
 	}
 	if fin.Name != string(dnsRec.Name) || fin.Outcome != string(dnsRec.Outcome) ||
 		fin.ItemsProcessed != dnsRec.ItemsProcessed || fin.ItemsFailed != dnsRec.ItemsFailed ||
@@ -699,25 +760,26 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 		t.Errorf("dns finished payload = %+v, want the recorded StageRecord mirror (partial, 3 processed, 1 failed, no error)", fin)
 	}
 	// The discovery stage (index 0) also emitted its completed pair.
-	discFin, ok := events[1].Payload.(event.StageFinished)
+	discFin, ok := stageEvents[1].Payload.(event.StageFinished)
 	if !ok {
-		t.Fatalf("events[1] payload type = %T, want event.StageFinished", events[1].Payload)
+		t.Fatalf("stageEvents[1] payload type = %T, want event.StageFinished", stageEvents[1].Payload)
 	}
 	if discFin.Name != string(pipeline.StageDiscover) || discFin.Outcome != string(pipeline.OutcomeCompleted) {
 		t.Errorf("discovery finished payload = %+v, want completed (the real discovery stage ran and finished)", discFin)
 	}
 	// The report stage (the last entry) still completed and emitted its
 	// finished event.
-	lastFin, ok := events[23].Payload.(event.StageFinished)
+	lastFin, ok := stageEvents[23].Payload.(event.StageFinished)
 	if !ok {
-		t.Fatalf("events[23] payload type = %T, want event.StageFinished", events[23].Payload)
+		t.Fatalf("stageEvents[23] payload type = %T, want event.StageFinished", stageEvents[23].Payload)
 	}
 	if lastFin.Name != string(pipeline.StageReport) || lastFin.Outcome != string(pipeline.OutcomeCompleted) {
 		t.Errorf("report finished payload = %+v, want completed (the pipeline reached the report)", lastFin)
 	}
 
-	// --- Reproducibility: a second identical run DeepEquals the first,
-	// including the event stream. ---
+	// --- Reproducibility: a second identical run DeepEquals the first;
+	// stage events match as ordered subsequences and task events match
+	// by kind count. ---
 	r2 := run()
 	if !reflect.DeepEqual(r1, r2) {
 		t.Fatalf("two identical partial runs differ:\nrun 1: %+v\nrun 2: %+v", r1, r2)
@@ -727,12 +789,17 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 	if h.discoveryExecutions() != 8 {
 		t.Errorf("discovery executions after run 2 = %d, want 8 (4 per cold run)", h.discoveryExecutions())
 	}
+	run1Events := events
 	events = obs.snapshot()
-	if len(events) != 48 {
-		t.Fatalf("events after run 2 = %d, want 48", len(events))
+	run2Events := events[len(run1Events):]
+	// Stage lifecycle: identical subsequence across runs (order contract).
+	if got, want := t5stageEventKinds(t5stageEvents(run2Events)), t5stageEventKinds(t5stageEvents(run1Events)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("run 2 stage events differ:\nrun 1: %+v\nrun 2: %+v", want, got)
 	}
-	if !reflect.DeepEqual(events[:24], events[24:]) {
-		t.Fatalf("the two runs' event streams differ:\nrun 1: %+v\nrun 2: %+v", events[:24], events[24:])
+	// Task/worker events: identical COUNTS across runs (completion order
+	// across concurrent pools is timing, never asserted).
+	if got, want := t5countKinds(run2Events), t5countKinds(run1Events); !reflect.DeepEqual(got, want) {
+		t.Fatalf("run 2 event counts differ:\nrun 1: %+v\nrun 2: %+v", want, got)
 	}
 	// Run 2 captured its own model, identical to run 1's.
 	if len(h.models) != 2 {
@@ -753,11 +820,12 @@ func TestT5FullRunPartialFailure(t *testing.T) {
 // cache:
 //
 //   - serves every succeeded unit from cache — zero re-execution: no
-//     resolver calls for www/api (their 6 type queries are completed
-//     records), zero new http probes, zero new jsintel fetches (gau still
+//     resolver calls for www/api (their 14 type queries are completed
+//     records: NEW-126 T1 2 hosts x 7 types), zero new http probes, zero
+//     new jsintel fetches (gau still
 //     runs once per run by design — its tool invocation is not cached, T4
 //     pinned);
-//   - RE-ATTEMPTS the failed work — exactly admin's 3 type queries are
+//   - RE-ATTEMPTS the failed work — exactly admin's 7 type queries are
 //     re-issued (the cache never serves a failed record as a hit:
 //     internal/cache/cache.go evaluate:207-209; internal/dns/run.go
 //     lookupType:434-443 treats every non-hit as "execute"), and they
@@ -810,19 +878,19 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 	if got := t5ipValues(r1.Results.IPs); !reflect.DeepEqual(got, []string{"93.184.216.34", "93.184.216.35"}) {
 		t.Fatalf("cold IPs = %v, want the two surviving hosts' addresses", got)
 	}
-	// Every (host, type) pair was attempted exactly once: 3 hosts x 3
-	// types = 9 queries.
-	if got := healing.callCount(); got != 9 {
-		t.Fatalf("cold resolver calls = %d, want 9 (3 hosts x A/AAAA/CNAME)", got)
+	// Every (host, type) pair was attempted exactly once: 3 hosts x 7
+	// types (NEW-126 T1: A/AAAA/CNAME/MX/TXT/NS/SRV) = 21 queries.
+	if got := healing.callCount(); got != 21 {
+		t.Fatalf("cold resolver calls = %d, want 21 (3 hosts x 7 types: A/AAAA/CNAME/MX/TXT/NS/SRV)", got)
 	}
 	// The failed host's queries never reached the wire (the failure is
-	// the resolver's own, before any answer); the surviving hosts' 6
+	// the resolver's own, before any answer); the surviving hosts' 14
 	// queries all did.
 	if base.seenHosts()["admin.example.com"] {
 		t.Fatal("cold run reached the wire for admin.example.com, want the first calls to fail at the resolver")
 	}
-	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 6 {
-		t.Fatalf("cold wire queries for the surviving hosts = %d, want 6 (2 hosts x 3 types)", got)
+	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 14 {
+		t.Fatalf("cold wire queries for the surviving hosts = %d, want 14 (2 hosts x 7 types)", got)
 	}
 	if got := h.discoveryExecutions(); got != 4 {
 		t.Fatalf("cold discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", got)
@@ -855,20 +923,20 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 		t.Fatalf("warm IPs = %v, want all three hosts' addresses (admin healed)", got)
 	}
 
-	// (a) Succeeded work served from cache: exactly the failed host's 3
-	// type queries were re-issued — www/api's 6 queries were completed
-	// records and performed ZERO new resolver calls.
-	if got := healing.callCount(); got != 12 {
-		t.Fatalf("warm resolver calls = %d, want 12 (9 cold + exactly 3 re-attempted admin queries)", got)
+	// (a) Succeeded work served from cache: exactly the failed host's 7
+	// type queries were re-issued — www/api's 14 queries were completed
+	// records (NEW-126 T1: 7 types/host) and performed ZERO new resolver calls.
+	if got := healing.callCount(); got != 28 {
+		t.Fatalf("warm resolver calls = %d, want 28 (21 cold + exactly 7 re-attempted admin queries)", got)
 	}
 	if !base.seenHosts()["admin.example.com"] {
 		t.Fatal("warm run never reached the wire for admin.example.com, want the re-attempted queries to execute")
 	}
-	if got := base.seenCount("admin.example.com"); got != 3 {
-		t.Fatalf("warm wire queries for admin = %d, want 3 (its 3 re-attempted types)", got)
+	if got := base.seenCount("admin.example.com"); got != 7 {
+		t.Fatalf("warm wire queries for admin = %d, want 7 (its 7 re-attempted types)", got)
 	}
-	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 6 {
-		t.Fatalf("warm wire queries for the surviving hosts = %d, want 6 (unchanged — zero re-execution)", got)
+	if got := base.seenCount("www.example.com") + base.seenCount("api.example.com"); got != 14 {
+		t.Fatalf("warm wire queries for the surviving hosts = %d, want 14 (unchanged — zero re-execution)", got)
 	}
 	// (a') Discovery re-executes only its NON-CACHEABLE source: 5 total
 	// executions (4 cold + 1 warm assetfinder; subfinder/amass/chaos served
@@ -921,8 +989,9 @@ func TestT5FullRunRetryHealing(t *testing.T) {
 // cache (zero new resolver calls for www/api, zero new http probes, zero
 // new jsintel fetches), re-executes only the discovery stage's
 // NON-CACHEABLE source (3 → 4 executions), RE-ATTEMPTS the failing part
-// (exactly admin's 3 type queries are re-issued), and fails again — the
-// same partial outcome, the same ItemsFailed, and the two RunReports are
+// (exactly admin's 7 type queries are re-issued: NEW-126 T1 7 types/host),
+// and fails again — the same partial outcome, the same ItemsFailed, and the
+// two RunReports are
 // fully DeepEqual (cache metadata is not part of RunReport; T4's
 // cache-hit parity pin holds on the persistent-failure path too).
 func TestT5FullRunRetryPersistent(t *testing.T) {
@@ -957,15 +1026,16 @@ func TestT5FullRunRetryPersistent(t *testing.T) {
 	if r1.Stages[1].ItemsFailed != 1 {
 		t.Fatalf("cold dns ItemsFailed = %d, want 1", r1.Stages[1].ItemsFailed)
 	}
-	// One (host, type) query per pair: 3 hosts x A/AAAA/CNAME = 9 total.
+	// One (host, type) query per pair: 3 hosts x 7 types (NEW-126 T1:
+	// A/AAAA/CNAME/MX/TXT/NS/SRV) = 21 total.
 	coldQueries := func() int {
 		return resolver.seenCount("www.example.com") + resolver.seenCount("api.example.com") + resolver.seenCount("admin.example.com")
 	}
-	if got := coldQueries(); got != 9 {
-		t.Fatalf("cold resolver queries = %d, want 9 (3 hosts x A/AAAA/CNAME)", got)
+	if got := coldQueries(); got != 21 {
+		t.Fatalf("cold resolver queries = %d, want 21 (3 hosts x 7 types: A/AAAA/CNAME/MX/TXT/NS/SRV)", got)
 	}
-	if got := resolver.seenCount("admin.example.com"); got != 3 {
-		t.Fatalf("cold admin queries = %d, want 3 (its A/AAAA/CNAME all attempted and failed)", got)
+	if got := resolver.seenCount("admin.example.com"); got != 7 {
+		t.Fatalf("cold admin queries = %d, want 7 (its 7 types all attempted and failed)", got)
 	}
 	if got := h.discoveryExecutions(); got != 4 {
 		t.Fatalf("cold discovery executions = %d, want 4 (subfinder + assetfinder + amass + chaos)", got)
@@ -980,16 +1050,16 @@ func TestT5FullRunRetryPersistent(t *testing.T) {
 	if r2.Stages[1].Outcome != pipeline.OutcomePartial || r2.Stages[1].ItemsFailed != 1 {
 		t.Fatalf("warm dns stage = %+v, want partial with ItemsFailed 1 (same honest outcome)", r2.Stages[1])
 	}
-	// The failing part was RE-ATTEMPTED: exactly admin's 3 type queries
-	// were re-issued; www/api's completed records served with zero calls.
-	if got := coldQueries(); got != 12 {
-		t.Fatalf("warm resolver queries = %d, want 12 (9 cold + exactly 3 re-attempted admin queries)", got)
+	// The failing part was RE-ATTEMPTED: exactly admin's 7 type queries
+	// were re-issued (NEW-126 T1: 7 types/host); www/api's completed records served with zero calls.
+	if got := coldQueries(); got != 28 {
+		t.Fatalf("warm resolver queries = %d, want 28 (21 cold + exactly 7 re-attempted admin queries)", got)
 	}
-	if got := resolver.seenCount("admin.example.com"); got != 6 {
-		t.Fatalf("warm admin queries = %d, want 6 (3 cold + 3 re-attempted)", got)
+	if got := resolver.seenCount("admin.example.com"); got != 14 {
+		t.Fatalf("warm admin queries = %d, want 14 (7 cold + 7 re-attempted)", got)
 	}
-	if got := resolver.seenCount("www.example.com") + resolver.seenCount("api.example.com"); got != 6 {
-		t.Fatalf("warm surviving-host queries = %d, want 6 (unchanged — served from cache)", got)
+	if got := resolver.seenCount("www.example.com") + resolver.seenCount("api.example.com"); got != 14 {
+		t.Fatalf("warm surviving-host queries = %d, want 14 (unchanged — served from cache)", got)
 	}
 	// Discovery re-executes only its NON-CACHEABLE source on the warm run
 	// (subfinder/amass/chaos served from cache; assetfinder executes fresh —

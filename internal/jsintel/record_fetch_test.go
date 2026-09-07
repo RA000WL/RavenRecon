@@ -165,7 +165,7 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 	// The hit was served by the cache: the entry exists as a completed
 	// record for the exact key.
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestCacheMissExecutesOnceAndRefetchesAfterDelete(t *testing.T) {
 
 	// Delete the entry: the next lookup misses and the fetch executes once
 	// more.
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestCacheTamperTable(t *testing.T) {
 	clock := newFakeClock(fixedTime)
 	cfg := cacheFetchConfig(t, srv.srv)
 	u := mustURL(t, srv.url()+"/tamper.js")
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestCacheMismatchedRecordIdentity(t *testing.T) {
 	clock := newFakeClock(fixedTime)
 	cfg := cacheFetchConfig(t, srv.srv)
 	u := mustURL(t, srv.url()+"/mismatch.js")
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestCacheIncompleteNeverHit(t *testing.T) {
 	clock := newFakeClock(fixedTime)
 	cfg := cacheFetchConfig(t, srv.srv)
 	u := mustURL(t, srv.url()+"/big.js")
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -449,11 +449,11 @@ func TestCacheKeyStability(t *testing.T) {
 	ub := mustURL(t, "http://example.com/other.js")
 	uc := mustURL(t, "https://example.com/app.js")
 
-	ka1, err := fetchKey(ua)
+	ka1, err := fetchKey(ua, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
-	ka2, err := fetchKey(mustURL(t, "http://example.com/app.js"))
+	ka2, err := fetchKey(mustURL(t, "http://example.com/app.js"), "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -472,10 +472,10 @@ func TestCacheKeyStability(t *testing.T) {
 		t.Errorf("key %s != canonical construction %s", ka1, canon)
 	}
 	// Distinct URLs produce distinct keys.
-	if kb, _ := fetchKey(ub); kb == ka1 {
+	if kb, _ := fetchKey(ub, ""); kb == ka1 {
 		t.Error("different path produced the same key")
 	}
-	if kc, _ := fetchKey(uc); kc == ka1 {
+	if kc, _ := fetchKey(uc, ""); kc == ka1 {
 		t.Error("different scheme produced the same key")
 	}
 	// Caps and retries are not part of the key by construction: fetchKey
@@ -549,7 +549,7 @@ func TestCacheFailedNeverStored(t *testing.T) {
 		if err := storeFetch(context.Background(), cfg, c, clock, res, []string{"test-source"}, time.Time{}, time.Time{}); err != nil {
 			t.Fatalf("storeFetch of a failed result must be a no-op, got error %v", err)
 		}
-		key, err := fetchKey(u)
+		key, err := fetchKey(u, "")
 		if err != nil {
 			t.Fatalf("fetchKey: %v", err)
 		}
@@ -570,7 +570,7 @@ func TestCacheFailedNeverStored(t *testing.T) {
 		if err := storeFetch(ctx, cfg, c, clock, res, []string{"test-source"}, time.Time{}, time.Time{}); err != nil {
 			t.Fatalf("storeFetch of a cancelled result must be a no-op, got error %v", err)
 		}
-		key, err := fetchKey(u)
+		key, err := fetchKey(u, "")
 		if err != nil {
 			t.Fatalf("fetchKey: %v", err)
 		}
@@ -627,7 +627,7 @@ func TestStoreSourceValidation(t *testing.T) {
 		}
 	}
 	// Nothing was stored by the rejected writes.
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}

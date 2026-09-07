@@ -7,6 +7,96 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-133 (HIGH) — mistake-path prober review follow-ups
+- Status: VERIFIED — orchestrator-verified 2026-09-05. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: Timeout-must-cover-surface tuning contract (docs ×3 + Cancelled pin, classifyHost untouched); port-gating + cache-warmth pins; root-observation retention; concurrency comment; exact-38 pin; programmatic-only enablement stated.
+- Verification: fix-round review APPROVE; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-130 (LOW) — amass bare-word output accepted as hostname
+- Status: VERIFIED — orchestrator-verified 2026-09-05. Full record in TODO.md.
+- Reporter: orchestrator (live field test). Owner: builder.
+- Fix: dot-guard in shared parseHostLines + chaos choke point; bare words malformed-counted, never emitted; comment tail restored.
+- Verification: review APPROVE; field case pinned; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-131 (HIGH) — diff/handoff review follow-ups
+- Status: VERIFIED — orchestrator-verified 2026-09-05. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: usage restore, NewModel re-validation, observed-roots rename, domains/ips/certs datasets, 256 MiB + 1000-list bounds, MkdirAll, 13 tests, ARCHITECTURE section; verification round: live-text purge, runner nested tests, 3-kind delta tests, typo/order fixes.
+- Verification: 2 review rounds APPROVE-equivalent; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-132 (HIGH) — config-precedence/derive review follow-ups
+- Status: VERIFIED — orchestrator-verified 2026-09-05. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: scan scalar fold (flag-wins pinned), null==absent docs+tests, precedence e2e + Deriver table, WithFile ordering docs, 512-cap proof, LookupEnv threading + 2 vars, dry-run base render, help asymmetry; verification round: dry-run fold test, README invocation fix, never-disables pin, diagram/trim/prose fixes.
+- Verification: 2 review rounds APPROVE-equivalent; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-123 (HIGH) — JS detector predicates need token-aware precision
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: local code-mask tokenizer + structural predicates (dotted-assignment, first-arg handler scope, statement-bounded proto); linear/bounded scans with ctx; rules 1.2.0→1.3.0.
+- Verification: recall 6/6, safe 0, FP 4→0, FN fires, benign 2→0, golden versions-only; 2 review rounds + polish APPROVE; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-129 (HIGH) — Chunked documents/snapshot for big bundles (windowing Phase 2, 3 slices)
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: builder. Owner: builder.
+- Fix: S1 identities/manifest/chunk-docs/sentinel/file-citation; S2 per-chunk analyze cache + orphan delete; S3 snapshot assets + buildJSContents mapping + JS subject→file normalization (rules 1.2.0); follow-ups (bound 32, sentinel pin, shared helper export, numeric order).
+- Verification: 5 MiB tail-secret + tail-sink acceptance citing the file, overlap→1 finding, warm parity, hostile golden regen reviewed (5 docs + sentinel only); orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-127 (MEDIUM) — POST/body/header reflection scope (header reflection stays unprobed)
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: POST form/JSON canary channel (CT-heuristic discovery, GET-first budget, scoped evidence, triage isolation) + POST-aware triage rescue (reflection_post meta, no conflation) + wire-spelling/read-error/scope/legacy fixes.
+- Verification: form/JSON echo-encode-silent tests, key separation, rescue/drop/unknown triage tests, legacy compat pin; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-126 (HIGH) — DNS MX/TXT/NS/SOA/SRV/CAA records (MX/TXT/NS/SRV landed; CAA/SOA deferred — no stdlib lookup)
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: T1 engine (7-type plan, depth-1 closure for MX/NS/SRV targets, TXT strings + SRV ports payloads, strict cache kind-gates, backward-compat decode) + adapt fixture widening (reviewer-APPROVED); T2 publication (host_to_mx/ns/srv kinds, assemble emission, dns:txt/dns:srv evidence, scoping, truncation chain; review-APPROVED + doc/merge follow-ups); T3 dnsrec pack (5 informational rules, clipped-silence guards, new golden additions-only; review-APPROVED).
+- Verification: per-type hermetic tests, key isolation, determinism, golden drift review (none — fixtures A-only); orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-118 (CRITICAL) — JS pack detectors scan hardcoded synthetic strings, never real JS bodies
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: SDK 2.0→2.1 additive JavaScriptContent channel (bounds, validation, fingerprint digests); 3 detectors rewritten on real bodies (rules 1.1.0); adapter document mapping; triage 8 rules 1.1.0 + honest JS descriptions + MaxSnapshotJSContentBodyBytes export + detect_js_contents_incomplete_input flag + requiredAPIMinor=1 (fix round); goldens versions-only.
+- Verification: hermetic vuln/safe body tests, cache parity, golden drift review; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-119 (CRITICAL) — httpprobe observations never reach techintel/priority adapters
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: host-level TLS resolution from graph edges + content-hash re-analysis; priority enrichment (Technologies/Secrets/Headers/JSBundleBytes/EndpointMethod) + priority_signals_truncated; multi-cert sorted-first documented; ARCHITECTURE sections added.
+- Verification: canned-probe enrichment tests, changed-cert re-analysis, golden drift (graphql promotion only); orchestrator re-ran full gates green.
+
+### NEW-120 (HIGH) — Triage pack is param-name-only with no reflection/behavior check
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: canary-reflection engine (url.reflect) + urllive wiring (default ON, 512 cap, overflow/truncated flags WITH Truncated — §0.6 fix round) + triage runTriage gate (fail-open); bare-?q Skipped; case-insensitive encoded match; liveness-gated candidates.
+- Verification: reflecting/encoding/silent endpoint tests, cache parity, E2E gate proof; orchestrator re-ran full gates green.
+
+### NEW-121 (HIGH) — naabu-discovered ports are reported but never probed
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: dns AllRelationships → host_to_ip/cname publication; httpprobe HostPorts synthesis (16/host, separate probe_ports knob); per-IP edge attribution end-to-end (cross-product fix round) with production-edges isolation test.
+- Verification: synthesis/join/cap/parity tests; goldens additive-only; orchestrator re-ran full gates green.
+
+### NEW-122 (HIGH) — takeover CNAME findings are DNS-shape-only, never HTTP-confirmed
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: ConfirmTakeoverHosts (bounded, uncached, 3-provider table) + TakeoverEvidence contract + stage selection + pack gating (rules 1.1.0, fail-open); confirmation always anonymous even in authed runs (session fix round).
+- Verification: provider/silent/timeout/tamper tests, pack gating tests, ZERO acceptance drift; orchestrator re-ran full gates green.
+
+### NEW-124 (HIGH) — Chunked >2 MiB bundle scanning (Phase 1 VERIFIED; Phase 2 = NEW-129 OPEN)
+- Status: VERIFIED (Phase 1) — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: streamed over-cap windowed analysis (512 KiB/8 KiB, Incomplete, nothing cached); fix round: Content-Length never trusted (stream to cap+1), windowed assets exist sizeless, analyzeWindows ctx-aware.
+- Verification: window/lying-length/cancellation tests; hostile huge.js +1 asset only; orchestrator re-ran full gates green.
+
+### NEW-125 (HIGH) — Operator session headers (no credential acquisition)
+- Status: VERIFIED — orchestrator-verified 2026-09-03. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: fail-closed session file parser + digest-bound cache keys; httpprobe/jsintel/urllive threading (origin-only, hops never inherit); CLI --session-headers path fan-out; fix round: anon takeover, empty-corpus fail-closed, framing/UA rejection, Fetch validation, 64/64KiB bounds; crawl deliberately excluded (argv exposure).
+- Verification: send/strip/separation/key tests, redaction audit (names-only errors, basename paths); orchestrator re-ran full gates green.
+
 ### NEW-117 (HIGH) — v2.2 Batch 1 SDK v2 Graph extension (Context.PriorFindings + GraphView) (internal/detect)
 - Status: VERIFIED — orchestrator-verified 2026-09-03 (review ses_f99bfb847ffeijM7lOF3TcDyLF APPROVE after fix round; gates re-run by orchestrator this session: gofmt clean, go vet clean, go build clean, go test ./... 37 packages ok, race green on detect)
 - Reporter: builder (task ses_fad44bad4ffeGfOSS56JmscX9K)

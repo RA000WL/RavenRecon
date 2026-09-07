@@ -5,20 +5,20 @@
 - Started: 2026-08-13T12:00:00Z
 - Ended: 2026-08-13T12:00:00Z
 - Duration: 0ms
-- Model digest: `152f576454e33a57afafd8338986e6ee872004e477f7e68b02a17b7a5265081d`
+- Model digest: `2d9375f8f6d9abb14ff102a855cf7b5e4a3041966ea954e6341057c7b0770abf`
 
 ## Summary
 
 | metric | value |
 | --- | --- |
-| assets | 58 |
+| assets | 59 |
 | hosts | 3 |
 | urls | 12 |
 | javascript | 10 |
 | secrets | 2 |
 | findings | 1 |
 | rules | 0 |
-| relationships | 40 |
+| relationships | 43 |
 | recommendations | 3 |
 | cache hits / misses | 0 / 0 |
 | worker time | 0ms |
@@ -30,6 +30,7 @@
 | host:admin.example.com | 0.6000 | medium | admin host admin |
 | url:http://admin.example.com/ | 0.6000 | medium | admin host admin |
 | url:https://admin.example.com/ | 0.6000 | medium | admin host admin |
+| url:http://www.example.com/graphql | 0.5000 | low | technology observation confidence 0.80 recorded by the detection phase |
 | host:api.example.com | 0.0000 | unknown |  |
 | host:www.example.com | 0.0000 | unknown |  |
 | url:http://api.example.com/ | 0.0000 | unknown |  |
@@ -38,7 +39,6 @@
 | url:http://www.example.com/ | 0.0000 | unknown |  |
 | url:http://www.example.com/api/v1/users | 0.0000 | unknown |  |
 | url:http://www.example.com/app.js | 0.0000 | unknown |  |
-| url:http://www.example.com/graphql | 0.0000 | unknown |  |
 | url:http://www.example.com/shared.js | 0.0000 | unknown |  |
 | url:https://api.example.com/ | 0.0000 | unknown |  |
 | url:https://www.example.com/ | 0.0000 | unknown |  |
@@ -86,15 +86,16 @@ _Detected candidates only — never verified, never severity-rated._
 
 | group anchor | score | level | members |
 | --- | --- | --- | --- |
-| domain:example.com | 0.6000 | medium | 15 |
+| domain:example.com | 0.8000 | medium | 15 |
 
 _Reconnaissance reading orders (hypotheses, never exploitation chains):_
 
-- **domain:example.com** (score 0.6000, medium)
+- **domain:example.com** (score 0.8000, medium)
   - `domain:example.com` — correlation root: 15 scored surface(s) group under this anchor
   - `host:admin.example.com` — admin host admin
   - `url:http://admin.example.com/` — admin host admin
   - `url:https://admin.example.com/` — admin host admin
+  - `url:http://www.example.com/graphql` — technology observation confidence 0.80 recorded by the detection phase
 
 ## Recommendations
 
@@ -115,7 +116,7 @@ _Reconnaissance guidance only; every item cites the evidence it came from._
 | endpoints | 12 |
 | technologies | 3 |
 | secrets | 2 |
-| relationships | 40 |
+| relationships | 43 |
 | findings | 1 |
 | live urls | 12 |
 | rules | 0 |

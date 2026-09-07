@@ -595,3 +595,150 @@ func TestTechIntelCounters(t *testing.T) {
 		})
 	}
 }
+
+// techTLSDB builds a synthetic database with one fingerprint firing an
+// IndicatorTLSIssuer match — the TLS family unreachable from URL-only
+// observations (NEW-119).
+func techTLSDB(t testing.TB) *fingerprints.DB {
+	t.Helper()
+	db, err := fingerprints.CompileForTest([]fingerprints.Fingerprint{{
+		Name:     "synthetic-ca-tech",
+		Category: asset.CategoryCloudProvider,
+		Indicators: []fingerprints.Indicator{{
+			Kind:   fingerprints.IndicatorTLSIssuer,
+			Match:  "synthetic-test-ca",
+			Weight: 0.8,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	return db
+}
+
+// techCert builds a leaf certificate asset carrying the given issuer.
+func techCert(t testing.TB, fingerprint, issuer string) asset.TLSCertificate {
+	t.Helper()
+	c, err := asset.NewTLSCertificate(fingerprint, asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewTLSCertificate: %v", err)
+	}
+	c, err = asset.WithIssuer(c, issuer)
+	if err != nil {
+		t.Fatalf("WithIssuer: %v", err)
+	}
+	c, err = asset.WithSubject(c, "example.com")
+	if err != nil {
+		t.Fatalf("WithSubject: %v", err)
+	}
+	return c
+}
+
+// techHostCertRel links a host to a certificate (the httpprobe
+// host_to_tls_certificate edge the adapter consumes).
+func techHostCertRel(t testing.TB, host string, cert asset.TLSCertificate) asset.Relationship {
+	t.Helper()
+	h := mustHost(t, host)
+	r, err := asset.NewRelationship(h.Identity(), asset.RelationshipHostToTLSCertificate, cert.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship: %v", err)
+	}
+	return r
+}
+
+// techInputWithResults builds a techintel StageInput carrying results
+// channels (certificates + relationships) alongside the corpus URLs.
+func techInputWithResults(target asset.Domain, urls []asset.URL, certs []asset.TLSCertificate, rels []asset.Relationship, c cache.Cache) pipeline.StageInput {
+	in := techintelInput(target, urls, nil, c)
+	in.Results = pipeline.Results{TLSCertificates: certs, Relationships: rels}
+	return in
+}
+
+// TestTechIntelStageTLSEnrichmentFires pins NEW-119: a corpus URL whose
+// host carries a host_to_tls_certificate edge is analyzed with the
+// certificate's issuer — the TLS family fires where URL-only observations
+// stay silent. The control leg (same URL, no certificate) detects
+// nothing: the enrichment, not the path, fires the fingerprint.
+func TestTechIntelStageTLSEnrichmentFires(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	u := techURL(t, "https://example.com/login")
+	cert := techCert(t, strings.Repeat("a", 64), "synthetic-test-ca")
+	rel := techHostCertRel(t, "example.com", cert)
+	s := NewTechIntelStage(techTLSDB(t))
+
+	withCert, err := s.Run(context.Background(), techInputWithResults(target, []asset.URL{u}, []asset.TLSCertificate{cert}, []asset.Relationship{rel}, nil))
+	if err != nil {
+		t.Fatalf("Run with cert: %v", err)
+	}
+	if withCert.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", withCert.Outcome)
+	}
+	if len(withCert.Results.Technologies) != 1 || withCert.Results.Technologies[0].Name != "synthetic-ca-tech" {
+		t.Fatalf("technologies = %v, want [synthetic-ca-tech] (TLS issuer enrichment)", withCert.Results.Technologies)
+	}
+
+	withoutCert, err := s.Run(context.Background(), techintelInput(target, []asset.URL{u}, nil, nil))
+	if err != nil {
+		t.Fatalf("Run without cert: %v", err)
+	}
+	if len(withoutCert.Results.Technologies) != 0 {
+		t.Fatalf("technologies = %v, want none without certificate observations", withoutCert.Results.Technologies)
+	}
+}
+
+// TestTechIntelStageTLSChangedCertReanalyzes pins the cache honesty of
+// enrichment: the engine key (identity + sources mask) plus the stored
+// content-hash cross-check mean a changed certificate misses and
+// re-analyzes — a stale detection is never served.
+func TestTechIntelStageTLSChangedCertReanalyzes(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	u := techURL(t, "https://example.com/login")
+	s := NewTechIntelStage(techTLSDB(t))
+	rec := &recordingCache{}
+
+	certA := techCert(t, strings.Repeat("a", 64), "synthetic-test-ca")
+	cold, err := s.Run(context.Background(), techInputWithResults(target, []asset.URL{u},
+		[]asset.TLSCertificate{certA}, []asset.Relationship{techHostCertRel(t, "example.com", certA)}, rec))
+	if err != nil {
+		t.Fatalf("cold Run: %v", err)
+	}
+	if len(cold.Results.Technologies) != 1 {
+		t.Fatalf("cold technologies = %d, want 1", len(cold.Results.Technologies))
+	}
+
+	certB := techCert(t, strings.Repeat("b", 64), "unrelated-ca")
+	warm, err := s.Run(context.Background(), techInputWithResults(target, []asset.URL{u},
+		[]asset.TLSCertificate{certB}, []asset.Relationship{techHostCertRel(t, "example.com", certB)}, rec))
+	if err != nil {
+		t.Fatalf("warm Run: %v", err)
+	}
+	if len(warm.Results.Technologies) != 0 {
+		t.Fatalf("warm technologies = %v, want none (changed certificate must re-analyze, never serve stale)", warm.Results.Technologies)
+	}
+}
+
+// TestTLSInfoForHostDeterministic pins the adapter's host→certificate
+// resolution: no edges (or no matching certificate) yield nil, and
+// multiple certificates resolve to the sorted-first fingerprint
+// (multi-cert hosts ignore the rest by design — see infoForHost).
+func TestTLSInfoForHostDeterministic(t *testing.T) {
+	host := mustHost(t, "example.com")
+	certB := techCert(t, strings.Repeat("b", 64), "issuer-b")
+	certA := techCert(t, strings.Repeat("a", 64), "issuer-a")
+	certs := []asset.TLSCertificate{certB, certA}
+	rels := []asset.Relationship{techHostCertRel(t, "example.com", certB), techHostCertRel(t, "example.com", certA)}
+
+	if got := newTLSCertIndex(nil, nil).infoForHost(host); got != nil {
+		t.Fatalf("infoForHost with no data = %+v, want nil", got)
+	}
+	if got := newTLSCertIndex(certs, rels).infoForHost(mustHost(t, "other.example.com")); got != nil {
+		t.Fatalf("infoForHost for unrelated host = %+v, want nil", got)
+	}
+	got := newTLSCertIndex(certs, rels).infoForHost(host)
+	if got == nil {
+		t.Fatal("infoForHost = nil, want the sorted-first certificate")
+	}
+	if got.Issuer != "issuer-a" {
+		t.Fatalf("issuer = %q, want issuer-a (sorted-first fingerprint wins)", got.Issuer)
+	}
+}

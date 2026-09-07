@@ -1246,16 +1246,18 @@ func TestJSIntelStageDocumentsByReference(t *testing.T) {
 	}
 }
 
-// TestJSIntelStageDocumentsTruncatedAbsent pins the truncation honesty rule
-// at the stage level: a fetch that could not be fully retained contributes
-// NO document (never a partial prefix) — the stage still reports the
-// truncation with its flag and folds to partial, exactly as before
-// retention existed.
+// TestJSIntelStageDocumentsTruncatedAbsent pins the Slice 1 truncation
+// honesty rule at the stage level: a windowed fetch contributes chunk
+// documents (one per window, aliased, Truncated false) plus a file sentinel
+// (nil, Truncated true) — never a partial file prefix as the file body —
+// and still reports the truncation with its flag and folds to partial.
+// Windowed (NEW-124 Phase 1 + NEW-129 Slice 1): an over-cap JS body yields
+// its windowed JS asset (the file IS a JS file) with Size/Hash unset.
 func TestJSIntelStageDocumentsTruncatedAbsent(t *testing.T) {
 	const over = (2 << 20) + 1 // engine default MaxJSBytes is 2 MiB; +1 exceeds it
 	tr := &cannedTransport{}
-	// ContentLength = len(body) > 2 MiB: the declared bound truncates
-	// without reading a byte.
+	// ContentLength = len(body) > 2 MiB: the streamed bound truncates
+	// after reading cap+1 bytes (declared length is never trusted).
 	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: strings.Repeat("x", over)})
 
 	in := jsStageInput(t, "example.com", []asset.URL{jsMustURL(t, "http://www.example.com/app.js")}, nil, nil)
@@ -1269,11 +1271,57 @@ func TestJSIntelStageDocumentsTruncatedAbsent(t *testing.T) {
 	if !res.Truncated || !res.StickyFlags[jsFetchTruncated] {
 		t.Fatalf("Truncated/flags = %v/%v, want true/%q set", res.Truncated, res.StickyFlags, jsFetchTruncated)
 	}
-	if len(res.Documents) != 0 {
-		t.Fatalf("Documents = %+v, want none (a truncated fetch retains NOTHING, never a partial prefix)", res.Documents)
+	// Slice 1: the default 2 MiB prefix tiles to 5 windows (512 KiB/8 KiB)
+	// plus the file sentinel — 6 documents, grouped-by-file in index order
+	// plus sentinel. No per-file cut below the produced windows.
+	if len(res.Documents) != 6 {
+		t.Fatalf("Documents = %d, want 6 (5 chunk docs + file sentinel for the 2 MiB prefix)", len(res.Documents))
 	}
-	if len(res.Results.JavaScript) != 0 {
-		t.Fatalf("Results.JavaScript = %+v, want none (no JS asset from a truncated fetch)", res.Results.JavaScript)
+	for i := 0; i < 5; i++ {
+		d := res.Documents[i]
+		if d.Truncated || d.Content == nil {
+			t.Fatalf("chunk doc %d: Truncated=%v Content nil=%v, want false/non-nil (aliased window)", i, d.Truncated, d.Content == nil)
+		}
+		if _, ci, total, _, _, _, _, perr := asset.ParseChunkIdentity(d.Identity); perr != nil {
+			t.Fatalf("chunk doc %d identity %q does not parse: %v", i, d.Identity, perr)
+		} else if ci != i || total != 5 {
+			t.Fatalf("chunk doc %d: index/total = %d/%d, want %d/5", i, ci, total, i)
+		}
+	}
+	sentinel := res.Documents[5]
+	if !sentinel.Truncated || sentinel.Content != nil {
+		t.Fatalf("sentinel = Truncated %v Content %d bytes, want true/nil (honest truncation marker)", sentinel.Truncated, len(sentinel.Content))
+	}
+	if want := "javascript:http://www.example.com/app.js"; sentinel.Identity.String() != want {
+		t.Fatalf("sentinel identity = %q, want %q (file JS identity)", sentinel.Identity, want)
+	}
+	if len(res.Results.JavaScript) != 6 {
+		t.Fatalf("Results.JavaScript = %d, want 6 (1 windowed file asset + 5 chunk assets)", len(res.Results.JavaScript))
+	}
+	if got := res.Results.JavaScript[0]; got.Size != 0 || got.ContentHash != "" {
+		t.Fatalf("windowed JS size/hash = %d/%q, want 0/empty (not observed)", got.Size, got.ContentHash)
+	}
+	// Slice 3: the file asset leads (first-seen wins downstream, so the
+	// corpus merge keeps the file linkage), then one sizeless chunk asset
+	// per window in chunk-identity order.
+	fileJS := res.Results.JavaScript[0]
+	if _, _, _, _, _, _, _, perr := asset.ParseChunkIdentity(fileJS.Identity()); perr == nil {
+		t.Fatalf("Results.JavaScript[0] = %q, want the FILE asset first", fileJS.Identity())
+	}
+	for i, js := range res.Results.JavaScript[1:] {
+		if js.Size != 0 || js.ContentHash != "" {
+			t.Fatalf("chunk asset %d size/hash = %d/%q, want 0/empty (sizeless like the file)", i, js.Size, js.ContentHash)
+		}
+		gotFile, gi, total, _, _, _, _, perr := asset.ParseChunkIdentity(asset.Identity{Kind: asset.KindJavaScript, Value: js.URL.String() + "#" + js.URL.Fragment})
+		if perr != nil {
+			t.Fatalf("chunk asset %d does not parse as a chunk: %v", i, perr)
+		}
+		if gotFile.String() != fileJS.URL.String() || gi != i || total != 5 {
+			t.Fatalf("chunk asset %d cites %q %d/%d, want file %q %d/5", i, gotFile, gi, total, fileJS.URL, i)
+		}
+		if js.Identity() != fileJS.Identity() {
+			t.Fatalf("chunk asset %d Identity() = %q, want the file %q (fragment excluded)", i, js.Identity(), fileJS.Identity())
+		}
 	}
 }
 

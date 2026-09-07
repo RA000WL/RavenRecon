@@ -40,7 +40,7 @@ func probeKeyFor(t testing.TB, host asset.Host, scheme string, domain asset.Doma
 	if err != nil {
 		t.Fatalf("probeTargetURL: %v", err)
 	}
-	key, err := probeKey(u, domain)
+	key, err := probeKey(u, domain, "")
 	if err != nil {
 		t.Fatalf("probeKey: %v", err)
 	}

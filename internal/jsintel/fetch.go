@@ -12,9 +12,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/textproto"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
@@ -143,6 +147,47 @@ const (
 	ReasonOther       FetchReason = "other"        // failed: anything else
 )
 
+// Truncation causes for a FetchTruncated observation. The cause decides the
+// manifest contract: a cap truncation carries a well-formed window manifest,
+// a read-error truncation carries none.
+const (
+	// truncCauseCap marks content-cap truncation (body exceeded MaxJSBytes
+	// while streaming): windows + manifest retained, content nil.
+	truncCauseCap = "cap"
+	// truncCauseRead marks a mid-body read failure: nothing retained, no
+	// manifest.
+	truncCauseRead = "read"
+)
+
+// ChunkInfo is one window's manifest entry: the deterministic byte span in
+// the retained prefix plus the full SHA-256 of the window bytes. The chunk
+// identity cites the first 8 hex digits (ph) of SHA256Hex.
+type ChunkInfo struct {
+	// Index is the window index in tiling order.
+	Index int
+	// Start is the byte offset of the window in the retained prefix.
+	Start int64
+	// End is the exclusive end offset (Start < End <= PrefixLen).
+	End int64
+	// SHA256Hex is the lowercase hex SHA-256 of the window bytes (64 hex).
+	SHA256Hex string
+}
+
+// FetchManifest describes the retained windows of a cap-truncated fetch: the
+// tiling tag that produced them, the retained prefix length, the cause, and
+// the per-window entries in index order. Read-error truncations carry a nil
+// manifest; completed fetches never carry one.
+type FetchManifest struct {
+	// TilingTag names the tiling that produced the windows (fetchTilingTag).
+	TilingTag string
+	// PrefixLen is the retained prefix length (== MaxJSBytes at cap time).
+	PrefixLen int64
+	// Cause is truncCauseCap for every manifest-bearing result.
+	Cause string
+	// Chunks holds one entry per window in index order.
+	Chunks []ChunkInfo
+}
+
 // FetchResult is the complete observation of one fetch operation. It is the
 // pipeline's internal currency: the cache layer (record_fetch.go) persists
 // completed observations as records and restores byte-identical results on a
@@ -183,6 +228,22 @@ type FetchResult struct {
 	// observation). A truncated fetch NEVER retains a partial prefix: the
 	// honest record has no content at all (see doc.go).
 	Content []byte
+	// Windows are the deterministic overlapped tilings of the retained
+	// prefix for over-cap bodies discovered while streaming (NEW-124
+	// Phase 1): window i covers
+	// [i*(maxFetchWindowBytes-fetchWindowOverlapBytes),
+	//  i*(...)+maxFetchWindowBytes), so every prefix byte appears in at
+	// least one window and any token shorter than the overlap appears
+	// whole in one. Empty unless the body exceeded the cap while
+	// streaming. Windows alias the
+	// retained prefix (read-only downstream) and never exceed MaxJSBytes
+	// total — the same memory ceiling as today.
+	Windows [][]byte
+	// Manifest describes the retained windows of a cap-truncated fetch
+	// (NEW-129 Slice 1): tiling tag, prefix length, per-window spans and
+	// hashes, and the truncation cause. Nil for completed fetches and for
+	// read-error truncations (which carry no manifest).
+	Manifest *FetchManifest
 	// Truncated reports that the content could not be fully retained
 	// (content cap hit, or a read failure mid-body). Never true together
 	// with non-nil Content.
@@ -254,6 +315,22 @@ type FetchConfig struct {
 	// Clock is the time source for provenance timestamps of URLs derived
 	// from redirect Locations. Nil means the wall clock.
 	Clock runtime.Clock
+
+	// RequestHeaders carries operator-supplied session headers (NEW-125):
+	// added to requests on the fetch target's own host. Nil or empty
+	// means anonymous fetching. Cross-host redirect hops NEVER inherit
+	// them (fail-closed direction). Values never enter logs, errors,
+	// reports, or cache records — only the session digest enters cache
+	// keys. Validated at the engine layer (fail-closed); direct Fetch
+	// callers pass already-validated headers.
+	RequestHeaders http.Header
+
+	// ResolveIP resolves redirect-target hostnames for the dial-safety
+	// gate (see redirectDialSafe). Nil means the system default resolver.
+	// Tests inject a hermetic stub; the engine leaves it nil (production
+	// resolution). It is consulted ONLY for cross-host redirect hops —
+	// same-host hops and the initial URL never resolve through it.
+	ResolveIP func(ctx context.Context, host string) ([]net.IP, error)
 }
 
 // validated applies defaults and clamps, rejecting negatives. The result is
@@ -288,6 +365,17 @@ func (c FetchConfig) validated() (FetchConfig, error) {
 	if c.Retries > maxRetries {
 		c.Retries = maxRetries
 	}
+	if len(c.RequestHeaders) > 0 {
+		// Fail-closed validation + canonicalization before any dispatch
+		// (mirrors the engine layer and httpprobe buildEnv): direct Fetch
+		// callers get the same whole-call rejection as pipeline runs — a
+		// half-authed fetch is worse than none.
+		normalized, _, err := normalizeRequestHeaders(c.RequestHeaders)
+		if err != nil {
+			return c, err
+		}
+		c.RequestHeaders = normalized
+	}
 	return c, nil
 }
 
@@ -297,7 +385,11 @@ func (c FetchConfig) validated() (FetchConfig, error) {
 // the wire). It follows up to MaxRedirects redirects — cross-host http(s)
 // redirects included, since jsintel has no declared-scope concept — but a
 // redirect to a NON-http(s) scheme is observed, never requested: the walk
-// ends with the redirect response as the final observation. It streams the
+// ends with the redirect response as the final observation. Cross-host
+// IP-literal targets are likewise refused at the string layer, and
+// cross-host DNS-name hops pass a dial-time gate (redirectDialSafe):
+// the target must resolve to all-public addresses or the hop is
+// observed, never followed. It streams the
 // terminal body under the MaxJSBytes content cap (truncating honestly,
 // never retaining a partial prefix), and classifies every outcome with a
 // typed FetchStatus and FetchReason.
@@ -401,6 +493,12 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 				Err: fmt.Errorf("jsintel: fetch %s: build request: %w", u.String(), err)}
 		}
 		req.Header.Set("User-Agent", userAgent)
+		// Session headers ride only same-host dispatches (NEW-125):
+		// the initial request targets u itself (always same-host);
+		// redirect hops to other hosts never inherit credentials.
+		if hostPart(cur.HostPort) == hostPart(u.HostPort) {
+			applySessionHeaders(req, cfg.RequestHeaders)
+		}
 		resp, err := cfg.Transport.RoundTrip(req)
 		if err != nil {
 			st, reason := classifyFetchError(ctx, err)
@@ -408,13 +506,21 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 		}
 
 		if isRedirectCode(resp.StatusCode) && resp.Header.Get("Location") != "" && hops < MaxRedirects {
-			next, ok := resolveRedirect(resp, cfg.Clock)
+			next, ok := resolveRedirect(resp, cur, cfg.Clock)
 			if !ok {
-				// An unparseable Location — or a Location whose target is
-				// NOT http(s) — ends the walk: the redirect response
-				// itself is the final observation (completed, FinalURL =
-				// the URL it was received from), observed but never
-				// followed.
+				// An unparseable Location — a non-http(s) target — or a
+				// cross-host IP-literal target ends the walk: the redirect
+				// response itself is the final observation (completed,
+				// FinalURL = the URL it was received from), observed but
+				// never followed.
+				return readTerminal(u, cur, resp, hops, cfg)
+			}
+			if !redirectDialSafe(reqCtx, cfg, cur, next) {
+				// Cross-host hop resolving to non-public addresses (or
+				// unresolvable at all): observed, never followed.
+				// Fail-closed — a hostile target controlling its DNS can
+				// only deny fetches, never steer them onto internal
+				// infrastructure (review wave 2026-09-03).
 				return readTerminal(u, cur, resp, hops, cfg)
 			}
 			// Intermediate redirect bodies are never read — only closed.
@@ -430,10 +536,154 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 	}
 }
 
+// Session header bounds (NEW-125, mirroring httpprobe's run.go — same
+// values, same fail-closed semantics; the two engines stay independent
+// with no shared dependency).
+const (
+	maxSessionHeaderCount      = 32
+	maxSessionHeaderNameBytes  = 256
+	maxSessionHeaderValueBytes = 8 << 10
+	// maxSessionHeaderValues bounds the total number of header values
+	// across all keys (a single key may carry many values).
+	maxSessionHeaderValues = 64
+	// maxSessionHeaderTotalBytes bounds the total session header value
+	// bytes across all keys (Σ len(values)).
+	maxSessionHeaderTotalBytes = 64 << 10
+)
+
+// forbiddenSessionHeader reports whether the canonical header name must
+// never arrive via session headers: Host (the transport would ignore
+// it — silent confusion), the framing headers Content-Length /
+// Transfer-Encoding / Connection (the transport owns framing), and
+// User-Agent (Fetch sets its own fixed identifier; a session override
+// would silently impersonate a different client).
+func forbiddenSessionHeader(canon string) bool {
+	switch canon {
+	case "Host", "Content-Length", "Transfer-Encoding", "Connection", "User-Agent":
+		return true
+	}
+	return false
+}
+
+// normalizeRequestHeaders validates session headers (fail-closed) and
+// returns the canonical form (net/textproto MIME form, sorted keys,
+// duplicate values merged in order) plus its cache-key digest. Mirrors
+// httpprobe.normalizeRequestHeaders exactly — same bounds, same
+// rejections (empty map, bad tokens, Host / framing / User-Agent
+// headers, empty/over-long values, control bytes, over-count keys,
+// over-count total values, over-budget total value bytes).
+func normalizeRequestHeaders(h http.Header) (http.Header, string, error) {
+	if len(h) == 0 {
+		return nil, "", fmt.Errorf("jsintel: no session headers")
+	}
+	if len(h) > maxSessionHeaderCount {
+		return nil, "", fmt.Errorf("jsintel: %d session headers over bound %d", len(h), maxSessionHeaderCount)
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(http.Header, len(h))
+	totalValues := 0
+	totalBytes := 0
+	for _, k := range keys {
+		if !validSessionHeaderToken(k) {
+			return nil, "", fmt.Errorf("jsintel: invalid session header name %q", k)
+		}
+		canon := textproto.CanonicalMIMEHeaderKey(k)
+		if len(canon) > maxSessionHeaderNameBytes {
+			return nil, "", fmt.Errorf("jsintel: session header name over bound %d", maxSessionHeaderNameBytes)
+		}
+		if forbiddenSessionHeader(canon) {
+			return nil, "", fmt.Errorf("jsintel: session headers must not set %s", canon)
+		}
+		for _, v := range h[k] {
+			if v == "" {
+				return nil, "", fmt.Errorf("jsintel: session header %q has an empty value", k)
+			}
+			if len(v) > maxSessionHeaderValueBytes {
+				return nil, "", fmt.Errorf("jsintel: session header %q value over bound %d", k, maxSessionHeaderValueBytes)
+			}
+			for i := 0; i < len(v); i++ {
+				if v[i] < 0x20 || v[i] > 0x7e {
+					return nil, "", fmt.Errorf("jsintel: session header %q value carries control bytes", k)
+				}
+			}
+			totalValues++
+			totalBytes += len(v)
+		}
+		out[canon] = append(out[canon], h[k]...)
+	}
+	if totalValues > maxSessionHeaderValues {
+		return nil, "", fmt.Errorf("jsintel: %d session header values over bound %d", totalValues, maxSessionHeaderValues)
+	}
+	if totalBytes > maxSessionHeaderTotalBytes {
+		return nil, "", fmt.Errorf("jsintel: session header values total %d bytes over bound %d", totalBytes, maxSessionHeaderTotalBytes)
+	}
+	return out, sessionDigest(out), nil
+}
+
+// validSessionHeaderToken reports whether name is an HTTP token.
+func validSessionHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sessionDigest binds session headers into cache keys without carrying
+// values (mirrors httpprobe.sessionDigest): hex SHA-256 over sorted
+// "name\x00value" lines; empty digests to "" (callers omit the key
+// component then, keeping anonymous keys byte-identical).
+func sessionDigest(h http.Header) string {
+	if len(h) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		for _, v := range h[k] {
+			b.WriteString(k)
+			b.WriteByte(0)
+			b.WriteString(v)
+			b.WriteByte(0)
+		}
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// applySessionHeaders sets validated session headers on an outbound
+// request. Callers gate scope themselves (same-host only for redirect
+// walks); single-URL observations call it directly.
+func applySessionHeaders(req *http.Request, headers http.Header) {
+	for k, vs := range headers {
+		req.Header[k] = append([]string(nil), vs...)
+	}
+}
+
 // resolveRedirect resolves a response's Location against the request URL and
 // canonicalizes it through the asset model. ok is false when the Location is
-// absent, unparseable, fails canonicalization, or points at a NON-http(s)
-// scheme — the caller then ends the walk with the current response as the
+// absent, unparseable, fails canonicalization, points at a NON-http(s)
+// scheme, or points at an IP literal on a DIFFERENT host than the current
+// request — the caller then ends the walk with the current response as the
 // final observation (observed, not followed).
 //
 // Redirect scheme policy: cross-host http(s) redirect targets ARE followed —
@@ -445,7 +695,18 @@ func attemptFetch(ctx context.Context, u asset.URL, cfg FetchConfig) FetchResult
 // path. That keeps one scheme-incompatible redirect from turning the whole
 // observation into a permanently failed record (an unsupported scheme can
 // never be fetched, so a "failed" classification would retry forever).
-func resolveRedirect(resp *http.Response, clock runtime.Clock) (asset.URL, bool) {
+//
+// Redirect address policy (mirrors httpprobe canonicalScopeHost): a
+// cross-host IP-literal target is NEVER requested — observed, never
+// followed. Otherwise a hostile target could drive the fetcher onto
+// link-local/loopback addresses (e.g. cloud instance metadata) via a 302
+// and retain the body into cache/reports. Same-host redirects (relative
+// hops and absolute URLs on the request's own host, including IP-literal
+// bases such as loopback test servers and operator-supplied IP targets)
+// are still followed; hostname targets (including cross-host DNS names)
+// are still followed. The initial dial follows whatever the target's DNS
+// returns at request time (see doc.go DNS-following contract).
+func resolveRedirect(resp *http.Response, cur asset.URL, clock runtime.Clock) (asset.URL, bool) {
 	loc, err := resp.Location()
 	if err != nil {
 		return asset.URL{}, false
@@ -460,22 +721,177 @@ func resolveRedirect(resp *http.Response, clock runtime.Clock) (asset.URL, bool)
 	if next.Scheme != "http" && next.Scheme != "https" {
 		return asset.URL{}, false
 	}
+	if isIPLiteralHostPort(next.HostPort) && hostPart(next.HostPort) != hostPart(cur.HostPort) {
+		return asset.URL{}, false
+	}
 	return next, true
 }
 
+// redirectDialSafe reports whether a resolved cross-host redirect hop
+// may be requested: the target hostname must resolve (through the
+// configured resolver, production DNS by default) to at least one
+// address, and every resolved address must be public. Same-host hops
+// always pass — the operator's own surface, including IP-literal bases
+// and loopback test servers, is never gated. Anything else (resolver
+// error, empty answer, or any loopback/link-local/private/multicast/
+// unspecified address) refuses the hop: observed, never followed.
+//
+// Fail-closed is deliberate: an attacker commanding the target's DNS
+// can only deny fetches, never steer them onto metadata endpoints,
+// loopback services, or RFC 1918 infrastructure. Residual risk remains
+// for DNS rebinding between this check and the transport's own dial
+// (short TTLs can swap answers) — operators scanning hostile domains
+// must still run behind egress that denies non-public destinations,
+// documented in doc.go.
+func redirectDialSafe(ctx context.Context, cfg FetchConfig, cur, next asset.URL) bool {
+	if hostPart(next.HostPort) == hostPart(cur.HostPort) {
+		return true
+	}
+	addrs, err := cfg.resolveIP(ctx, hostPart(next.HostPort))
+	if err != nil || len(addrs) == 0 {
+		return false
+	}
+	for _, ip := range addrs {
+		if !isPublicDialIP(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveIP resolves a hostname to addresses for the dial-safety gate,
+// via the injected stub in tests or the system resolver in production.
+func (c FetchConfig) resolveIP(ctx context.Context, host string) ([]net.IP, error) {
+	if c.ResolveIP != nil {
+		return c.ResolveIP(ctx, host)
+	}
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// isPublicDialIP reports whether ip is a public routable address: not
+// loopback, link-local (v4 or v6), multicast, unspecified, or private
+// (RFC 1918 / RFC 4193, including IPv4-mapped forms). Anything else is
+// internal infrastructure a hostile redirect must never reach.
+func isPublicDialIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() || ip.IsPrivate() {
+		return false
+	}
+	return true
+}
+
+// hostPart returns the host without port or IPv6 brackets for same-host
+// comparison (canonical HostPorts are already lowercase).
+func hostPart(hostPort string) string {
+	hp := hostPort
+	if host, _, err := net.SplitHostPort(hp); err == nil {
+		hp = host
+	}
+	hp = strings.TrimPrefix(hp, "[")
+	hp = strings.TrimSuffix(hp, "]")
+	return hp
+}
+
+// isIPLiteralHostPort reports whether a canonical asset HostPort names an IP
+// literal (never a fetchable redirect target). The canonical HostPort may
+// carry a non-default port ("host:8080" or a bracketed IPv6 literal), which
+// is stripped before the check; the parse uses netip.ParseAddr so the
+// verdict matches the asset model's own IP/host routing (including the
+// leading-zero-octet asymmetry documented in normalizeHost).
+//
+// The check is deliberately broader than ParseAddr: a trailing root dot is
+// stripped, and classic non-canonical IP spellings — dotted quads with
+// leading-zero octets ("010.0.0.1"), pure decimal ("2130706433"), and
+// 0x-hex ("0x7f000001"), all of which ParseAddr rejects but some
+// resolvers interpret as addresses — are refused via isNumericHost.
+// Mixed-alphanumeric ("db2", "cafe01") and pure-hex-alpha ("dead")
+// names are real hostname shapes and still pass through to DNS. The
+// initial fetch URL (the operator's explicit target) is never gated.
+func isIPLiteralHostPort(hostPort string) bool {
+	hp := hostPort
+	if host, _, err := net.SplitHostPort(hp); err == nil {
+		hp = host
+	}
+	hp = strings.TrimPrefix(hp, "[")
+	hp = strings.TrimSuffix(hp, "]")
+	hp = strings.ToLower(strings.TrimSuffix(hp, "."))
+	if isNumericHost(hp) {
+		return true
+	}
+	_, err := netip.ParseAddr(hp)
+	return err == nil
+}
+
+// isNumericHost reports whether h is an IP-address spelling no DNS
+// name needs: pure decimal ("2130706433"), 0x-hex ("0x7f000001"), or
+// dotted numerics ("10.0.0.1" including leading-zero octets like
+// "010.0.0.1" — which ParseAddr rejects but some resolvers interpret
+// as addresses). Mixed-alphanumeric names ("db2", "a1", "cafe01",
+// "123abc") and pure-hex-alpha names ("dead", "cafe") are real
+// hostname shapes and pass through to DNS.
+func isNumericHost(hp string) bool {
+	if hp == "" {
+		return false
+	}
+	if isDecimal(hp) || isHexIP(hp) || isDottedNumeric(hp) {
+		return true
+	}
+	return false
+}
+
+// isDecimal reports an all-digit host (a decimal IP spelling).
+func isDecimal(hp string) bool {
+	for i := 0; i < len(hp); i++ {
+		if hp[i] < '0' || hp[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isHexIP reports a 0x/0X-prefixed hex IP spelling.
+func isHexIP(hp string) bool {
+	if len(hp) < 3 || (hp[:2] != "0x" && hp[:2] != "0X") {
+		return false
+	}
+	for i := 2; i < len(hp); i++ {
+		c := hp[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// isDottedNumeric reports dot-separated all-digit groups ("10.0.0.1",
+// "010.0.0.1", "1.2.3.4.5"). Empty groups and non-digit bytes fail.
+func isDottedNumeric(hp string) bool {
+	if !strings.Contains(hp, ".") {
+		return false
+	}
+	for _, part := range strings.Split(hp, ".") {
+		if part == "" || !isDecimal(part) {
+			return false
+		}
+	}
+	return true
+}
+
 // readTerminal retains the bounded metadata and content of the terminal
-// response. Content bounds run in two stages:
+// response. The declared Content-Length is never trusted: every body is
+// streamed up to MaxJSBytes+1 bytes, and reading more than MaxJSBytes
+// means the body exceeds the cap (the bound is kept, the trust is
+// dropped — a lying Content-Length can neither truncate a small body
+// nor retain a huge one).
 //
-//  1. Declared bound: a server-declared Content-Length above the cap means
-//     the body is larger than we will ever retain — close it WITHOUT reading
-//     a byte.
-//  2. Streamed bound: otherwise stream up to MaxJSBytes+1 bytes; reading
-//     more than MaxJSBytes means the body exceeds the cap.
-//
-// On either cap hit — or on a read failure mid-body — the retained content
-// is nil and the fetch is truncated (FetchTruncated): a partial prefix is
-// never stored or served as if it were the file (see doc.go). A truncated
-// observation still carries its honest metadata: status, headers, and the
+// On a cap hit — or on a read failure mid-body — the fetch is
+// truncated (FetchTruncated): Content stays nil and Size/Hash stay zero
+// (a partial prefix is never stored or served as if it were the file,
+// see doc.go). The over-cap path additionally retains deterministic
+// overlapped windows over the bounded prefix (NEW-124 Phase 1,
+// splitWindows) for analysis — same memory ceiling, same
+// truncated/incomplete honesty. A truncated observation
+// still carries its honest metadata: status, headers, and the
 // declared/observed ContentLength.
 func readTerminal(u, finalURL asset.URL, resp *http.Response, hops int, cfg FetchConfig) FetchResult {
 	defer resp.Body.Close()
@@ -496,11 +912,6 @@ func readTerminal(u, finalURL asset.URL, resp *http.Response, hops int, cfg Fetc
 			res.LastModified = t
 		}
 	}
-	if resp.ContentLength > cfg.MaxJSBytes {
-		res.Truncated = true
-		res.Status = FetchTruncated
-		return res
-	}
 	body, exceeded, rerr := readBounded(resp.Body, cfg.MaxJSBytes)
 	if rerr != nil {
 		res.Err = fmt.Errorf("jsintel: fetch %s: read body: %w", u.String(), rerr)
@@ -509,6 +920,17 @@ func readTerminal(u, finalURL asset.URL, resp *http.Response, hops int, cfg Fetc
 		return res
 	}
 	if exceeded {
+		// Over-cap body discovered while streaming: retain deterministic
+		// overlapped windows over the bounded prefix for analysis
+		// (NEW-124 Phase 1) — same memory ceiling as today (cap+1 read),
+		// same truncated/incomplete honesty, Content still nil.
+		// Accepted waste: windows are tiled before JS classification, so
+		// an over-cap non-JS body retains a prefix that analysis
+		// discards — bounded by MaxJSBytes either way, and gating on
+		// Content-Type/extension here would duplicate the engine's
+		// isJSAsset rule (a second classifier for the same concept).
+		res.Windows = splitWindows(body, maxFetchWindowBytes, fetchWindowOverlapBytes)
+		res.Manifest = buildFetchManifest(body, res.Windows)
 		res.Truncated = true
 		res.Status = FetchTruncated
 		return res
@@ -523,19 +945,155 @@ func readTerminal(u, finalURL asset.URL, resp *http.Response, hops int, cfg Fetc
 }
 
 // readBounded streams r up to cap+1 bytes. A body larger than cap reports
-// exceeded (the retained bytes are dropped by the caller); the streamed read
-// is bounded to cap+1 bytes of memory regardless of the true body size, so a
-// gzip-decompressing transport (ContentLength -1) cannot grow memory without
-// bound either.
+// exceeded with the first cap bytes retained (the analysis prefix —
+// callers tile it into windows, never serve it as the file); the streamed
+// read is bounded to cap+1 bytes of memory regardless of the true body
+// size, so a gzip-decompressing transport (ContentLength -1) cannot grow
+// memory without bound either.
 func readBounded(r io.Reader, capBytes int64) (data []byte, exceeded bool, err error) {
 	n, rerr := io.ReadAll(io.LimitReader(r, capBytes+1))
 	if rerr != nil {
 		return nil, false, rerr
 	}
 	if int64(len(n)) > capBytes {
-		return nil, true, nil
+		return n[:capBytes], true, nil
 	}
 	return n, false, nil
+}
+
+// Fetch window bounds (NEW-124 Phase 1, tiling tag NEW-129 Slice 1).
+// Fixed constants, deliberately NOT configuration: they bound retained
+// memory exactly like MaxJSBytes, so they must never enter cache keys. The
+// overlap covers the parser's longest atomic token (maxParserStringBytes
+// 4 KiB) with margin, so any literal or specifier split by a window
+// boundary still appears whole in a neighbor window. OD-4 measurement
+// (NEW-129): the secrentel engine's longest retained candidate value is
+// 800 bytes (aws session token, MaxLen 800; max Trail 120 is already
+// bounded by its own MaxLen), so the 8 KiB overlap covers it with a ~7 KiB
+// margin (10x) — no resize; the tag below stays "w512-o8-v1".
+const (
+	// maxFetchWindowBytes bounds one analysis window.
+	maxFetchWindowBytes = 512 << 10
+	// fetchWindowOverlapBytes bounds the overlap between consecutive
+	// windows (stride = window - overlap).
+	fetchWindowOverlapBytes = 8 << 10
+	// fetchTilingTag names the tiling that produced a window set. It enters
+	// chunk identities and fetch manifests (never cache keys — the constants
+	// above never enter keys either); a tag mismatch means the windows were
+	// tiled differently and the manifest must be recomputed.
+	fetchTilingTag = "w512-o8-v1"
+	// maxWindowedChunks bounds how many windows one fetch may retain. The
+	// default 2 MiB prefix tiles to 5 windows; the 8 MiB maximum tiles to
+	// 17 in the worst case, so the bound keeps margin at 32 and the
+	// manifest decode rejects counts above this bound so a tampered
+	// record cannot smuggle unbounded windows. No per-file chunk cut is
+	// applied below the produced windows: jsDocuments emits every
+	// produced window.
+	maxWindowedChunks = 32
+)
+
+// snapToRuneStart backs off to the nearest UTF-8 rune boundary at or before
+// off (a deterministic pure function of bytes): while off points at a UTF-8
+// continuation byte it moves one byte earlier. Offsets 0 and len(data) are
+// fixed points. Mirrors secrentel's Trail rune-boundary backup so a window
+// boundary never splits a multi-byte rune into invalid UTF-8 at its edges.
+func snapToRuneStart(data []byte, off int) int {
+	if off <= 0 || off >= len(data) {
+		return off
+	}
+	for off > 0 && off < len(data) && !utf8.RuneStart(data[off]) {
+		off--
+	}
+	return off
+}
+
+// splitWindows tiles data into deterministic overlapped windows:
+// window i covers [i*stride, i*stride+size), the last window ending
+// exactly at len(data). Every byte appears in at least one window.
+// Windows alias data (read-only downstream); no bytes are copied.
+// Window boundaries (except 0 and len(data)) snap to UTF-8 rune
+// boundaries via snapToRuneStart — a deterministic pure function of the
+// bytes, at most 3 bytes of shift against the 8 KiB overlap, so coverage
+// and overlap guarantees are unchanged.
+func splitWindows(data []byte, size, overlap int) [][]byte {
+	if len(data) <= size {
+		return [][]byte{data}
+	}
+	stride := size - overlap
+	if stride <= 0 {
+		return [][]byte{data}
+	}
+	var out [][]byte
+	for start := 0; start < len(data); start += stride {
+		s := snapToRuneStart(data, start)
+		end := start + size
+		if end > len(data) {
+			end = len(data)
+		} else {
+			end = snapToRuneStart(data, end)
+			if end <= s {
+				// Degenerate snap (a >512 KiB rune run, unreachable for
+				// valid UTF-8): fall back to the raw end so no byte is
+				// ever dropped.
+				end = start + size
+				if end > len(data) {
+					end = len(data)
+				}
+			}
+		}
+		out = append(out, data[s:end])
+		if end == len(data) {
+			break
+		}
+	}
+	return out
+}
+
+// buildFetchManifest describes windows tiled from prefix: the tiling tag,
+// the prefix length, and one entry per window in index order with byte
+// spans and full SHA-256 hex. It replays the exact tiling math of
+// splitWindows (including rune snapping) so spans always agree with the
+// retained windows by construction. The manifest copies no window bytes.
+func buildFetchManifest(prefix []byte, windows [][]byte) *FetchManifest {
+	if len(windows) == 0 {
+		return nil
+	}
+	size, overlap := maxFetchWindowBytes, fetchWindowOverlapBytes
+	stride := size - overlap
+	m := &FetchManifest{
+		TilingTag: fetchTilingTag,
+		PrefixLen: int64(len(prefix)),
+		Cause:     truncCauseCap,
+		Chunks:    make([]ChunkInfo, 0, len(windows)),
+	}
+	wi := 0
+	for start := 0; start < len(prefix) && wi < len(windows); start += stride {
+		s := snapToRuneStart(prefix, start)
+		end := start + size
+		if end > len(prefix) {
+			end = len(prefix)
+		} else {
+			end = snapToRuneStart(prefix, end)
+			if end <= s {
+				end = start + size
+				if end > len(prefix) {
+					end = len(prefix)
+				}
+			}
+		}
+		sum := sha256.Sum256(windows[wi])
+		m.Chunks = append(m.Chunks, ChunkInfo{
+			Index:     wi,
+			Start:     int64(s),
+			End:       int64(s + len(windows[wi])),
+			SHA256Hex: hex.EncodeToString(sum[:]),
+		})
+		wi++
+		if end == len(prefix) {
+			break
+		}
+	}
+	return m
 }
 
 // sanitizeHeader bounds one captured response header value to at most max

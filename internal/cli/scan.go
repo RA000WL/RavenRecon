@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,13 +45,25 @@ Options (after the target):
                           (subfinder, assetfinder, amass).
   --request-timeout <d>   Per-request timeout for the httpprobe stage (Go
                           duration, e.g. 10s). 0 = engine default.
+  --session-headers <f>   Operator session-headers file ("Name: value"
+                          lines) fanned out to the httpprobe, jsintel, and
+                          urllive stages for authenticated-surface probing.
+                          Absent = anonymous. A broken file fails the run
+                          (fail-closed); values never enter logs or reports.
   --concurrency <n>       Worker concurrency override for every selected
                           stage (>= 1).
-  --timeout <d>           Per-stage deadline override for every selected
+  --timeout <d>           Deprecated alias of --stage-timeout (identical
+                          behavior; prefer --stage-timeout).
+  --stage-timeout <d>     Per-stage deadline override for every selected
                           stage (Go duration; 0 = no per-job deadline).
   --cache <dir>           Open the persistent cache at dir for this run.
   --no-cache              Disable the cache for this run even if --cache was
                           given (or caching is enabled in configuration).
+  --config <file>         JSON config file (flags > env > file > defaults;
+                          environment: RAVENRECON_* — see the README
+                          "Configuration file and environment" section.
+                          doctor reads the environment only: it takes no
+                          --config flag.)
   --dry-run               Parse and validate everything, print the effective
                           configuration (canonical target, selected stages,
                           per-stage concurrency/deadline bounds, parameter
@@ -71,12 +84,15 @@ Options (after the target):
                           progress counters (completed/remaining/in-flight/
                           elapsed/eta), warnings/errors, the declared target
                           and output directory, and one deterministic final
-                          summary frame. Production runs publish only run
-                          metadata and stage lifecycle events today, so the
-                          totals render unknown, in-flight renders zero, the
-                          ETA stays unknown, and the worker, throughput, and
-                          interesting-asset sections stay empty until their
-                          event streams are published.
+                          summary frame. Engine worker pools and the cache
+                          publish task/worker/cache events through the run
+                          observer, and pool-job results derive canonical
+                          asset/relationship/evidence/finding events at the
+                          job boundary — so the worker dashboard,
+                          throughput, cache, totals/ETA, and interesting-
+                          asset sections are live. Derived streams are
+                          observation aids (capped per job, sampled on
+                          overload); the report stays the complete record.
                           Mutually exclusive with --verbose.
   --tui-compact           Condense the --tui frame (drops the resource
                           section). Requires --tui.
@@ -87,6 +103,10 @@ Options (after the target):
   --target-parallel <n>   With multiple targets: maximum number of targets
                           scanned concurrently, 1-8 (default 1 =
                           strictly sequential, in the order given).
+  --strict                With multiple targets: exit 1 unless EVERY target
+                          produced data (default exits 0 when at least one
+                          did — use in CI so one failed target cannot hide
+                          behind the rest).
 
 Multiple targets: each target runs the complete pipeline independently —
 its own ScanConfig and its own output subdirectory (<output>/<target>/,
@@ -95,7 +115,8 @@ shared across targets; cache keys are per-target. Per-target summaries
 print as each run finishes (in the order given), followed by one combined
 summary block listing every target's outcome. The exit code is 0 when AT
 LEAST ONE target produced data (completed or partial) and 1 only when
-every target ended failed or cancelled. An invalid target aborts the
+every target ended failed or cancelled (--strict: 0 only when EVERY
+target produced data). An invalid target aborts the
 whole invocation before anything runs. Ctrl-C/SIGTERM cancels the
 in-flight targets; targets not yet started are recorded as cancelled in
 the combined summary, and whatever was produced is still summarized.
@@ -104,11 +125,10 @@ the combined summary, and whatever was produced is still summarized.
 Timeouts: each external discovery tool runs under a per-tool execution
 deadline — the configuration key Discovery.Timeout (internal/config; zero
 defers to the global configuration Timeout, then to the discovery stage
-default). --timeout <d> is a DIFFERENT knob: it maps onto the pipeline's
-per-stage deadline override applied to EVERY selected stage (--timeout 0
-means no per-stage deadline); it does not change the per-tool discovery
-timeout. There is deliberately no amass opt-in flag: amass runs by default
-and is excluded via --sources.
+per-stage deadline override applied to EVERY selected stage (--stage-timeout 0
+means no per-stage deadline; --timeout is its deprecated alias); it does
+not change the per-tool discovery timeout. There is deliberately no amass
+opt-in flag: amass runs by default and is excluded via --sources.
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
@@ -128,10 +148,12 @@ supplies a rule registry programmatically.
 Exit codes:
   0   the run completed, or completed with partial results (usable report —
       the summary states the outcome explicitly). With multiple targets: at
-      least one target produced data (completed or partial).
+      least one target produced data (completed or partial); with --strict,
+      every target produced data.
   1   usage/validation errors, cache open failures, and runs that ended
       failed, cancelled, or incomplete (see the summary); with multiple
-      targets, only when EVERY target ended failed or cancelled; also any
+      targets, only when EVERY target ended failed or cancelled (or, with
+      --strict, when ANY target did not produce data); also any
       run interrupted by Ctrl-C/SIGTERM, which is still summarized first.
 
 --tui renders on stderr as the run progresses and never changes the summary
@@ -146,7 +168,9 @@ exit.
 
 Target validation: every target is normalized through the Phase 2 asset
 model; uppercase, surrounding whitespace, and a trailing dot are normalized
-away. All targets are validated before the first stage runs.
+away, and spellings that normalize to the same canonical target collapse
+to the first occurrence (no double scan). All targets are validated before
+the first stage runs.
 
 RavenRecon is intended for authorized security testing and
 bug bounty programs where the target is explicitly in scope.
@@ -188,23 +212,48 @@ type scanOptions struct {
 	requestTimeout    string
 	requestTimeoutSet bool
 
+	// sessionHeaders is the operator session-headers FILE path fanned out
+	// to every fetching stage's "session_headers" param (NEW-125). A path,
+	// never secret material (shell history and process lists stay clean);
+	// empty when unset. Stages read and validate the file (fail-closed).
+	sessionHeaders    string
+	sessionHeadersSet bool
+
 	// concurrency is the per-stage worker override (0 = unset).
 	concurrency    int
 	concurrencySet bool
+
+	// rate is the per-stage rate-limit override folded from the base
+	// configuration (0 = unset). No --rate flag exists: the configured
+	// rate (file, env) applies when it differs from the default; explicit
+	// per-stage tuning stays a code-level concern.
+	rate    float64
+	rateSet bool
 
 	// timeout is the per-stage deadline override (0 = no per-job deadline,
 	// the engine default).
 	timeout    time.Duration
 	timeoutSet bool
+	// legacyTimeout records that the value came from the deprecated
+	// --timeout spelling (runScan prints a one-line stderr deprecation
+	// notice; behavior is identical to --stage-timeout).
+	legacyTimeout bool
+	cacheDir      string
+	noCache       bool
+	outputDir     string
+	verbose       bool
 
-	cacheDir  string
-	noCache   bool
-	outputDir string
-	verbose   bool
+	// configPath is --config: JSON config file (flags > env > file >
+	// defaults). Empty means defaults + environment only.
+	configPath string
 
 	// dryRun (--dry-run): validate everything and print the effective
 	// configuration without invoking any stage (NEW-48).
 	dryRun bool
+	// strict is --strict: multi-target runs exit 1 unless EVERY target
+	// produced data (default exits 0 when at least one did — which masks
+	// fleet failures in CI unless the combined summary is parsed).
+	strict bool
 
 	// tui enables the live observability frame on stderr (--tui); it is
 	// mutually exclusive with verbose. tuiCompact condenses the frame
@@ -253,8 +302,10 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	stages := fs.String("stages", "", "comma-separated stage names")
 	sources := fs.String("sources", "", "comma-separated discovery source names")
 	requestTimeout := fs.String("request-timeout", "", "httpprobe per-request timeout (Go duration)")
+	sessionHeaders := fs.String("session-headers", "", "operator session-headers file for authenticated probing")
 	concurrency := fs.Int("concurrency", 0, "worker concurrency override (>= 1)")
-	timeout := fs.String("timeout", "", "per-stage deadline (Go duration; 0 = none)")
+	timeout := fs.String("timeout", "", "per-stage deadline (Go duration; 0 = none) [deprecated alias of --stage-timeout]")
+	stageTimeout := fs.String("stage-timeout", "", "per-stage deadline override for every selected stage (Go duration; 0 = none)")
 	cacheDir := fs.String("cache", "", "cache directory")
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	outputDir := fs.String("output", "", "report output directory")
@@ -264,6 +315,8 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	verbose := fs.Bool("verbose", false, "print stage events to stderr")
 	tuiFlag := fs.Bool("tui", false, "render a live observability frame on stderr")
 	tuiCompact := fs.Bool("tui-compact", false, "condense the --tui frame (requires --tui)")
+	strict := fs.Bool("strict", false, "multi-target runs exit 1 unless every target produced data (default: exit 0 when at least one did)")
+	configPath := fs.String("config", "", "JSON config file (flags > env > file > defaults)")
 	if err := fs.Parse(args[i:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return scanOptions{}, errScanHelp
@@ -287,9 +340,13 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		cacheDir:   *cacheDir,
 		outputDir:  *outputDir,
 		dryRun:     *dryRun,
+		strict:     *strict,
+		configPath: *configPath,
 	}
 	targetsSet := false
 	parallelSet := false
+	timeoutVisited := false
+	stageTimeoutVisited := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "targets":
@@ -303,10 +360,16 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			opts.sourcesSet = true
 		case "request-timeout":
 			opts.requestTimeoutSet = true
+		case "session-headers":
+			opts.sessionHeadersSet = true
 		case "concurrency":
 			opts.concurrencySet = true
 		case "timeout":
 			opts.timeoutSet = true
+			timeoutVisited = true
+		case "stage-timeout":
+			opts.timeoutSet = true
+			stageTimeoutVisited = true
 		}
 	})
 
@@ -324,9 +387,9 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		opts.targets = append(opts.targets, lines...)
 	}
 	// Exact duplicates across positionals and file entries collapse to the
-	// first occurrence; spellings that normalize identically but differ
-	// textually stay (they simply rescan the same canonical target, which
-	// the per-target cache makes cheap).
+	// first occurrence here; spellings that normalize identically but
+	// differ textually (case, whitespace, trailing dot) collapse after
+	// normalization in runScan through the canonical domain identity.
 	opts.targets = dedupeStrings(opts.targets)
 	if len(opts.targets) == 0 {
 		return scanOptions{}, fmt.Errorf("scan: missing target argument (usage: ravenrecon scan <target> [more targets...] [options] | --targets <file>)")
@@ -393,23 +456,45 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		}
 		opts.requestTimeout = *requestTimeout
 	}
+	if opts.sessionHeadersSet {
+		// A path, never secret material: emptiness is the only parse-time
+		// check (missing/unreadable/invalid files fail at the stages with
+		// precise errors — fail-closed, never anonymous). An explicitly
+		// empty path is a user error like --targets "".
+		if *sessionHeaders == "" {
+			return scanOptions{}, fmt.Errorf("scan: --session-headers: empty file path")
+		}
+		opts.sessionHeaders = *sessionHeaders
+	}
 	if opts.concurrencySet && *concurrency < 1 {
 		return scanOptions{}, fmt.Errorf("scan: --concurrency: must be >= 1 (got %d)", *concurrency)
 	} else if opts.concurrencySet {
 		opts.concurrency = *concurrency
 	}
 	if opts.timeoutSet {
-		if *timeout == "" {
-			return scanOptions{}, fmt.Errorf("scan: --timeout: empty duration")
+		// Canonical --stage-timeout wins when explicitly given; the
+		// deprecated --timeout alias fills in otherwise. Both given
+		// with different values is a usage error (never a silent pick).
+		// legacyTimeout is true only when --timeout (and not
+		// --stage-timeout) was visited.
+		raw, which := *stageTimeout, "--stage-timeout"
+		if !stageTimeoutVisited {
+			raw, which = *timeout, "--timeout"
+		} else if timeoutVisited && *timeout != *stageTimeout {
+			return scanOptions{}, fmt.Errorf("scan: --timeout %q and --stage-timeout %q disagree (use --stage-timeout)", *timeout, *stageTimeout)
 		}
-		d, err := time.ParseDuration(*timeout)
+		if raw == "" {
+			return scanOptions{}, fmt.Errorf("scan: %s: empty duration", which)
+		}
+		d, err := time.ParseDuration(raw)
 		if err != nil {
-			return scanOptions{}, fmt.Errorf("scan: --timeout: invalid duration %q: %v", *timeout, err)
+			return scanOptions{}, fmt.Errorf("scan: %s: invalid duration %q: %v", which, raw, err)
 		}
 		if d < 0 {
-			return scanOptions{}, fmt.Errorf("scan: --timeout: must be >= 0 (got %s)", d)
+			return scanOptions{}, fmt.Errorf("scan: %s: must be >= 0 (got %s)", which, d)
 		}
 		opts.timeout = d
+		opts.legacyTimeout = timeoutVisited && !stageTimeoutVisited
 	}
 	// --tui and --verbose are mutually exclusive: the frame is the live
 	// observability surface, the one-line-per-event sink is the other; a
@@ -522,10 +607,26 @@ func scanTargetOutputDir(base string, d asset.Domain) string {
 	return filepath.Join(base, d.Name)
 }
 
+// setStageParam merges one StageParams entry (maps pre-allocated by the
+// caller): multiple flags may target one stage without overwriting each
+// other (request-timeout and session-headers share the httpprobe stage).
+func setStageParam(params map[pipeline.StageName]map[string]string, stage pipeline.StageName, k, v string) {
+	m, ok := params[stage]
+	if !ok {
+		m = map[string]string{}
+		params[stage] = m
+	}
+	m[k] = v
+}
+
 // buildScanConfig maps the parsed scan options onto the pipeline run
-// configuration. It wires flags directly to pipeline.ScanConfig — no new
-// config.Config fields (the scan command has no configuration-file
-// surface yet; see the CLI-wiring section of ARCHITECTURE.md).
+// configuration. Flag selections route through StageParams/StageBounds;
+// configured base values (file, env) reach the bounds through runScan,
+// which folds non-default base concurrency/timeout/rate into the options
+// before this call whenever the matching flag was not typed — so what
+// this function sees is already the effective flags > env > file >
+// defaults resolution, and --dry-run prints exactly what the runner
+// would enforce.
 func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig, error) {
 	cfg := pipeline.ScanConfig{
 		Target:    target,
@@ -542,16 +643,28 @@ func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig
 			pipeline.StageDiscover: {"sources": strings.Join(opts.sources, ",")},
 		}
 	}
-	if opts.requestTimeoutSet {
+	// Per-stage parameters. Multiple flags may target one stage —
+	// entries merge (setStageParam), never overwrite each other.
+	if opts.requestTimeoutSet || opts.sessionHeadersSet {
 		if cfg.StageParams == nil {
 			cfg.StageParams = make(map[pipeline.StageName]map[string]string)
 		}
-		cfg.StageParams[pipeline.StageHTTPProbe] = map[string]string{"request_timeout": opts.requestTimeout}
+	}
+	if opts.requestTimeoutSet {
+		setStageParam(cfg.StageParams, pipeline.StageHTTPProbe, "request_timeout", opts.requestTimeout)
+	}
+	if opts.sessionHeadersSet {
+		// The session FILE PATH fans out to every fetching stage (never
+		// secret material — dry-run output and shell history stay clean);
+		// stages read and validate the file themselves (fail-closed).
+		for _, name := range []pipeline.StageName{pipeline.StageHTTPProbe, pipeline.StageJSIntel, pipeline.StageURLLive} {
+			setStageParam(cfg.StageParams, name, "session_headers", opts.sessionHeaders)
+		}
 	}
 
-	// Per-stage bounds: --concurrency and --timeout apply to EVERY
-	// selected stage.
-	if opts.concurrencySet || opts.timeoutSet {
+	// Per-stage bounds: --concurrency, --timeout/--stage-timeout, and the
+	// configured rate apply to EVERY selected stage.
+	if opts.concurrencySet || opts.timeoutSet || opts.rateSet {
 		bounds := make(map[pipeline.StageName]pipeline.StageConfig, len(cfg.Stages))
 		for _, name := range cfg.Stages {
 			b := pipeline.StageConfig{}
@@ -560,6 +673,9 @@ func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig
 			}
 			if opts.timeoutSet {
 				b.Timeout = opts.timeout
+			}
+			if opts.rateSet {
+				b.Rate = opts.rate
 			}
 			bounds[name] = b
 		}
@@ -570,12 +686,42 @@ func buildScanConfig(opts scanOptions, target asset.Domain) (pipeline.ScanConfig
 	return cfg, nil
 }
 
+// forwardingObserver is a mutex-guarded event.Observer target swap: it
+// lets handles created before the run's observer exists (the shared
+// cache handle, opened in runScan ahead of flag dispatch) publish into
+// whichever sink the flags select. A nil target drops events (counted by
+// the caller, never blocking). The zero value is a valid dropping
+// observer; set swaps the target exactly once per call site in practice
+// (verbose observer or TUI bus), raced safely under -race.
+type forwardingObserver struct {
+	mu     sync.Mutex
+	target event.Observer
+}
+
+// Observe implements event.Observer.
+func (f *forwardingObserver) Observe(ev event.Event) {
+	f.mu.Lock()
+	t := f.target
+	f.mu.Unlock()
+	if t == nil {
+		return
+	}
+	t.Observe(ev)
+}
+
+// set swaps the publish target (nil = drop).
+func (f *forwardingObserver) set(t event.Observer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.target = t
+}
+
 // scanCache opens the persistent cache for a scan run. Mirroring
 // discoverConfig: with an explicit --cache dir the cache is opened there
 // regardless of configuration; without it, the cache is opened only when
 // enabled in configuration (at the configured dir or the platform default),
 // and --no-cache forces it off on every path.
-func scanCache(cfg config.Config, opts scanOptions) (cache.Cache, error) {
+func scanCache(cfg config.Config, opts scanOptions, obs event.Observer) (cache.Cache, error) {
 	dir, open, err := resolveScanCacheDir(cfg, opts)
 	if err != nil {
 		return nil, err
@@ -583,7 +729,13 @@ func scanCache(cfg config.Config, opts scanOptions) (cache.Cache, error) {
 	if !open {
 		return nil, nil
 	}
-	c, err := cache.Open(dir, cache.WithTTL(cfg.Cache.TTL))
+	openOpts := []cache.Option{cache.WithTTL(cfg.Cache.TTL)}
+	if obs != nil {
+		// Cache hit/miss events join the run's observer (the TUI cache
+		// counters); a nil observer keeps cache behavior byte-identical.
+		openOpts = append(openOpts, cache.WithObserver(obs))
+	}
+	c, err := cache.Open(dir, openOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("scan: open cache at %s: %w", dir, err)
 	}
@@ -755,11 +907,21 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 	// invocation BEFORE any stage runs or any cache is opened, never
 	// halfway through a batch.
 	domains := make([]asset.Domain, 0, len(opts.targets))
+	seenDomains := make(map[asset.Identity]struct{}, len(opts.targets))
 	for _, raw := range opts.targets {
 		d, err := asset.NewDomain(raw, asset.Provenance{})
 		if err != nil {
 			return fmt.Errorf("scan: invalid target %q: %w", raw, err)
 		}
+		// Spellings that normalize identically (case, whitespace,
+		// trailing dot) collapse to the first occurrence: rescanning the
+		// same canonical target wastes tool budget and double-counts the
+		// combined summary. Exact-string dupes already collapsed at parse
+		// time; this catches the rest through the canonical identity.
+		if _, dup := seenDomains[d.Identity()]; dup {
+			continue
+		}
+		seenDomains[d.Identity()] = struct{}{}
 		domains = append(domains, d)
 	}
 
@@ -772,8 +934,46 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 	// target (separated by a blank line), each showing that target's
 	// effective output subdirectory; a single-target dry-run is
 	// byte-identical to the historical form.
+	// Base configuration (flags > env > file > defaults): resolved once
+	// per command run, before dry-run display and cache opening, so every
+	// consumer sees the same effective values.
+	base, err := resolveBaseConfig(opts.configPath)
+	if err != nil {
+		return err
+	}
+	// Base scalars (file, env) feed the per-stage bounds when the matching
+	// flag was not typed: the explicit flag always wins, and values that
+	// match the defaults are left unset so default runs (and their
+	// --dry-run rendering) stay byte-identical with or without a config
+	// layer. user_agent has no scan bound (engines probe with their
+	// built-in UA; see internal/config) and is deliberately not folded.
+	defCfg := config.Default()
+	if !opts.concurrencySet && base.Concurrency != defCfg.Concurrency {
+		opts.concurrency = base.Concurrency
+		opts.concurrencySet = true
+	}
+	if !opts.timeoutSet && base.Timeout != defCfg.Timeout {
+		opts.timeout = base.Timeout
+		opts.timeoutSet = true
+	}
+	if !opts.rateSet && base.Rate != defCfg.Rate {
+		opts.rate = base.Rate
+		opts.rateSet = true
+	}
+	// Configured discovery sources (file, env) apply when --sources was
+	// not given: the explicit flag always wins. Marking sourcesSet routes
+	// them through the standard StageParams path (visible in --dry-run).
+	if !opts.sourcesSet && len(base.Discovery.Sources) > 0 {
+		opts.sources = append([]string(nil), base.Discovery.Sources...)
+		opts.sourcesSet = true
+	}
+	if opts.legacyTimeout {
+		// Deprecation notice on stderr (diagnostics, never the
+		// machine-facing summary): the run proceeds identically.
+		fmt.Fprintln(os.Stderr, "scan: --timeout is deprecated, use --stage-timeout")
+	}
 	if opts.dryRun {
-		cacheDir, cacheOpen, err := resolveScanCacheDir(config.Default(), opts)
+		cacheDir, cacheOpen, err := resolveScanCacheDir(base, opts)
 		if err != nil {
 			return err
 		}
@@ -797,16 +997,21 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 		return nil
 	}
 
-	c, err := scanCache(config.Default(), opts)
+	// The shared cache handle is opened before flag dispatch knows the
+	// observer, so it publishes through a forwarder retargeted below
+	// (verbose observer or TUI bus; nil target drops when neither flag
+	// is set). Engines publish through StageInput.Observer directly.
+	fwd := &forwardingObserver{}
+	c, err := scanCache(base, opts, fwd)
 	if err != nil {
 		return err
 	}
 
 	// One resolved target: the historical single-target flow, verbatim.
 	if len(domains) == 1 {
-		return runScanSingleTarget(ctx, w, opts, domains[0], c, stages, tuiNew)
+		return runScanSingleTarget(ctx, w, opts, domains[0], c, stages, tuiNew, fwd)
 	}
-	return runScanMultiTarget(ctx, w, opts, domains, c, stages)
+	return runScanMultiTarget(ctx, w, opts, domains, c, stages, fwd)
 }
 
 // runScanSingleTarget is the historical single-target flow, unchanged:
@@ -814,7 +1019,7 @@ func runScan(ctx context.Context, w io.Writer, args []string, stages func(pipeli
 // summary, and map the outcome onto the documented exit semantics. Kept as
 // its own function so multi-target fan-out cannot perturb it — single-target
 // invocations behave byte-identically to the pre-multi-target CLI.
-func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, target asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage, tuiNew scanTUIFactory) error {
+func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, target asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage, tuiNew scanTUIFactory, fwd *forwardingObserver) error {
 	cfg, err := buildScanConfig(opts, target)
 	if err != nil {
 		return err
@@ -822,7 +1027,11 @@ func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, tar
 	if opts.verbose {
 		// Stage events are emitted synchronously in stage order as the
 		// runner proceeds; the observer prints each one as it arrives.
-		cfg.Observer = &stageObserver{w: os.Stderr}
+		// The shared cache handle publishes through the same sink via
+		// the forwarder (it was opened before this dispatch).
+		so := &stageObserver{w: os.Stderr}
+		cfg.Observer = so
+		fwd.set(so)
 	}
 	if opts.tui {
 		// Live observability: one bus, one bounded subscriber, one
@@ -861,8 +1070,10 @@ func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, tar
 		}
 		// The bus is the run's single event sink (ScanConfig.Observer is
 		// the only observer the pipeline runner consults) and the
-		// controller consumes the run's stage events through it.
+		// controller consumes the run's stage events through it. The
+		// shared cache handle joins the same sink via the forwarder.
 		cfg.Observer = bus
+		fwd.set(bus)
 		tuiDone := make(chan error, 1) // buffered: Run's result never blocks
 		go func() { tuiDone <- ctl.Run(ctx) }()
 		// Lifecycle (bounded, leak-free): the goroutine above is joined on
@@ -916,14 +1127,16 @@ func runScanSingleTarget(ctx context.Context, w io.Writer, opts scanOptions, tar
 // outcome. Exit contract: nil when at least one target produced data
 // (completed/partial); otherwise the interrupt error when the run context
 // was cancelled, else an all-targets-failed error.
-func runScanMultiTarget(ctx context.Context, w io.Writer, opts scanOptions, domains []asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage) error {
+func runScanMultiTarget(ctx context.Context, w io.Writer, opts scanOptions, domains []asset.Domain, c cache.Cache, stages func(pipeline.ScanConfig) []pipeline.Stage, fwd *forwardingObserver) error {
 	// One shared verbose observer for the whole fan-out: stage events reach
 	// stderr live regardless of producing target (payloads carry no target
 	// identity; stderr diagnostics tolerate the interleave). The observer
-	// serializes its own writes.
+	// serializes its own writes. The shared cache handle joins the same
+	// sink via the forwarder (nil target drops when not verbose).
 	var observer event.Observer
 	if opts.verbose {
 		observer = &stageObserver{w: os.Stderr}
+		fwd.set(observer)
 	}
 
 	par := opts.targetParallel
@@ -965,33 +1178,53 @@ func runScanMultiTarget(ctx context.Context, w io.Writer, opts scanOptions, doma
 			runOne(i, w)
 		}
 	} else {
-		// Bounded fan-out: at most par pipeline runs in flight. Results
-		// land on disjoint indices; summaries buffer per target and flush
-		// in input order below, so no shared-writer race exists.
-		sem := make(chan struct{}, par)
+		// Bounded fan-out: exactly par worker goroutines iterate a job
+		// channel, so goroutine count (and peak RSS from stacks) scales
+		// with par — never with len(domains) (§10). Results land on
+		// disjoint indices; summaries buffer per target and flush in
+		// input order below, so no shared-writer race exists.
 		buffers := make([]*bytes.Buffer, len(domains))
+		jobs := make(chan int)
 		var wg sync.WaitGroup
-		for i := range domains {
+		for w := 0; w < par; w++ {
 			wg.Add(1)
-			go func(idx int) {
+			go func() {
 				defer wg.Done()
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
-					results[idx] = targetResult{
-						domain:    domains[idx],
-						outputDir: scanTargetOutputDir(opts.outputDir, domains[idx]),
+				for idx := range jobs {
+					if err := ctx.Err(); err != nil {
+						results[idx] = targetResult{
+							domain:    domains[idx],
+							outputDir: scanTargetOutputDir(opts.outputDir, domains[idx]),
+							outcome:   pipeline.OutcomeCancelled,
+							err:       err,
+						}
+						continue
+					}
+					buf := &bytes.Buffer{}
+					buffers[idx] = buf
+					runOne(idx, buf)
+				}
+			}()
+		}
+	feed:
+		for i := range domains {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				// Context cancelled mid-feed: every un-fed target is
+				// recorded cancelled without starting its pipeline.
+				for k := i; k < len(domains); k++ {
+					results[k] = targetResult{
+						domain:    domains[k],
+						outputDir: scanTargetOutputDir(opts.outputDir, domains[k]),
 						outcome:   pipeline.OutcomeCancelled,
 						err:       ctx.Err(),
 					}
-					return
 				}
-				defer func() { <-sem }()
-				buf := &bytes.Buffer{}
-				buffers[idx] = buf
-				runOne(idx, buf)
-			}(i)
+				break feed
+			}
 		}
+		close(jobs)
 		wg.Wait()
 		for _, buf := range buffers {
 			if buf == nil {
@@ -1013,11 +1246,17 @@ func runScanMultiTarget(ctx context.Context, w io.Writer, opts scanOptions, doma
 			ok++
 		}
 	}
-	if ok > 0 {
+	// Default: exit 0 when at least one target produced data. --strict
+	// exits 1 unless EVERY target did, so CI fleets fail loudly instead
+	// of masking all-but-one failures behind a partial success.
+	if ok > 0 && (!opts.strict || ok == len(results)) {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("scan: run interrupted: %w", err)
+	}
+	if ok > 0 {
+		return fmt.Errorf("scan: --strict: %d of %d targets produced data (see the summaries)", ok, len(domains))
 	}
 	return fmt.Errorf("scan: all %d targets ended failed or cancelled: no target produced data (see the summaries)", len(domains))
 }
@@ -1144,7 +1383,11 @@ func printDryRun(w io.Writer, cfg pipeline.ScanConfig, cacheDir string, cacheOpe
 		if b.Timeout > 0 {
 			timeout = b.Timeout.String()
 		}
-		if _, err := fmt.Fprintf(w, "  %-10s concurrency=%d timeout=%s\n", name, b.MaxConcurrency, timeout); err != nil {
+		rate := "none"
+		if b.Rate > 0 {
+			rate = strconv.FormatFloat(b.Rate, 'g', -1, 64) + "/s"
+		}
+		if _, err := fmt.Fprintf(w, "  %-10s concurrency=%d timeout=%s rate=%s\n", name, b.MaxConcurrency, timeout, rate); err != nil {
 			return err
 		}
 	}

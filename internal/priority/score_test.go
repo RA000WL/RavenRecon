@@ -181,7 +181,9 @@ func TestCapsAndGates(t *testing.T) {
 	sig := Signal{Identity: testIdentity(), Kind: asset.KindURL, Path: "/x", ScoredAt: fixedTime(1)}
 
 	// Single category, weight 1.0: capped at perCategoryCap, gated to
-	// medium (one indicator category can never be high).
+	// medium — one indicator category reaches high only through the
+	// single-structural-high escape (a recorded >= 0.9 detection, which
+	// this signal lacks: no technologies, no secrets).
 	out, err := ScoreSurface(sig, one, empty)
 	if err != nil {
 		t.Fatal(err)
@@ -237,6 +239,68 @@ func TestCapsAndGates(t *testing.T) {
 	}
 	if out.Level != LevelLow {
 		t.Errorf("confidence-only level = %s, want low (confidence is not an indicator category; without one, medium is unreachable)", out.Level)
+	}
+}
+
+func TestSingleStructuralHigh(t *testing.T) {
+	ic, rc := mustCatalogs(t)
+
+	// One leaked AWS credential at 0.95: high_value_secret fires at the
+	// 0.6 cap, the confidence group caps at 0.5, score = 1−0.4·0.5 = 0.8
+	// with exactly one indicator category — the escape lifts it to high.
+	leak := Signal{
+		Identity: testIdentity(), Kind: asset.KindURL,
+		Secrets:   []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Identity: "secret_candidate:aws/key/1"}},
+		FirstSeen: fixedTime(1), ScoredAt: fixedTime(2),
+	}
+	out, err := ScoreSurface(leak, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Score != 0.8 {
+		t.Errorf("leak score = %v, want 0.8 (0.6 category cap × 0.5 confidence cap)", out.Score)
+	}
+	if out.Level != LevelHigh {
+		t.Errorf("leak level = %s, want high (single-structural-high escape)", out.Level)
+	}
+
+	// Same shape at 0.85: below the structural bar, stays medium.
+	weak := leak
+	weak.Secrets = []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.85, Identity: "secret_candidate:aws/key/1"}}
+	out, err = ScoreSurface(weak, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Level != LevelMedium {
+		t.Errorf("sub-bar leak level = %s, want medium", out.Level)
+	}
+
+	// Generic unattributed shape at 0.95: the catalog deliberately
+	// excludes it from high-value terms, so no indicator category at cap
+	// forms — the escape has nothing to lift.
+	generic := leak
+	generic.Secrets = []SecretSignal{{Type: asset.SecretTypeGeneric, Confidence: 0.95, Identity: "secret_candidate:generic/x"}}
+	out, err = ScoreSurface(generic, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Level == LevelHigh {
+		t.Errorf("generic-shape level = %s, must not reach high (excluded from high-value terms)", out.Level)
+	}
+
+	// Header-only single category at score >= 0.8: spoofable evidence can
+	// never trigger the escape, however confident the header match.
+	headerSig := Signal{
+		Identity: testIdentity(), Kind: asset.KindURL,
+		Headers:   []string{"server: nginx/1.25.3"},
+		FirstSeen: fixedTime(1), ScoredAt: fixedTime(2),
+	}
+	out, err = ScoreSurface(headerSig, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Score >= highThreshold && out.Level == LevelHigh {
+		t.Errorf("header-only level = %s at score %v, spoofable evidence must never escape to high", out.Level, out.Score)
 	}
 }
 

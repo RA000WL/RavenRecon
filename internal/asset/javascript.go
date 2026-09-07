@@ -100,6 +100,277 @@ func (j JavaScript) Identity() Identity {
 	return Identity{Kind: KindJavaScript, Value: j.URL.String()}
 }
 
+// Chunk identity (NEW-129 Slice 1): one deterministic overlapped window of a
+// truncated script prefix.
+//
+// Format (exact, single normalization point — all chunk-string parsing lives
+// here; parsing the same strings anywhere else is forbidden):
+//
+//	javascript:<file-url>#rr-chunk=i/n/span=start-end/ph=<8hex>/t=<tag>
+//
+// where <file-url> is the canonical file URL string (URL.String(), which
+// never carries a fragment — file identities never contain '#', verified by
+// TestNewJavaScriptIdentity), i/n are the window index/count, span=start-end
+// are byte offsets in the retained prefix, ph is the first 8 lowercase hex
+// digits of the window's SHA-256, and t is the tiling tag supplied by the
+// producer (jsintel's fetchTilingTag, e.g. "w512-o8-v1") carried opaquely.
+//
+// ChunkJavaScriptIdentity is the ONLY constructor of chunk identities and
+// ParseChunkIdentity the ONLY parser: every other package must build and
+// read chunk identities through these two functions, never by formatting or
+// splitting the strings itself.
+func ChunkJavaScriptIdentity(file URL, index, total int, start, end int64, chunkPrefixHash, tilingTag string) (Identity, error) {
+	if file.IsZero() {
+		return Identity{}, fmt.Errorf("chunk identity: file URL must not be zero")
+	}
+	if file.Fragment != "" {
+		return Identity{}, fmt.Errorf("chunk identity: file URL must not carry a fragment")
+	}
+	fileStr := file.String()
+	if fileStr == "" {
+		return Identity{}, fmt.Errorf("chunk identity: file URL string must not be empty")
+	}
+	if strings.Contains(fileStr, "#") {
+		return Identity{}, fmt.Errorf("chunk identity: file URL %q must not contain '#'", fileStr)
+	}
+	if total <= 0 || total > 1024 {
+		return Identity{}, fmt.Errorf("chunk identity: total %d out of range [1,1024]", total)
+	}
+	if index < 0 || index >= total {
+		return Identity{}, fmt.Errorf("chunk identity: index %d out of range [0,%d)", index, total)
+	}
+	if start < 0 || end <= start {
+		return Identity{}, fmt.Errorf("chunk identity: span %d-%d is not a positive range", start, end)
+	}
+	if end > 8<<20 {
+		return Identity{}, fmt.Errorf("chunk identity: span end %d exceeds 8 MiB", end)
+	}
+	if end-start > 1<<20 {
+		return Identity{}, fmt.Errorf("chunk identity: span length %d exceeds 1 MiB", end-start)
+	}
+	if len(chunkPrefixHash) != 8 {
+		return Identity{}, fmt.Errorf("chunk identity: prefix hash must be 8 hex digits, got %q", chunkPrefixHash)
+	}
+	for i := 0; i < 8; i++ {
+		c := chunkPrefixHash[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return Identity{}, fmt.Errorf("chunk identity: prefix hash %q is not lowercase hex", chunkPrefixHash)
+		}
+	}
+	if err := validateChunkTilingTag(tilingTag); err != nil {
+		return Identity{}, err
+	}
+	value := fileStr + "#rr-chunk=" + itoa(index) + "/" + itoa(total) + "/span=" + itoa64(start) + "-" + itoa64(end) + "/ph=" + chunkPrefixHash + "/t=" + tilingTag
+	return Identity{Kind: KindJavaScript, Value: value}, nil
+}
+
+// validateChunkTilingTag checks the opaque tiling-tag shape w<N>-o<M>-v<K>
+// (e.g. "w512-o8-v1"): 'w' + decimal KiB window, "-o" + decimal KiB overlap,
+// "-v" + decimal version. The producer owns the exact value; this layer only
+// enforces the shape so malformed tags never enter an identity.
+func validateChunkTilingTag(tag string) error {
+	if tag == "" || len(tag) > 32 {
+		return fmt.Errorf("chunk identity: tiling tag %q out of range", tag)
+	}
+	// Expected shape: w<digits>-o<digits>-v<digits>.
+	i := 0
+	if i >= len(tag) || tag[i] != 'w' {
+		return fmt.Errorf("chunk identity: tiling tag %q must start with 'w'", tag)
+	}
+	i++
+	s := i
+	for i < len(tag) && tag[i] >= '0' && tag[i] <= '9' {
+		i++
+	}
+	if i == s {
+		return fmt.Errorf("chunk identity: tiling tag %q lacks window digits", tag)
+	}
+	if i+1 >= len(tag) || tag[i] != '-' || tag[i+1] != 'o' {
+		return fmt.Errorf("chunk identity: tiling tag %q must carry '-o'", tag)
+	}
+	i += 2
+	s = i
+	for i < len(tag) && tag[i] >= '0' && tag[i] <= '9' {
+		i++
+	}
+	if i == s {
+		return fmt.Errorf("chunk identity: tiling tag %q lacks overlap digits", tag)
+	}
+	if i+1 >= len(tag) || tag[i] != '-' || tag[i+1] != 'v' {
+		return fmt.Errorf("chunk identity: tiling tag %q must carry '-v'", tag)
+	}
+	i += 2
+	s = i
+	for i < len(tag) && tag[i] >= '0' && tag[i] <= '9' {
+		i++
+	}
+	if i == s || i != len(tag) {
+		return fmt.Errorf("chunk identity: tiling tag %q must end with version digits", tag)
+	}
+	return nil
+}
+
+// ParseChunkIdentity parses a chunk identity built by ChunkJavaScriptIdentity
+// and returns the file URL plus the window parameters. It is the ONLY legal
+// reader of chunk strings: callers must never split or match on the
+// "#rr-chunk=" marker themselves.
+//
+// The file part must re-parse canonically through ParseURL (the same
+// re-parse check normalizeSnapshot applies to snapshot scripts): the stored
+// file string must equal its own canonical form and carry no fragment, so a
+// chunk always cites a canonical file.
+func ParseChunkIdentity(id Identity) (file URL, index, total int, start, end int64, chunkPrefixHash, tilingTag string, err error) {
+	if id.Kind != KindJavaScript {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: kind %q is not javascript", id.Kind)
+	}
+	fileStr, rest, ok := strings.Cut(id.Value, "#rr-chunk=")
+	if !ok {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: missing '#rr-chunk=' marker")
+	}
+	if fileStr == "" || strings.Contains(fileStr, "#") {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: file part is not a fragment-free URL")
+	}
+	re, rerr := ParseURL(fileStr, Provenance{})
+	if rerr != nil {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: file part does not parse: %w", rerr)
+	}
+	if re.String() != fileStr {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: file part %q is not canonical (normalizes to %q)", fileStr, re.String())
+	}
+	if re.Fragment != "" {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: file part must not carry a fragment")
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 5 {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: chunk part must have 5 '/'-separated fields, got %d", len(parts))
+	}
+	index, err = atoiBounded(parts[0], "index", 0, 1023)
+	if err != nil {
+		return URL{}, 0, 0, 0, 0, "", "", err
+	}
+	total, err = atoiBounded(parts[1], "total", 1, 1024)
+	if err != nil {
+		return URL{}, 0, 0, 0, 0, "", "", err
+	}
+	if index >= total {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: index %d out of range [0,%d)", index, total)
+	}
+	span, ok := strings.CutPrefix(parts[2], "span=")
+	if !ok {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: chunk part %q must start with 'span='", parts[2])
+	}
+	s0, s1, ok := strings.Cut(span, "-")
+	if !ok {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: span %q must be start-end", span)
+	}
+	start, err = atoi64Bounded(s0, "span start", 0, 8<<20)
+	if err != nil {
+		return URL{}, 0, 0, 0, 0, "", "", err
+	}
+	end, err = atoi64Bounded(s1, "span end", 0, 8<<20)
+	if err != nil {
+		return URL{}, 0, 0, 0, 0, "", "", err
+	}
+	if end <= start || end-start > 1<<20 {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: span %d-%d is not a positive range within 1 MiB", start, end)
+	}
+	ph, ok := strings.CutPrefix(parts[3], "ph=")
+	if !ok || len(ph) != 8 {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: ph field must be 'ph=<8hex>'")
+	}
+	for i := 0; i < 8; i++ {
+		c := ph[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: prefix hash %q is not lowercase hex", ph)
+		}
+	}
+	tag, ok := strings.CutPrefix(parts[4], "t=")
+	if !ok {
+		return URL{}, 0, 0, 0, 0, "", "", fmt.Errorf("chunk identity: tag field must start with 't='")
+	}
+	if verr := validateChunkTilingTag(tag); verr != nil {
+		return URL{}, 0, 0, 0, 0, "", "", verr
+	}
+	return re, index, total, start, end, ph, tag, nil
+}
+
+// atoiBounded parses a decimal integer with an exact digit shape and range.
+func atoiBounded(s, field string, min, max int) (int, error) {
+	if s == "" || len(s) > 10 {
+		return 0, fmt.Errorf("chunk identity: %s %q is not a decimal integer", field, s)
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("chunk identity: %s %q is not a decimal integer", field, s)
+		}
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		n = n*10 + int(s[i]-'0')
+		if n > max {
+			return 0, fmt.Errorf("chunk identity: %s %d exceeds %d", field, n, max)
+		}
+	}
+	if n < min {
+		return 0, fmt.Errorf("chunk identity: %s %d below %d", field, n, min)
+	}
+	return n, nil
+}
+
+// atoi64Bounded parses a decimal int64 with range.
+func atoi64Bounded(s, field string, min, max int64) (int64, error) {
+	if s == "" || len(s) > 10 {
+		return 0, fmt.Errorf("chunk identity: %s %q is not a decimal integer", field, s)
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("chunk identity: %s %q is not a decimal integer", field, s)
+		}
+	}
+	var n int64
+	for i := 0; i < len(s); i++ {
+		n = n*10 + int64(s[i]-'0')
+		if n > max {
+			return 0, fmt.Errorf("chunk identity: %s %d exceeds %d", field, n, max)
+		}
+	}
+	if n < min {
+		return 0, fmt.Errorf("chunk identity: %s %d below %d", field, n, min)
+	}
+	return n, nil
+}
+
+// itoa formats a small non-negative int without importing strconv (stdlib
+// only, single normalization point stays in this package).
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [12]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// itoa64 formats a non-negative int64.
+func itoa64(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [24]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
 // ID returns the canonical identity string.
 func (j JavaScript) ID() string { return j.Identity().String() }
 

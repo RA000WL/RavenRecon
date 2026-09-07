@@ -197,3 +197,30 @@ func sortFindings(list []asset.Finding) {
 		return list[i].Identity().String() < list[j].Identity().String()
 	})
 }
+
+// findingRankLess orders findings by hunter rank for over-cap retention:
+// confidence descending, then category, priority, rule ID, and subject
+// identity ascending, with the canonical JSON form as the final tie-break.
+// Every key is validated and normalized (confidence is NaN-free by
+// NewFinding; strings are bounded labels and canonical identities), so the
+// order is total: for any two distinct findings exactly one direction
+// holds, and retained sets never depend on completion order. Rank is an
+// attention hint, never a severity claim — Priority stays what it is.
+func findingRankLess(a, b asset.Finding) bool {
+	if a.Confidence != b.Confidence {
+		return a.Confidence > b.Confidence
+	}
+	if a.Category != b.Category {
+		return a.Category < b.Category
+	}
+	if a.Priority != b.Priority {
+		return a.Priority < b.Priority
+	}
+	if a.RuleID != b.RuleID {
+		return a.RuleID < b.RuleID
+	}
+	if sa, sb := a.Subject.String(), b.Subject.String(); sa != sb {
+		return sa < sb
+	}
+	return marshalFindingJSON(a) < marshalFindingJSON(b)
+}

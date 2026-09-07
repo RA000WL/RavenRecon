@@ -592,9 +592,14 @@ aggressive options.
 Tool stdout is untrusted input. Each non-blank line contributes its first
 whitespace-delimited token (this also handles amass's historical
 `name (FQDN) --> 1.2.3.4` format). Blank, whitespace-only, CRLF-terminated,
-and duplicate lines are handled; lines that do not normalize to a valid Phase
-2 host are counted in a malformed diagnostic and never emitted, so bad lines
-cannot poison results. Every candidate is normalized only through
+and duplicate lines are handled; tokens without a dot are rejected before
+normalization (tool log/progress lines leak bare words — amass emitted a
+lone "no" — and a bare word is never a valid enumerated subdomain, while
+the asset model accepts single-label names by design, so the discovery
+layer refuses them or junk hosts bill downstream DNS budget); lines that
+do not normalize to a valid Phase 2 host are counted in a malformed
+diagnostic and never emitted, so bad lines cannot poison results.
+Every candidate is normalized only through
 `asset.NewDomain`/`asset.NewHost` — there is no second normalization
 implementation, so `Example.COM`, `example.com.`, and ` example.com ` produce
 the same identity. Deduplication is by Phase 2 identity, both within one
@@ -745,19 +750,28 @@ captured as part of the probe; see `ROADMAP.md`).
 
 ### Records and relationships
 
-Exactly three record families are supported: A, AAAA, and CNAME. Every
-observation is normalized through the Phase 2 asset model — `asset.IP` for
-addresses, `asset.Host` for CNAME targets — and every host result carries
-typed `asset.Relationship` edges: `host -> address`
-(`RelationshipHostToIP`) and `host -> CNAME target`
-(`RelationshipHostToCNAME`). CNAME queries use the stdlib's `LookupCNAME`,
-which follows the chain to the final canonical target. When a host's CNAME
-query completes with a target, the direct target's A and AAAA records are
-resolved at depth exactly 1, so the canonical target becomes a first-class
-host asset with its own address edges; no deeper recursion ever happens, so
-CNAME loops are impossible by construction (see "Known limitations" for the
-multi-hop flattening trade-off). Relationships are deduplicated by edge
-identity and emitted sorted, deterministically.
+Seven record families are supported: A, AAAA, CNAME, MX, TXT, NS, and SRV
+(CAA/SOA deferred — no stdlib lookup). Every observation is normalized
+through the Phase 2 asset model — `asset.IP` for addresses, `asset.Host`
+for CNAME/MX/NS/SRV targets (SRV ports ride alongside as service data,
+never as assets; TXT strings ride a strings payload, never as assets) —
+and every host result carries typed `asset.Relationship` edges:
+`host -> address` (`RelationshipHostToIP`), `host -> CNAME target`
+(`RelationshipHostToCNAME`), `host -> MX exchanger` (`RelationshipHostToMX`),
+`host -> nameserver` (`RelationshipHostToNS`), and `host -> SRV target`
+(`RelationshipHostToSRV`, one edge per distinct target host — ports ride
+adapter Evidence, not the edge). CNAME queries use the stdlib's
+`LookupCNAME`, which follows the chain to the final canonical target. When
+a host-target query (CNAME/MX/NS/SRV alike) completes with a non-self
+target, the distinct targets' A and AAAA records are resolved at depth
+exactly 1, so each target becomes a first-class host asset with its own
+address edges; no deeper recursion ever happens, so alias loops are
+impossible by construction (see "Known limitations" for the multi-hop
+flattening trade-off). TXT strings and SRV (target, port) pairs carry no
+engine edges: the pipeline DNS adapter publishes them as `dns:txt` /
+`dns:srv` Evidence sourced at the queried host (NEW-126 T2; the detect
+stage consumes them via `Snapshot.Evidence` verbatim). Relationships are
+deduplicated by edge identity and emitted sorted, deterministically.
 
 ### Scope boundary
 
@@ -766,9 +780,12 @@ domain. Every input hostname is re-validated canonically through the Phase 2
 asset model and must be the target domain itself or a subdomain of it;
 anything non-canonical (raw input, uppercase, trailing dots, IP literals,
 hand-built structs) or out-of-domain is rejected before a single query is
-issued. A queried host's CNAME target is a DNS observation and may
-legitimately point outside the target domain (cross-domain CNAMEs are
-observed, never chased beyond depth 1). The package is a boundary, not an
+issued. A queried host's host-target observation (CNAME/MX/NS/SRV target)
+is a DNS observation and may legitimately point outside the target domain
+(cross-domain targets are observed, never chased beyond depth 1); the
+pipeline DNS adapter keeps such targets in the Relationships/evidence
+results channels unfiltered for attribution while the corpus additions stay
+`FilterHosts`-scoped (NEW-121 precedent). The package is a boundary, not an
 arbitrary-scanning feature.
 
 ### Concurrency and rate limiting
@@ -814,8 +831,14 @@ cache instance's configured TTL and expired records are reported as misses.
 - `MaxAnswersPerType` (64, fixed constant): per-type answer retention is
   deduplicated by Phase 2 identity, sorted, and capped; oversized sets are
   retained truncated and reported/stored `incomplete` — never completed.
-- CNAME depth is ≤ 1 by construction: only the direct target's A/AAAA are
-  resolved, exactly once, with no recursion.
+  Edges and adapter evidence derive from the retained set only.
+- `MaxTXTStringBytes` (4096, fixed constant): a single TXT string longer
+  than this is dropped as malformed, never retained; adapter evidence
+  values are additionally bounded to 256 bytes by the asset package.
+- SRV ports get a u16 range check only (ports are service data, never
+  asset-normalized); the SRV edge is per distinct target host.
+- Host-target depth is ≤ 1 by construction: only the direct CNAME/MX/NS/SRV
+  targets' A/AAAA are resolved, exactly once, with no recursion.
 - Per-job deadline: 30 s by default (`DefaultConfig.Timeout`), covering the
   central limiter wait and the queries.
 - Pool bounds: exactly `Concurrency` workers (default 8) and a bounded
@@ -1239,11 +1262,83 @@ arbitrary addresses.
   in sanitized form (userinfo and control bytes stripped) and never
   requested.
 
+### Port discovery, port-target synthesis, and takeover confirmation
+
+Optional naabu port discovery (`port_discovery`, default OFF) runs over the
+addresses the dns stage resolved: the dns adapter publishes `host_to_ip`
+and `host_to_cname` edges into the results channel, and the httpprobe
+stage runs naabu over the resolved IPs before probing. Every open `ip:port`
+pair is emitted as results-channel additions — a `tcp` Port asset plus an
+`ip_to_port` edge attributing exactly its own line's address (per-IP, never
+the cross-product).Honesty markers ride sticky flags on the producing
+stage (`ports_naabu_missing`, `ports_naabu_failed`,
+`ports_output_truncated` + `Truncated`, the §0.6 carve-out); the cache op
+`ports.discover` keys on the scope hash, the result-affecting flags, and
+the tool version, and stores the per-IP edges so warm replays re-derive
+the same attribution.
+
+Discovered ports become probe targets only when the operator additionally
+opts into `probe_ports` (default OFF, a separate knob because inventory
+traffic and probing traffic are different budgets): the engine's
+`Config.HostPorts map[hostname][]port` resolves each in-scope host's ports
+through the dns `host_to_ip` edges plus one CNAME hop, capped at 16 ports
+per host (sorted head; the cut sets `httpprobe_port_targets_truncated` +
+`Truncated`). Targets probe through the standard engine path under their
+own URL identities, so port surfaces join the corpus and flow downstream.
+
+Takeover confirmation (`takeover_confirm`, default ON) resolves dangling
+CNAME candidates from DNS shape (a `host_to_cname` edge whose target
+carries no `host_to_ip` edge — no provider lists), fetches each
+candidate's roots (https then http, redirects never followed, bodies
+bounded), and matches a curated provider table case-insensitively; the
+first match in scheme order wins and the first response status wins.
+Matches become `takeover_page:<provider>` evidence (informational,
+recon-only). Capped at 64 hosts per run (sorted head; the cut sets
+`httpprobe_takeover_overflow` + `Truncated`); body-cap hits and hard
+errors set `httpprobe_takeover_truncated` + `Truncated`. Confirmation is
+deliberately uncached (freshness-critical claims re-verify every run).
+
+Mistake-path probing (`mistake_paths`, default OFF) fetches a curated
+well-known set per host (robots/sitemaps, version control, env files,
+actuator/health/metrics/debug endpoints, API docs, GraphQL playgrounds,
+backups, manifests, legacy handlers — 38 paths, pinned under the engine
+bound). The engine gates paths per host: only a root that proved an HTTP
+server enables them, on the responding scheme (https preferred), so dead
+hosts cost zero extra requests. Every path enjoys cache-before-execute
+under its own URL identity with the standard redirect/header/body bounds,
+and the observations join the corpus (URLs, GET endpoints, host→url
+edges) for techintel, jsintel, and the detect packs. Default OFF like
+`probe_ports`: 38 extra targets per host is an explicit traffic decision.
+Tuning requirement: one job probes a host's whole surface sequentially
+(2 roots + port pairs + one request per path, at most 1 in flight), so
+the run Timeout must cover all of it — a Timeout sized for roots alone
+expires mid-surface and the host folds to Cancelled by the
+cancelled-first vocabulary. That outcome is contractual, not surprising.
+Enablement is programmatic-only in this milestone: the pipeline stage
+parameter (no scan CLI flag or global config key).
+
+### URL liveness and canary reflection
+URL liveness (`ProbeURLs`, pipeline stage `urllive`) probes each corpus
+URL once (redirects observed, never followed; header caps bound the
+read). Canary reflection enriches the live corpus: each liveness-completed
+URL (`Status != 0 && Err == nil` — dead URLs are never reflected) with
+query parameters gets one GET with every targeted parameter substituted
+by a deterministic per-(URL, param) canary; the bounded body is searched
+raw (exact) then percent-encoded (case-insensitive on the hex). Bare
+`?q` parameters (no `=`) are counted Skipped at extraction, never
+targeted — substitution only rewrites `k=<canary>` pairs, so a bare
+parameter would otherwise verdict a false-absent. Cuts ride flags on a
+completed result (the §0.6 carve-out, always with `Truncated`):
+`urllive_reflect_overflow` (parameterized set over budget, sorted head
+reflected) and `urllive_reflect_truncated` (body-cap hits, per-URL
+errors, or a cut-short pass).
+
 ### Known limitations
 
 - Default ports and root path only: probing covers `http://host/` and
-  `https://host/`; non-default ports, non-root paths, and crawling are not
-  supported.
+  `https://host/` unless the operator opts into `probe_ports` with
+  discovered ports or `mistake_paths` with the curated well-known set
+  (see above); crawling is not supported.
 - No title or body content, and no technology detection: bodies are
   counted, never retained; technology detection is a later roadmap
   milestone.
@@ -1681,6 +1776,21 @@ canonicalize: the engine's line seam owns all of it.
 
 ### Asset model
 
+Chunk identities (NEW-129 Slice 1) name one deterministic overlapped window of a
+truncated script prefix: `javascript:<file-url>#rr-chunk=i/n/span=start-end/ph=<8hex>/t=w512-o8-v1`
+(file URL canonical, fragment-free; i/n index/count; byte span; first 8 hex of the
+window SHA-256; tiling tag `w512-o8-v1`). Built and parsed ONLY through
+`asset.ChunkJavaScriptIdentity` / `ParseChunkIdentity` — no other package formats or
+splits chunk strings. Ceiling: windows alias the bounded prefix (no copy) under
+`maxWindowedChunks` 32 (pipeline path 5 for the default 2 MiB cap, no per-file cut);
+the effective per-entry cap is MaxJSBytes total either way. Slice 3 exposes
+one sizeless chunk script per window (`Report.AllChunkJavaScript`, URL parsed
+from the constructor output — fragment cites the window, `Identity()` stays
+the file); the jsintel stage appends them after the file asset in
+`Results.JavaScript` (files first: the runner's first-seen corpus merge keeps
+the file linkage), and the detect stage maps chunk documents to retained
+bodies citing chunk identities with the file sentinel still marking the gap.
+
 Phase 2 gained three asset kinds and five relationship kinds. The
 JavaScript asset records the observation window (size, lowercase-hex
 SHA-256 content hash ≤ 64 chars, content type ≤ 128 bytes, ETag ≤ 256,
@@ -1800,7 +1910,7 @@ else Low) and emits Technology assets plus per-marker `MethodJS` evidence.
 
 ### Cache integration
 
-Two operations, both cache-before-execute. `js.fetch` keys on the
+Three operations, all cache-before-execute. `js.fetch` keys on the
 operation and the canonical URL identity ONLY — the request shape is
 fixed, and timings, retries, caps, and concurrency never enter a key, so
 cap changes never invalidate entries (a lowered cap simply re-truncates on
@@ -1808,12 +1918,24 @@ the re-fetch path; truncated records are stored incomplete and never
 served as hits). `js.analyze` keys on the operation, the URL identity, and
 the parser schema version plus the family mask ("1:eimst") — a record
 written by a different analysis contract is unreachable by construction.
-A fetch hit performs zero network requests and zero limiter waits; an
-analysis hit performs ZERO parses — the stored payload rebuilds a
-byte-identical entry through the same applyAnalysis. Both records are
-re-validated at decode (identity containment, content hash re-verified,
-bounds re-checked, statuses consistent); a tampered or corrupt record is
-deleted and recomputed in the same run (self-healing). Completed
+`js.analyze.chunk` (NEW-129 Slice 2, fresh namespace) keys on the
+operation, the chunk identity
+(`javascript:<file>#rr-chunk=i/n/span/ph/t`), the parser tag, the tiling
+tag (`w512-o8-v1`), and the session digest iff present — caps excluded, so
+warm windowed runs skip parsing (the windowed fetch itself is never
+served; every run re-fetches and re-tiles, then hits per-chunk). Chunk
+payloads bind the chunk-bytes SHA-256 (never the file hash; windowed files
+stay sizeless) with the same decode gates; a hash mismatch deletes under
+the same key and recomputes. Warm merges union per-chunk payloads in index
+order, then cap once via applyAnalysis. Shrink-to-complete deletes exactly
+the listed chunk keys (OD-3a); other orphans (content moves changing the
+hash prefix, tiling changes) are bounded findings-only records reclaimed by
+TTL/Clear. A fetch hit performs zero network requests and zero limiter
+waits; an analysis or chunk hit performs ZERO parses — the stored payload
+rebuilds a byte-identical entry through the same applyAnalysis. All
+records are re-validated at decode (identity containment, content hash
+re-verified, bounds re-checked, statuses consistent); a tampered or corrupt
+record is deleted and recomputed in the same run (self-healing). Completed
 negatives are stored completed with their reason; failed and cancelled
 observations are never stored.
 
@@ -2174,8 +2296,10 @@ Composition (the same combine math as the confidence engines):
 score   = 1 − ∏(1 − w_g)        over groups g
 w_g     = min(cap_g, 1 − ∏(1 − w_f))   over group g's factors f
 cap_g   = 0.6 per indicator category; 0.5 for the confidence group
-level   = gated: high ≥ 0.8 AND ≥ 2 indicator categories;
-          medium ≥ 0.5 AND ≥ 1; low ≥ 0.2; else unknown
+level   = gated: high ≥ 0.8 AND ≥ 2 indicator categories, OR ≥ 0.8 with
+          1 category backed by recorded ≥ 0.9 secret/technology detection
+          (single-structural-high escape); medium ≥ 0.5 AND ≥ 1;
+          low ≥ 0.2; else unknown
 ```
 
 The single composition point (`compose`) is shared by surface scoring,
@@ -2192,7 +2316,10 @@ prefix, the shape `asset.Endpoint` itself defines) to the canonical
 host; the host canonicalizes through `asset.NewHost` (or `asset.NewIP`
 for address literals); a name with three or more labels anchors at its
 first-label-dropped parent (re-validated through `asset.NewDomain`),
-shorter names at themselves; IP surfaces anchor at themselves; anything
+shorter names at themselves — except under a curated multi-tenant suffix
+(herokuapp.com, s3.amazonaws.com, github.io, …): there the anchor is one
+label above the shared suffix, so unrelated tenants never merge into one
+group; IP surfaces anchor at themselves; anything
 that does not re-canonicalize forms an honest singleton group at its own
 identity. A group's aggregate score recomputes through `compose` over
 the UNION of its retained members' factors — repeated indicators
@@ -2294,6 +2421,15 @@ and the warm-run bench).
 - Library capability only: no CLI command yet; the reporting phase that
   would consume groups, paths, and recommendations is a later roadmap
   milestone.
+- URL-signal enrichment cuts (`priority_signals_truncated`): each URL
+  signal carries what earlier stages observed about it (technologies,
+  secrets, header lines, bundle size, endpoint method), bounded to the
+  engine's per-signal caps (32 technologies, 32 secrets, 128 header lines
+  of at most 512 bytes each); cuts retain the sorted head and set
+  `Truncated` + `priority_signals_truncated` (AGENTS §0.6), alongside the
+  parameter-name derivation cut (`priority_params_truncated`) and the
+  correlation/attack-path cuts (`priority_groups_truncated`,
+  `priority_paths_truncated`).
 - Correlation anchors derive from identity values alone (no
   relationship traversal): surfaces whose host cannot be derived from
   their identity form singleton groups.
@@ -2390,7 +2526,8 @@ secret candidates, JavaScript, endpoints). It is NOT untrusted tool
 output — every entry must be a canonical Phase 2 value;
 `normalizeSnapshot` validates each entry (round-trips through the Phase 2
 builders), bounds every domain (assets 100k, relationships 200k, evidence
-100k, technologies 50k, secrets 50k, JavaScript 50k, endpoints 100k —
+100k, technologies 50k, secrets 50k, JavaScript 50k, endpoints 100k,
+script contents 1024 entries / 64 MiB total / 2 MiB per body —
 over-bound input is REJECTED, never silently truncated, because
 truncating input would silently change findings), deduplicates through
 the Phase 2 merge primitives, sorts by identity, and derives the observed
@@ -2399,12 +2536,24 @@ carries exactly: the seven corpus domains, plus (SDK v2) `PriorFindings
 []asset.Finding` (findings from completed levels, deterministically
 sorted) and `GraphView GraphQuerier` (Neighbors/Path over the snapshot
 graph) — the ONLY read-only inter-rule dataflow (dependencies order
-execution; PriorFindings/GraphView now flow data, see api.go), the bounded
+execution; PriorFindings/GraphView now flow data, see api.go) — plus
+(SDK v2.1, NEW-118) `JavaScriptContent []JavaScriptContent` (retained
+script bodies for observed scripts: identity must match a snapshot
+JavaScript asset, bodies complete/valid-UTF-8/bounded, identity-sorted;
+absent bodies mean "not retained"), the bounded
 configuration map (64 entries), a bounded Logger (256 retained entries,
 oversized messages truncated, excess counted), and the injected Clock —
 nothing else; the cancellation context is the detector's first argument.
-Rules operate only on these structured domains: no raw HTTP parsing, no JS
-parsing, no URL parsing (those phases are complete).
+Rules operate only on these structured domains: no raw HTTP parsing, no URL
+parsing (those phases are complete); retained JS bodies arrive as validated
+snapshot content and are analyzed through case-insensitive substring
+heuristics over the retained bodies (comments/strings fire; token-aware
+filtering is NEW-123 future work) — never fetched, never executed.
+Slice 3 admits chunk-window bodies (NEW-129): a chunk content links by
+chunk identity when the snapshot carries the chunk script, else via its
+file (parsed, never split); the JS pack normalizes every finding subject
+to the FILE identity with file-relative offsets, so overlap-identical
+signals share finding identity and merge to one.
 
 The engine builds ONE normalized Context per run and hands every rule its
 OWN copy: since the v2.0 prerequisite (`OPT-P1-2`, commit 7956f0d), each
@@ -2414,7 +2563,9 @@ per-rule job receives a clone produced by `cloneContextForRule`
 longer leak mutations into sibling rules executing in parallel on the
 shared runtime pool (barrier test: `TestContextIsolation`). SDK v2 extends
 the clone to `PriorFindings` (slice header cloned) and `GraphView`
-(read-only handle shared immutably, not the index). The contract still
+(read-only handle shared immutably, not the index); SDK v2.1 extends it
+to `JavaScriptContent` (slice cloned — shared immutable body strings need
+no deeper copy). The contract still
 forbids mutation; the difference is that a violation is now contained per
 rule instead of being a cross-rule data race by definition.
 
@@ -2441,9 +2592,10 @@ failed alongside completed → incomplete; all attempted failed → failed;
 skipped rules — disabled, required-kind-absent, or cascaded — are honest
 observations that do not force a non-completed outcome), the bounded rule
 logs, and cache-hit counts. Two identical runs under an identical
-injected Clock produce identical reports (pinned by test) — identical up
-to the findings cap: above the 4096-finding cap the retained findings
-are the completion-order prefix, which is not deterministic across runs.
+injected Clock produce identical reports (pinned by test) — including
+above the findings cap: retention keeps the deterministic top by finding
+rank (confidence, then category/priority/rule/subject), so re-runs keep
+identical findings regardless of rule completion order.
 Execution timings live in Metrics, never the Report.
 
 The output contract (enforced identically for fresh and cache-served
@@ -2546,7 +2698,14 @@ as "SDK v2 (Core)" at API level 2.0 (`APIMajor = 2`, `APIMinor = 0`) via
 the 4-step gate (concrete failing need — authz.idor inexpressible on v1
 because dependencies order but do not flow data and Context has no
 PriorFindings/GraphView — plus proposal, maintainer approval, and golden
-regeneration in the same change; see `internal/detect/api.go`). The freeze
+regeneration in the same change; see `internal/detect/api.go`). NEW-118
+bumps the minor to API level 2.1 (`APIMinor = 1`): the ADDITIVE retained-
+script-body channel (`Snapshot.JavaScriptContent` /
+`Context.JavaScriptContent` plus caller bounds). Additive means backward
+compatible by the policy's own terms — no existing field, signature, or
+behavior changes, `CheckAPIVersion(2,0)` keeps passing, snapshots without
+contents behave byte-identically — so no major gate applies; the surface
+golden regenerates in the same change. The freeze
 itself is documented in `internal/detect/api.go` (three-layer versioning
 and the Level-1 stability policy) and `internal/detect/doc.go`; this
 subsection is the pack-author guide: the lifecycle, the rule contract, the
@@ -2740,7 +2899,9 @@ shape without new asset kinds or SDK surface; `LoadTakeoverPack` /
 - **JavaScript** (`internal/detect/packs/js`, commit 453de88) — 3 rules:
   `js.dom.xss`, `js.postmessage.no-origin-check`,
   `js.prototype.pollution`; deterministic synthetic fixtures through the
-  jsintel parse seam.
+  jsintel parse seam. v1.2.0 (NEW-129 Slice 3): chunk-window subjects
+  normalize to the FILE identity with file-relative offsets
+  (chunk-local + span start) in evidence/metadata — predicates unchanged.
 - **APIs** (`internal/detect/packs/apis`, commit 7c2c3f1) — 3 rules:
   `api.openapi.exposed`, `api.rest.idor-indicator`,
   `api.graphql.introspection`.
@@ -2773,7 +2934,9 @@ shape without new asset kinds or SDK surface; `LoadTakeoverPack` /
   `Finding.Truncated` sticky flag via `adapt/buildDetectResult` (techintel
   `Truncated`/`Overflow`, urlintel `Overflow`) — because triage triages
   param names, not retained corpora; Information/PriorityInfo, MethodDetection,
-  `RequiredAssetTypes` endpoint-gated, stdlib-only, <100 lines per detector
+  confidence 0.6 unenriched / 0.8 reflection-backed (`reflection_backed`
+  marker — a flagged param the probe saw return), `RequiredAssetTypes`
+  endpoint-gated, stdlib-only, <100 lines per detector
   (`extractParamNames`); deterministic fixtures and `triage_report.golden`.
 - **Takeover** (`internal/detect/packs/takeover`, v2.1 Batch 1) — 3
   informational recon rules: `takeover.cname.unclaimed` (dangling CNAME to
@@ -2941,6 +3104,46 @@ reports. Reporting is presentation only — the framework never rescans a
 target, never mutates the data it is given, and never invents a field.
 It is a library capability only; there is no `ravenrecon report` command
 yet.
+
+### Change detection
+
+`internal/diff` answers "what changed" between two report JSON exports
+(`ravenrecon diff [options] old.json new.json`): per-dataset
+added/removed identity sets (domains, hosts, IPs, URLs, endpoints,
+parameters, technologies, secrets, findings, JavaScript, source maps,
+ports, services, TLS certificates) plus priority surface movements,
+rendered as `delta.json`, `delta.md`, and a stdout counts summary.
+Excluded by design (run metadata or derivable detail, never attack
+surface): runtime/cache/execution statistics, errors, evidence,
+relationships, live records, and attribution. Schema versions must match
+and targets must match — cross-target and stale-schema comparisons are
+rejected, never coerced. The delta is observational only: no rescanning;
+baseline retention is an explicit operator concern (files, not a store)
+in this version.
+
+Snapshot/delta model: `SnapshotOf` round-trips the decoded export
+through `report.NewModel` (the single normalization point), so every
+stored entry re-validates through the Phase 2 builders — malformed
+values fail with a structured error naming the target, over-bound lists
+are rejected, duplicates merge, zero identities are refused — and only
+then are identities diffed as sets (`Diff`) with non-nil sorted
+added/removed lists plus surface movements. Inputs are bounded
+fail-closed (`LoadReport` refuses files over 256 MiB before decoding);
+`delta.json` is always the complete record while the human `delta.md`
+caps each list at 1000 entries with an explicit "+N more" marker.
+Digests are recorded-as-input (carried verbatim from the exports, never
+recomputed): an empty delta on matching recorded digests means
+"recorded identical", not an independent verification.
+
+`ravenrecon handoff [options] report.json` feeds external scanners from
+the same model: `targets.txt` (observed root URLs — path "/" with no
+query — as recorded in the report, never re-verified, possibly stale)
+plus `handoff.json` (per-host technology attribution via
+`host_to_technology` edges ONLY — `url_to_technology` and
+`endpoint_to_technology` edges are out of scope by design, so attribution
+is per host, never per URL/endpoint — and a per-finding severity
+ordering map where unknown priority labels coerce to "info"). Same
+honesty contract as the delta: observation only, never verification.
 
 ### Report lifecycle
 
@@ -3477,17 +3680,37 @@ paths are given.
 
 ## Configuration precedence
 
-Future configuration should follow:
+Effective configuration resolves per command run as (see
+`internal/config/file.go`, `internal/cli/config.go`):
 
 ```text
 CLI flags
-   ↓
-Environment
-   ↓
-Config file
-   ↓
-Defaults
+   ↑ (per-flag *Set gates at use sites)
+Environment (RAVENRECON_*, fail-closed on unparsable values)
+   ↑ (WithEnv)
+Config file (--config <path>, strict JSON, unknown keys rejected)
+   ↑ (WithFile, fills defaults-held values)
+Defaults (config.Default)
 ```
+
+The file surface is scalars + cache + discovery tuning (no Bin paths,
+no TUI enablement); durations are Go strings; explicit nulls decode as
+absent. `WithFile` applies only where the running config still holds the
+default (so ordering is fixed: file fills defaults-held values, then
+`WithEnv` overrides unconditionally, then typed flags win at use sites
+— never the reverse), and a file `cache.enabled: false` never applies
+(the file can enable the cache, never disable it; `--no-cache` and
+`RAVENRECON_CACHE_ENABLED=false` force it off). `doctor` shows
+defaults+environment (it takes no flags); `scan`/`discover`/`ingest`
+resolve the base once per run and explicit flags always win
+(--no-cache beats everything; --sources beats configured sources).
+Scan folds non-default base concurrency/timeout/rate into its per-stage
+bounds when the matching flag is unset (so `--dry-run` prints the
+resolved effective values); `user_agent` is display/reserved (shown by
+`doctor`, never wired into scan/discover traffic). Set-but-empty
+environment variables fail closed (presence is explicit via
+`os.LookupEnv`); the full variable list lives in `internal/config/file.go`
+and the README "Configuration file and environment" section.
 
 ## Safety boundary
 
@@ -3659,6 +3882,19 @@ Implemented:
   rate-limiter wall clock gates job starts only and never changes an
   outcome at the default Timeout 0 (`internal/discovery`,
   `internal/pipeline/adapt`, `internal/asset`)
+* pipeline execution levels (`internal/pipeline/level.go`): consecutive
+  selection entries sharing a level run CONCURRENTLY (httpprobe+urlintel,
+  techintel+jsintel, secrentel+urllive — each pair verified
+  input-independent along the production order); everything else runs
+  solo, always in selection order. Merges land in selection order after
+  each group completes, so merged corpus/results/documents/provenance are
+  byte-identical to the sequential runner — the full adapt golden suite
+  (acceptance ×3 profiles, T3d, T4, T5) passes unchanged, and paired
+  200 ms stages complete in ~400 ms instead of ~800 ms. Stages without a
+  level (test fakes, external callers) are barriers: strictly sequential,
+  zero changes required. Events emit started/finished per stage in
+  selection order (started for every group member, then finished for
+  every member).
 * pipeline document channel + secrentel adapter (see "Pipeline
   requirements" and "Secret intelligence" above; v1.3 T3c): the
   pipeline-internal document channel (`StageResult.Documents` /

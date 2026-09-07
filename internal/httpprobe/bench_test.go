@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -321,5 +322,51 @@ func BenchmarkCaptureTLS(b *testing.B) {
 		if m == nil || m.Certificate.Fingerprint == "" {
 			b.Fatal("captureTLS produced no certificate metadata")
 		}
+	}
+}
+
+// benchSinkReflect consumes benchmark outputs so the compiler cannot
+// eliminate the measured calls.
+var benchSinkReflect string
+
+// BenchmarkMatchTakeoverProvider measures provider matching over a
+// 32 KiB page (NEW-122): the per-host cost of the confirmation match.
+func BenchmarkMatchTakeoverProvider(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString("<html><body>")
+	for sb.Len() < 30<<10 {
+		sb.WriteString("<p>filler content for deterministic page size</p>")
+	}
+	sb.WriteString("There isn't a GitHub Pages site here.</body></html>")
+	body := sb.String()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		provider, fp, ok := matchTakeoverProvider(body)
+		if !ok || provider != "github-pages" || fp == "" {
+			b.Fatal("takeover match failed")
+		}
+		benchSinkReflect = provider + fp
+	}
+}
+
+// BenchmarkSubstituteCanaries measures query substitution for an 8-param
+// URL (NEW-120): the per-URL cost of the reflection request build.
+func BenchmarkSubstituteCanaries(b *testing.B) {
+	raw := "q=term&page=2&lang=en&sort=asc&filter=new&view=full&limit=50&offset=0"
+	canaries := map[string]string{
+		"q": "rr12345678x90ab:q", "page": "rr12345678x90ab:q",
+		"lang": "rr12345678x90ab:q", "sort": "rr12345678x90ab:q",
+		"filter": "rr12345678x90ab:q", "view": "rr12345678x90ab:q",
+		"limit": "rr12345678x90ab:q", "offset": "rr12345678x90ab:q",
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := substituteCanaries(raw, canaries)
+		if len(out) == 0 {
+			b.Fatal("substitution produced nothing")
+		}
+		benchSinkReflect = out
 	}
 }

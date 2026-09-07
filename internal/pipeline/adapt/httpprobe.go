@@ -84,11 +84,71 @@ const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
 //	probe), ports_naabu_failed (execution failure; pairs parsed before the
 //	failure still merge), ports_output_truncated (+ Truncated: the captured
 //	stdout hit the stream cap, so the retained pair set is incomplete).
-//	Discovered ports propagate through the results channel rather than
-//	mutating the probe-target list (targets are hostname-built URL forms);
+//	Discovered ports propagate through the results channel;
 //	results-channel caps stay runner-side per MaxOutput. Cache op
 //	"ports.discover", keyed on the scope hash of the input IPs, the
 //	result-affecting flags, and the tool version (§11).
+//
+//	"probe_ports" — optional probing of discovered ports (default OFF;
+//	NEW-121). Truthy values (same spellings) build scheme://host:port/
+//	engine targets from the discovery output: each in-scope host's ports
+//	are resolved through the dns stage's host→IP edges (plus one CNAME
+//	hop) joined with naabu's ip→port edges, capped at 16 ports per host
+//	(sorted head; the cut sets httpprobe_port_targets_truncated +
+//	Truncated). Targets probe through the standard engine path
+//	(cache-before-execute under their own URL identities, redirect
+//	scope, asset/edge derivation), so port surfaces join the corpus and
+//	flow downstream like root targets. Without probe_ports, discovery
+//	output is inventory only (the historical behavior, byte-identical).
+//	probe_ports without discovery results is an inert no-op (no ports,
+//	no flag).
+//
+//	"takeover_confirm" — optional HTTP confirmation of dangling CNAME
+//	hosts (default ON; NEW-122). The exact value "false"
+//	(case/space-insensitive) disables it. When on, hosts with a CNAME
+//	edge whose target has no addresses (dangling shape — computed from
+//	the dns stage's host→IP/host→CNAME edges, no provider lists) get
+//	bounded root fetches matched against a curated provider table
+//	(github-pages/heroku/aws-s3); matches become takeover evidence.
+//	Capped at 64 hosts per run (sorted head; the cut sets
+//	httpprobe_takeover_overflow + Truncated), body-cap hits and hard
+//	errors set httpprobe_takeover_truncated + Truncated. The fetch is
+//	deliberately uncached (freshness-critical claims); confirmed matches
+//	flow downstream as evidence, coherent through the snapshot
+//	fingerprint like every other evidence record.
+//
+//	"mistake_paths" — developer-mistake path probing (default OFF).
+//	Truthy values ("true"/"1"/"yes"/"on", case-insensitive — the
+//	dnsx_brute spelling convention, mirroring "probe_ports") fetch the
+//	curated well-known set (defaultMistakePaths: robots/sitemaps,
+//	version control, env files, actuator/health/metrics/debug endpoints,
+//	API docs, GraphQL playgrounds, backups, manifests, legacy handlers)
+//	on every probed host. The engine gates paths per host — only a root
+//	that proved an HTTP server enables them, on the responding scheme —
+//	so dead hosts cost zero extra requests; every path enjoys
+//	cache-before-execute under its own URL identity with the standard
+//	redirect/header/body bounds, and the observations join the corpus
+//	(URLs, GET endpoints, host→url edges) for techintel, jsintel, and
+//	the detect packs. Default OFF like "probe_ports": 38 extra targets
+//	per host is a traffic decision the operator makes explicitly, never
+//	a silent multiplication of the scan profile. No trim, no flag: the
+//	curated set sits below the engine bound by construction (pinned).
+//	Tuning requirement: the engine probes one host's whole surface
+//	sequentially in one job (2 roots + port pairs + one request per
+//	path, at most 1 in flight), so the run Timeout must cover all 38
+//	extra requests — a Timeout sized for roots alone expires
+//	mid-surface and the host folds to Cancelled by the cancelled-first
+//	vocabulary. That outcome is contractual, not surprising (pinned by
+//	the engine's short-Timeout contract test). Enablement is
+//	programmatic-only in this milestone: this stage parameter — no
+//	scan CLI flag or global config key exists for it.
+//	"session_headers" — optional operator session file (default absent =
+//	anonymous; NEW-125). The value is a filesystem path to "Name: value"
+//	headers (see ReadSessionFile); the file is read at stage start and
+//	a broken file fails the stage (fail-closed). Headers ride in-scope
+//	requests (cross-host redirect hops never inherit them) and bind
+//	cache keys by digest — values never enter logs, errors, reports,
+//	or cache records.
 //
 // Outcome mapping (engine host status → pipeline outcome; internal/
 // httpprobe/observe.go "classifyHost"):
@@ -183,6 +243,9 @@ func NewHTTPProbeStage(transport http.RoundTripper) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *HTTPProbeStage) Name() pipeline.StageName { return pipeline.StageHTTPProbe }
 
+// Level implements pipeline.LeveledStage: probing needs dns-resolved hosts.
+func (s *HTTPProbeStage) Level() int { return 2 }
+
 // Run implements pipeline.Stage.
 func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
@@ -201,10 +264,45 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 	// the list (canonical names only — the single normalization point stays
 	// in internal/asset).
 	hosts := pipeline.FilterHosts(in.Target, in.Hosts)
+	// Port-target synthesis (NEW-121): when the operator opted into BOTH
+	// discovery and probing, each in-scope host's naabu ports become
+	// scheme://host:port/ engine targets. Either knob off means root-only
+	// probing — byte-identical to the pre-synthesis behavior.
+	var portTargets map[string][]int
+	portsTruncated := false
+	if portProbeEnabled(in.Config) {
+		portTargets, portsTruncated = synthesizePortTargets(hosts, in.Results.Relationships, pd)
+	}
+	// Mistake-path surface: the curated set when the operator opted in
+	// (nil = root-only probing, byte-identical to the historical
+	// behavior).
+	var mistakePaths []string
+	if mistakePathsEnabled(in.Config) {
+		mistakePaths = defaultMistakePaths
+	}
+	// Takeover candidate selection is input-determined (no network): the
+	// cut flag rides every outcome path below through opts, exactly like
+	// the port-synthesis cut.
+	var takeoverHosts []asset.Host
+	takeoverCut := false
+	if takeoverConfirmEnabled(in.Config) {
+		takeoverHosts, takeoverCut = selectTakeoverHosts(hosts, in.Results.Relationships)
+	}
 	opts := probeResultOptions{
 		sanExpansion: tlsSANExpansionEnabled(in.Config),
 		corpusHosts:  hosts,
 		ports:        pd,
+		portsCut:     portsTruncated,
+		takeoverCut:  takeoverCut,
+	}
+	// Operator session headers (NEW-125): resolved before the
+	// short-circuit below so a broken session file fails the stage even
+	// on an empty corpus — fail-closed, never scan anonymously when
+	// authentication was asked for.
+	sessionHeaders, err := sessionHeadersFromParams(in.Config)
+	if err != nil {
+		wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
+		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed, Err: wrapped}, wrapped
 	}
 
 	// Empty filtered list: short-circuit with completed and zero additions —
@@ -224,6 +322,7 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		return buildResult(in.Target, httpprobe.Report{}, pipeline.OutcomeCompleted, nil, opts), nil
 	}
 
+	// Operator session headers (NEW-125): resolved above (fail-closed).
 	cfg := httpprobe.Config{
 		// Bounds pass-through: 0 = engine default/disabled per the engine's
 		// own documented semantics, never pre-resolved pipeline defaults
@@ -239,6 +338,8 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// The single StageParam (documented on the type): invalid or absent
 		// resolves to 0 = the engine's 10 s per-request default.
 		RequestTimeout: requestTimeoutFromParams(in.Config),
+		// Operator session headers (nil = anonymous probing).
+		RequestHeaders: sessionHeaders,
 		// Cache and Clock pass through: nil cache = caching disabled; nil
 		// clock = the engine's wall clock. The runner guarantees a non-nil
 		// clock; the engine tolerates nil either way.
@@ -247,6 +348,12 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// Constructor test seam: nil = the engine's bounded production
 		// transport.
 		Transport: s.transport,
+		// Synthesized port targets (nil = root-only probing).
+		HostPorts: portTargets,
+		// Mistake-path targets (nil = root-only probing).
+		WellKnownPaths: mistakePaths,
+		// Forward the run observer into the engine pool; nil disables events.
+		Observer: in.Observer,
 	}
 
 	// The ips map stays nil: IP assets are not part of the pipeline corpus
@@ -284,12 +391,39 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 
 	// Outcome fold over the engine's per-host statuses (mapping table
 	// documented on the type).
-	return buildResult(in.Target, report, foldHostOutcomes(report), nil, opts), nil
+	outcome := foldHostOutcomes(report)
+	// Takeover confirmation (NEW-122): additive evidence over completed
+	// or partial liveness — a failed or cancelled run leaves no corpus
+	// worth confirming. It never changes a failed/cancelled outcome and
+	// only ever downgrades completed to partial (never the reverse).
+	if takeoverConfirmEnabled(in.Config) && (outcome == pipeline.OutcomeCompleted || outcome == pipeline.OutcomePartial) {
+		evs, trunc, cerr := s.confirmTakeover(ctx, in, takeoverHosts, cfg)
+		opts.takeoverEvidence = evs
+		if trunc {
+			opts.takeoverTruncated = true
+		}
+		if cerr != nil {
+			// Hard-error cut-short: the liveness result stands,
+			// downgraded to partial when it was completed, with the
+			// truncation flag marking the evidence set incomplete. The
+			// detail rides res.Err with a NIL Go return — a non-nil
+			// return would force Outcome failed and corrupt the honest
+			// partial (runner normalizeResult contract).
+			opts.takeoverTruncated = true
+			if outcome == pipeline.OutcomeCompleted {
+				outcome = pipeline.OutcomePartial
+			}
+			return buildResult(in.Target, report, outcome,
+				fmt.Errorf("stage %s: takeover confirmation: %w", s.Name(), cerr), opts), nil
+		}
+	}
+	return buildResult(in.Target, report, outcome, nil, opts), nil
 }
 
 // probeResultOptions carries the Run-scoped inputs buildResult needs beyond
-// the engine report: the SAN-expansion gate and its known-corpus seed, and
-// the optional port-discovery output to merge into the results channel.
+// the engine report: the SAN-expansion gate and its known-corpus seed, the
+// optional port-discovery output to merge into the results channel, the
+// port-target synthesis cut flag, and the takeover-confirmation output.
 type probeResultOptions struct {
 	// sanExpansion enables TLS SAN host expansion (StageParams
 	// "tls_san_expansion" != "false").
@@ -299,6 +433,18 @@ type probeResultOptions struct {
 	corpusHosts []asset.Host
 	// ports is the optional port-discovery output; nil = disabled or inert.
 	ports *portDiscoveryOutput
+	// portsCut reports that port-target synthesis cut a host's port list
+	// at maxProbePortsPerHost (NEW-121).
+	portsCut bool
+	// takeoverEvidence carries confirmed-takeover evidence (NEW-122);
+	// nil when confirmation was disabled, inapplicable, or silent.
+	takeoverEvidence []asset.Evidence
+	// takeoverCut reports that the takeover candidate set exceeded
+	// maxTakeoverConfirmHosts (NEW-122).
+	takeoverCut bool
+	// takeoverTruncated reports an incomplete confirmation set: body-cap
+	// hits or a hard-error cut-short (NEW-122).
+	takeoverTruncated bool
 }
 
 // buildResult maps one engine report onto the pipeline's StageResult shape:
@@ -334,6 +480,18 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		res.Truncated = true
 		flags[HTTPProbeTLSDNSNamesStickyFlag] = true
 	}
+	if opts.portsCut {
+		res.Truncated = true
+		flags[httpprobePortTargetsTruncatedFlag] = true
+	}
+	if opts.takeoverCut {
+		res.Truncated = true
+		flags[httpprobeTakeoverOverflowFlag] = true
+	}
+	if opts.takeoverTruncated {
+		res.Truncated = true
+		flags[httpprobeTakeoverTruncatedFlag] = true
+	}
 	if len(flags) > 0 {
 		res.StickyFlags = flags
 	}
@@ -363,6 +521,7 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 		Endpoints:       report.AllEndpoints(),
 		TLSCertificates: certs,
 		Relationships:   report.AllRelationships(),
+		Evidence:        opts.takeoverEvidence,
 	}
 	// Optional port discovery (opt-in): naabu's open ports and ip→port
 	// edges merge into the results channel on EVERY path above (success,
@@ -466,6 +625,128 @@ func mergePortAssets(base, add []asset.Port) []asset.Port {
 	}
 	sortPorts(out)
 	return out
+}
+
+// Takeover-confirmation bounds and flags (NEW-122).
+const (
+	// maxTakeoverConfirmHosts caps confirmed hosts per run: worst case
+	// twice that many confirmation GETs, inside pool/queue budgets, with
+	// the per-request deadline bounding slow ones honestly. Dangling
+	// hosts are rare; the cap is a backstop, and cuts set
+	// httpprobeTakeoverOverflowFlag — never silent.
+	maxTakeoverConfirmHosts = 64
+	// httpprobeTakeoverOverflowFlag marks a run whose dangling candidate
+	// set exceeded maxTakeoverConfirmHosts: only the sorted head was
+	// confirmed.
+	httpprobeTakeoverOverflowFlag = "httpprobe_takeover_overflow"
+	// httpprobeTakeoverTruncatedFlag marks an incomplete confirmation
+	// set: body-cap hits or a hard-error cut-short.
+	httpprobeTakeoverTruncatedFlag = "httpprobe_takeover_truncated"
+)
+
+// takeoverConfirmEnabled reports whether takeover confirmation runs: ON
+// unless StageParams carries an explicit "false"
+// (case/space-insensitive). Confirmation traffic is tiny (dangling hosts
+// only — usually zero), so operators opt OUT rather than in; liveness
+// probing itself is unaffected either way.
+func takeoverConfirmEnabled(params map[string]string) bool {
+	if params == nil {
+		return true
+	}
+	v, ok := params["takeover_confirm"]
+	if !ok {
+		return true
+	}
+	return strings.TrimSpace(strings.ToLower(v)) != "false"
+}
+
+// selectTakeoverHosts resolves the confirmation candidates (NEW-122):
+// in-scope hosts with a host→CNAME edge whose target carries no
+// host→IP edge (dangling shape). No provider lists are consulted here —
+// candidacy is pure DNS shape, so the stage never branches on pack
+// content; the takeover pack's suffix lists decide relevance
+// downstream. Output is sorted by hostname; beyond
+// maxTakeoverConfirmHosts the head is kept and the cut reported.
+func selectTakeoverHosts(hosts []asset.Host, rels []asset.Relationship) ([]asset.Host, bool) {
+	inScope := make(map[string]asset.Host, len(hosts))
+	for _, h := range hosts {
+		inScope[h.Identity().String()] = h
+	}
+	hasIP := make(map[string]bool)
+	var cnames [][2]string
+	for _, r := range rels {
+		switch r.Kind {
+		case asset.RelationshipHostToIP:
+			hasIP[r.From.String()] = true
+		case asset.RelationshipHostToCNAME:
+			cnames = append(cnames, [2]string{r.From.String(), r.To.String()})
+		}
+	}
+	var cands []asset.Host
+	seen := make(map[string]bool)
+	for _, c := range cnames {
+		src, tgt := c[0], c[1]
+		h, ok := inScope[src]
+		if !ok || seen[src] {
+			continue
+		}
+		if hasIP[tgt] {
+			continue
+		}
+		seen[src] = true
+		cands = append(cands, h)
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].Name < cands[j].Name })
+	if len(cands) > maxTakeoverConfirmHosts {
+		cands = cands[:maxTakeoverConfirmHosts]
+		return cands, true
+	}
+	return cands, false
+}
+
+// confirmTakeover runs provider confirmation over the candidate hosts
+// and maps confirmed verdicts to evidence. Unconfirmed verdicts
+// (clean pages, errors, truncations) yield no evidence — the pack
+// treats missing evidence as "unconfirmed" (fail-open). It returns the
+// sorted evidence, whether the confirmation set is incomplete (any
+// body-cap hit OR any per-host error — an unreachable host contributes
+// no verdict), and the hard error (nil unless the confirmation run
+// itself failed).
+func (s *HTTPProbeStage) confirmTakeover(ctx context.Context, in pipeline.StageInput, hosts []asset.Host, cfg httpprobe.Config) ([]asset.Evidence, bool, error) {
+	if len(hosts) == 0 {
+		return nil, false, nil
+	}
+	// Takeover evidence is always anonymous (NEW-125): confirmation
+	// probes assert what a stranger on the internet sees (a dangling
+	// CNAME serving attacker-chosen content), so session credentials
+	// never ride them even in authed runs.
+	anon := cfg
+	anon.RequestHeaders = nil
+	rep, err := httpprobe.ConfirmTakeoverHosts(ctx, in.Target, hosts, anon)
+	if err != nil {
+		return nil, true, err
+	}
+	var evs []asset.Evidence
+	truncated := false
+	for _, v := range rep.Results {
+		if v.Truncated || v.Err != nil {
+			// A body-cap hit OR a per-host transport/cancel/submit
+			// failure: no verdict was reachable, so the confirmation
+			// set is incomplete — flagged, never silent (review wave
+			// 2026-09-03).
+			truncated = true
+		}
+		if !v.Confirmed {
+			continue
+		}
+		ev, everr := httpprobe.TakeoverEvidence(v.Host.Identity(), v.Provider, v.Fingerprint)
+		if everr != nil {
+			continue
+		}
+		evs = append(evs, ev)
+	}
+	sort.Slice(evs, func(i, j int) bool { return evs[i].ID() < evs[j].ID() })
+	return evs, truncated, nil
 }
 
 // mergeRelationshipAssets unions two relationship lists, first-seen dedup by
@@ -685,4 +966,66 @@ func portDiscoveryEnabled(params map[string]string) bool {
 		return true
 	}
 	return false
+}
+
+// mistakePathsEnabled reports whether mistake-path probing runs. OFF by
+// default (38 extra targets per host is an explicit traffic decision);
+// truthy values ("true"/"1"/"yes"/"on", case-insensitive — the
+// dnsx_brute spelling convention, mirroring portDiscoveryEnabled) enable
+// it. Every other value — including absent — leaves it disabled.
+func mistakePathsEnabled(params map[string]string) bool {
+	if params == nil {
+		return false
+	}
+	switch strings.TrimSpace(strings.ToLower(params["mistake_paths"])) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// defaultMistakePaths is the curated well-known set fetched per live host:
+// robots/sitemaps, version control, env files, actuator/health/metrics/
+// debug endpoints, API docs, GraphQL playgrounds, backups, manifests, and
+// legacy handlers. It must stay below the engine's maxWellKnownPaths bound
+// (pinned by TestDefaultMistakePathsBounded) — no trim, no flag.
+var defaultMistakePaths = []string{
+	"/.DS_Store",
+	"/.env",
+	"/.env.bak",
+	"/.git/HEAD",
+	"/.git/config",
+	"/.hg/hgrc",
+	"/.svn/entries",
+	"/.well-known/change-password",
+	"/.well-known/security.txt",
+	"/actuator",
+	"/actuator/health",
+	"/api-docs",
+	"/api/docs",
+	"/backup.zip",
+	"/clientaccesspolicy.xml",
+	"/composer.json",
+	"/crossdomain.xml",
+	"/db.sqlite",
+	"/debug/pprof/",
+	"/elmah.axd",
+	"/favicon.ico",
+	"/graphiql",
+	"/graphql",
+	"/health",
+	"/healthz",
+	"/info.php",
+	"/metrics",
+	"/openapi.json",
+	"/package.json",
+	"/phpinfo.php",
+	"/playground",
+	"/robots.txt",
+	"/server-status",
+	"/sitemap.xml",
+	"/sitemap_index.xml",
+	"/swagger.json",
+	"/swagger.yaml",
+	"/wp-json/",
 }

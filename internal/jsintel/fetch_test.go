@@ -1,6 +1,7 @@
 package jsintel
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -372,38 +374,40 @@ func TestFetchGzip(t *testing.T) {
 	}
 }
 
-func TestFetchContentLengthPrecheck(t *testing.T) {
+func TestFetchLyingContentLengthIgnored(t *testing.T) {
+	// The declared Content-Length is never trusted: a lying huge
+	// declaration over a small complete body completes (the bound is
+	// kept, the trust is dropped). Constructed at the readTerminal
+	// level so the declared/observed pair is exact and hermetic.
 	const declared = int64(10 << 30) // 10 GiB, far above any cap
-	block := make(chan struct{})
-	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", strconv.FormatInt(declared, 10))
-		w.Write([]byte("prefix"))
-		w.(http.Flusher).Flush()
-		// Block forever (until the test ends): a fetch that drained the
-		// body would hang here waiting for more bytes, so the test would
-		// fail its bound — proving the pre-check closes without reading.
-		<-block
-	})
-	t.Cleanup(func() { close(block) })
+	body := "var a = 1;\n"
+	u := mustURL(t, "http://example.com/a.js")
+	resp := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": []string{"application/javascript"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: declared,
+	}
 	cfg := testFetchConfig()
 	cfg.MaxJSBytes = 64 << 10 // the clamped minimum
-	cfg.Transport = transportFor(t, srv.srv)
-
-	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/huge.js"))
-	if res.Status != FetchTruncated {
-		t.Fatalf("status = %s, want incomplete (truncated)", res.Status)
+	var res FetchResult
+	mustFinish(t, "readTerminal with lying Content-Length", func() {
+		res = readTerminal(u, u, resp, 0, cfg)
+	})
+	if res.Status != FetchCompleted {
+		t.Fatalf("status = %s, want completed (small body despite lying declaration)", res.Status)
 	}
-	if !res.Truncated {
-		t.Error("truncated = false, want true")
+	if res.Truncated {
+		t.Error("truncated = true, want false (declared length is not trusted)")
 	}
-	if res.Size != 0 || res.Content != nil || res.Hash != "" {
-		t.Errorf("retained content = size %d, %d bytes, hash %q; want none", res.Size, len(res.Content), res.Hash)
+	if string(res.Content) != body || res.Size != int64(len(body)) || res.Hash == "" {
+		t.Errorf("retained content = size %d, %d bytes, hash %q; want the full small body", res.Size, len(res.Content), res.Hash)
 	}
 	if res.ContentLength != declared {
-		t.Errorf("content length = %d, want declared %d", res.ContentLength, declared)
+		t.Errorf("content length = %d, want declared %d (metadata stays honest)", res.ContentLength, declared)
 	}
-	if res.StatusCode != 200 {
-		t.Errorf("status code = %d, want 200 (the response WAS observed)", res.StatusCode)
+	if len(res.Windows) != 0 {
+		t.Errorf("windows = %d, want 0 (completed bodies carry no windows)", len(res.Windows))
 	}
 }
 
@@ -631,6 +635,9 @@ func TestFetchRedirectCrossHostFollowed(t *testing.T) {
 	})
 	cfg := testFetchConfig()
 	cfg.Transport = transportFor(t, srv.srv)
+	// The dial-safety gate resolves cross-host names: stub public
+	// resolution (the loopback transport serves every destination).
+	cfg.ResolveIP = privateResolver([]net.IP{net.ParseIP("93.184.216.34")}, nil)
 
 	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
 	if res.Status != FetchCompleted || res.Reason != ReasonNone {
@@ -647,6 +654,322 @@ func TestFetchRedirectCrossHostFollowed(t *testing.T) {
 	}
 	if srv.count() != 2 {
 		t.Errorf("requests = %d, want 2 (initial + cross-host hop)", srv.count())
+	}
+}
+
+func TestFetchRedirectIPLiteralsNotFollowed(t *testing.T) {
+	// A redirect into an IP literal is observed, never requested (mirrors
+	// httpprobe canonicalScopeHost): the walk ends with the redirect
+	// response as the final observation. Otherwise a hostile target could
+	// drive the fetcher onto link-local/loopback addresses (e.g. cloud
+	// metadata) and retain the body into cache/reports.
+	for _, tc := range []struct {
+		name     string
+		location string
+	}{
+		{name: "ipv4 literal", location: "http://192.0.2.1/final.js"},
+		{name: "ipv4 literal with port", location: "http://192.0.2.1:8080/final.js"},
+		{name: "ipv6 literal", location: "http://[2001:db8::1]/final.js"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", tc.location)
+				w.WriteHeader(http.StatusFound)
+			})
+			cfg := testFetchConfig()
+			cfg.Transport = transportFor(t, srv.srv)
+
+			res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+			if res.Status != FetchCompleted || res.Reason != ReasonNone {
+				t.Fatalf("status/reason = %s/%s, want completed/none", res.Status, res.Reason)
+			}
+			if res.StatusCode != http.StatusFound {
+				t.Errorf("status code = %d, want %d (the terminal redirect response IS the observation)", res.StatusCode, http.StatusFound)
+			}
+			if res.Redirects != 0 {
+				t.Errorf("redirects = %d, want 0 (the IP-literal hop is observed, never followed)", res.Redirects)
+			}
+			if got, want := res.FinalURL.String(), srv.url()+"/start"; got != want {
+				t.Errorf("final url = %s, want %s (the walk ends at the redirect response)", got, want)
+			}
+			if srv.count() != 1 {
+				t.Errorf("requests = %d, want 1 (the %s target must never be requested)", srv.count(), tc.location)
+			}
+		})
+	}
+}
+
+func TestIsPublicDialIP(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"10.0.0.1", false},
+		{"172.16.0.1", false},
+		{"172.31.255.255", false},
+		{"192.168.1.1", false},
+		{"169.254.169.254", false},
+		{"224.0.0.1", false},
+		{"ff02::1", false},
+		{"::", false},
+		{"0.0.0.0", false},
+		{"::ffff:10.0.0.1", false},
+		{"fe80::1", false},
+		{"8.8.8.8", true},
+		{"1.1.1.1", true},
+		{"::ffff:8.8.8.8", true},
+		{"2001:db8::1", true},
+	}
+	for _, tc := range cases {
+		ip := net.ParseIP(tc.ip)
+		if ip == nil {
+			t.Fatalf("ParseIP(%q) = nil", tc.ip)
+		}
+		if got := isPublicDialIP(ip); got != tc.want {
+			t.Errorf("isPublicDialIP(%s) = %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+func TestIsIPLiteralHostPortSpellings(t *testing.T) {
+	// Canonical literals refuse; classic non-canonical IP spellings
+	// refuse; real hostname shapes pass through to DNS.
+	refuse := []string{
+		"192.0.2.1", "192.0.2.1:8080", "192.0.2.1.", "[2001:db8::1]",
+		"010.0.0.1", "2130706433", "0x7f000001", "0X7F000001",
+	}
+	for _, h := range refuse {
+		if !isIPLiteralHostPort(h) {
+			t.Errorf("isIPLiteralHostPort(%q) = false, want true", h)
+		}
+	}
+	allow := []string{
+		"example.com", "dead", "cafe", "db2", "a1", "cafe01", "123abc",
+		"other-host.test", "cdn.example.net",
+	}
+	for _, h := range allow {
+		if isIPLiteralHostPort(h) {
+			t.Errorf("isIPLiteralHostPort(%q) = true, want false (real hostname shape)", h)
+		}
+	}
+}
+
+// privateResolver returns a ResolveIP stub answering every hostname
+// with the given addresses (or error).
+func privateResolver(addrs []net.IP, err error) func(context.Context, string) ([]net.IP, error) {
+	return func(context.Context, string) ([]net.IP, error) {
+		return addrs, err
+	}
+}
+
+func TestFetchRedirectPrivateDNSRefused(t *testing.T) {
+	// The review-wave TOCTOU case: a cross-host DNS NAME (not literal)
+	// resolving to private addresses is observed, never requested.
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "http://cdn.example.net/final.js")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Write([]byte("should never be requested"))
+	})
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+	cfg.ResolveIP = privateResolver([]net.IP{net.ParseIP("169.254.169.254")}, nil)
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+	if res.Status != FetchCompleted || res.Reason != ReasonNone {
+		t.Fatalf("status/reason = %s/%s, want completed/none", res.Status, res.Reason)
+	}
+	if res.Redirects != 0 {
+		t.Errorf("redirects = %d, want 0 (private-DNS hop observed, never followed)", res.Redirects)
+	}
+	if got, want := res.FinalURL.String(), srv.url()+"/start"; got != want {
+		t.Errorf("final url = %s, want %s", got, want)
+	}
+	if srv.count() != 1 {
+		t.Errorf("requests = %d, want 1", srv.count())
+	}
+}
+
+func TestFetchRedirectPublicDNSFollowed(t *testing.T) {
+	// A cross-host name resolving publicly still follows (no
+	// over-blocking): the loopback transport serves the hop.
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			w.Header().Set("Location", "http://cdn.example.net/final.js")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Write([]byte("public-body"))
+	})
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+	cfg.ResolveIP = privateResolver([]net.IP{net.ParseIP("93.184.216.34")}, nil)
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+	if res.Redirects != 1 || string(res.Content) != "public-body" {
+		t.Errorf("redirects/content = %d/%q, want 1/public-body", res.Redirects, res.Content)
+	}
+	if srv.count() != 2 {
+		t.Errorf("requests = %d, want 2", srv.count())
+	}
+}
+
+func TestFetchRedirectDNSErrorRefused(t *testing.T) {
+	// Fail-closed: an unresolvable cross-host hop is observed, never
+	// followed (an attacker commanding DNS can only deny, never steer).
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://cdn.example.net/final.js")
+		w.WriteHeader(http.StatusFound)
+	})
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+	cfg.ResolveIP = privateResolver(nil, errors.New("synthetic DNS failure"))
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/start"))
+	if res.Redirects != 0 {
+		t.Errorf("redirects = %d, want 0 (unresolvable hop observed, never followed)", res.Redirects)
+	}
+	if srv.count() != 1 {
+		t.Errorf("requests = %d, want 1", srv.count())
+	}
+}
+
+func TestSplitWindows(t *testing.T) {
+	const size = 512 << 10
+	const overlap = 8 << 10
+	stride := size - overlap
+	build := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte('a' + i%26)
+		}
+		return b
+	}
+	// Under-cap input: single window (callers only split over-cap
+	// bodies; the helper itself is total).
+	if got := splitWindows(build(100), size, overlap); len(got) != 1 || len(got[0]) != 100 {
+		t.Fatalf("small input windows = %d, want 1×100", len(got))
+	}
+	// Exact multiple: tiling covers without a degenerate tail.
+	body := build(2 * size)
+	got := splitWindows(body, size, overlap)
+	if len(got) != 3 {
+		t.Fatalf("windows = %d, want 3 for 2×size", len(got))
+	}
+	if !bytes.Equal(got[0], body[:size]) {
+		t.Fatal("window 0 is not the head prefix")
+	}
+	if !bytes.Equal(got[1], body[stride:stride+size]) {
+		t.Fatal("window 1 is not the overlapped stride")
+	}
+	// Coverage: every byte of the prefix appears in at least one
+	// window (overlap duplicates the seams, never drops them).
+	covered := make([]bool, len(body))
+	for start := 0; start < len(body); start += stride {
+		end := start + size
+		if end > len(body) {
+			end = len(body)
+		}
+		for i := start; i < end; i++ {
+			covered[i] = true
+		}
+	}
+	for i, ok := range covered {
+		if !ok {
+			t.Fatalf("byte %d uncovered by tiling", i)
+		}
+	}
+}
+
+// bigChunkedServer serves body in flushed chunks without Content-Length
+// (chunked encoding hides the length, so the streamed — not declared —
+// bound discovers the cap).
+func bigChunkedServer(t *testing.T, body []byte, contentType string) *recordingServer {
+	t.Helper()
+	return newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		rest := body
+		for len(rest) > 0 {
+			n := 32 << 10
+			if n > len(rest) {
+				n = len(rest)
+			}
+			w.Write(rest[:n])
+			w.(http.Flusher).Flush()
+			rest = rest[n:]
+		}
+	})
+}
+
+// TestFetchWindowedStreamedPrefix pins NEW-124 Phase 1: an over-cap body
+// discovered while streaming retains deterministic overlapped windows
+// over the bounded prefix — same memory ceiling as today (cap+1 read),
+// same truncated/incomplete honesty, Content still nil.
+func TestFetchWindowedStreamedPrefix(t *testing.T) {
+	body := make([]byte, 3<<20)
+	for i := range body {
+		body[i] = byte('a' + i%26)
+	}
+	srv := bigChunkedServer(t, body, "application/javascript")
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/big.js"))
+	if res.Status != FetchTruncated {
+		t.Fatalf("status = %s, want incomplete (truncated)", res.Status)
+	}
+	if !res.Truncated {
+		t.Error("truncated = false, want true")
+	}
+	if res.Content != nil || res.Size != 0 || res.Hash != "" {
+		t.Errorf("content contract = size %d, %d bytes, hash %q; want nil/0/empty (unchanged truncated contract)", res.Size, len(res.Content), res.Hash)
+	}
+	if len(res.Windows) != 5 {
+		t.Fatalf("windows = %d, want 5 over the 2 MiB prefix (512 KiB/8 KiB tiling)", len(res.Windows))
+	}
+	if !bytes.Equal(res.Windows[0], body[:512<<10]) {
+		t.Error("window 0 is not the head prefix")
+	}
+	// 2 MiB prefix, 512 KiB windows, 504 KiB stride: starts at 0,
+	// 516096, 1032192, 1548288, 2064384 — the last window is the
+	// 32768-byte tail.
+	last := res.Windows[len(res.Windows)-1]
+	if len(last) != 32768 || !bytes.Equal(last, body[2064384:2<<20]) {
+		t.Errorf("last window = %d bytes, want the 32768-byte prefix tail", len(last))
+	}
+	// Determinism: refetch yields identical windows.
+	res2 := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/big.js"))
+	if len(res2.Windows) != len(res.Windows) {
+		t.Fatalf("refetch windows = %d, want %d", len(res2.Windows), len(res.Windows))
+	}
+	for i := range res.Windows {
+		if !bytes.Equal(res.Windows[i], res2.Windows[i]) {
+			t.Fatalf("window %d differs across fetches", i)
+		}
+	}
+}
+
+// TestFetchExactCapRetained pins the unchanged under-cap path: full
+// retention, no windows.
+func TestFetchWindowedSmallUnchanged(t *testing.T) {
+	body := []byte("var small = 1;\n")
+	srv := bigChunkedServer(t, body, "application/javascript")
+	cfg := testFetchConfig()
+	cfg.Transport = transportFor(t, srv.srv)
+
+	res := fetchOrTimeout(t, context.Background(), cfg, mustURL(t, srv.url()+"/small.js"))
+	if res.Status != FetchCompleted {
+		t.Fatalf("status = %s, want completed", res.Status)
+	}
+	if len(res.Windows) != 0 {
+		t.Fatalf("windows = %d, want 0 (under-cap bodies retain whole)", len(res.Windows))
+	}
+	if string(res.Content) != string(body) {
+		t.Errorf("content = %q, want the full body", res.Content)
 	}
 }
 

@@ -2,16 +2,31 @@ package js
 
 import (
 	"context"
-	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
-	"github.com/RA000WL/RavenRecon/internal/jsintel"
 )
 
-// postMessageDetector detects per-script postMessage handlers without origin checks.
+// postMessageDetector detects per-script postMessage handlers without
+// origin checks in retained script bodies (SDK v2.1 content channel):
+// token-aware structural scan (NEW-123) — a code addEventListener call
+// whose first argument is the static string "message" (handler scope: a
+// "message" literal elsewhere does not count) with no `.origin` read in
+// code (a comment-only origin mention does not suppress).
+// Scripts without a retained body are silent (fail-open).
+//
+// Bounded (AGENTS.md §10): inputs are pre-bounded snapshot bodies (2 MiB)
+// or 512 KiB chunk windows; the scan is one linear codeMask pass plus
+// bounded finder walks (each addEventListener occurrence costs at most one
+// 4 KiB literal scan plus O(gap) next-code skips — linear overall,
+// ctx-checked every 128 occurrences) — no per-parse timeout beyond the
+// rule's 2s Timeout.
+//
+// Origin scope is file-global by design (known-FN limitation): any code
+// `.origin` in the body suppresses the rule, even for a different handler
+// (see hasCodeOrigin; pinned by
+// TestJSFPPostMessageFileGlobalOriginLimitation).
 func postMessageDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -19,72 +34,36 @@ func postMessageDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fin
 	if dctx.Config["js.postmessage.no-origin-check.disabled"] == "true" {
 		return nil, nil
 	}
-	parser := jsintel.NewParser()
-	seen := make(map[asset.Identity]struct{})
-	var subjects []asset.Identity
-	for _, js := range dctx.JavaScript {
+	var cands []jsCandidate
+	for _, jc := range dctx.JavaScriptContent {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		src := postMessageSource(js)
-		parsed, err := parser.Parse([]byte(src))
+		low := strings.ToLower(jc.Body)
+		mask := codeMask(low)
+		// The locator: the predicate guarantees a static-"message"
+		// addEventListener call in code, so the handler offset always lands.
+		local, err := postMessageCodeHandlerCtx(ctx, low, mask)
 		if err != nil {
 			return nil, err
 		}
-		_ = parsed
-		if !hasPostMessageNoOrigin(src) {
+		if local < 0 {
 			continue
 		}
-		id := js.Identity()
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			subjects = append(subjects, id)
-		}
-	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
-	var out []asset.Finding
-	for _, s := range subjects {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		meta := map[string]string{"signal": "postmessage_no_origin"}
-		if dropped > 0 {
-			meta["subjects_dropped"] = fmt.Sprintf("%d", dropped)
-			meta["truncated"] = "true"
-		}
-		f, err := jsFinding(dctx, rulePostMessage, "PostMessage No Origin Check", detect.CategoryInformation, s, nil, meta)
+		hasOrigin, err := hasCodeOriginCtx(ctx, low, mask)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, f)
+		if hasOrigin {
+			continue
+		}
+		subject, span := fileSubjectOfContent(jc.Identity)
+		cands = append(cands, jsCandidate{subject: subject, offset: int64(local) + span})
 	}
-	if dropped > 0 {
-		dctx.Logger.Log(detect.LevelWarn, rulePostMessage, fmt.Sprintf("truncated %d subjects over bound 256", dropped))
+	out, err := emitJSCandidates(ctx, dctx, rulePostMessage, "PostMessage No Origin Check", detect.CategoryInformation, "postmessage_no_origin", cands)
+	if err != nil {
+		return nil, err
 	}
 	formatConfigKeys(dctx, rulePostMessage)
 	return out, nil
-}
-
-func postMessageSource(js asset.JavaScript) string {
-	_ = js
-	return `window.addEventListener("click", function(){console.log("click");});`
-}
-
-func hasPostMessageNoOrigin(src string) bool {
-	low := strings.ToLower(src)
-	if !strings.Contains(low, "addeventlistener") {
-		return false
-	}
-	if !strings.Contains(low, "\"message\"") && !strings.Contains(low, "'message'") {
-		return false
-	}
-	if strings.Contains(low, "event.origin") || strings.Contains(low, "e.origin") || strings.Contains(low, ".origin") {
-		return false
-	}
-	return true
 }

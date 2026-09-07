@@ -134,8 +134,12 @@ type StageRecord struct {
 }
 
 // Run validates cfg, resolves every selected stage name against the
-// provided stages slice, and runs the stages strictly in cfg.Stages
-// order.
+// provided stages slice, and runs the selection in execution-level groups
+// (see level.go): consecutive entries sharing a level run concurrently,
+// everything else runs solo, always in selection order. Merges land in
+// selection order after each group completes, so the merged corpus,
+// results, documents, and provenance are byte-identical to a strictly
+// sequential run given the level contract.
 //
 // Stage resolution: a provided stage is used if and only if its Name
 // appears in cfg.Stages — provided stages whose name is not in the
@@ -245,81 +249,18 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 		report.StageErrors = append(report.StageErrors, StageError{Name: sr.Name, Err: sr.Err})
 	}
 
+	// Execution levels (see level.go): entries sharing a level with no
+	// barrier between them run concurrently in one group; groups run in
+	// ascending level order, members merge in selection order. Entries
+	// without a resolvable stage are barriers (always solo, in position).
+	// Unlevelled stages are barriers too, so callers that never opted
+	// into levels run strictly sequentially — byte-identical to the
+	// historical runner.
+	levels := make([]int, len(entries))
 	for i, entry := range entries {
-		name := cfg.Stages[i]
-		sr := StageRecord{Name: name}
-		emitStageStarted(cfg.Observer, clock, name)
-		if ctx.Err() != nil {
-			// The run is cancelled: this stage and every remaining
-			// stage is recorded cancelled without being invoked.
-			sr.Outcome = OutcomeCancelled
-			sr.Err = ctx.Err()
-			report.Stages = append(report.Stages, sr)
-			collectStageErr(sr)
-			emitStageFinished(cfg.Observer, clock, sr)
-			continue
-		}
-		if entry.nameErr != nil {
-			// Unresolvable (Name() panicked during resolution): recorded
-			// failed without being invoked.
-			sr.Outcome = OutcomeFailed
-			sr.Err = entry.nameErr
-			report.Stages = append(report.Stages, sr)
-			collectStageErr(sr)
-			emitStageFinished(cfg.Observer, clock, sr)
-			continue
-		}
-		eff := effectiveConfig(cfg, name)
-		input := StageInput{
-			Target:    cfg.Target,
-			Domains:   domains,
-			Hosts:     hosts,
-			URLs:      urls,
-			Results:   results,
-			Documents: documents,
-			Bounds:    eff,
-			Config:    effectiveStageParams(cfg, name),
-			Clock:     clock,
-			Cache:     cache,
-			OutputDir: cfg.OutputDir,
-			// The run bracket's start (RunReport.StartAt, stamped above
-			// the loop): stages that present the run's wall-clock bracket
-			// (the report stage) compose it from here. RunEndedAt stays
-			// zero — EndAt does not exist until the loop below completes;
-			// the report stage falls back to its own render-time read.
-			RunStartedAt: report.StartAt,
-			// The merged import-provenance sidecar so far (v1.8 T12
-			// wiring): read-only for stages, consumed by the report
-			// stage's attribution projection. A stage never sees its own
-			// additions — the merge below runs after the stage returns.
-			Provenance: provenance,
-			// Stage failures recorded so far (NEW-90): read-only for
-			// stages, folded into the error summary by the report stage.
-			// A stage never sees its own error — collection happens after
-			// its record is finalized.
-			StageErrors: report.StageErrors,
-		}
-		stageCtx := ctx
-		cancel := func() {}
-		if eff.Timeout > 0 {
-			stageCtx, cancel = context.WithTimeout(ctx, eff.Timeout)
-		}
-		t0 := clock.Now()
-		res, err := runStage(entry.stage, stageCtx, input)
-		t1 := clock.Now()
-		cancel()
-		sr = normalizeResult(sr, res, err)
-		sr.Duration = t1.Sub(t0)
-		report.Stages = append(report.Stages, sr)
-		collectStageErr(sr)
-		emitStageFinished(cfg.Observer, clock, sr)
-		// Corpus propagation: merge this stage's additions into the
-		// shared corpus handed to the remaining stages (first-seen dedup,
-		// deterministic order), then enforce this stage's MaxCorpusSize
-		// cap. Runner-side capping records the corpus_capped sticky flag
-		// at the report level (AGENTS §0.6 carve-out): the stage's own
-		// outcome is untouched, but the flag and Truncated mark the
-		// retained set incomplete.
+		levels[i] = levelOf(entry.stage)
+	}
+	merge := func(name StageName, eff StageConfig, res StageResult) {
 		domains = mergeCorpus(domains, res.Additions.Domains, seen)
 		hosts = mergeCorpus(hosts, res.Additions.Hosts, seen)
 		urls = mergeCorpus(urls, res.Additions.URLs, seen)
@@ -332,17 +273,6 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags["corpus_capped"] = true
 		}
-		// Results propagation: merge this stage's result-channel additions
-		// into the shared channel handed to the remaining stages (first-seen
-		// dedup, deterministic order), then enforce this stage's MaxOutput
-		// cap per channel. The merge runs regardless of the stage's outcome
-		// — a failed stage's retained results are still merged (mirroring
-		// the corpus Additions semantics above). Runner-side capping records
-		// one <channel>_truncated sticky flag per cut channel at the report
-		// level (AGENTS §0.6 carve-out, mirroring corpus_capped): the
-		// stage's own outcome is untouched, but the flags and Truncated mark
-		// the retained set incomplete. A stage never sees its own additions:
-		// StageInput.Results is the merged state before this stage's turn.
 		for _, ch := range mergeResults(&results, res.Results, resultsSeen, eff.MaxOutput) {
 			report.Truncated = true
 			if report.StickyFlags == nil {
@@ -350,21 +280,6 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags[ch+"_truncated"] = true
 		}
-		// Documents propagation: merge this stage's document-channel
-		// additions into the shared channel handed to the remaining stages
-		// (first-seen dedup keyed by the canonical source-asset identity
-		// string, deterministic order), then enforce this stage's MaxOutput
-		// cap. The merge runs regardless of the stage's outcome — a failed
-		// stage's retained documents are still merged (mirroring the
-		// Additions/results semantics above) — and hostile over-cap content
-		// is re-bound inside the merge (dropped whole, the document marked
-		// Truncated — never a partial prefix; see mergeDocuments). A cut
-		// records the documents_truncated sticky flag at the report level
-		// (AGENTS §0.6 carve-out, mirroring corpus_capped and the results
-		// channels): the stage's own outcome is untouched, but the flag and
-		// Truncated mark the retained set incomplete. A stage never sees
-		// its own documents: StageInput.Documents is the merged state
-		// before this stage's turn.
 		var documentsCut []string
 		documents, documentsCut = mergeDocuments(documents, res.Documents, documentsSeen, eff.MaxOutput)
 		for _, ch := range documentsCut {
@@ -374,13 +289,6 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 			}
 			report.StickyFlags[ch+"_truncated"] = true
 		}
-		// Import-provenance propagation (v1.8 T11): merge this stage's
-		// sidecar additions into the run-level provenance slice (first-seen
-		// dedup on identity|filename|importer, deterministic order), then
-		// enforce this stage's MaxOutput cap. The merge runs regardless of
-		// the stage's outcome, mirroring Additions/Results/Documents. A cut
-		// records the import_provenance_truncated sticky flag at the report
-		// level (AGENTS §0.6 carve-out).
 		var provCut bool
 		provenance, provCut = mergeProvenance(provenance, res.Provenance, provenanceSeen, eff.MaxOutput)
 		if provCut {
@@ -389,6 +297,122 @@ func Run(ctx context.Context, cfg ScanConfig, cache cache.Cache, clock runtime.C
 				report.StickyFlags = make(map[string]bool)
 			}
 			report.StickyFlags["import_provenance_truncated"] = true
+		}
+	}
+	finalize := func(name StageName, eff StageConfig, res StageResult, err error, dur time.Duration) {
+		sr := StageRecord{Name: name}
+		sr = normalizeResult(sr, res, err)
+		sr.Duration = dur
+		report.Stages = append(report.Stages, sr)
+		collectStageErr(sr)
+		emitStageFinished(cfg.Observer, clock, sr)
+		merge(name, eff, res)
+	}
+	for _, group := range planGroups(levels) {
+		// Phase A, in selection order: events start, terminal states
+		// record without invoking, runnable members snapshot the
+		// pre-group input (one snapshot: every member sees the merged
+		// state of all lower levels, never a same-group member's
+		// additions — the level contract).
+		type runnable struct {
+			name StageName
+			eff  StageConfig
+			run  func(context.Context) memberResult
+		}
+		var runnables []runnable
+		// One input snapshot per member: the corpus slices stay shared
+		// read-only (every member sees the merged state of all lower
+		// levels, never a same-group member's additions — the level
+		// contract), while Bounds and Config resolve per stage exactly
+		// as the sequential runner resolved them.
+		preCancelled := ctx.Err() != nil
+		for _, idx := range group.indices {
+			name := cfg.Stages[idx]
+			entry := entries[idx]
+			emitStageStarted(cfg.Observer, clock, name)
+			if preCancelled {
+				// The run is cancelled: this stage and every remaining
+				// stage is recorded cancelled without being invoked.
+				sr := StageRecord{Name: name, Outcome: OutcomeCancelled, Err: ctx.Err()}
+				report.Stages = append(report.Stages, sr)
+				collectStageErr(sr)
+				emitStageFinished(cfg.Observer, clock, sr)
+				continue
+			}
+			if entry.nameErr != nil {
+				// Unresolvable (Name() panicked during resolution):
+				// recorded failed without being invoked.
+				sr := StageRecord{Name: name, Outcome: OutcomeFailed, Err: entry.nameErr}
+				report.Stages = append(report.Stages, sr)
+				collectStageErr(sr)
+				emitStageFinished(cfg.Observer, clock, sr)
+				continue
+			}
+			eff := effectiveConfig(cfg, name)
+			stage := entry.stage
+			input := StageInput{
+				Target:    cfg.Target,
+				Domains:   domains,
+				Hosts:     hosts,
+				URLs:      urls,
+				Results:   results,
+				Documents: documents,
+				Bounds:    eff,
+				Config:    effectiveStageParams(cfg, name),
+				Clock:     clock,
+				Cache:     cache,
+				OutputDir: cfg.OutputDir,
+				Observer:  cfg.Observer,
+				// The run bracket's start (RunReport.StartAt, stamped above
+				// the loop): stages that present the run's wall-clock bracket
+				// (the report stage) compose it from here. RunEndedAt stays
+				// zero — EndAt does not exist until the loop below completes;
+				// the report stage falls back to its own render-time read.
+				RunStartedAt: report.StartAt,
+				// The merged import-provenance sidecar so far (v1.8 T11
+				// wiring): read-only for stages, consumed by the report
+				// stage's attribution projection. A stage never sees its own
+				// additions — the merge below runs after the stage returns.
+				Provenance: provenance,
+				// Stage failures recorded so far (NEW-90): read-only for
+				// stages, folded into the error summary by the report stage.
+				// A stage never sees its own error — collection happens after
+				// its record is finalized.
+				StageErrors: report.StageErrors,
+			}
+			timeout := eff.Timeout
+			runnables = append(runnables, runnable{name: name, eff: eff, run: func(mctx context.Context) memberResult {
+				// A member whose context is already done records
+				// cancelled WITHOUT invoking the stage (mirroring the
+				// sequential runner's pre-invocation check — evaluated at
+				// goroutine start, so a cancel landing mid-group still
+				// honors "recorded cancelled, never invoked" per member).
+				if mctx.Err() != nil {
+					return memberResult{res: StageResult{Outcome: OutcomeCancelled}, err: mctx.Err()}
+				}
+				stageCtx := mctx
+				cancel := func() {}
+				if timeout > 0 {
+					stageCtx, cancel = context.WithTimeout(mctx, timeout)
+				}
+				defer cancel()
+				t0 := clock.Now()
+				res, err := runStage(stage, stageCtx, input)
+				return memberResult{res: res, err: err, dur: clock.Now().Sub(t0)}
+			}})
+		}
+		// Phase B: run the group (a singleton runs inline, no goroutine).
+		runs := make([]func(context.Context) memberResult, len(runnables))
+		for i := range runnables {
+			runs[i] = runnables[i].run
+		}
+		outs := runGroup(ctx, runs)
+		// Phase C, in selection order: normalize, record, finish events,
+		// merge (first-seen dedup, deterministic order — identical to the
+		// sequential runner given the level contract).
+		for i, r := range runnables {
+			mr := outs[i]
+			finalize(r.name, r.eff, mr.res, mr.err, mr.dur)
 		}
 	}
 

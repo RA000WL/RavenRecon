@@ -112,15 +112,19 @@ func TestClassifyQueryErrorNil(t *testing.T) {
 }
 
 // TestNetResolverUnsupportedType verifies the production adapter rejects
-// record types outside the supported set without touching the network.
+// record types outside the supported set without touching the network. CAA
+// and SOA have no standard-library lookup and are deferred (NEW-126 T1) —
+// they must stay ErrFailure, as must any unknown type.
 func TestNetResolverUnsupportedType(t *testing.T) {
 	r := NewNetResolver()
-	_, err := r.Lookup(context.Background(), "www.example.com", RecordType("MX"))
-	if err == nil {
-		t.Fatal("Lookup(MX) succeeded; want an error")
-	}
-	if kind, ok := KindOf(err); !ok || kind != ErrFailure {
-		t.Fatalf("unsupported type kind = %v/%v, want ErrFailure", kind, ok)
+	for _, rt := range []RecordType{RecordType("SOA"), RecordType("CAA"), RecordType("NAPTR")} {
+		_, err := r.Lookup(context.Background(), "www.example.com", rt)
+		if err == nil {
+			t.Fatalf("Lookup(%s) succeeded; want an error", rt)
+		}
+		if kind, ok := KindOf(err); !ok || kind != ErrFailure {
+			t.Fatalf("unsupported type %s kind = %v/%v, want ErrFailure", rt, kind, ok)
+		}
 	}
 }
 

@@ -25,6 +25,34 @@ func runOne(t *testing.T, f *fakeResolver, cfg Config, hosts []asset.Host) Repor
 
 // TestResolveASuccess covers a plain A-record host: typed IP asset, host->IP
 // relationship, completed status, provenance from the injectable clock.
+// TestReportAllRelationships pins the report-level relationship merge
+// (NEW-121): every host result's edges merged, deduplicated by edge
+// identity, sorted deterministically. Two hosts sharing one CNAME target
+// emit one target->address edge, not two.
+func TestReportAllRelationships(t *testing.T) {
+	f := newFakeResolver()
+	for _, h := range []string{"a.example.com", "b.example.com"} {
+		f.set(h, TypeA, "192.0.2.1")
+		f.set(h, TypeCNAME, "origin.example.net")
+	}
+	f.set("origin.example.net", TypeA, "192.0.2.1")
+	cfg := testConfig(f)
+
+	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "a.example.com"), mustHost(t, "b.example.com")})
+	var got []string
+	for _, r := range rep.AllRelationships() {
+		got = append(got, r.ID())
+	}
+	sortStrings(got)
+	requireEqualStrings(t, "AllRelationships", got, []string{
+		"host:a.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:a.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:b.example.com" + "\x00" + "host_to_cname\x00" + "host:origin.example.net",
+		"host:b.example.com" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+		"host:origin.example.net" + "\x00" + "host_to_ip\x00" + "ip:192.0.2.1",
+	})
+}
+
 func TestResolveASuccess(t *testing.T) {
 	f := newFakeResolver()
 	f.set("www.example.com", TypeA, "192.0.2.1")
@@ -57,9 +85,9 @@ func TestResolveASuccess(t *testing.T) {
 	requireEqualStrings(t, "AllIPs", ipNames(rep.AllIPs()), []string{"192.0.2.1"})
 	requireEqualStrings(t, "AllHosts", hostNames(rep.AllHosts()), []string{"www.example.com"})
 
-	// 3 types queried, exactly once each.
-	if got := f.callCount(); got != 3 {
-		t.Fatalf("calls = %d, want 3", got)
+	// 7 types queried, exactly once each.
+	if got := f.callCount(); got != 7 {
+		t.Fatalf("calls = %d, want 7", got)
 	}
 }
 
@@ -125,11 +153,12 @@ func TestResolveCNAMESuccess(t *testing.T) {
 		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:2001:db8::9",
 	})
 
-	// Query plan: www A/AAAA/CNAME + origin A/AAAA = 5 queries; the target's
-	// CNAME is NEVER queried (depth exactly 1, CNAME loops impossible by
-	// construction). Asserted by the call accounting.
-	if got := f.callCount(); got != 5 {
-		t.Fatalf("calls = %d, want 5", got)
+	// Query plan: www A/AAAA/CNAME/MX/TXT/NS/SRV + origin A/AAAA = 9 queries;
+	// the target's own host-target types are NEVER queried (depth exactly 1,
+	// CNAME loops impossible by construction). Asserted by the call
+	// accounting.
+	if got := f.callCount(); got != 9 {
+		t.Fatalf("calls = %d, want 9", got)
 	}
 }
 
@@ -165,6 +194,10 @@ func TestResolveEmptyAnswer(t *testing.T) {
 	f.set("mail.example.com", TypeA) // empty
 	f.set("mail.example.com", TypeAAAA)
 	f.set("mail.example.com", TypeCNAME)
+	f.set("mail.example.com", TypeMX)
+	f.set("mail.example.com", TypeTXT)
+	f.set("mail.example.com", TypeNS)
+	f.set("mail.example.com", TypeSRV)
 	cfg := testConfig(f)
 
 	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "mail.example.com")})
@@ -173,7 +206,7 @@ func TestResolveEmptyAnswer(t *testing.T) {
 	if hr.Status != StatusCompleted {
 		t.Fatalf("status = %s, want completed for empty-but-successful answers", hr.Status)
 	}
-	for _, rt := range []RecordType{TypeA, TypeAAAA, TypeCNAME} {
+	for _, rt := range hostTypes {
 		tr := typeResultFor(hr, hr.Host, rt)
 		if tr.Status != TypeCompleted {
 			t.Fatalf("%s type status = %s, want completed", rt, tr.Status)
@@ -192,9 +225,9 @@ func TestResolveEmptyAnswer(t *testing.T) {
 // = legitimate completed" convention. The host is completed, not failed.
 func TestResolveNXDOMAIN(t *testing.T) {
 	f := newFakeResolver()
-	f.setErr("gone.example.com", TypeA, &QueryError{Kind: ErrNotFound, Host: "gone.example.com", Type: TypeA, Err: errNoSuchHost()})
-	f.setErr("gone.example.com", TypeAAAA, &QueryError{Kind: ErrNotFound, Host: "gone.example.com", Type: TypeAAAA, Err: errNoSuchHost()})
-	f.setErr("gone.example.com", TypeCNAME, &QueryError{Kind: ErrNotFound, Host: "gone.example.com", Type: TypeCNAME, Err: errNoSuchHost()})
+	for _, rt := range hostTypes {
+		f.setErr("gone.example.com", rt, &QueryError{Kind: ErrNotFound, Host: "gone.example.com", Type: rt, Err: errNoSuchHost()})
+	}
 	cfg := testConfig(f)
 
 	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "gone.example.com")})
@@ -203,7 +236,7 @@ func TestResolveNXDOMAIN(t *testing.T) {
 	if hr.Status != StatusCompleted {
 		t.Fatalf("status = %s, want completed for NXDOMAIN observations", hr.Status)
 	}
-	for _, rt := range []RecordType{TypeA, TypeAAAA, TypeCNAME} {
+	for _, rt := range hostTypes {
 		tr := typeResultFor(hr, hr.Host, rt)
 		if tr.Status != TypeCompleted || !tr.NXDOMAIN {
 			t.Fatalf("%s type = %+v, want completed NXDOMAIN", rt, tr)
@@ -226,11 +259,16 @@ func (*dnsErrNotFound) Error() string { return "no such host" }
 
 // TestResolveServfail covers resolver failures: SERVFAIL-classified
 // (temporary) and plain errors both map to a failed type, never success.
+// Every queried type fails here, so the host is failed (a mix of failures
+// with completed types would be incomplete — see TestResolvePartialResults).
 func TestResolveServfail(t *testing.T) {
 	f := newFakeResolver()
 	f.setErr("mail.example.com", TypeA, &QueryError{Kind: ErrTemporary, Host: "mail.example.com", Type: TypeA, Err: errors.New("server misbehaving")})
 	f.setErr("mail.example.com", TypeAAAA, errors.New("untyped resolver failure"))
 	f.setErr("mail.example.com", TypeCNAME, &QueryError{Kind: ErrFailure, Host: "mail.example.com", Type: TypeCNAME, Err: errors.New("refused")})
+	for _, rt := range []RecordType{TypeMX, TypeTXT, TypeNS, TypeSRV} {
+		f.setErr("mail.example.com", rt, &QueryError{Kind: ErrFailure, Host: "mail.example.com", Type: rt, Err: errors.New("refused")})
+	}
 	cfg := testConfig(f)
 
 	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "mail.example.com")})
@@ -239,7 +277,7 @@ func TestResolveServfail(t *testing.T) {
 	if hr.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed when every type failed", hr.Status)
 	}
-	for _, rt := range []RecordType{TypeA, TypeAAAA, TypeCNAME} {
+	for _, rt := range hostTypes {
 		tr := typeResultFor(hr, hr.Host, rt)
 		if tr.Status != TypeFailed {
 			t.Fatalf("%s type status = %s, want failed", rt, tr.Status)
@@ -407,9 +445,10 @@ func TestResolveCancellationLastQueryStdlibShape(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			// Query plan for one host, strictly sequential within its single
-			// pool job: host A(1), AAAA(2), CNAME(3), target A(4), target
-			// AAAA(5). Cancel while query 5 is in flight.
-			f.setCancelInFlight(5, cancel, flags)
+			// pool job: host A(1), AAAA(2), CNAME(3), MX(4), TXT(5), NS(6),
+			// SRV(7), target A(8), target AAAA(9). Cancel while query 9 is
+			// in flight.
+			f.setCancelInFlight(9, cancel, flags)
 
 			cfg := testConfig(f)
 			hosts := []asset.Host{mustHost(t, "www.example.com")}
@@ -438,9 +477,9 @@ func TestResolveCancellationLastQueryStdlibShape(t *testing.T) {
 			if tr.Status != TypeCancelled {
 				t.Fatalf("target AAAA status = %s, want cancelled", tr.Status)
 			}
-			// Exactly 5 queries issued; no query after the context was done.
-			if got := f.callCount(); got != 5 {
-				t.Fatalf("calls = %d, want 5", got)
+			// Exactly 9 queries issued; no query after the context was done.
+			if got := f.callCount(); got != 9 {
+				t.Fatalf("calls = %d, want 9", got)
 			}
 		})
 	}
@@ -468,9 +507,9 @@ func TestResolveSelfCNAME(t *testing.T) {
 	if len(hr.Targets) != 0 {
 		t.Fatalf("self-target must not become a target asset: %v", hostNames(hr.Targets))
 	}
-	// Only the 3 host queries; the self-target is not resolved further.
-	if got := f.callCount(); got != 3 {
-		t.Fatalf("calls = %d, want 3", got)
+	// Only the 7 host queries; the self-target is not resolved further.
+	if got := f.callCount(); got != 7 {
+		t.Fatalf("calls = %d, want 7", got)
 	}
 }
 
@@ -490,8 +529,8 @@ func TestResolveCNAMENormalization(t *testing.T) {
 	requireEqualStrings(t, "CNAME targets", hostNames(cname.Hosts), []string{"origin.example.net"})
 	requireEqualStrings(t, "targets", hostNames(hr.Targets), []string{"origin.example.net"})
 	// The target's address resolution ran against the canonical name.
-	if got := f.callCount(); got != 5 {
-		t.Fatalf("calls = %d, want 5", got)
+	if got := f.callCount(); got != 9 {
+		t.Fatalf("calls = %d, want 9", got)
 	}
 }
 
@@ -531,8 +570,8 @@ func TestResolveCNAMEMultiHopFlattening(t *testing.T) {
 }
 
 // TestResolveDepthOneBound verifies the depth-1 boundary precisely: the
-// CNAME target's A/AAAA are resolved, its CNAME is never queried, and
-// nothing deeper exists by construction (CNAME loops are impossible).
+// target's A/AAAA are resolved, its host-target types are never queried, and
+// nothing deeper exists by construction (alias loops are impossible).
 func TestResolveDepthOneBound(t *testing.T) {
 	f := newFakeResolver()
 	f.set("www.example.com", TypeCNAME, "origin.example.net")
@@ -545,8 +584,8 @@ func TestResolveDepthOneBound(t *testing.T) {
 	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "www.example.com")})
 	hr := hostByName(t, rep, "www.example.com")
 
-	if got := f.callCount(); got != 5 {
-		t.Fatalf("calls = %d, want 5 (host A/AAAA/CNAME + target A/AAAA; never target CNAME)", got)
+	if got := f.callCount(); got != 9 {
+		t.Fatalf("calls = %d, want 9 (host A/AAAA/CNAME/MX/TXT/NS/SRV + target A/AAAA; never target host-target types)", got)
 	}
 	// The target's empty AAAA (NODATA) is a legitimate completed observation;
 	// the queried hosts are exactly the input host and its direct target.
@@ -556,6 +595,7 @@ func TestResolveDepthOneBound(t *testing.T) {
 	}
 	want := []string{
 		"www.example.com:A", "www.example.com:AAAA", "www.example.com:CNAME",
+		"www.example.com:MX", "www.example.com:TXT", "www.example.com:NS", "www.example.com:SRV",
 		"origin.example.net:A", "origin.example.net:AAAA",
 	}
 	requireEqualStrings(t, "query plan", queried, want)

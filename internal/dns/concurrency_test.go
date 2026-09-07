@@ -35,9 +35,10 @@ func TestResolveConcurrent(t *testing.T) {
 	if len(rep.Results) != n {
 		t.Fatalf("results = %d, want %d", len(rep.Results), n)
 	}
-	// Exactly 5 queries per host (host A/AAAA/CNAME + target A/AAAA).
-	if got := f.callCount(); got != n*5 {
-		t.Fatalf("calls = %d, want %d", got, n*5)
+	// Exactly 9 queries per host (host A/AAAA/CNAME/MX/TXT/NS/SRV + target
+	// A/AAAA).
+	if got := f.callCount(); got != n*9 {
+		t.Fatalf("calls = %d, want %d", got, n*9)
 	}
 	errors := 0
 	for _, hr := range rep.Results {
@@ -172,8 +173,8 @@ func TestResolveRateLimiterDisabled(t *testing.T) {
 	cfg := testConfig(f) // Rate 0 from testConfig
 
 	rep := runOne(t, f, cfg, []asset.Host{mustHost(t, "www.example.com")})
-	if got := f.callCount(); got != 3 {
-		t.Fatalf("calls = %d, want 3 (pacing disabled)", got)
+	if got := f.callCount(); got != 7 {
+		t.Fatalf("calls = %d, want 7 (pacing disabled)", got)
 	}
 	hr := hostByName(t, rep, "www.example.com")
 	if hr.Status != StatusCompleted {

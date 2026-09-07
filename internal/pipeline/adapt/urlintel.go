@@ -219,6 +219,9 @@ func NewURLIntelStage(runner discovery.Runner, lookPath discovery.LookupFunc) pi
 // Name implements pipeline.Stage.
 func (s *urlintelStage) Name() pipeline.StageName { return pipeline.StageURLIntel }
 
+// Level implements pipeline.LeveledStage: urlintel needs the declared target only.
+func (s *urlintelStage) Level() int { return 2 }
+
 // Run implements pipeline.Stage.
 func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
@@ -275,6 +278,10 @@ func (s *urlintelStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 		// clock = the engine's wall clock.
 		Cache: in.Cache,
 		Clock: in.Clock,
+		// The run's shared instrumentation sink (nil = off): task/cache/progress
+		// events reach the live TUI frame. Engines never invent events, only
+		// forward the sink.
+		Observer: in.Observer,
 	}
 
 	// The detected tool version enters the engine's cache keys together with

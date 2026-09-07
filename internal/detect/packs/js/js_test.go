@@ -377,6 +377,142 @@ func TestJSPackDeterminismGolden(t *testing.T) {
 	golden.Compare(t, "testdata/js_report.golden", b1)
 }
 
+// snapWithBody builds a snapshot of one script asset plus its retained
+// body (SDK v2.1 content channel).
+func snapWithBody(t testing.TB, rawURL, body string) detect.Snapshot {
+	t.Helper()
+	js := mustJS(t, rawURL)
+	return detect.Snapshot{
+		JavaScript:        []asset.JavaScript{js},
+		JavaScriptContent: []detect.JavaScriptContent{{Identity: js.Identity(), Body: body}},
+	}
+}
+
+// TestJSPackDomXSSBodyEmits pins NEW-118: with a retained body carrying a
+// real sink, the rule fires; a safe body stays quiet; and a body-less
+// snapshot stays silent (fail-open — the pre-118 zero behavior preserved
+// where no bodies were retained).
+func TestJSPackDomXSSBodyEmits(t *testing.T) {
+	reg := registerJSPack(t)
+	run := func(snap detect.Snapshot) int {
+		t.Helper()
+		cfg := detect.DefaultEngineConfig(reg)
+		cfg.Clock = testClock
+		rep, err := detect.Run(context.Background(), cfg, snap)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		var count int
+		for _, f := range rep.Findings {
+			if f.RuleID == ruleDomXSS {
+				count++
+				if f.Subject.Kind != asset.KindJavaScript {
+					t.Fatalf("subject kind %s, want javascript", f.Subject.Kind)
+				}
+			}
+		}
+		return count
+	}
+	if got := run(snapWithBody(t, "https://www.example.com/vuln_xss.js", `el.innerHTML = location.hash;`)); got != 1 {
+		t.Fatalf("vuln body findings = %d, want 1", got)
+	}
+	if got := run(snapWithBody(t, "https://www.example.com/safe_xss.js", `el.textContent = "safe";`)); got != 0 {
+		t.Fatalf("safe body findings = %d, want 0", got)
+	}
+	if got := run(buildXSSSnapshot(t)); got != 0 {
+		t.Fatalf("body-less snapshot findings = %d, want 0 (fail-open preserved)", got)
+	}
+}
+
+// TestJSPackPostMessageBodyEmits pins NEW-118 for the postMessage rule:
+// a handler without an origin check fires; one with a check stays
+// quiet; body-less stays silent.
+func TestJSPackPostMessageBodyEmits(t *testing.T) {
+	reg := registerJSPack(t)
+	run := func(snap detect.Snapshot) int {
+		t.Helper()
+		cfg := detect.DefaultEngineConfig(reg)
+		cfg.Clock = testClock
+		rep, err := detect.Run(context.Background(), cfg, snap)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		var count int
+		for _, f := range rep.Findings {
+			if f.RuleID == rulePostMessage {
+				count++
+			}
+		}
+		return count
+	}
+	vuln := `window.addEventListener("message", function(e){ console.log(e.data); });`
+	if got := run(snapWithBody(t, "https://www.example.com/vuln_pm.js", vuln)); got != 1 {
+		t.Fatalf("vuln body findings = %d, want 1", got)
+	}
+	safe := `window.addEventListener("message", function(e){ if (e.origin !== "https://example.com") return; console.log(e.data); });`
+	if got := run(snapWithBody(t, "https://www.example.com/safe_pm.js", safe)); got != 0 {
+		t.Fatalf("safe body findings = %d, want 0", got)
+	}
+	if got := run(buildPostMessageSnapshot(t)); got != 0 {
+		t.Fatalf("body-less snapshot findings = %d, want 0 (fail-open preserved)", got)
+	}
+}
+
+// TestJSPackProtoBodyEmits pins NEW-118 for the prototype-pollution
+// rule: a __proto__ assignment fires; benign assignments stay quiet;
+// body-less stays silent.
+func TestJSPackProtoBodyEmits(t *testing.T) {
+	reg := registerJSPack(t)
+	run := func(snap detect.Snapshot) int {
+		t.Helper()
+		cfg := detect.DefaultEngineConfig(reg)
+		cfg.Clock = testClock
+		rep, err := detect.Run(context.Background(), cfg, snap)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		var count int
+		for _, f := range rep.Findings {
+			if f.RuleID == ruleProtoPollute {
+				count++
+			}
+		}
+		return count
+	}
+	if got := run(snapWithBody(t, "https://www.example.com/vuln_proto.js", `obj.__proto__.polluted = true;`)); got != 1 {
+		t.Fatalf("vuln body findings = %d, want 1", got)
+	}
+	if got := run(snapWithBody(t, "https://www.example.com/safe_proto.js", `obj.normal = true; a.b = 1;`)); got != 0 {
+		t.Fatalf("safe body findings = %d, want 0", got)
+	}
+	if got := run(buildProtoSnapshot(t)); got != 0 {
+		t.Fatalf("body-less snapshot findings = %d, want 0 (fail-open preserved)", got)
+	}
+}
+
+// TestJSPackRuleVersions pins the rule-content bump contract: the
+// body-driven rewrites bumped each rule to 1.1.0, the Slice 3
+// subject-attribution change (chunk-window subjects normalize to the
+// FILE identity with file-relative offsets in evidence/metadata)
+// bumped them to 1.2.0, and the NEW-123 token-aware precision redesign
+// (code-mask structural predicates replacing substring heuristics) bumps
+// them to 1.3.0 — which changes rule cache keys by construction
+// (old records never replay).
+func TestJSPackRuleVersions(t *testing.T) {
+	rules, err := Rules()
+	if err != nil {
+		t.Fatalf("Rules: %v", err)
+	}
+	if len(rules) != 3 {
+		t.Fatalf("pack carries %d rules, want 3", len(rules))
+	}
+	for _, r := range rules {
+		if r.Version != "1.3.0" {
+			t.Errorf("rule %q version %q, want 1.3.0 (token-aware precision rewrite)", r.ID, r.Version)
+		}
+	}
+}
+
 func TestJSPackDomXSSEmits(t *testing.T) {
 	reg := registerJSPack(t)
 	snap := buildXSSSnapshot(t)

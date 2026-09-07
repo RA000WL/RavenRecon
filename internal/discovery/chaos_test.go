@@ -198,6 +198,28 @@ func TestChaosMalformedLines(t *testing.T) {
 	}
 }
 
+func TestChaosBareWordsRejected(t *testing.T) {
+	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
+		"chaos -d example.com -silent -json": func(Cmd) (RunResult, error) {
+			// NEW-130: tool chatter lines leak bare words; they must
+			// count malformed, never become hosts.
+			return RunResult{Stdout: []byte("no\n{\"domain\":\"ok.example.com\"}\nYES\n")}, nil
+		},
+	})
+	c := chaos{env: chaosEnv(r, newFakeLookup())}
+	c.env.name = "chaos"
+	dres, err := c.Discover(context.Background(), mustDomain(t, "example.com"))
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(dres.Hosts) != 1 || dres.Hosts[0].Name != "ok.example.com" {
+		t.Fatalf("hosts = %v, want [ok.example.com]", names(dres.Hosts))
+	}
+	if dres.Malformed != 2 {
+		t.Fatalf("malformed = %d, want 2 (bare no + YES)", dres.Malformed)
+	}
+}
+
 func TestChaosDedupAndSorting(t *testing.T) {
 	r := newFakeRunner(t, map[string]func(Cmd) (RunResult, error){
 		"chaos -d example.com -silent -json": func(Cmd) (RunResult, error) {

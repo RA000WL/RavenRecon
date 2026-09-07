@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/secrentel"
 	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
@@ -55,6 +56,9 @@ func NewSecretIntelStage(db *patterns.DB) pipeline.Stage {
 
 // Name implements pipeline.Stage.
 func (s *secretIntelStage) Name() pipeline.StageName { return pipeline.StageSecretIntel }
+
+// Level implements pipeline.LeveledStage: secrets need jsintel documents.
+func (s *secretIntelStage) Level() int { return 5 }
 
 // Run implements pipeline.Stage.
 //
@@ -288,6 +292,10 @@ func (s *secretIntelStage) runIngest(ctx context.Context, in pipeline.StageInput
 		// clock; the engine tolerates nil either way.
 		Clock: in.Clock,
 		Cache: in.Cache,
+		// Observer passes through: nil = pool instrumentation off (zero
+		// behavior change); the runner's StageInput.Observer carries the
+		// run's shared sink.
+		Observer: in.Observer,
 		// Constructor test seam: nil = the engine's production database
 		// (patterns.Load). The per-document analysis caps
 		// (MaxCandidatesPerDocument / MaxEvidencePerCandidate) stay at 0 =
@@ -445,14 +453,26 @@ func filterDocuments(docs []pipeline.Document) []pipeline.Document {
 // Run), and Source stays "" so the engine uses its documented default
 // provenance name "secrentel". ObservedAt stays zero so the engine stamps
 // the run clock (in.Clock) — deterministic through the injected clock.
+//
+// Chunk documents (NEW-129 Slice 1) cite the FILE: a chunk identity parses
+// through asset.ParseChunkIdentity (the single normalization point — no
+// chunk-string splitting here) to its file JS identity, which becomes the
+// SourceAsset, so a value found in a window merges with the same value found
+// by jsintel's file-sourced analysis under the (type,value,source=file)
+// dedup key, first-seen-wins in index order.
 func toSecretDocuments(docs []pipeline.Document) []secrentel.Document {
 	out := make([]secrentel.Document, 0, len(docs))
 	for _, d := range docs {
+		src := d.Identity
+		if file, _, _, _, _, _, _, perr := asset.ParseChunkIdentity(d.Identity); perr == nil {
+			src = asset.Identity{Kind: asset.KindJavaScript, Value: file.String()}
+		}
+		srcCopy := src
 		out = append(out, secrentel.Document{
 			Kind:        secrentel.KindJS,
 			Content:     d.Content,
 			URL:         d.URL,
-			SourceAsset: &d.Identity,
+			SourceAsset: &srcCopy,
 			Source:      "",
 		})
 	}

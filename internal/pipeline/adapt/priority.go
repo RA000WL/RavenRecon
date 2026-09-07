@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
@@ -36,6 +39,15 @@ const priorityPathsTruncated = "priority_paths_truncated"
 // validation rejects — a pathological URL degrades to an explicit
 // truncation signal, never a failed asset (NEW-14).
 const priorityParamsTruncated = "priority_params_truncated"
+
+// prioritySignalsTruncated is the sticky flag this adapter records when
+// the URL-signal enrichment cut a bounded family (technologies, secrets,
+// or headers over the engine's per-signal bounds, or an overlong header
+// line truncated to the engine's line bound). Like priorityParamsTruncated
+// it marks a derivation cut — the asset still scores on the retained
+// head — and it fires independently of it. Neither cut is ever swallowed
+// (AGENTS §0.6).
+const prioritySignalsTruncated = "priority_signals_truncated"
 
 // priorityStage adapts internal/priority (priority.Score) into a
 // pipeline.Stage.
@@ -82,6 +94,9 @@ func NewPriorityStage(interesting, risk *priority.Catalog) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriority }
 
+// Level implements pipeline.LeveledStage: scoring needs the whole corpus.
+func (s *priorityStage) Level() int { return 6 }
+
 // Run implements pipeline.Stage.
 //
 // Engine config is derived from StageInput only:
@@ -112,10 +127,21 @@ func (s *priorityStage) Name() pipeline.StageName { return pipeline.StagePriorit
 // canonical query string (the URL asset itself carries the query; the
 // adapter derives the names deterministically — the canonical query has
 // sorted keys, so the parameter-name list is deterministic by
-// construction). All other signal fields (port, service, headers,
-// technologies, secrets, bundle sizes, first-seen, ...) stay zero: the
-// pipeline corpus does not carry those observation channels yet. The
-// adapter never fabricates observations.
+// construction). URL signals additionally carry what the earlier stages
+// observed about that URL, resolved from the results channel by URL
+// identity (NEW-119): detected technologies (url_to_technology edges),
+// secret candidates (url_to_secret_candidate edges), final-response
+// headers (urllive LiveRecords, rendered as sorted lowercased
+// "key: value" lines), the JavaScript bundle size (jsintel assets), and
+// the endpoint method (most specific observed method wins over plain GET).
+// Every family is deterministically ordered and bounded to the engine's
+// per-signal bounds (32 technologies, 32 secrets, 128 header lines of at
+// most 512 bytes each); cuts set priority_signals_truncated. Corrupt
+// upstream entries (empty names, non-[0,1] confidences, unknown secret
+// types) are filtered — engine-validated data never triggers this. Ports
+// and services stay zero: they are keyed by address in the results
+// channel with no host linkage, so no URL signal can honestly claim them.
+// The adapter never fabricates observations.
 //
 // Boundary (mandatory, both sides): input corpus entries are pre-filtered
 // with pipeline.InDomain/FilterHosts and filterURLs (canonical names only —
@@ -203,7 +229,7 @@ func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 	// single normalization point.
 	if len(domains)+len(hosts)+len(urls) == 0 {
 		if !targetCanonical(in.Target) {
-			return s.runScore(ctx, in, nil, false)
+			return s.runScore(ctx, in, nil, false, false)
 		}
 		if err := ctx.Err(); err != nil {
 			wrapped := fmt.Errorf("stage %s: %w", s.Name(), err)
@@ -213,21 +239,22 @@ func (s *priorityStage) Run(ctx context.Context, in pipeline.StageInput) (pipeli
 	}
 
 	// One signal per in-scope corpus asset, carrying only what the corpus
-	// assets canonically carry (see Run). A URL whose query yields more
-	// parameter names than the engine's bound truncates the derivation and
-	// reports it (NEW-14).
-	sigs, paramsTruncated := buildPrioritySignals(domains, hosts, urls)
-	return s.runScore(ctx, in, sigs, paramsTruncated)
+	// assets canonically carry plus the results-channel enrichment for
+	// URLs (see Run). A URL whose query yields more parameter names than
+	// the engine's bound truncates the derivation and reports it (NEW-14).
+	sigs, paramsTruncated, signalsTruncated := buildPrioritySignals(domains, hosts, urls, in.Results)
+	return s.runScore(ctx, in, sigs, paramsTruncated, signalsTruncated)
 }
 
 // runScore derives the engine config from the StageInput, calls
 // priority.Score, and maps the engine's report and error onto the
 // pipeline's StageResult shape. It is shared by the normal path and the
 // non-canonical-target fall-through so both honor the identical error and
-// cancellation mapping. paramsTruncated (NEW-14) applies the parameter-name
-// truncation signal to every returned result — on any outcome path: a cut
-// input set is never silently completed, even when the engine itself fails.
-func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, sigs []priority.Signal, paramsTruncated bool) (res pipeline.StageResult, _ error) {
+// cancellation mapping. paramsTruncated (NEW-14) and signalsTruncated
+// (NEW-119) apply their truncation signals to every returned result — on
+// any outcome path: a cut input set is never silently completed, even
+// when the engine itself fails.
+func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, sigs []priority.Signal, paramsTruncated, signalsTruncated bool) (res pipeline.StageResult, _ error) {
 	defer func() {
 		if paramsTruncated {
 			// The derivation retained only the first
@@ -238,6 +265,16 @@ func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, si
 				res.StickyFlags = make(map[string]bool)
 			}
 			res.StickyFlags[priorityParamsTruncated] = true
+		}
+		if signalsTruncated {
+			// The enrichment cut a bounded family (or truncated an
+			// overlong header line) for at least one URL signal: mark
+			// the retained set incomplete (AGENTS §0.6).
+			res.Truncated = true
+			if res.StickyFlags == nil {
+				res.StickyFlags = make(map[string]bool)
+			}
+			res.StickyFlags[prioritySignalsTruncated] = true
 		}
 	}()
 	cfg := priority.EngineConfig{
@@ -258,6 +295,10 @@ func (s *priorityStage) runScore(ctx context.Context, in pipeline.StageInput, si
 		// clock; the engine tolerates nil either way.
 		Clock: in.Clock,
 		Cache: in.Cache,
+		// Observer passes through: nil = pool instrumentation off (zero
+		// behavior change); the runner's StageInput.Observer carries the
+		// run's shared sink.
+		Observer: in.Observer,
 		// Constructor test seam: nil/nil = the engine's production tables.
 		Interesting: s.interesting,
 		Risk:        s.risk,
@@ -411,16 +452,16 @@ func filterDomains(declared asset.Domain, domains []asset.Domain) []asset.Domain
 
 // buildPrioritySignals maps the in-scope corpus assets onto one
 // priority.Signal each, carrying only what the corpus assets canonically
-// carry (see priorityStage.Run): domains and hosts contribute their
-// canonical names as the hostname field; URLs contribute their canonical
-// path, hostname, and the parameter names derived from the canonical query
-// string. The order is deterministic (the filtered slices are in corpus
-// order: domains, then hosts, then URLs). The second return reports whether
-// any URL's parameter-name derivation was cut at the engine's bound
-// (NEW-14).
-func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []asset.URL) ([]priority.Signal, bool) {
+// carry (see priorityStage.Run) plus the results-channel enrichment for
+// URLs (see Run). The order is deterministic (the filtered slices are in
+// corpus order: domains, then hosts, then URLs). The second return reports
+// whether any URL's parameter-name derivation was cut at the engine's
+// bound (NEW-14); the third reports whether any URL's enrichment was cut
+// at an engine bound (NEW-119).
+func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []asset.URL, res pipeline.Results) ([]priority.Signal, bool, bool) {
 	sigs := make([]priority.Signal, 0, len(domains)+len(hosts)+len(urls))
 	paramsTruncated := false
+	signalsTruncated := false
 	for _, d := range domains {
 		sigs = append(sigs, priority.Signal{
 			Identity: d.Identity(),
@@ -435,6 +476,7 @@ func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []ass
 			Hostname: h.Name,
 		})
 	}
+	enrich := indexSignalEnrichment(res)
 	for _, u := range urls {
 		h, ok := urlHost(u)
 		if !ok {
@@ -444,15 +486,288 @@ func buildPrioritySignals(domains []asset.Domain, hosts []asset.Host, urls []ass
 		}
 		names, truncated := queryParamNames(u.Query)
 		paramsTruncated = paramsTruncated || truncated
-		sigs = append(sigs, priority.Signal{
+		sig := priority.Signal{
 			Identity:       u.Identity(),
 			Kind:           asset.KindURL,
 			Path:           u.Path,
 			Hostname:       h.Name,
 			ParameterNames: names,
-		})
+		}
+		if cut := enrichURLSignal(&sig, u, enrich); cut {
+			signalsTruncated = true
+		}
+		sigs = append(sigs, sig)
 	}
-	return sigs, paramsTruncated
+	return sigs, paramsTruncated, signalsTruncated
+}
+
+// signalEnrichment indexes the results-channel observations URL signals
+// consume, keyed by canonical URL identity string. Built once per stage
+// run; per-signal attachment is map reads plus bounded, sorted retention.
+type signalEnrichment struct {
+	tech    map[string][]priority.TechSignal
+	secrets map[string][]priority.SecretSignal
+	headers map[string][]string
+	jsSize  map[string]int64
+	methods map[string][]string
+}
+
+// indexSignalEnrichment resolves technologies, secrets, headers, bundle
+// sizes, and endpoint methods by URL identity. Relationships the adapter
+// cannot resolve (edges to assets absent from the channel) are ignored:
+// no observation is fabricated for them. Every list is deterministically
+// ordered (sorted) so retention heads are stable.
+func indexSignalEnrichment(res pipeline.Results) *signalEnrichment {
+	e := &signalEnrichment{
+		tech:    make(map[string][]priority.TechSignal),
+		secrets: make(map[string][]priority.SecretSignal),
+		headers: make(map[string][]string),
+		jsSize:  make(map[string]int64),
+		methods: make(map[string][]string),
+	}
+	techByID := make(map[string]asset.Technology, len(res.Technologies))
+	for _, t := range res.Technologies {
+		techByID[t.Identity().String()] = t
+	}
+	secretByID := make(map[string]asset.SecretCandidate, len(res.Secrets))
+	for _, s := range res.Secrets {
+		secretByID[s.Identity().String()] = s
+	}
+	for _, r := range res.Relationships {
+		switch r.Kind {
+		case asset.RelationshipURLToTechnology:
+			t, ok := techByID[r.To.String()]
+			if !ok {
+				continue
+			}
+			ts, ok := techSignal(t)
+			if !ok {
+				continue
+			}
+			e.tech[r.From.String()] = append(e.tech[r.From.String()], ts)
+		case asset.RelationshipURLToSecretCandidate:
+			s, ok := secretByID[r.To.String()]
+			if !ok {
+				continue
+			}
+			ss, ok := secretSignal(s)
+			if !ok {
+				continue
+			}
+			e.secrets[r.From.String()] = append(e.secrets[r.From.String()], ss)
+		}
+	}
+	for id, list := range e.tech {
+		e.tech[id] = dedupeTechSignals(list)
+	}
+	for id, list := range e.secrets {
+		e.secrets[id] = dedupeSecretSignals(list)
+	}
+	for _, rec := range res.LiveRecords {
+		id := rec.URL.Identity().String()
+		if _, ok := e.headers[id]; ok {
+			continue // first-seen wins (the merge already dedups; defensive)
+		}
+		e.headers[id] = renderHeaderLines(rec.Headers)
+	}
+	for _, js := range res.JavaScript {
+		if js.Size <= 0 {
+			continue // zero means "not observed"
+		}
+		id := js.URL.Identity().String()
+		if _, ok := e.jsSize[id]; !ok {
+			e.jsSize[id] = js.Size
+		}
+	}
+	for _, ep := range res.Endpoints {
+		id := ep.URL.Identity().String()
+		e.methods[id] = append(e.methods[id], ep.Method)
+	}
+	for id, list := range e.methods {
+		sort.Strings(list)
+		e.methods[id] = dedupeStrings(list)
+	}
+	return e
+}
+
+// techSignal maps one technology asset onto its signal. Confidence is the
+// asset's own Prov.Confidence — never invented. Invalid entries (empty
+// names, non-[0,1] confidences) are refused: engine-validated data never
+// triggers this, and a corrupt entry must not fail the asset.
+func techSignal(t asset.Technology) (priority.TechSignal, bool) {
+	if t.Name == "" {
+		return priority.TechSignal{}, false
+	}
+	c := t.Prov.Confidence
+	if math.IsNaN(c) || c < 0 || c > 1 {
+		return priority.TechSignal{}, false
+	}
+	return priority.TechSignal{
+		Name:       t.Name,
+		Category:   string(t.Category),
+		Confidence: c,
+		Identity:   t.Identity().Value,
+	}, true
+}
+
+// secretSignal maps one secret candidate onto its signal, with the same
+// contract as techSignal (unknown types and bad confidences refused).
+func secretSignal(s asset.SecretCandidate) (priority.SecretSignal, bool) {
+	if !s.Type.Valid() {
+		return priority.SecretSignal{}, false
+	}
+	c := s.Prov.Confidence
+	if math.IsNaN(c) || c < 0 || c > 1 {
+		return priority.SecretSignal{}, false
+	}
+	return priority.SecretSignal{
+		Type:       s.Type,
+		Confidence: c,
+		Identity:   s.Identity().String(),
+	}, true
+}
+
+// renderHeaderLines renders one live record's headers as the engine's
+// "key: value" lines: keys lowercased, one line per value, values sorted
+// per key, keys sorted. The rendering is total and deterministic.
+func renderHeaderLines(h map[string][]string) []string {
+	if len(h) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		vals := append([]string(nil), h[k]...)
+		sort.Strings(vals)
+		for _, v := range vals {
+			out = append(out, strings.ToLower(k)+": "+v)
+		}
+	}
+	return out
+}
+
+// enrichURLSignal attaches one URL's enrichment to its signal, retaining
+// deterministic sorted heads at the engine's per-signal bounds. It
+// reports whether any family was cut (or a header line truncated): the
+// caller maps that onto priority_signals_truncated.
+func enrichURLSignal(sig *priority.Signal, u asset.URL, e *signalEnrichment) (cut bool) {
+	id := u.Identity().String()
+	if techs := e.tech[id]; len(techs) > 0 {
+		if len(techs) > priority.MaxSignalTechnologies {
+			techs = techs[:priority.MaxSignalTechnologies]
+			cut = true
+		}
+		sig.Technologies = techs
+	}
+	if secrets := e.secrets[id]; len(secrets) > 0 {
+		if len(secrets) > priority.MaxSignalSecrets {
+			secrets = secrets[:priority.MaxSignalSecrets]
+			cut = true
+		}
+		sig.Secrets = secrets
+	}
+	if headers := e.headers[id]; len(headers) > 0 {
+		// Copy before truncating: the map's backing array is shared
+		// across signals for duplicate corpus URLs, and enriching one
+		// signal must never mutate another's retained lines.
+		headers = append([]string(nil), headers...)
+		if len(headers) > priority.MaxSignalHeaders {
+			headers = headers[:priority.MaxSignalHeaders]
+			cut = true
+		}
+		for i, h := range headers {
+			if len(h) > priority.MaxSignalHeaderBytes {
+				headers[i] = truncateHeaderLine(h)
+				cut = true
+			}
+		}
+		sig.Headers = headers
+	}
+	if size, ok := e.jsSize[id]; ok {
+		sig.JSBundleBytes = size
+	}
+	if methods := e.methods[id]; len(methods) > 0 {
+		sig.EndpointMethod = preferredMethod(methods)
+	}
+	return cut
+}
+
+// preferredMethod selects one method for a URL observed with several:
+// the sorted-first non-GET method (the specific class — GQL, SSE, WS —
+// carries the signal; plain GET is the default), else GET. Endpoint
+// methods are canonically ≤16 bytes (asset.maxMethodBytes), so the
+// engine's method bound cannot fire; overlong values are skipped
+// defensively and never fail the asset.
+func preferredMethod(methods []string) string {
+	for _, m := range methods {
+		if len(m) > priority.MaxSignalMethodBytes {
+			continue
+		}
+		if m != "GET" {
+			return m
+		}
+	}
+	for _, m := range methods {
+		if len(m) <= priority.MaxSignalMethodBytes {
+			return m
+		}
+	}
+	return ""
+}
+
+// truncateHeaderLine bounds one rendered header line to the engine's per-
+// line bound, backing off to a UTF-8 boundary so reports stay valid.
+func truncateHeaderLine(h string) string {
+	if len(h) <= priority.MaxSignalHeaderBytes {
+		return h
+	}
+	h = h[:priority.MaxSignalHeaderBytes]
+	for len(h) > 0 && !utf8.ValidString(h) {
+		h = h[:len(h)-1]
+	}
+	return h
+}
+
+func dedupeTechSignals(in []priority.TechSignal) []priority.TechSignal {
+	sort.Slice(in, func(i, j int) bool { return in[i].Identity < in[j].Identity })
+	out := in[:0]
+	var prev string
+	for i, ts := range in {
+		if i == 0 || ts.Identity != prev {
+			out = append(out, ts)
+			prev = ts.Identity
+		}
+	}
+	return out
+}
+
+func dedupeSecretSignals(in []priority.SecretSignal) []priority.SecretSignal {
+	sort.Slice(in, func(i, j int) bool { return in[i].Identity < in[j].Identity })
+	out := in[:0]
+	var prev string
+	for i, ss := range in {
+		if i == 0 || ss.Identity != prev {
+			out = append(out, ss)
+			prev = ss.Identity
+		}
+	}
+	return out
+}
+
+func dedupeStrings(in []string) []string {
+	out := in[:0]
+	var prev string
+	for i, s := range in {
+		if i == 0 || s != prev {
+			out = append(out, s)
+			prev = s
+		}
+	}
+	return out
 }
 
 // queryParamNames derives the parameter-name list from a canonical query

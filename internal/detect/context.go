@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
@@ -25,6 +26,45 @@ const (
 	maxSnapshotJavaScript    = 50_000
 	maxSnapshotEndpoints     = 100_000
 )
+
+// Retained-script-body bounds (SDK v2.1, NEW-118). MaxSnapshotJSContents,
+// MaxSnapshotJSContentBytes, and MaxSnapshotJSContentBodyBytes are
+// exported so callers composing snapshots (the pipeline adapter trims
+// its document channel to these) share the exact limits the engine
+// enforces: entries beyond the count, sets beyond the byte budget, or
+// bodies beyond the per-body bound are rejected outright — never
+// silently truncated, which would silently change findings.
+const (
+	// MaxSnapshotJSContents bounds retained script bodies per snapshot.
+	MaxSnapshotJSContents = 1024
+	// MaxSnapshotJSContentBytes bounds retained script body bytes per
+	// snapshot, summed over bodies (64 MiB).
+	MaxSnapshotJSContentBytes = 67108864
+)
+
+// MaxSnapshotJSContentBodyBytes bounds one retained script body (2 MiB).
+// It mirrors the pipeline document channel's MaxDocumentBytes (a detect→
+// pipeline import would cycle, so the value is repeated here with the
+// provenance documented): bodies are complete retained observations,
+// never truncated prefixes.
+const MaxSnapshotJSContentBodyBytes = 2097152
+
+// JavaScriptContent is one retained script body attached to its observed
+// script asset (SDK v2.1, NEW-118). Identity MUST equal a snapshot
+// JavaScript asset identity — content for unobserved scripts is rejected,
+// so a finding can never cite an asset that was not observed — and Body
+// MUST be the complete retained body: truncated prefixes never enter
+// (producers drop them whole, mirroring the pipeline document channel),
+// and non-UTF-8 bodies are rejected (snapshot JSON must be byte-stable).
+// Bodies are read-only rule input; detectors must never mutate them
+// (per-rule clones share the backing strings, which are immutable).
+type JavaScriptContent struct {
+	// Identity is the canonical JavaScript asset identity the body was
+	// retained from.
+	Identity asset.Identity `json:"identity"`
+	// Body is the complete retained script body.
+	Body string `json:"body"`
+}
 
 // Snapshot is the caller-composed input of one detection run: the canonical
 // structured corpus the earlier phases produced. It is NOT untrusted tool
@@ -56,6 +96,14 @@ type Snapshot struct {
 
 	// JavaScript carries the observed script assets.
 	JavaScript []asset.JavaScript `json:"javascript,omitempty"`
+
+	// JavaScriptContent carries retained script bodies for the observed
+	// scripts (SDK v2.1, NEW-118): one entry per script, at most — the
+	// identity must equal a JavaScript asset identity in this snapshot.
+	// Absent bodies mean "not retained": rules treat scripts without
+	// bodies exactly as before (no finding), so snapshots without
+	// contents behave byte-identically to v2.0 runs.
+	JavaScriptContent []JavaScriptContent `json:"javascript_content,omitempty"`
 
 	// Endpoints carries the observed endpoints.
 	Endpoints []asset.Endpoint `json:"endpoints,omitempty"`
@@ -115,6 +163,11 @@ type Context struct {
 	// JavaScript is the identity-sorted, merged script assets.
 	JavaScript []asset.JavaScript `json:"javascript"`
 
+	// JavaScriptContent is the identity-sorted retained script bodies,
+	// one per observed script at most. Read-only rule input (see the
+	// type); absent for scripts whose bodies were not retained.
+	JavaScriptContent []JavaScriptContent `json:"javascript_content"`
+
 	// Endpoints is the identity-sorted, merged endpoints.
 	Endpoints []asset.Endpoint `json:"endpoints"`
 
@@ -155,14 +208,17 @@ type Context struct {
 //
 //   - one level deep at the Context's own fields: every corpus slice
 //     (Assets, Relationships, Evidence, Technologies, Secrets, JavaScript,
-//     Endpoints) is cloned via slices.Clone into a fresh backing array and
-//     Config via maps.Clone into a fresh map;
+//     JavaScriptContent, Endpoints) is cloned via slices.Clone into a fresh
+//     backing array and Config via maps.Clone into a fresh map;
 //   - no deeper copy is needed: the slice element types
 //     (asset.Identity/Relationship/Evidence/Technology/SecretCandidate/
-//     JavaScript/Endpoint) are immutable-by-value structs with no interior
-//     slices, maps, or pointers, so copying the struct isolates it fully —
-//     a rule mutating cp.Evidence[i].Value or appending to cp.Evidence
-//     cannot affect siblings or the engine's original corpus;
+//     JavaScript/JavaScriptContent/Endpoint) are immutable-by-value structs
+//     with no interior slices, maps, or pointers — JavaScriptContent.Body
+//     strings are immutable and shared read-only — so copying the struct
+//     isolates it fully: a rule mutating cp.Evidence[i].Value or appending
+//     to cp.Evidence cannot affect siblings or the engine's original
+//     corpus; a rule MUST never mutate a shared Body string (strings are
+//     immutable in Go, so this holds by construction);
 //   - Logger and Clock are shared interfaces (they are documented
 //     concurrency-safe seams, not per-rule state);
 //   - PriorFindings is the SDK v2 inter-rule view: the slice header is
@@ -190,6 +246,7 @@ func cloneContextForRule(src *Context) *Context {
 	cp.Technologies = slices.Clone(src.Technologies)
 	cp.Secrets = slices.Clone(src.Secrets)
 	cp.JavaScript = slices.Clone(src.JavaScript)
+	cp.JavaScriptContent = slices.Clone(src.JavaScriptContent)
 	cp.Endpoints = slices.Clone(src.Endpoints)
 	cp.PriorFindings = slices.Clone(src.PriorFindings)
 	for i := range cp.PriorFindings {
@@ -526,6 +583,17 @@ func normalizeSnapshot(s Snapshot) (*corpus, error) {
 		if err != nil || reparsed.Identity() != js.URL.Identity() {
 			return nil, fmt.Errorf("detect: snapshot javascript %d has a non-canonical URL", i)
 		}
+		// NEW-129 Slice 3: a script may carry a chunk fragment (one
+		// retained window of a truncated file's prefix, built by the
+		// jsintel stage through asset.ChunkJavaScriptIdentity). The
+		// fragment must read back through the single chunk parser —
+		// any other fragment is a caller bug, rejected like any other
+		// non-canonical snapshot entry.
+		if js.URL.Fragment != "" {
+			if _, ok := ChunkIdentityOfScript(js); !ok {
+				return nil, fmt.Errorf("detect: snapshot javascript %d carries a non-chunk fragment", i)
+			}
+		}
 		scripts = append(scripts, js)
 	}
 	c.context.JavaScript = mergeSortedScripts(scripts)
@@ -543,6 +611,64 @@ func normalizeSnapshot(s Snapshot) (*corpus, error) {
 		endpoints = append(endpoints, ep)
 	}
 	c.context.Endpoints = mergeSortedEndpoints(endpoints)
+
+	// JavaScriptContent (SDK v2.1, NEW-118).
+	if len(s.JavaScriptContent) > MaxSnapshotJSContents {
+		return nil, fmt.Errorf("detect: snapshot carries %d script contents over bound %d", len(s.JavaScriptContent), MaxSnapshotJSContents)
+	}
+	jsSet := make(map[asset.Identity]struct{}, len(c.context.JavaScript))
+	for _, js := range c.context.JavaScript {
+		jsSet[js.Identity()] = struct{}{}
+		// NEW-129 Slice 3: chunk bodies link by chunk identity — the
+		// snapshot's chunk scripts carry them (see mergeSortedScripts).
+		if cid, ok := ChunkIdentityOfScript(js); ok {
+			jsSet[cid] = struct{}{}
+		}
+	}
+	contents := make([]JavaScriptContent, 0, len(s.JavaScriptContent))
+	seenContent := make(map[asset.Identity]struct{}, len(s.JavaScriptContent))
+	var contentBytes int
+	for i, jc := range s.JavaScriptContent {
+		if jc.Identity.IsZero() {
+			return nil, fmt.Errorf("detect: snapshot script content %d is a zero identity", i)
+		}
+		if jc.Identity.Kind != asset.KindJavaScript {
+			return nil, fmt.Errorf("detect: snapshot script content %d (%s) is not a javascript identity", i, jc.Identity)
+		}
+		if _, ok := jsSet[jc.Identity]; !ok {
+			// NEW-129 Slice 3: chunk bodies link via their file when
+			// the snapshot carries no chunk script for them — the
+			// window's file part parses through the single chunk
+			// parser and must be an observed script (the pipeline's
+			// first-seen corpus merge keeps the file and drops the
+			// chunk scripts sharing its Identity, so detect-stage
+			// snapshots in production carry files only).
+			file, _, _, _, _, _, _, perr := asset.ParseChunkIdentity(jc.Identity)
+			if perr != nil {
+				return nil, fmt.Errorf("detect: snapshot script content %d cites unobserved script %s", i, jc.Identity)
+			}
+			if _, ok := jsSet[asset.Identity{Kind: asset.KindJavaScript, Value: file.String()}]; !ok {
+				return nil, fmt.Errorf("detect: snapshot script content %d cites unobserved script %s", i, jc.Identity)
+			}
+		}
+		if !utf8.ValidString(jc.Body) {
+			return nil, fmt.Errorf("detect: snapshot script content %d is not valid UTF-8", i)
+		}
+		if len(jc.Body) > MaxSnapshotJSContentBodyBytes {
+			return nil, fmt.Errorf("detect: snapshot script content %d is %d bytes over bound %d", i, len(jc.Body), MaxSnapshotJSContentBodyBytes)
+		}
+		if _, dup := seenContent[jc.Identity]; dup {
+			return nil, fmt.Errorf("detect: snapshot script content %d duplicates script %s", i, jc.Identity)
+		}
+		seenContent[jc.Identity] = struct{}{}
+		contentBytes += len(jc.Body)
+		if contentBytes > MaxSnapshotJSContentBytes {
+			return nil, fmt.Errorf("detect: snapshot script contents exceed %d bytes", MaxSnapshotJSContentBytes)
+		}
+		contents = append(contents, jc)
+	}
+	sort.Slice(contents, func(i, j int) bool { return contents[i].Identity.String() < contents[j].Identity.String() })
+	c.context.JavaScriptContent = contents
 
 	// Observed identity set and kind census.
 	for _, id := range c.context.Assets {
@@ -567,6 +693,15 @@ func normalizeSnapshot(s Snapshot) (*corpus, error) {
 	for _, js := range c.context.JavaScript {
 		c.observed[js.Identity()] = struct{}{}
 		c.kinds[asset.KindJavaScript]++
+		// NEW-129 Slice 3: a chunk script observes its window too — the
+		// chunk identity joins the observed set so content linkage and
+		// any chunk-citing validation see exactly what the snapshot
+		// carried. (The file identity above is shared by construction:
+		// a chunk URL's fragment is excluded from the canonical form.)
+		if cid, ok := ChunkIdentityOfScript(js); ok {
+			c.observed[cid] = struct{}{}
+			c.kinds[asset.KindJavaScript]++
+		}
 	}
 	for _, ep := range c.context.Endpoints {
 		c.observed[ep.Identity()] = struct{}{}
@@ -666,18 +801,113 @@ func mergeSortedSecrets(list []asset.SecretCandidate) []asset.SecretCandidate {
 	return out
 }
 
+// ChunkIdentityOfScript recovers the chunk identity a snapshot script
+// carries in its URL fragment (NEW-129 Slice 3 chunk assets): the file
+// part is the canonical URL string (fragments are excluded from it) and
+// the fragment cites the window, so rejoining them reproduces the
+// constructor's format exactly — which is then READ BACK through the
+// single chunk parser, never split ad hoc. ok is false for file scripts
+// (no fragment) and for malformed fragments.
+//
+// Single shared copy (NEW-129 Slice 3 review F1): the pipeline adapter
+// calls this function rather than keeping a twin — keep it that way.
+func ChunkIdentityOfScript(js asset.JavaScript) (asset.Identity, bool) {
+	if js.URL.Fragment == "" {
+		return asset.Identity{}, false
+	}
+	cid := asset.Identity{Kind: asset.KindJavaScript, Value: js.URL.String() + "#" + js.URL.Fragment}
+	if _, _, _, _, _, _, _, err := asset.ParseChunkIdentity(cid); err != nil {
+		return asset.Identity{}, false
+	}
+	return cid, true
+}
+
 func mergeSortedScripts(list []asset.JavaScript) []asset.JavaScript {
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].Identity().Value < list[j].Identity().Value
+	// NEW-129 Slice 3: file scripts merge by identity exactly as before;
+	// chunk scripts (fragment-carrying windows of one file, sharing its
+	// Identity) must NOT merge — each window is a distinct observation.
+	// Files keep the existing path verbatim (no-fragment snapshots merge
+	// byte-identically to before); chunks sort by parsed (file, index)
+	// NUMERIC — parsed once per chunk through asset.ParseChunkIdentity,
+	// string tie-break — and dedupe exact duplicates through the same
+	// merge primitive, appended after the files. Deterministic for any
+	// input multiset. (String order would misorder multi-digit windows:
+	// "10/.." sorts before "2/..", so the numeric index decides.)
+	var files, chunks []asset.JavaScript
+	for _, j := range list {
+		if j.URL.Fragment != "" {
+			chunks = append(chunks, j)
+		} else {
+			files = append(files, j)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Identity().Value < files[j].Identity().Value
 	})
 	out := make([]asset.JavaScript, 0, len(list))
-	for _, j := range list {
+	for _, j := range files {
 		if n := len(out); n > 0 {
 			if merged, err := asset.MergeJavaScripts(out[n-1], j); err == nil {
 				out[n-1] = merged
 				continue
 			}
 		}
+		out = append(out, j)
+	}
+	type chunkKey struct {
+		js    asset.JavaScript
+		cid   string
+		file  string
+		index int
+	}
+	keyed := make([]chunkKey, 0, len(chunks))
+	for _, j := range chunks {
+		ck := chunkKey{js: j, index: -1}
+		if cid, ok := ChunkIdentityOfScript(j); ok {
+			// Validated by ChunkIdentityOfScript, so this re-parse
+			// cannot fail: the file/index order key is parsed once
+			// here, never per comparison.
+			file, index, _, _, _, _, _, _ := asset.ParseChunkIdentity(cid)
+			ck.cid, ck.file, ck.index = cid.String(), file.String(), index
+		} else {
+			// Malformed fragment (test-only hand-rolled input — see
+			// below): no window to order by, keyed by raw fragment so
+			// it sorts deterministically ahead of valid windows.
+			ck.cid = j.URL.String() + "#" + j.URL.Fragment
+		}
+		keyed = append(keyed, ck)
+	}
+	sort.SliceStable(keyed, func(i, j int) bool {
+		if keyed[i].file != keyed[j].file {
+			return keyed[i].file < keyed[j].file
+		}
+		if keyed[i].index != keyed[j].index {
+			return keyed[i].index < keyed[j].index
+		}
+		return keyed[i].cid < keyed[j].cid
+	})
+	chunks = chunks[:0]
+	for _, k := range keyed {
+		chunks = append(chunks, k.js)
+	}
+	var prev string
+	for _, j := range chunks {
+		cid, ok := ChunkIdentityOfScript(j)
+		if !ok {
+			// Defensive, test-only: normalizeSnapshot validates
+			// fragments before merging, so only hand-rolled callers
+			// (tests) arrive here with a malformed fragment — keep it
+			// (never drop an observation silently) keyed by its raw
+			// fragment.
+			cid = asset.Identity{Kind: asset.KindJavaScript, Value: j.URL.String() + "#" + j.URL.Fragment}
+		}
+		if len(out) > len(files) && prev == cid.String() {
+			if merged, err := asset.MergeJavaScripts(out[len(out)-1], j); err == nil {
+				out[len(out)-1] = merged
+				continue
+			}
+		}
+		prev = cid.String()
 		out = append(out, j)
 	}
 	return out

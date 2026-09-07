@@ -53,8 +53,10 @@
 // per-rule finding bound 256 via deterministic truncation.
 //
 // This pack produces TESTING ASSIGNMENTS, not vulnerability claims: every
-// finding is CategoryInformation / PriorityInfo, StatusOpen, Confidence 0.6
-// (heuristic), with metadata naming the triage class and matched params.
+// finding is CategoryInformation / PriorityInfo, StatusOpen, confidence 0.6
+// for unenriched name-only matches or 0.8 when live reflection evidence
+// backs a flagged param (reflection_backed marker, heuristic), with
+// metadata naming the triage class and matched params.
 // It is recon-only (AGENTS §0.1).
 //
 // Loading sketch (SDK-only, no core edits):

@@ -234,6 +234,23 @@ func TestParseScanArgsMultiTarget(t *testing.T) {
 	}
 }
 
+func TestRunScanCanonicalDuplicateCollapse(t *testing.T) {
+	out := t.TempDir()
+	capture := &configCapture{}
+	var buf bytes.Buffer
+	args := []string{"WWW.Example.COM", "www.example.com.", " other.example.com ", "--stages", "discover", "--output", out}
+	if err := runScan(context.Background(), &buf, args, capture.seam, nil); err != nil {
+		t.Fatalf("runScan: %v", err)
+	}
+	cfgs := capture.snapshot()
+	if len(cfgs) != 2 {
+		t.Fatalf("ran %d configs, want 2 (case/dot/whitespace variants are one canonical target)", len(cfgs))
+	}
+	if cfgs[0].Target.Name != "www.example.com" || cfgs[1].Target.Name != "other.example.com" {
+		t.Fatalf("targets = [%s %s], want [www.example.com other.example.com] in first-occurrence order", cfgs[0].Target.Name, cfgs[1].Target.Name)
+	}
+}
+
 // TestRunScanMultiTargetSequential pins the core fan-out contract: two
 // positional targets run the existing pipeline once each, every seam
 // invocation receives ITS OWN ScanConfig with the correct canonical Target
@@ -407,6 +424,45 @@ func TestRunScanMultiTargetInterrupted(t *testing.T) {
 	}
 }
 
+// TestRunScanMultiTargetManyTargetsComplete pins the bounded worker-pool
+// contract at scale: 20 targets with --target-parallel 3 all complete, the
+// combined summary counts 20/20, and per-target lines flush in input order.
+// Guards the §10 refactor (fixed workers over a job channel, never a
+// goroutine per target) against feed/worker regressions.
+func TestRunScanMultiTargetManyTargetsComplete(t *testing.T) {
+	out := t.TempDir()
+	var targets []string
+	for i := 0; i < 20; i++ {
+		targets = append(targets, "host"+string(rune('a'+i))+".example.com")
+	}
+	args := append(append([]string{}, targets...), "--stages", "discover", "--target-parallel", "3", "--output", out)
+	capture := &configCapture{}
+	var buf bytes.Buffer
+	if err := runScan(context.Background(), &buf, args, capture.seam, nil); err != nil {
+		t.Fatalf("runScan: %v", err)
+	}
+	if n := len(capture.snapshot()); n != 20 {
+		t.Fatalf("seam consulted %d times, want 20 (one pipeline per target)", n)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "Targets with data: 20/20") {
+		t.Fatalf("combined summary must report 20/20:\n%s", got)
+	}
+	// Input-order flush: each target's summary line appears after the
+	// previous target's line.
+	prev := -1
+	for _, name := range targets {
+		idx := strings.Index(got, "  "+name)
+		if idx < 0 {
+			t.Fatalf("combined summary missing target %s:\n%s", name, got)
+		}
+		if idx < prev {
+			t.Fatalf("target %s out of input order in combined summary", name)
+		}
+		prev = idx
+	}
+}
+
 // TestRunScanMultiTargetExitCodes pins the documented multi-target exit
 // rule: exit 1 ONLY when every target ended failed or cancelled; ANY single
 // successful target (completed or partial) yields exit 0, with the combined
@@ -444,6 +500,30 @@ func TestRunScanMultiTargetExitCodes(t *testing.T) {
 		}
 		if !strings.Contains(got, "\n  b.example.com") || !strings.Contains(got, "partial") || !strings.Contains(got, "failed") {
 			t.Fatalf("combined summary must list each target's honest outcome:\n%s", got)
+		}
+	})
+	t.Run("strict fails on partial fleet", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := runScan(context.Background(), &buf,
+			[]string{"a.example.com", "b.example.com", "--stages", "discover", "--strict"},
+			perTargetStages(map[string]pipeline.Outcome{
+				"a.example.com": pipeline.OutcomeFailed,
+				"b.example.com": pipeline.OutcomePartial,
+			}), nil)
+		if err == nil || !strings.Contains(err.Error(), "--strict: 1 of 2 targets produced data") {
+			t.Fatalf("want the strict partial-fleet error, got %v", err)
+		}
+	})
+	t.Run("strict passes on full fleet", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := runScan(context.Background(), &buf,
+			[]string{"a.example.com", "b.example.com", "--stages", "discover", "--strict"},
+			perTargetStages(map[string]pipeline.Outcome{
+				"a.example.com": pipeline.OutcomeCompleted,
+				"b.example.com": pipeline.OutcomePartial,
+			}), nil)
+		if err != nil {
+			t.Fatalf("a fully producing fleet must give exit 0 under --strict, got %v", err)
 		}
 	})
 }

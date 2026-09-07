@@ -12,12 +12,15 @@ import (
 //
 // Each non-blank line contributes its first whitespace-delimited token, which
 // handles tools (amass) that print annotations such as
-// "name (FQDN) --> 1.2.3.4" after the name. Every token is normalized through
-// the Phase 2 asset model (asset.NewHost); there is no second normalization
-// implementation, so uppercase, surrounding whitespace, and trailing dots all
-// collapse to the same identity. Lines whose first token is not a valid host
-// are counted and skipped, never emitted. Duplicates are removed by Phase 2
-// identity. The result is sorted by canonical name for deterministic output.
+// "name (FQDN) --> 1.2.3.4" after the name. Tokens without a dot are
+// rejected as malformed before normalization: tool log/progress lines leak
+// bare words (amass emitted a lone "no", NEW-130) and a bare word is never
+// a valid enumerated subdomain — the asset model accepts single-label
+// names by design, so the discovery layer must refuse them or junk hosts
+// bill downstream DNS budget. Every token is normalized through
+// asset.NewHost — the single normalization point — unparseable tokens are
+// counted and skipped, duplicates are dropped by identity, and output is
+// sorted by name. The dot rule scopes to subdomain enumeration only.
 func parseHostLines(stdout []byte, prov asset.Provenance) ([]asset.Host, int) {
 	var hosts []asset.Host
 	seen := make(map[asset.Identity]struct{})
@@ -26,6 +29,10 @@ func parseHostLines(stdout []byte, prov asset.Provenance) ([]asset.Host, int) {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue // blank or whitespace-only line
+		}
+		if !strings.Contains(fields[0], ".") {
+			malformed++ // bare word: tool chatter, never a subdomain (NEW-130)
+			continue
 		}
 		h, err := asset.NewHost(fields[0], prov)
 		if err != nil {

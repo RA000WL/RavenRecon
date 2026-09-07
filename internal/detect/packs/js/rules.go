@@ -10,7 +10,11 @@ import (
 
 const (
 	requiredAPIMajor = 2
-	requiredAPIMinor = 0
+	// requiredAPIMinor is 1: every rule in this pack reads the SDK v2.1
+	// retained-script-body channel (Context.JavaScriptContent) — without
+	// it the detectors are silent by construction, so the pack refuses
+	// to load on a 2.0 surface rather than run blind.
+	requiredAPIMinor = 1
 
 	ruleDomXSS       = "js.dom.xss"
 	rulePostMessage  = "js.postmessage.no-origin-check"
@@ -29,20 +33,20 @@ func Rules() ([]detect.Rule, error) {
 	}
 	rules := []detect.Rule{
 		newJsRule(ruleDomXSS, "DOM XSS",
-			"Detects DOM XSS sinks innerHTML/outerHTML/document.write assignment via jsintel parse tree over synthetic script content derived from observed JavaScript URL (whole-token heuristic, informational). Per-script finding when sink present.",
+			"Detects DOM XSS sinks in code via a token-aware structural scan over retained bodies (NEW-123): innerHTML/outerHTML as dotted property writes with an assignment operator, document.write as an identifier-bounded call. Comment/string/template mentions, bare reads, and comparisons stay quiet. Informational, per-script finding on the first code sink; scripts without a retained body are silent.",
 			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputJavaScript},
-			domXSSDetector, "1.0.0"),
+			domXSSDetector, "1.3.0"),
 		newJsRule(rulePostMessage, "PostMessage No Origin Check",
-			"Detects window.addEventListener(\"message\", handler) without origin check (no event.origin comparison in handler body) via jsintel parse tree (whole-token heuristic, informational). Per-script finding when handler lacks origin guard.",
+			"Detects postMessage handlers without origin checks via a token-aware structural scan over retained bodies (NEW-123): fires when a code addEventListener call carries the static event-type argument \"message\" (handler scope — a \"message\" literal elsewhere does not count) and no .origin read occurs in code (a comment-only origin mention does not suppress). Informational, per-script finding; scripts without a retained body are silent.",
 			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputJavaScript},
-			postMessageDetector, "1.0.0"),
+			postMessageDetector, "1.3.0"),
 		newJsRule(ruleProtoPollute, "Prototype Pollution",
-			"Detects assignment to __proto__/constructor.prototype via jsintel parse tree. Informational, per-script finding.",
+			"Detects prototype-pollution writes in code via a token-aware structural scan over retained bodies (NEW-123): __proto__/constructor.prototype as dotted property access with a statement-bounded code assignment. Comment/string mentions and bare reads stay quiet. Informational, per-script finding; scripts without a retained body are silent.",
 			detect.CategoryInformation,
 			[]detect.RuleInput{detect.InputJavaScript},
-			protoPollutionDetector, "1.0.0"),
+			protoPollutionDetector, "1.3.0"),
 	}
 	rules[0].RequiredAssetTypes = []asset.Kind{asset.KindJavaScript}
 	rules[1].RequiredAssetTypes = []asset.Kind{asset.KindJavaScript}

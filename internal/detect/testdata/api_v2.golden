@@ -15,7 +15,7 @@
 ## consts
 
 const APIMajor = 2
-const APIMinor = 0
+const APIMinor = 1
 const CategoryAPI Category = "api"
 const CategoryAuthentication Category = "authentication"
 const CategoryAuthorization Category = "authorization"
@@ -56,6 +56,9 @@ const MaxRuleIDBytes = 128
 const MaxRuleNameBytes = 256
 const MaxRuleTimeout = 600000000000
 const MaxRuleVersionBytes = 32
+const MaxSnapshotJSContentBodyBytes = 2097152
+const MaxSnapshotJSContentBytes = 67108864
+const MaxSnapshotJSContents = 1024
 const Operation = "detect.rule"
 const OutcomeCancelled Outcome = "cancelled"
 const OutcomeCompleted Outcome = "completed"
@@ -86,6 +89,7 @@ type Context struct {
 	Technologies []asset.Technology `json:"technologies"`
 	Secrets []asset.SecretCandidate `json:"secrets"`
 	JavaScript []asset.JavaScript `json:"javascript"`
+	JavaScriptContent []JavaScriptContent `json:"javascript_content"`
 	Endpoints []asset.Endpoint `json:"endpoints"`
 	PriorFindings []asset.Finding `json:"-"`
 	GraphView GraphQuerier `json:"-"`
@@ -95,6 +99,9 @@ type Context struct {
 }
 
 type Cost string
+
+type Deriver struct {
+}
 
 type Detector func(context.Context, *Context) ([]asset.Finding, error)
 
@@ -111,6 +118,7 @@ type EngineConfig struct {
 	Config map[string]string
 	Emit func(context.Context, asset.Finding) error
 	Metrics *Metrics
+	Observer event.Observer
 }
 
 type FindingPriority string
@@ -118,6 +126,11 @@ type FindingPriority string
 type FindingStatus string
 
 type GraphQuerier interface { Neighbors(asset.Identity) []asset.Relationship; Path(asset.Identity, asset.Identity) []asset.Identity }
+
+type JavaScriptContent struct {
+	Identity asset.Identity `json:"identity"`
+	Body string `json:"body"`
+}
 
 type LogEntry struct {
 	Level LogLevel `json:"level"`
@@ -189,6 +202,7 @@ type Snapshot struct {
 	Technologies []asset.Technology `json:"technologies,omitempty"`
 	Secrets []asset.SecretCandidate `json:"secrets,omitempty"`
 	JavaScript []asset.JavaScript `json:"javascript,omitempty"`
+	JavaScriptContent []JavaScriptContent `json:"javascript_content,omitempty"`
 	Endpoints []asset.Endpoint `json:"endpoints,omitempty"`
 }
 
@@ -204,6 +218,7 @@ Category.String() string
 Category.Valid() bool
 Cost.String() string
 Cost.Valid() bool
+Deriver.Derive(event.Event, any) []event.Event
 FindingPriority.String() string
 FindingPriority.Valid() bool
 FindingStatus.String() string

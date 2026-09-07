@@ -11,6 +11,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -192,6 +193,13 @@ type EngineConfig struct {
 	Emit func(context.Context, SurfaceAsset) error
 	// Metrics, when non-nil, accumulates the run's work counters.
 	Metrics *Metrics
+	// Observer is the optional pool instrumentation sink (an
+	// internal/event Observer; the Bus satisfies it). When non-nil, the
+	// worker pool emits canonical pool-boundary events (scan start/stop,
+	// worker start/stop, task submitted/started/running/terminal,
+	// progress, shutdown). Nil (the default) is the off switch: zero
+	// behavior change.
+	Observer event.Observer
 }
 
 // DefaultEngineConfig returns the documented default engine configuration.
@@ -349,6 +357,11 @@ func Score(ctx context.Context, cfg EngineConfig, signals <-chan Signal) (Report
 		Rate:        c.Rate,
 		Burst:       c.Burst,
 		Clock:       c.Clock,
+		Observer:    c.Observer,
+		// Deriver converts each job's AssetResult into derived canonical
+		// events at the pool-job boundary (see derive.go). With a nil
+		// Observer the bridge is inert, so the off switch is unchanged.
+		Deriver: Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("priority: pool: %w", err)
@@ -398,7 +411,10 @@ func Score(ctx context.Context, cfg EngineConfig, signals <-chan Signal) (Report
 							e.recordErr(fmt.Errorf("priority: emit: %w", err))
 						}
 					}
-					return nil, nil
+					// The accumulator merge above stays the report path; the
+					// returned result is the pool-job-boundary hand-off the
+					// Deriver converts into derived events.
+					return result, nil
 				},
 			}); err != nil {
 				if errors.Is(err, runtime.ErrPoolClosed) || ctx.Err() != nil {

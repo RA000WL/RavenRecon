@@ -1234,3 +1234,277 @@ func TestHTTPProbeStageTLSSANExpansionNoCertificates(t *testing.T) {
 		t.Fatalf("TLSCertificates = %d, want 0", len(res.Results.TLSCertificates))
 	}
 }
+
+// takeoverCNAMEFixture builds DNS-edge fixtures: ghost has a CNAME to a
+// target with no addresses (dangling); www has a CNAME to a target WITH
+// addresses (resolving, never a candidate).
+func takeoverCNAMEFixture(t testing.TB) (ghost, www asset.Host, rels []asset.Relationship) {
+	t.Helper()
+	ghost = httpProbeMustHost(t, "ghost.example.com")
+	www = httpProbeMustHost(t, "www.example.com")
+	dangling := httpProbeMustHost(t, "dangling.example.net")
+	cdn := httpProbeMustHost(t, "cdn.example.net")
+	mkrel := func(from asset.Host, kind asset.RelationshipKind, to asset.Identity) asset.Relationship {
+		r, err := asset.NewRelationship(from.Identity(), kind, to)
+		if err != nil {
+			t.Fatalf("NewRelationship: %v", err)
+		}
+		return r
+	}
+	ip, err := asset.NewIP("93.184.216.34", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewIP: %v", err)
+	}
+	rels = []asset.Relationship{
+		mkrel(ghost, asset.RelationshipHostToCNAME, dangling.Identity()),
+		mkrel(www, asset.RelationshipHostToCNAME, cdn.Identity()),
+		mkrel(cdn, asset.RelationshipHostToIP, ip.Identity()),
+	}
+	return ghost, www, rels
+}
+
+// TestConfirmTakeoverTransportErrorFlag pins the review-wave honesty
+// fix: verdicts carrying transport errors mark the confirmation set
+// truncated — an unreachable host is never silently completed.
+func TestConfirmTakeoverTransportErrorFlag(t *testing.T) {
+	stage := &HTTPProbeStage{transport: &failLiveTransport{}}
+	in := httpProbeStageInput(t, "example.com",
+		[]asset.Host{httpProbeMustHost(t, "ghost.example.com")}, nil, nil)
+	cfg := httpprobe.Config{
+		Concurrency: 2,
+		QueueSize:   4,
+		Transport:   &failLiveTransport{},
+	}
+	evs, truncated, err := stage.confirmTakeover(context.Background(), in,
+		[]asset.Host{httpProbeMustHost(t, "ghost.example.com")}, cfg)
+	if err != nil {
+		t.Fatalf("confirmTakeover hard error = %v, want nil (per-host errors stay in verdicts)", err)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("evidence = %d, want 0", len(evs))
+	}
+	if !truncated {
+		t.Fatal("truncated = false, want true (errored verdicts are an incomplete set)")
+	}
+}
+
+// TestHTTPProbeStageTakeoverConfirms pins NEW-122 end to end at stage
+// level: a dangling host's provider page becomes takeover evidence,
+// while a resolving CNAME host is never fetched for confirmation.
+func TestHTTPProbeStageTakeoverConfirms(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "ghost.example.com", cannedResponse{status: 200, body: "roots"})
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "roots"})
+	cannedHostPath(tr, "ghost.example.com", "https", "/", cannedResponse{status: 404, body: "<h1>There isn't a GitHub Pages site here.</h1>"})
+	cannedHostPath(tr, "ghost.example.com", "http", "/", cannedResponse{status: 404, body: "<h1>There isn't a GitHub Pages site here.</h1>"})
+	ghost, www, rels := takeoverCNAMEFixture(t)
+	stage := &HTTPProbeStage{transport: tr}
+	in := httpProbeStageInput(t, "example.com", []asset.Host{ghost, www}, nil, nil)
+	in.Results.Relationships = rels
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Evidence for the dangling host only, parsed back through the
+	// pack-facing contract.
+	found := false
+	for _, ev := range res.Results.Evidence {
+		provider, ok := httpprobe.ParseTakeoverEvidence(ev)
+		if !ok {
+			t.Fatalf("non-takeover evidence in takeover output: %+v", ev)
+		}
+		if ev.Source.String() != "host:ghost.example.com" {
+			t.Errorf("evidence source = %s, want the dangling host", ev.Source)
+		}
+		if provider != "github-pages" {
+			t.Errorf("provider = %q, want github-pages", provider)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("no takeover evidence for the confirmed dangling host")
+	}
+	// Roots (2×2) + confirmation pair for ghost only: www's resolving
+	// CNAME is never fetched for confirmation.
+	if got := tr.requestCount(); got != 6 {
+		t.Errorf("requests = %d, want 6 (4 roots + ghost confirmation pair)", got)
+	}
+}
+
+// TestHTTPProbeStageTakeoverSilentNoEvidence pins the quiet path: a
+// dangling host serving a clean page yields no evidence and no flags.
+func TestHTTPProbeStageTakeoverSilentNoEvidence(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "ghost.example.com", cannedResponse{status: 200, body: "<h1>legit site</h1>"})
+	ghost, _, rels := takeoverCNAMEFixture(t)
+	stage := &HTTPProbeStage{transport: tr}
+	in := httpProbeStageInput(t, "example.com", []asset.Host{ghost}, nil, nil)
+	in.Results.Relationships = rels
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Results.Evidence) != 0 {
+		t.Fatalf("evidence = %v, want none (clean page)", res.Results.Evidence)
+	}
+	if res.Truncated || len(res.StickyFlags) != 0 {
+		t.Fatalf("truncated/flags = %v/%v, want clean", res.Truncated, res.StickyFlags)
+	}
+}
+
+// TestHTTPProbeStageTakeoverDisabled pins the opt-out: takeover_confirm
+// false means no confirmation traffic and no evidence.
+func TestHTTPProbeStageTakeoverDisabled(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "ghost.example.com", cannedResponse{status: 200, body: "roots"})
+	cannedHostPath(tr, "ghost.example.com", "https", "/", cannedResponse{status: 404, body: "There isn't a GitHub Pages site here."})
+	ghost, _, rels := takeoverCNAMEFixture(t)
+	stage := &HTTPProbeStage{transport: tr}
+	in := httpProbeStageInput(t, "example.com", []asset.Host{ghost},
+		map[string]string{"takeover_confirm": "false"}, nil)
+	in.Results.Relationships = rels
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Results.Evidence) != 0 {
+		t.Fatalf("evidence = %v, want none (confirmation disabled)", res.Results.Evidence)
+	}
+	if got := tr.requestCount(); got != 2 {
+		t.Errorf("requests = %d, want 2 (roots only)", got)
+	}
+}
+
+// TestHTTPProbeStageTakeoverOverflowFlag pins the per-run candidate
+// bound: beyond maxTakeoverConfirmHosts the sorted head is confirmed
+// and the cut rides the flag on a completed result.
+func TestHTTPProbeStageTakeoverOverflowFlag(t *testing.T) {
+	tr := &cannedTransport{}
+	var hosts []asset.Host
+	var rels []asset.Relationship
+	for i := 0; i < maxTakeoverConfirmHosts+1; i++ {
+		name := "dangling" + padTakeover(i) + ".example.com"
+		h := httpProbeMustHost(t, name)
+		hosts = append(hosts, h)
+		cannedHost(tr, name, cannedResponse{status: 404, body: "There isn't a GitHub Pages site here."})
+		tgt := httpProbeMustHost(t, "target"+padTakeover(i)+".example.net")
+		r1, err := asset.NewRelationship(h.Identity(), asset.RelationshipHostToCNAME, tgt.Identity())
+		if err != nil {
+			t.Fatalf("NewRelationship: %v", err)
+		}
+		rels = append(rels, r1)
+	}
+	stage := &HTTPProbeStage{transport: tr}
+	in := httpProbeStageInput(t, "example.com", hosts, nil, nil)
+	in.Results.Relationships = rels
+
+	res, err := httpProbeRunBounded(t, stage, context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcome = %q, want completed (overflow rides the flag)", res.Outcome)
+	}
+	if !res.StickyFlags[httpprobeTakeoverOverflowFlag] {
+		t.Fatalf("flags = %v, want %q", res.StickyFlags, httpprobeTakeoverOverflowFlag)
+	}
+	if len(res.Results.Evidence) != maxTakeoverConfirmHosts {
+		t.Fatalf("evidence = %d, want %d (sorted head)", len(res.Results.Evidence), maxTakeoverConfirmHosts)
+	}
+}
+
+func padTakeover(i int) string {
+	return string(rune('0'+i/100%10)) + string(rune('0'+i/10%10)) + string(rune('0'+i%10))
+}
+
+func TestMistakePathsEnabled(t *testing.T) {
+	if mistakePathsEnabled(nil) {
+		t.Error("nil params must leave mistake paths disabled (default OFF)")
+	}
+	for _, v := range []string{"true", "1", "yes", "on", " TRUE ", "On"} {
+		if !mistakePathsEnabled(map[string]string{"mistake_paths": v}) {
+			t.Errorf("mistake_paths=%q must enable", v)
+		}
+	}
+	for _, v := range []string{"false", "FALSE", "no", "0", "", "robot"} {
+		if mistakePathsEnabled(map[string]string{"mistake_paths": v}) {
+			t.Errorf("mistake_paths=%q must not enable", v)
+		}
+	}
+}
+func TestDefaultMistakePathsBounded(t *testing.T) {
+	if len(defaultMistakePaths) == 0 || len(defaultMistakePaths) > 64 {
+		t.Fatalf("%d curated paths, want 1..64 (engine bound)", len(defaultMistakePaths))
+	}
+	seen := make(map[string]struct{}, len(defaultMistakePaths))
+	for _, p := range defaultMistakePaths {
+		if !strings.HasPrefix(p, "/") || strings.Contains(p, "://") {
+			t.Fatalf("curated path %q is not a bare absolute path", p)
+		}
+		if _, dup := seen[p]; dup {
+			t.Fatalf("curated path %q duplicated", p)
+		}
+		seen[p] = struct{}{}
+	}
+}
+
+// TestDefaultMistakePathsCountGuardsCommentAccuracy pins the curated-set
+// length the "mistake_paths" prose cites ("38 extra targets"): if the set
+// grows or shrinks, the prose must move with it — update the count in the
+// stage doc comment, the param comment, and ARCHITECTURE.md together.
+func TestDefaultMistakePathsCountGuardsCommentAccuracy(t *testing.T) {
+	if len(defaultMistakePaths) != 38 {
+		t.Fatalf("curated set = %d paths, want 38 (the count the prose cites)", len(defaultMistakePaths))
+	}
+}
+
+func TestHTTPProbeStageMistakePaths(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+	cannedHostPath(tr, "www.example.com", "https", "/robots.txt", cannedResponse{status: 200, body: "User-agent: *"})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+	}, map[string]string{"mistake_paths": "true"}, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want completed", res.Outcome)
+	}
+	found := false
+	for _, u := range res.Additions.URLs {
+		if u.String() == "https://www.example.com/robots.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("robots.txt URL missing from additions: %v", httpProbeURLStrings(res.Additions.URLs))
+	}
+	// 2 roots + the full curated set on the responding (https) scheme.
+	if want := 2 + len(defaultMistakePaths); tr.requestCount() != want {
+		t.Fatalf("requests = %d, want %d (2 roots + curated set)", tr.requestCount(), want)
+	}
+}
+
+func TestHTTPProbeStageMistakePathsDefaultOff(t *testing.T) {
+	tr := &cannedTransport{}
+	cannedHost(tr, "www.example.com", cannedResponse{status: 200, body: "ok"})
+
+	in := httpProbeStageInput(t, "example.com", []asset.Host{
+		httpProbeMustHost(t, "www.example.com"),
+	}, map[string]string{"mistake_paths": "false"}, nil)
+	res, err := httpProbeRunBounded(t, testStage(tr), context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	httpProbeRequireStrings(t, "Additions.URLs", httpProbeURLStrings(res.Additions.URLs),
+		[]string{"http://www.example.com/", "https://www.example.com/"})
+	if got := tr.requestCount(); got != 2 {
+		t.Fatalf("requests = %d, want 2 (opt-out is root-only)", got)
+	}
+}

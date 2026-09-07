@@ -31,8 +31,8 @@ Commands:
   scan          Run the full end-to-end reconnaissance pipeline for one or
                 more domains
   ingest        Import existing reconnaissance data files and enrich them
-
-Options:
+  diff          Compare two report JSON exports and show what changed
+  handoff       Export scanner feeder files from a report JSON export
   -h, --help    Show this help message
 
 Examples:
@@ -45,10 +45,9 @@ Examples:
   ravenrecon scan a.example.com b.example.com --output out/ --target-parallel 2
   ravenrecon scan --targets targets.txt --output out/
   ravenrecon ingest --output out/ example.com urls.txt
+  ravenrecon diff --output deltas/ old-report.json new-report.json
+  ravenrecon handoff --output feed/ report.json
 
-Discovery is passive-only. It invokes external tools in their passive modes:
-  subfinder -d <domain> -silent, assetfinder <domain>,
-  amass enum -passive -d <domain>.
 The scan command runs discover → dns → httpprobe → urlintel → crawl →
 techintel → jsintel → secrentel → urllive → priority → detect → report
 (twelve stages) and writes the report into an output directory
@@ -74,7 +73,7 @@ Options (after the domain):
                     amass). Default: all built-in sources.
   --no-cache        Disable the cache for this run (default: cache is off
                     unless enabled in configuration).
-
+  --config <file>   JSON config file (flags > env > file > defaults).
 Signals: Ctrl-C or SIGTERM cancels the run gracefully — the partial report
 is still printed and the exit code is 1. A second signal forces an
 immediate exit.
@@ -174,6 +173,11 @@ func Run(ctx context.Context, args []string) error {
 	case "ingest":
 		return runIngest(ctx, os.Stdout, args[1:], newIngestStages, newScanTUI)
 
+	case "diff":
+		return runDiff(ctx, os.Stdout, args[1:])
+
+	case "handoff":
+		return runHandoff(ctx, os.Stdout, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
@@ -198,9 +202,10 @@ func printVersion(w io.Writer) error {
 
 // discoverOptions is the parsed (domain, flags) pair of the discover command.
 type discoverOptions struct {
-	domain  string
-	sources []string // nil or empty means every built-in source
-	noCache bool
+	domain     string
+	sources    []string // nil or empty means every built-in source
+	noCache    bool
+	configPath string
 }
 
 // parseDiscoverArgs parses "discover" arguments: exactly one target domain,
@@ -220,6 +225,7 @@ func parseDiscoverArgs(args []string) (discoverOptions, error) {
 	fs.SetOutput(io.Discard) // errors are returned, not printed
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	sources := fs.String("sources", "", "comma-separated source names")
+	configPath := fs.String("config", "", "JSON config file (flags > env > file > defaults)")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return discoverOptions{}, errDiscoverHelp
@@ -247,7 +253,7 @@ func parseDiscoverArgs(args []string) (discoverOptions, error) {
 		}
 	})
 
-	opts := discoverOptions{domain: args[0], noCache: *noCache}
+	opts := discoverOptions{domain: args[0], noCache: *noCache, configPath: *configPath}
 	if sourcesSet {
 		for _, s := range strings.Split(*sources, ",") {
 			if s = strings.TrimSpace(s); s != "" {
@@ -269,8 +275,13 @@ func discoverConfig(cfg config.Config, opts discoverOptions) (discovery.Config, 
 	dc.Concurrency = cfg.Concurrency
 	dc.Timeout = cfg.Timeout
 	dc.Rate = cfg.Rate
+	// Explicit --sources wins; otherwise the configured sources (file,
+	// env) apply; empty throughout means every built-in source. This
+	// makes discovery timeouts and sources tunable without code edits.
 	dc.Sources = opts.sources
-	dc.Bin = cfg.Discovery.Bin
+	if len(dc.Sources) == 0 {
+		dc.Sources = cfg.Discovery.Sources
+	}
 	if cfg.Discovery.Timeout > 0 {
 		dc.Timeout = cfg.Discovery.Timeout
 	}
@@ -280,6 +291,7 @@ func discoverConfig(cfg config.Config, opts discoverOptions) (discovery.Config, 
 	if cfg.Discovery.MaxOutputSize > 0 {
 		dc.MaxOutputSize = cfg.Discovery.MaxOutputSize
 	}
+	dc.Bin = cfg.Discovery.Bin
 	if cfg.Cache.Enabled && !opts.noCache {
 		dir := cfg.Cache.Dir
 		if dir == "" {
@@ -319,9 +331,25 @@ func runDiscover(ctx context.Context, w io.Writer, args []string) error {
 	if err != nil {
 		return fmt.Errorf("discover: invalid target %q: %w", opts.domain, err)
 	}
-	cfg, err := discoverConfig(config.Default(), opts)
+	base, err := resolveBaseConfig(opts.configPath)
 	if err != nil {
 		return err
+	}
+	cfg, err := discoverConfig(base, opts)
+	if err != nil {
+		return err
+	}
+	// Streaming progress: each source prints one completion line on
+	// stderr as its job finalizes (completion order), so long runs show
+	// life before the full per-source report prints at the end. Counts
+	// are pre-quality-gate and therefore provisional; the final report
+	// below is authoritative. Stderr keeps diagnostics off the
+	// machine-facing stdout report.
+	var progressMu sync.Mutex
+	cfg.OnSource = func(res discovery.SourceResult) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		fmt.Fprintf(os.Stderr, "discover: %s finished: %s (%d hosts)\n", res.Source, res.Status, len(res.Hosts))
 	}
 	rep, err := discovery.Run(ctx, target, cfg)
 	if err != nil {
@@ -426,7 +454,13 @@ func onOff(b bool) string {
 }
 
 func runDoctor(ctx context.Context, w io.Writer) error {
-	cfg := config.Default()
+	// Doctor shows the effective configuration: defaults overlaid with
+	// the environment (no file — doctor takes no flags). An invalid
+	// variable fails closed, like every other command.
+	cfg, err := config.Default().WithEnv()
+	if err != nil {
+		return err
+	}
 
 	cacheDir := cfg.Cache.Dir
 	if cacheDir == "" {

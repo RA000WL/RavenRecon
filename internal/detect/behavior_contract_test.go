@@ -212,17 +212,21 @@ func TestContractGraphValidationDeterministic(t *testing.T) {
 // Contract 5 — the versioning contract: CheckAPIVersion boundaries.
 // ---------------------------------------------------------------------------
 
-// Contract: CheckAPIVersion(2,0) passes; (2,1), (3,0), and (0,0) fail. Every
-// error names the SDK ("detect SDK") and BOTH version numbers — the pack's
-// required version and this build's provided version — and distinguishes
-// the two failure classes: a too-new required minor (this build predates
-// the pack) versus a major mismatch (the pack must be recompiled).
+// Contract: CheckAPIVersion(2,0) and (2,1) pass; (2,2), (3,0), and (0,0)
+// fail. Every error names the SDK ("detect SDK") and BOTH version numbers
+// — the pack's required version and this build's provided version — and
+// distinguishes the two failure classes: a too-new required minor (this
+// build predates the pack) versus a major mismatch (the pack must be
+// recompiled).
 func TestContractAPIVersioning(t *testing.T) {
-	if APIMajor != 2 || APIMinor != 0 {
-		t.Fatalf("frozen API level is %d.%d, want 2.0", APIMajor, APIMinor)
+	if APIMajor != 2 || APIMinor != 1 {
+		t.Fatalf("frozen API level is %d.%d, want 2.1", APIMajor, APIMinor)
 	}
 	if err := CheckAPIVersion(2, 0); err != nil {
 		t.Fatalf("CheckAPIVersion(2,0) must pass: %v", err)
+	}
+	if err := CheckAPIVersion(2, 1); err != nil {
+		t.Fatalf("CheckAPIVersion(2,1) must pass: %v", err)
 	}
 
 	rejected := []struct {
@@ -231,7 +235,7 @@ func TestContractAPIVersioning(t *testing.T) {
 		min    int
 		marker string // the failure-class marker the error must carry
 	}{
-		{"future minor", 2, 1, "predates"},
+		{"future minor", 2, 2, "predates"},
 		{"old major", 1, 0, "major version mismatch"},
 		{"future major", 3, 0, "major version mismatch"},
 		{"zero major", 0, 0, "major version mismatch"},

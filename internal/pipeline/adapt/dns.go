@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -21,6 +22,22 @@ import (
 // whenever any retained type is truncated and is preserved end-to-end
 // (result → RunReport → report), never swallowed (AGENTS §0.6).
 const dnsAnswersTruncated = "dns_answers_truncated"
+
+// DNS evidence indicators (NEW-126 T2): the canonical Evidence.Indicator
+// values this adapter synthesizes from the engine's string/port payloads.
+// Both ride MethodDNS with the queried host as Evidence.Source (see
+// dnsEvidence's evidence-subject convention).
+const (
+	// dnsTXTIndicator marks one retained TXT record string: Value is the
+	// record string itself (stored truncated to the asset package's 256-byte
+	// evidence bound with its "…" marker when longer).
+	dnsTXTIndicator = "dns:txt"
+	// dnsSRVIndicator marks one retained SRV (target, port) observation:
+	// Value is "target:port" with the canonical target name and decimal
+	// port (e.g. "sip.example.net:5060"); the host→target topology rides
+	// the host_to_srv edge, the port detail rides this record.
+	dnsSRVIndicator = "dns:srv"
+)
 
 // dnsBruteWildcardFlag is the sticky flag this adapter sets when the
 // wildcard probe detected a wildcard DNS zone and brute was aborted to
@@ -88,6 +105,9 @@ func NewDNSStage(resolver dns.Resolver) pipeline.Stage {
 
 // Name implements pipeline.Stage.
 func (s *dnsStage) Name() pipeline.StageName { return pipeline.StageDNS }
+
+// Level implements pipeline.LeveledStage: dns needs discover hosts only.
+func (s *dnsStage) Level() int { return 1 }
 
 // Run implements pipeline.Stage.
 //
@@ -183,11 +203,11 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 		Concurrency: in.Bounds.MaxConcurrency,
 		QueueSize:   in.Bounds.QueueSize,
 		Timeout:     in.Bounds.Timeout,
-		Rate:        in.Bounds.Rate,
-		Burst:       in.Bounds.Burst,
 		Cache:       in.Cache,
 		Clock:       in.Clock,
 		Resolver:    s.resolver,
+		// Forward the run observer into the engine pool; nil disables events.
+		Observer: in.Observer,
 	}
 
 	rep, engineErr := dns.Resolve(ctx, in.Target, hosts, cfg)
@@ -329,27 +349,41 @@ func (s *dnsStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.St
 // fixed outcome vocabulary, additions, counters, and truncation flags.
 func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dns.Report, engineErr error) (pipeline.StageResult, error) {
 	// Boundary filter, output side: the engine's report can carry
-	// out-of-domain hosts — a queried host's CNAME target is a legitimate
-	// DNS observation that may point anywhere (dns doc.go), and the engine
-	// resolves the direct target's addresses at depth exactly 1. Cross-domain
-	// CNAME targets must never enter the corpus, so every host the engine
-	// reported (input hosts plus CNAME targets, merged and sorted by
-	// dns.Report.AllHosts) is re-filtered through pipeline.FilterHosts
-	// before it can become an Addition. Input hosts re-enter harmlessly: the
-	// runner deduplicates by identity (first-seen wins).
+	// out-of-domain hosts — a queried host's host-target observation
+	// (CNAME/MX/NS/SRV target) is a legitimate DNS observation that may
+	// point anywhere (dns doc.go), and the engine resolves the direct
+	// target's addresses at depth exactly 1. Cross-domain MX/NS/SRV targets
+	// (like cross-domain CNAME targets before them) must never enter the
+	// corpus, so every host the engine reported (input hosts plus
+	// CNAME/MX/NS/SRV targets, merged and sorted by dns.Report.AllHosts)
+	// is re-filtered through pipeline.FilterHosts before it can become an
+	// Addition. Input hosts re-enter harmlessly: the runner deduplicates by
+	// identity (first-seen wins).
 	additions := pipeline.StageAdditions{
 		Hosts: pipeline.FilterHosts(in.Target, rep.AllHosts()),
 	}
 
-	// Results: the engine report's canonical resolved addresses are copied
-	// into the results channel, never rebuilt (the one-normalization-point
-	// rule, AGENTS §0.5). IPs need no scope filtering: they are the answers
-	// of the in-scope hosts this stage resolved, and an address is not
-	// "in-domain" or "out-of-domain" — an out-of-domain address (CDN, ...)
-	// is a legitimate observation of an in-scope host (mirrors how the
-	// engine records them; the stage produces no IP corpus additions, so
-	// the corpus scope boundary is unaffected).
-	results := pipeline.Results{IPs: rep.AllIPs()}
+	// Results: the engine report's canonical resolved addresses, typed
+	// edges, and synthesized evidence are copied into the results channel,
+	// never rebuilt (the one-normalization-point rule, AGENTS §0.5 — the
+	// evidence records are built through asset.NewEvidence, the single
+	// evidence constructor, from the engine's already-normalized payloads).
+	// IPs need no scope filtering: they are the answers of the in-scope
+	// hosts this stage resolved, and an address is not "in-domain" or
+	// "out-of-domain" — an out-of-domain address (CDN, ...) is a legitimate
+	// observation of an in-scope host (mirrors how the engine records them;
+	// the stage produces no IP corpus additions, so the corpus scope
+	// boundary is unaffected). Relationships (host->address,
+	// target->address, host->CNAME/MX/NS/SRV-target) ride along for the same
+	// reason: later stages attribute observations to hosts through them
+	// (NEW-121, extended by NEW-126 T2 to mail/delegation/service
+	// topology), and a target pointing anywhere is a legitimate observation
+	// of its in-scope source. Evidence (dns:txt TXT strings, dns:srv
+	// target:port pairs, both sourced at the queried host — see
+	// dnsEvidence) rides for the same reason: the detect stage builds its
+	// Snapshot.Evidence from in.Results.Evidence verbatim, so T3 rules can
+	// observe SPF/DMARC strings and service ports without re-querying.
+	results := pipeline.Results{IPs: rep.AllIPs(), Relationships: rep.AllRelationships(), Evidence: dnsEvidence(rep)}
 
 	// Engine error paths. Errors are wrapped with context and returned;
 	// cancellation is reported through Outcome cancelled with the context
@@ -470,17 +504,101 @@ func (s *dnsStage) mapResult(ctx context.Context, in pipeline.StageInput, rep dn
 }
 
 // applyTruncation attaches the stage's truncation marker: any type the
-// engine capped at dns.MaxAnswersPerType (dns.TypeResult.Truncated) sets
-// Truncated=true plus the dnsAnswersTruncated sticky flag, never swallowed.
-// A truncated host is engine-incomplete by definition, so this outcome is
-// never completed-with-truncation — the carve-out downgrade in the runner
-// never fires for this adapter.
+// engine capped at dns.MaxAnswersPerType (dns.TypeResult.Truncated — A/AAAA,
+// CNAME, MX, TXT, NS, and SRV alike) sets Truncated=true plus the
+// dnsAnswersTruncated sticky flag, never swallowed. A truncated host is
+// engine-incomplete by definition, so this outcome is never
+// completed-with-truncation — the carve-out downgrade in the runner never
+// fires for this adapter. The flag covers the evidence payloads too: TXT
+// strings and SRV pairs that were cut at the engine cap never reach
+// dnsEvidence, and the flag — not silence — marks the retained evidence
+// incomplete end-to-end (result → RunReport → report).
 func applyTruncation(res pipeline.StageResult, anyTruncated bool) pipeline.StageResult {
 	if anyTruncated {
 		res.Truncated = true
-		res.StickyFlags = map[string]bool{dnsAnswersTruncated: true}
+		if res.StickyFlags == nil {
+			res.StickyFlags = make(map[string]bool)
+		}
+		res.StickyFlags[dnsAnswersTruncated] = true
 	}
 	return res
+}
+
+// dnsEvidence synthesizes the DNS evidence channel from the engine report's
+// retained string/port payloads (NEW-126 T2).
+//
+// Evidence-subject convention (documented here because the Evidence.Source
+// is the attribution key downstream): the QUERIED host is always the
+// Source — the name whose records were asked for — and the observed datum
+// is the Value. Topology (which target a host points at) rides the
+// host_to_mx / host_to_ns / host_to_srv Relationships; detail rides here:
+//   - TXT: one record per retained string, Indicator dns:txt, Value the
+//     record string itself;
+//   - SRV: one record per retained (target, port) pair, Indicator dns:srv,
+//     Value "target:port" with the canonical target name and decimal port.
+//
+// Bounds (never unbounded): the count per queried host per type is the
+// engine's own MaxAnswersPerType retention (64) — dnsEvidence only converts
+// retained observations, never re-expands the raw answer set — and every
+// Value is bounded by the asset package's 256-byte evidence bound
+// (asset.NewEvidence truncates longer TXT strings rune-safely with its "…"
+// marker; SRV "target:port" values are far below it by construction).
+// Count truncation (a capped answer set) is the engine's Truncated marker
+// and maps to the dns_answers_truncated sticky flag via applyTruncation —
+// never to a silent evidence subset. Per-value truncation (a long TXT
+// string stored with "…") carries no flag: the identity covers exactly the
+// stored bytes by construction. "…"-suffixed values are clipped; rules must
+// not derive absence-of-directive from a clipped value.
+//
+// Only completed, non-NXDOMAIN observations publish: NXDOMAIN, failed,
+// timed-out, and cancelled types contribute no evidence (mirroring
+// assemble's no-edges rule). Records are built through asset.NewEvidence —
+// the single normalization point — so non-UTF-8 TXT payloads that fail
+// validation are skipped defensively, never fabricated. Output is
+// ID-deduplicated (first-seen wins) and sorted by ID, deterministically.
+func dnsEvidence(rep dns.Report) []asset.Evidence {
+	var out []asset.Evidence
+	seen := make(map[string]struct{})
+	prov := asset.Provenance{Source: "dns"}
+	add := func(ev asset.Evidence) {
+		id := ev.ID()
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, ev)
+	}
+	for _, hr := range rep.Results {
+		for _, tr := range hr.Types {
+			if tr.Status != dns.TypeCompleted || tr.NXDOMAIN {
+				continue
+			}
+			switch tr.Type {
+			case dns.TypeTXT:
+				for _, s := range tr.Strings {
+					ev, err := asset.NewEvidence(asset.MethodDNS, dnsTXTIndicator, s, tr.Host.Identity(), prov)
+					if err != nil {
+						continue
+					}
+					add(ev)
+				}
+			case dns.TypeSRV:
+				for i, h := range tr.Hosts {
+					if i >= len(tr.Ports) {
+						continue
+					}
+					val := h.Name + ":" + strconv.Itoa(int(tr.Ports[i]))
+					ev, err := asset.NewEvidence(asset.MethodDNS, dnsSRVIndicator, val, tr.Host.Identity(), prov)
+					if err != nil {
+						continue
+					}
+					add(ev)
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out
 }
 
 // dnsBruteEnabled reports whether brute is enabled via StageParams.
@@ -574,6 +692,12 @@ func dnsBruteResolvers(params map[string]string) (resolvers []string, invalid in
 // or candidate set was truncated, and whether a wildcard was detected. The
 // candidate resolution is bounded by BruteTimeout and the stage's own
 // context, with the same bounded pool and limiter as the normal path.
+//
+// Brute publishes corpus (+IPs) only by design: the brute result carries
+// resolving hosts and their IPs, never Relationships (host_to_mx/ns/srv)
+// or dns:txt/dns:srv evidence from the brute resolve — so T3 consumers see
+// brute hosts in the corpus without the MX/NS/SRV/TXT observations behind
+// them (attribution gap).
 func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns.Config, base pipeline.StageResult) (pipeline.StageResult, bool, bool) {
 	// Wildcard probe before any brute work.
 	// Use the stage's resolver seam (nil = production). IsWildcard handles nil.
@@ -707,14 +831,15 @@ func (s *dnsStage) runBrute(ctx context.Context, in pipeline.StageInput, cfg dns
 	}
 
 	// Filter brute hosts to only those that actually resolved (have at least
-	// one address or CNAME observation). NXDOMAIN / NODATA hosts are not
+	// one address or host-target observation — CNAME/MX/NS/SRV targets alike
+	// via hr.Targets, NEW-126 T2). NXDOMAIN / NODATA hosts are not
 	// useful brute discoveries and must not pollute the corpus.
 	var resolving []asset.Host
 	for _, hr := range rep.Results {
 		if len(hr.IPs) > 0 || len(hr.Targets) > 0 {
-			// Host resolved to at least one IP or CNAME target.
+			// Host resolved to at least one IP or host-target observation.
 			resolving = append(resolving, hr.Host)
-			// Also include the CNAME targets themselves if they are in-domain
+			// Also include the targets themselves if they are in-domain
 			// (the adapter's output filter will enforce in-domain again).
 			resolving = append(resolving, hr.Targets...)
 		}
@@ -853,7 +978,11 @@ func pipelineFilterIPs(resolvingHosts []asset.Host, ips []asset.IP) []asset.IP {
 }
 
 // mergeBruteAdditions merges brute hosts and results into the base stage
-// result, deduplicating by identity and sorting deterministically.
+// result, deduplicating by identity and sorting deterministically. The merge
+// covers hosts and IPs only — matching runBrute's corpus(+IPs)-only
+// publication, brute MX/NS/SRV relationships and dns:txt/dns:srv evidence
+// are intentionally not merged, so T3 consumers must not assume a merged
+// brute host's mail/name-server/service observations are present.
 func mergeBruteAdditions(base, brute pipeline.StageResult, target asset.Domain) pipeline.StageResult {
 	merged := base
 	// Merge Hosts additions.

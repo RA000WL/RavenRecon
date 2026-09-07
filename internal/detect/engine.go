@@ -11,6 +11,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -27,7 +28,8 @@ const (
 	// exceeds it has violated its contract and fails.
 	maxFindingsPerRule = 256
 	// maxFindingsPerRun bounds the report's retained findings; the cut is
-	// surfaced through Report.FindingsTruncated, never silent.
+	// surfaced through Report.FindingsTruncated, never silent. Retention
+	// is by finding rank (findingRankLess), never completion order.
 	maxFindingsPerRun = 4096
 )
 
@@ -62,7 +64,7 @@ const (
 // Outcome is the aggregate outcome of one engine run, derived from the
 // per-rule statuses in fixed priority order: any cancelled rule →
 // cancelled; a run whose retained findings were cut at maxFindingsPerRun →
-// incomplete (truncated results are never completed, even when every
+// incomplete (rank-truncated results are never completed, even when every
 // attempted rule completed); any failed rule alongside completed ones →
 // incomplete (the successes are kept and reported, the run is not
 // completed); every attempted rule failed → failed; otherwise completed.
@@ -108,11 +110,10 @@ type RuleResult struct {
 // Report is the deterministic result of one engine run: every rule's
 // outcome sorted by rule ID, the merged findings sorted by finding
 // identity, the counts, the aggregate outcome, and the bounded rule logs.
-// Two identical runs under an identical injected Clock produce identical
-// reports (pinned by test) — identical up to the findings cap: above
-// maxFindingsPerRun the retained findings are the completion-order prefix,
-// which is not deterministic across runs. Execution timings deliberately
-// live in Metrics, never here.
+// reports (pinned by test) — including above the findings cap: retention
+// keeps the deterministic top by finding rank (findingRankLess), so
+// identical runs keep identical findings regardless of completion order.
+// Execution timings deliberately live in Metrics, never here.
 type Report struct {
 	// Outcome is the aggregate run outcome (see Outcome).
 	Outcome Outcome `json:"outcome"`
@@ -197,9 +198,13 @@ type EngineConfig struct {
 	// order; within one rule it is that rule's sorted finding order. Panics
 	// inside Emit are contained and reported as run diagnostics.
 	Emit func(context.Context, asset.Finding) error
-
 	// Metrics, when non-nil, accumulates the run's work counters.
 	Metrics *Metrics
+	// Observer is the optional pool-event sink (an internal/event
+	// Observer; the Bus satisfies it). When non-nil, the run's worker
+	// pool emits canonical task events; nil (the default) disables
+	// emission with zero behavior change.
+	Observer event.Observer
 }
 
 // DefaultEngineConfig returns the documented default engine configuration.
@@ -352,23 +357,29 @@ func (a *resultAccumulator) get(id string) (RuleResult, bool) {
 	return *r, true
 }
 
-// addFindings appends validated findings under the run cap.
+// addFindings retains validated findings under the run cap. Batches that
+// fit append directly; a batch that would overflow merges with the
+// retained set and keeps the deterministic top by finding rank
+// (findingRankLess: confidence, then category/priority/rule/subject), so
+// re-runs keep the same findings regardless of rule completion order. The
+// retained slice never exceeds maxFindingsPerRun; the overflow batch is
+// transient (one rule's output, itself bounded by maxFindingsPerRule).
 func (a *resultAccumulator) addFindings(fs []asset.Finding) {
 	if len(fs) == 0 {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	room := maxFindingsPerRun - len(a.findings)
-	if room <= 0 {
-		a.truncated = true
+	if len(a.findings)+len(fs) <= maxFindingsPerRun {
+		a.findings = append(a.findings, fs...)
 		return
 	}
-	if len(fs) > room {
-		fs = fs[:room]
-		a.truncated = true
-	}
-	a.findings = append(a.findings, fs...)
+	combined := make([]asset.Finding, 0, len(a.findings)+len(fs))
+	combined = append(combined, a.findings...)
+	combined = append(combined, fs...)
+	sort.Slice(combined, func(i, j int) bool { return findingRankLess(combined[i], combined[j]) })
+	a.findings = combined[:maxFindingsPerRun]
+	a.truncated = true
 }
 
 func (a *resultAccumulator) snapshot() ([]RuleResult, []asset.Finding, bool) {
@@ -477,6 +488,8 @@ func Run(ctx context.Context, cfg EngineConfig, snap Snapshot) (Report, error) {
 		Rate:        c.Rate,
 		Burst:       c.Burst,
 		Clock:       c.Clock,
+		Observer:    c.Observer,
+		Deriver:     Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("detect: pool: %w", err)
@@ -546,7 +559,6 @@ levelsLoop:
 					SkipReason: fmt.Sprintf("dependency %q did not complete (status %s)", bad, status)})
 				continue
 			}
-			acc.install(RuleResult{RuleID: r.ID, RuleVersion: r.Version, Status: RuleStatusCancelled})
 			if _, err := pool.Submit(ctx, runtime.Job{
 				Timeout: r.Timeout,
 				Func: func(jctx context.Context) (any, error) {
@@ -554,7 +566,7 @@ levelsLoop:
 					res, fs := processRule(jctx, r, e)
 					acc.merge(res)
 					acc.addFindings(fs)
-					return nil, nil
+					return ruleJobResult{Result: res, Findings: fs}, nil
 				},
 			}); err != nil {
 				if errors.Is(err, runtime.ErrPoolClosed) || ctx.Err() != nil {

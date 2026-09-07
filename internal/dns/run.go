@@ -10,6 +10,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -24,12 +25,26 @@ import (
 // treated as incomplete — never as a completed result.
 const MaxAnswersPerType = 64
 
-// hostTypes is the stable per-host query plan for the input host itself, in
-// this order. The direct CNAME target's A/AAAA (depth 1) follow in the same
-// stable order when the CNAME query yields a non-self target.
-var hostTypes = []RecordType{TypeA, TypeAAAA, TypeCNAME}
+// MaxTXTStringBytes caps the retained size of one single TXT record string.
+// The exact rule (see normalizeAnswers): a TXT answer longer than this many
+// bytes is counted malformed and dropped — never retained, never truncated
+// in place — while the retained set as a whole is still subject to the
+// MaxAnswersPerType count cap with Truncated semantics. The value is generous
+// on purpose: operational TXT records (SPF, DKIM, DMARC, verification
+// strings) are well under 2 KiB, so anything larger is pathological, while
+// the worst-case per-type retention stays bounded at
+// MaxAnswersPerType*MaxTXTStringBytes bytes. Like MaxAnswersPerType it is a
+// fixed constant, never configuration, and never enters cache keys.
+const MaxTXTStringBytes = 4096
 
-// targetTypes is the depth-1 address closure plan for a CNAME target.
+// hostTypes is the stable per-host query plan for the input host itself, in
+// this order. The direct targets' A/AAAA (depth 1) follow in the same
+// stable order when a host-target query (CNAME/MX/NS/SRV) yields a non-self
+// target.
+var hostTypes = []RecordType{TypeA, TypeAAAA, TypeCNAME, TypeMX, TypeTXT, TypeNS, TypeSRV}
+
+// targetTypes is the depth-1 address closure plan for a host-target
+// observation (CNAME/MX/NS/SRV targets alike).
 var targetTypes = []RecordType{TypeA, TypeAAAA}
 
 // storeTimeout bounds a single cache write performed after the run context
@@ -95,12 +110,27 @@ type Config struct {
 	// query limiter. Nil means the wall clock; tests inject a fake clock
 	// for deterministic assertions.
 	Clock runtime.Clock
+
+	// Observer is the optional instrumentation sink (internal/event
+	// Observer; the Bus satisfies it). When non-nil, the run's
+	// runtime.Pool emits canonical pool-boundary events (scan
+	// start/stop, worker start/stop, task submitted/started/running/
+	// terminal, phase transitions, progress, shutdown). Nil (the
+	// default) disables emission with zero behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns a Config with documented defaults. Concurrency and
 // the per-job timeout are consistent with the Phase 4 conventions (the
 // timeout matches exactly); the query rate is the documented conservative
 // default for pacing outbound DNS queries.
+//
+// Timeout adequacy note (NEW-126 T1): the per-host sequential query budget
+// grew from 3 direct + 2 closure queries to 7 direct (A/AAAA/CNAME/MX/TXT/
+// NS/SRV) plus 2 per distinct host-target observation. The default 30 s is
+// RETAINED unchanged: with pacing disabled the bound is resolver latency
+// times query count, and no measurement shows the wider plan breaching it —
+// raise it only with a test proving need, never on arithmetic alone.
 func DefaultConfig() Config {
 	return Config{
 		Concurrency: 8,
@@ -176,6 +206,11 @@ func Resolve(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg C
 		// job-start pacing (see Config.Rate).
 		Rate:  0,
 		Burst: 0,
+		// Forward the instrumentation sink; nil disables pool events.
+		// The stateless Deriver converts completed job results into
+		// canonical derived events at the pool-job boundary.
+		Observer: cfg.Observer,
+		Deriver:  Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("dns: create worker pool: %w", err)
@@ -194,7 +229,7 @@ func Resolve(ctx context.Context, domain asset.Domain, hosts []asset.Host, cfg C
 		h := h
 		if _, err := pool.Submit(ctx, runtime.Job{Func: func(jctx context.Context) (any, error) {
 			results[i] = resolveHost(jctx, h, e)
-			return nil, nil
+			return results[i], nil
 		}}); err != nil {
 			results[i] = HostResult{
 				Host:   h,
@@ -314,13 +349,13 @@ func normalizeInputHosts(hosts []asset.Host, domain asset.Domain) ([]asset.Host,
 	return out, nil
 }
 
-// resolveHost resolves one input host: the host's own A/AAAA/CNAME, then —
-// when the CNAME query completed with a non-self target — the direct
-// target's A/AAAA at depth exactly 1. Every query is cache-before-execute
-// when caching is enabled, and every outbound query waits on the central
-// limiter first. Once the context is done, no further query is issued;
-// un-attempted types are recorded cancelled (the runtime's convention for
-// work that never started).
+// resolveHost resolves one input host: the host's own records across every
+// hostTypes entry, then — when a host-target query (CNAME/MX/NS/SRV)
+// completed with a non-self target — each distinct target's A/AAAA at depth
+// exactly 1. Every query is cache-before-execute when caching is enabled,
+// and every outbound query waits on the central limiter first. Once the
+// context is done, no further query is issued; un-attempted types are
+// recorded cancelled (the runtime's convention for work that never started).
 func resolveHost(ctx context.Context, host asset.Host, e env) HostResult {
 	hr := HostResult{Host: host, Status: StatusCompleted}
 
@@ -333,12 +368,13 @@ func resolveHost(ctx context.Context, host asset.Host, e env) HostResult {
 		hr.Types = append(hr.Types, resolveType(ctx, host, rt, e))
 	}
 
-	// 2. Direct CNAME target addresses, depth exactly 1: only when the
-	// host's CNAME query completed with a non-self target. The target is a
-	// DNS observation and may point anywhere (cross-domain CNAMEs are a
-	// legitimate observation); its A/AAAA are resolved exactly once, never
-	// deeper — no recursion, so CNAME loops are impossible by construction.
-	for _, t := range cnameTargets(hr.Types) {
+	// 2. Direct target addresses, depth exactly 1: only for the distinct,
+	// non-self targets of completed host-target queries. A target is a DNS
+	// observation and may point anywhere (cross-domain CNAMEs, dangling MX
+	// exchangers, out-of-zone nameservers are all legitimate observations);
+	// its A/AAAA are resolved exactly once, never deeper — no recursion, so
+	// alias loops are impossible by construction.
+	for _, t := range closureTargets(hr.Types) {
 		for _, rt := range targetTypes {
 			if ctx.Err() != nil {
 				hr.Types = append(hr.Types, cancelledType(t, rt, ctx.Err()))
@@ -360,13 +396,19 @@ func cancelledType(host asset.Host, rt RecordType, err error) TypeResult {
 	return TypeResult{Host: host, Type: rt, Status: TypeCancelled, Err: err}
 }
 
-// cnameTargets extracts the distinct, non-self CNAME targets from completed
-// CNAME type results, sorted by canonical name.
-func cnameTargets(types []TypeResult) []asset.Host {
+// closureTargets extracts the distinct, non-self host targets from completed
+// host-target type results (CNAME/MX/NS/SRV alike), sorted by canonical
+// name. TXT results carry strings, never hosts, so they contribute nothing.
+// Only completed, non-NXDOMAIN observations qualify (defense in depth: an
+// NXDOMAIN result carries no answers by construction, and decodeStoredType
+// refuses NXDOMAIN-answer contradictions — the flag check preserves the
+// pre-T1 invariant). A target whose own A/AAAA then resolve NXDOMAIN stays
+// bare at assembly: no IPs, no edges.
+func closureTargets(types []TypeResult) []asset.Host {
 	seen := make(map[asset.Identity]bool)
 	var out []asset.Host
 	for _, tr := range types {
-		if tr.Type != TypeCNAME || tr.Status != TypeCompleted || tr.NXDOMAIN {
+		if !isHostTargetType(tr.Type) || tr.Status != TypeCompleted || tr.NXDOMAIN {
 			continue
 		}
 		for _, h := range tr.Hosts {
@@ -382,6 +424,17 @@ func cnameTargets(types []TypeResult) []asset.Host {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// isHostTargetType reports whether rt's answers are hostnames observed as
+// asset.Host targets (as opposed to addresses, strings, or wire pairs).
+func isHostTargetType(rt RecordType) bool {
+	switch rt {
+	case TypeCNAME, TypeMX, TypeNS, TypeSRV:
+		return true
+	default:
+		return false
+	}
 }
 
 // resolveType resolves one (queried host, record type) pair with
@@ -508,23 +561,44 @@ func applyAnswers(tr TypeResult, answers []string, err error, clock runtime.Cloc
 		return tr
 	}
 	tr.Status = TypeCompleted
-	tr.IPs, tr.Hosts, tr.Malformed, tr.Truncated = normalizeAnswers(tr.Type, answers, tr.Host, clock)
+	tr.IPs, tr.Hosts, tr.Strings, tr.Ports, tr.Malformed, tr.Truncated = normalizeAnswers(tr.Type, answers, tr.Host, clock)
 	return tr
 }
 
-// normalizeAnswers converts raw resolver answers into typed Phase 2 assets:
-// every string is re-validated through asset.NewIP / asset.NewHost (a
-// resolver can never inject non-canonical assets), answers are deduplicated
-// by Phase 2 identity, sorted by canonical value, and capped at
-// MaxAnswersPerType. Answers that fail normalization are counted malformed
-// and dropped. For CNAME, self-targets (answers identical to the queried
-// host) are dropped: a host "pointing at itself" is no observation.
-func normalizeAnswers(rt RecordType, answers []string, queried asset.Host, clock runtime.Clock) (ips []asset.IP, hosts []asset.Host, malformed int, truncated bool) {
+// normalizeAnswers converts raw resolver answers into typed observations:
+// every address string is re-validated through asset.NewIP, every hostname
+// (CNAME/MX/NS targets, SRV wire targets) through asset.NewHost — a
+// resolver can never inject non-canonical assets (an MX exchanger that is an
+// IP literal, or an SRV target of ".", fails NewHost and is counted
+// malformed). Answers are deduplicated by Phase 2 identity, sorted by
+// canonical value, and capped at MaxAnswersPerType. Answers that fail
+// normalization are counted malformed and dropped. For host-target types,
+// self-targets (answers identical to the queried host) are dropped: a host
+// "pointing at itself" is no observation.
+//
+// Per-type rules:
+//
+//   - A/AAAA: address strings -> IPs.
+//   - CNAME/MX/NS: hostnames -> Hosts (deduped by host identity).
+//   - SRV: "target:port" wire strings (see parseSRVAnswer) -> Hosts with a
+//     parallel Ports slice (Ports[i] is the service port of Hosts[i]).
+//     Deduplication is by (host identity, port): the same target on two
+//     ports is two observations. The port gets a u16 range check only —
+//     ports are service data, never asset-normalized.
+//   - TXT: opaque record strings -> Strings, deduplicated exactly and sorted
+//     lexicographically. One string longer than MaxTXTStringBytes is counted
+//     malformed and dropped (never retained, never truncated in place);
+//     empty strings are valid records and retained.
+func normalizeAnswers(rt RecordType, answers []string, queried asset.Host, clock runtime.Clock) (ips []asset.IP, hosts []asset.Host, txts []string, ports []uint16, malformed int, truncated bool) {
 	prov := asset.Provenance{Source: "dns", DiscoveredAt: clock.Now().UTC()}
 	var rawIPs []asset.IP
 	var rawHosts []asset.Host
+	var rawPorts []uint16
+	var rawTXTs []string
 	seenIPs := make(map[asset.Identity]bool)
 	seenHosts := make(map[asset.Identity]bool)
+	seenSRV := make(map[asset.Identity]map[uint16]bool)
+	seenTXTs := make(map[string]bool)
 	for _, a := range answers {
 		switch rt {
 		case TypeA, TypeAAAA:
@@ -538,7 +612,7 @@ func normalizeAnswers(rt RecordType, answers []string, queried asset.Host, clock
 			}
 			seenIPs[ip.Identity()] = true
 			rawIPs = append(rawIPs, ip)
-		case TypeCNAME:
+		case TypeCNAME, TypeMX, TypeNS:
 			h, err := asset.NewHost(a, prov)
 			if err != nil {
 				malformed++
@@ -552,10 +626,68 @@ func normalizeAnswers(rt RecordType, answers []string, queried asset.Host, clock
 			}
 			seenHosts[h.Identity()] = true
 			rawHosts = append(rawHosts, h)
+		case TypeSRV:
+			target, port, ok := parseSRVAnswer(a)
+			if !ok {
+				malformed++
+				continue
+			}
+			h, err := asset.NewHost(target, prov)
+			if err != nil {
+				malformed++
+				continue
+			}
+			if h.Identity() == queried.Identity() {
+				continue // self-target: no observation
+			}
+			if seenSRV[h.Identity()] == nil {
+				seenSRV[h.Identity()] = make(map[uint16]bool)
+			}
+			if seenSRV[h.Identity()][port] {
+				continue
+			}
+			seenSRV[h.Identity()][port] = true
+			rawHosts = append(rawHosts, h)
+			rawPorts = append(rawPorts, port)
+		case TypeTXT:
+			if len(a) > MaxTXTStringBytes {
+				malformed++
+				continue
+			}
+			if seenTXTs[a] {
+				continue
+			}
+			seenTXTs[a] = true
+			rawTXTs = append(rawTXTs, a)
+		default:
+			malformed++
 		}
 	}
 	sort.Slice(rawIPs, func(i, j int) bool { return rawIPs[i].Addr.String() < rawIPs[j].Addr.String() })
-	sort.Slice(rawHosts, func(i, j int) bool { return rawHosts[i].Name < rawHosts[j].Name })
+	sort.Slice(rawTXTs, func(i, j int) bool { return rawTXTs[i] < rawTXTs[j] })
+	if len(rawHosts) > 0 && rt == TypeSRV {
+		// Keep Ports aligned with Hosts through the sort: order by
+		// (canonical name, port) for a deterministic retained set.
+		order := make([]int, len(rawHosts))
+		for i := range order {
+			order[i] = i
+		}
+		sort.Slice(order, func(i, j int) bool {
+			if rawHosts[order[i]].Name != rawHosts[order[j]].Name {
+				return rawHosts[order[i]].Name < rawHosts[order[j]].Name
+			}
+			return rawPorts[order[i]] < rawPorts[order[j]]
+		})
+		sortedHosts := make([]asset.Host, len(rawHosts))
+		sortedPorts := make([]uint16, len(rawPorts))
+		for i, idx := range order {
+			sortedHosts[i] = rawHosts[idx]
+			sortedPorts[i] = rawPorts[idx]
+		}
+		rawHosts, rawPorts = sortedHosts, sortedPorts
+	} else {
+		sort.Slice(rawHosts, func(i, j int) bool { return rawHosts[i].Name < rawHosts[j].Name })
+	}
 	if len(rawIPs) > MaxAnswersPerType {
 		truncated = true
 		rawIPs = rawIPs[:MaxAnswersPerType]
@@ -563,8 +695,17 @@ func normalizeAnswers(rt RecordType, answers []string, queried asset.Host, clock
 	if len(rawHosts) > MaxAnswersPerType {
 		truncated = true
 		rawHosts = rawHosts[:MaxAnswersPerType]
+		if rt == TypeSRV {
+			// Ports parallels Hosts only for SRV; other host-target
+			// types leave it nil, and slicing nil would panic.
+			rawPorts = rawPorts[:MaxAnswersPerType]
+		}
 	}
-	return rawIPs, rawHosts, malformed, truncated
+	if len(rawTXTs) > MaxAnswersPerType {
+		truncated = true
+		rawTXTs = rawTXTs[:MaxAnswersPerType]
+	}
+	return rawIPs, rawHosts, rawTXTs, rawPorts, malformed, truncated
 }
 
 // storeType is the cache write side: it persists the type's terminal
@@ -587,6 +728,8 @@ func storeType(ctx context.Context, host asset.Host, rt RecordType, tr TypeResul
 		Truncated: tr.Truncated,
 		IPs:       tr.IPs,
 		Hosts:     tr.Hosts,
+		Strings:   tr.Strings,
+		Ports:     tr.Ports,
 		Malformed: tr.Malformed,
 	}
 	data, err := json.Marshal(st)
@@ -615,10 +758,28 @@ func storeType(ctx context.Context, host asset.Host, rt RecordType, tr TypeResul
 
 // assemble derives the typed assets and relationships from a host's type
 // results: IP assets and host->address edges for every successful A/AAAA
-// observation (of the input host and of its direct CNAME targets), and CNAME
-// target host assets with host->target edges for every successful CNAME
-// observation. Relationships are deduplicated by edge identity and sorted
-// deterministically.
+// observation (of the input host and of its direct targets), and host->target
+// edges for every successful host-target observation: CNAME via
+// RelationshipHostToCNAME, MX via RelationshipHostToMX, NS via
+// RelationshipHostToNS, and SRV via RelationshipHostToSRV. Targets from all
+// four host-target families merge into the returned hosts (deduped by Phase
+// 2 identity via mergeHosts, sorted canonically) so in-domain targets enter
+// the corpus through Report.AllHosts while cross-domain targets are filtered
+// at the pipeline adapter (NEW-121 precedent: edges ride unfiltered,
+// corpus stays FilterHosts-scoped). SRV emits one edge per distinct target
+// host — ports ride adapter Evidence (dns:srv), never the edge — via the
+// shared addRel identity dedup (the same (from, kind, to) added twice
+// collapses, so a target observed on two ports still yields one edge).
+// TXT observations carry no assets or edges (free text rides adapter
+// Evidence as dns:txt).
+//
+// Cap rule: edges derive from the RETAINED (capped) set only — answers
+// beyond MaxAnswersPerType are dropped in normalizeAnswers before assembly,
+// the type is marked Truncated, and the host folds to incomplete. Truncated
+// retention is never silently completed; the pipeline adapter maps any
+// Truncated type to its sticky flag end-to-end. NXDOMAIN, failed, timed-out,
+// and cancelled types contribute no assets and no edges. Relationships are
+// deduplicated by edge identity and sorted deterministically.
 func assemble(types []TypeResult) (ips []asset.IP, targets []asset.Host, rels []asset.Relationship) {
 	relSet := make(map[asset.Relationship]bool)
 	addRel := func(from asset.Identity, kind asset.RelationshipKind, to asset.Identity) {
@@ -649,6 +810,24 @@ func assemble(types []TypeResult) (ips []asset.IP, targets []asset.Host, rels []
 				addRel(from, asset.RelationshipHostToCNAME, h.Identity())
 			}
 			targets = append(targets, tr.Hosts...)
+		case TypeMX:
+			for _, h := range tr.Hosts {
+				addRel(from, asset.RelationshipHostToMX, h.Identity())
+			}
+			targets = append(targets, tr.Hosts...)
+		case TypeNS:
+			for _, h := range tr.Hosts {
+				addRel(from, asset.RelationshipHostToNS, h.Identity())
+			}
+			targets = append(targets, tr.Hosts...)
+		case TypeSRV:
+			for _, h := range tr.Hosts {
+				addRel(from, asset.RelationshipHostToSRV, h.Identity())
+			}
+			targets = append(targets, tr.Hosts...)
+		case TypeTXT:
+			// Free-text observations: no assets, no edges. The pipeline
+			// adapter publishes each retained string as dns:txt Evidence.
 		}
 	}
 	return mergeIPs(ips), mergeHosts(targets), sortRelationships(rels)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -98,6 +99,14 @@ type EngineConfig struct {
 	// clock). It never enters report content — report bytes are
 	// deterministic regardless.
 	Clock runtime.Clock
+	// Observer is the optional pool instrumentation sink (an
+	// internal/event Observer; the Bus satisfies it). When non-nil, the
+	// render pool emits canonical pool-boundary events (scan start/stop,
+	// worker start/stop, task submitted/started/running/terminal,
+	// progress, shutdown): one task per report proves the render fan-out
+	// is observable. Nil (the default) is the off switch: zero behavior
+	// change.
+	Observer event.Observer
 }
 
 // DefaultEngineConfig returns the default configuration for a registry and
@@ -319,13 +328,17 @@ func Run(ctx context.Context, cfg EngineConfig, input Context) (RunResult, error
 			Status: ReportStatusSkipped, SkipReason: reason,
 		})
 	}
-
 	if len(active) > 0 {
+		// No Deriver here by design: render jobs yield ReportResult
+		// part outcomes (reporter, format, byte counts — no canonical
+		// assets), so there is nothing canonical to derive. Render
+		// fan-out remains observable through task events.
 		pool, err := runtime.NewPool(ctx, runtime.Config{
 			Concurrency: c.Concurrency,
 			QueueSize:   c.QueueSize,
 			Timeout:     c.Timeout,
 			Clock:       c.Clock,
+			Observer:    c.Observer,
 		})
 		if err != nil {
 			return RunResult{}, fmt.Errorf("report: pool: %w", err)

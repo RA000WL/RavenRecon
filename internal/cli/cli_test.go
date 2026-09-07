@@ -43,6 +43,14 @@ func TestParseDiscoverArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "config flag",
+			args: []string{"example.com", "--config", "/tmp/r.json"},
+			wantOpts: discoverOptions{
+				domain:     "example.com",
+				configPath: "/tmp/r.json",
+			},
+		},
+		{
 			name:     "no-cache only",
 			args:     []string{"example.com", "--no-cache"},
 			wantOpts: discoverOptions{domain: "example.com", noCache: true},
@@ -129,6 +137,13 @@ func TestParseDiscoverArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+func TestRunDiscoverBadConfigPath(t *testing.T) {
+	var buf bytes.Buffer
+	err := runDiscover(context.Background(), &buf, []string{"example.com", "--config", filepath.Join(t.TempDir(), "missing.json")})
+	if err == nil || !strings.Contains(err.Error(), "missing.json") {
+		t.Fatalf("want missing-file error, got %v", err)
 	}
 }
 

@@ -447,13 +447,16 @@ func TestNewRegistryUnsealed(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCheckAPIVersion(t *testing.T) {
-	if APIMajor != 2 || APIMinor != 0 {
-		t.Fatalf("frozen SDK API level is %d.%d, want 2.0", APIMajor, APIMinor)
+	if APIMajor != 2 || APIMinor != 1 {
+		t.Fatalf("frozen SDK API level is %d.%d, want 2.1 (additive content channel)", APIMajor, APIMinor)
 	}
 
 	// Same major, minor at or below this build's minor: compatible.
 	if err := CheckAPIVersion(2, 0); err != nil {
 		t.Fatalf("CheckAPIVersion(2,0): %v", err)
+	}
+	if err := CheckAPIVersion(2, 1); err != nil {
+		t.Fatalf("CheckAPIVersion(2,1): %v", err)
 	}
 	if err := CheckAPIVersion(2, -1); err != nil {
 		t.Fatalf("CheckAPIVersion(2,-1) must pass per the exact semantics: %v", err)
@@ -465,7 +468,7 @@ func TestCheckAPIVersion(t *testing.T) {
 		maj  int
 		min  int
 	}{
-		{"future minor", 2, 1},
+		{"future minor", 2, 2},
 		{"old major", 1, 0},
 		{"future major", 3, 0},
 		{"zero major", 0, 0},

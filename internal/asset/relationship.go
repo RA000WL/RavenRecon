@@ -18,6 +18,16 @@ const (
 	// observed by the resolver; see the DNS pipeline's documented multi-hop
 	// flattening limitation.
 	RelationshipHostToCNAME RelationshipKind = "host_to_cname"
+	// RelationshipHostToMX links a host to a mail exchanger observed in its
+	// MX records (Host -> Host). NEW-126 T2: mail topology publication.
+	RelationshipHostToMX RelationshipKind = "host_to_mx"
+	// RelationshipHostToNS links a host to a nameserver observed in its NS
+	// records (Host -> Host). NEW-126 T2: delegation topology publication.
+	RelationshipHostToNS RelationshipKind = "host_to_ns"
+	// RelationshipHostToSRV links a host to a service target observed in
+	// its SRV records (Host -> Host). One edge per distinct target host —
+	// service ports ride Evidence (dns:srv), never the edge. NEW-126 T2.
+	RelationshipHostToSRV RelationshipKind = "host_to_srv"
 	// RelationshipIPToPort links a listening address to a port (IP -> Port).
 	RelationshipIPToPort RelationshipKind = "ip_to_port"
 	// RelationshipPortToService links a port to a service identified on it
@@ -86,7 +96,7 @@ const (
 // Valid reports whether k is one of the known relationship kinds.
 func (k RelationshipKind) Valid() bool {
 	switch k {
-	case RelationshipHostToIP, RelationshipHostToCNAME, RelationshipIPToPort, RelationshipPortToService,
+	case RelationshipHostToIP, RelationshipHostToCNAME, RelationshipHostToMX, RelationshipHostToNS, RelationshipHostToSRV, RelationshipIPToPort, RelationshipPortToService,
 		RelationshipHostToURL, RelationshipURLToEndpoint, RelationshipURLToJavaScript, RelationshipURLToParameter,
 		RelationshipEndpointToParameter, RelationshipHostToTechnology, RelationshipURLToTechnology, RelationshipEndpointToTechnology,
 		RelationshipTechnologyToEvidence, RelationshipHostToTLSCertificate, RelationshipPortToTLSCertificate,

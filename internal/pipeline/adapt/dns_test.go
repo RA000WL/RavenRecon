@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +285,42 @@ func TestDNSStageResultsIPsDeduped(t *testing.T) {
 		[]string{"api.example.com", "www.example.com"})
 }
 
+// TestDNSStageResultsRelationships pins the results-channel relationship
+// wiring (NEW-121): the engine's host->address and host->CNAME edges flow
+// through the results channel merged and sorted — later stages attribute
+// observations to hosts through them. CNAME edges ride along: they are
+// legitimate observations of in-scope hosts (the target may point
+// anywhere), mirroring how IPs need no scope filter.
+func TestDNSStageResultsRelationships(t *testing.T) {
+	target := mustDomain(t, "example.com")
+	www := mustHost(t, "www.example.com")
+	api := mustHost(t, "api.example.com")
+
+	fake := newFakeResolver()
+	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
+	fake.set("www.example.com", dns.TypeCNAME, "alias.example.com")
+	fake.set("api.example.com", dns.TypeA, "93.184.216.35")
+
+	in := dnsInput(target, []asset.Host{www, api})
+	res, err := NewDNSStage(fake).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("Outcome = %q, want %q", res.Outcome, pipeline.OutcomeCompleted)
+	}
+	var got []string
+	for _, r := range res.Results.Relationships {
+		got = append(got, r.ID())
+	}
+	sort.Strings(got)
+	requireEqualStrings(t, "results relationships", got, []string{
+		"host:api.example.com" + "\x00" + "host_to_ip\x00" + "ip:93.184.216.35",
+		"host:www.example.com" + "\x00" + "host_to_cname\x00" + "host:alias.example.com",
+		"host:www.example.com" + "\x00" + "host_to_ip\x00" + "ip:93.184.216.34",
+	})
+}
+
 // TestDNSStageResultsDeterminism pins the determinism contract for the
 // results channel: two identical runs (fixed clock, scripted resolver)
 // produce DeepEqual StageResults including the IPs channel — the engine's
@@ -387,7 +424,11 @@ func TestDNSStageAllHostsFailed(t *testing.T) {
 	www := mustHost(t, "www.example.com")
 
 	fake := newFakeResolver()
-	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME} {
+	// NEW-126 T1: the engine queries 7 types/host (A/AAAA/CNAME/MX/TXT/NS/SRV);
+	// fail all 7 so the host has no completed type and classifyHost
+	// (failed without completed → failed, internal/dns/run.go) keeps this a
+	// fully-failed host.
+	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT, dns.TypeNS, dns.TypeSRV} {
 		fake.setErr("www.example.com", rt, failureErr("www.example.com", rt))
 	}
 
@@ -416,7 +457,11 @@ func TestDNSStageMixedOutcomesPartial(t *testing.T) {
 
 	fake := newFakeResolver()
 	fake.set("www.example.com", dns.TypeA, "93.184.216.34")
-	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME} {
+	// NEW-126 T1: the engine queries 7 types/host (A/AAAA/CNAME/MX/TXT/NS/SRV);
+	// fail all 7 so api has no completed type and classifyHost
+	// (failed without completed → failed, internal/dns/run.go) keeps it a
+	// fully-failed host, preserving the completed+failed → partial fold.
+	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT, dns.TypeNS, dns.TypeSRV} {
 		fake.setErr("api.example.com", rt, failureErr("api.example.com", rt))
 	}
 
@@ -684,8 +729,8 @@ func TestDNSBruteDisabledNoExtraCost(t *testing.T) {
 		t.Fatalf("Outcome = %q, want completed", res.Outcome)
 	}
 	// The resolver should have been queried only for the input host's types
-	// (A/AAAA/CNAME) and the CNAME target's A/AAAA if any — exactly 3 plus
-	// 2 for the CNAME target if it existed. With no brute, the wildcard
+	// (A/AAAA/CNAME/MX/TXT/NS/SRV — 7 per host, NEW-126 T1) and each distinct
+	// host-target's A/AAAA at depth 1 if any. With no brute, the wildcard
 	// probe host must never be queried.
 	if seen := fake.seenHosts(); seen["ravenrecon-wildcard-check.example.com"] {
 		t.Fatalf("wildcard probe host was queried despite brute being disabled (zero cost violation)")

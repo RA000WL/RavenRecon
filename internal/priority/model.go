@@ -15,7 +15,10 @@ type PriorityLevel string
 
 const (
 	// LevelHigh: score >= 0.8 with at least TWO independent indicator
-	// categories matched.
+	// categories matched — or score >= 0.8 with one category backed by a
+	// recorded high-confidence detection (confidence:secret or
+	// confidence:technology at or above 0.9; the single-structural-high
+	// escape, see score.go).
 	LevelHigh PriorityLevel = "high"
 	// LevelMedium: score >= 0.5 with at least one indicator category.
 	LevelMedium PriorityLevel = "medium"

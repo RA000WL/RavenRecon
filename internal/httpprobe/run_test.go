@@ -1529,3 +1529,151 @@ func TestDrainFollowedBodyBoundedAndCloses(t *testing.T) {
 		t.Fatalf("small body drained %d bytes, want 2", got)
 	}
 }
+
+// TestNormalizeHostPortsDeterministicError pins review-wave ordering:
+// with several bad entries the reported error is deterministic (map
+// iteration order is not).
+func TestNormalizeHostPortsDeterministicError(t *testing.T) {
+	bad := map[string][]int{"zzz.example.com": {0}, "aaa.example.com": {70000}}
+	for i := 0; i < 5; i++ {
+		_, err := normalizeHostPorts(bad)
+		if err == nil {
+			t.Fatal("normalizeHostPorts accepted invalid ports")
+		}
+		if !strings.Contains(err.Error(), "aaa.example.com") {
+			t.Fatalf("error = %v, want the sorted-first offender (aaa...)", err)
+		}
+	}
+}
+
+// probeResultForURL returns the probe result for the exact target URL
+// string, or the zero ProbeResult when absent (port targets share
+// schemes with the roots, so scheme lookup is ambiguous).
+func probeResultForURL(hr HostResult, target string) ProbeResult {
+	for _, pr := range hr.Probes {
+		if pr.URL.String() == target {
+			return pr
+		}
+	}
+	return ProbeResult{}
+}
+
+// TestProbePortTargets pins NEW-121: per-host ports synthesize
+// http+https targets probed like roots — full observations, assets, and
+// edges derived from the TARGET port (never the scheme default).
+func TestProbePortTargets(t *testing.T) {
+	cs := newCountingServer(t, 200, "ok-port")
+	cfg := testConfig()
+	cfg.HostPorts = map[string][]int{"www.example.com": {8443}}
+
+	rep := probeOne(t, cs.srv, []asset.Host{mustHost(t, "www.example.com")}, cfg)
+	hr := hostByName(t, rep, "www.example.com")
+	if hr.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", hr.Status)
+	}
+	if len(hr.Probes) != 4 {
+		t.Fatalf("probes = %d, want 4 (2 roots + 8443 pair)", len(hr.Probes))
+	}
+	httpPort := probeResultForURL(hr, "http://www.example.com:8443/")
+	if httpPort.Status != ProbeCompleted || httpPort.StatusCode != 200 {
+		t.Fatalf("http:8443 probe = %+v, want completed 200", httpPort)
+	}
+	httpsPort := probeResultForURL(hr, "https://www.example.com:8443/")
+	if httpsPort.Status != ProbeCompleted || httpsPort.FailureReason != ReasonTLS {
+		t.Fatalf("https:8443 probe = %+v, want completed tls failure", httpsPort)
+	}
+	// Assets keyed by the TARGET port: 8443/tcp open (served + TLS
+	// failure both prove a listener), http service confirmed on 8443.
+	requireEqualStrings(t, "urls", urlNames(hr.URLs), []string{
+		"http://www.example.com/", "http://www.example.com:8443/",
+		"https://www.example.com/", "https://www.example.com:8443/",
+	})
+	requireEqualStrings(t, "ports", portNames(hr.Ports), []string{"443/tcp", "80/tcp", "8443/tcp"})
+	requireEqualStrings(t, "services", serviceNames(hr.Services), []string{"service:80/tcp/http", "service:8443/tcp/http"})
+	// 2 host->url (served: http root + http:8443) + 2 port->service +
+	// 4 url->endpoint (every executed target).
+	if len(hr.Relationships) != 8 {
+		t.Fatalf("relationships = %v, want 8", relationshipIDs(hr))
+	}
+}
+
+// TestProbePortDedup pins canonical-identity dedup: same-scheme
+// default ports (http:80, https:443) strip to the roots and probe once,
+// and repeated port entries collapse. Cross-scheme non-defaults
+// (https:80, http:443) stay distinct targets — different identities,
+// different cache keys, different handshakes.
+func TestProbePortDedup(t *testing.T) {
+	cs := newCountingServer(t, 200, "ok")
+	cfg := testConfig()
+	cfg.HostPorts = map[string][]int{"www.example.com": {443, 80, 8443, 8443}}
+
+	rep := probeOne(t, cs.srv, []asset.Host{mustHost(t, "www.example.com")}, cfg)
+	hr := hostByName(t, rep, "www.example.com")
+	if len(hr.Probes) != 6 {
+		t.Fatalf("probes = %d, want 6 (roots + https:80 + http:443 + one 8443 pair)", len(hr.Probes))
+	}
+	requireEqualStrings(t, "urls", urlNames(hr.URLs), []string{
+		"http://www.example.com/", "http://www.example.com:443/", "http://www.example.com:8443/",
+		"https://www.example.com/", "https://www.example.com:80/", "https://www.example.com:8443/",
+	})
+}
+
+// TestProbePortsInvalidRejects pins caller-bug rejection: an invalid
+// port rejects the whole call before any request is issued.
+func TestProbePortsInvalidRejects(t *testing.T) {
+	for _, port := range []int{0, -1, 70000} {
+		cs := newCountingServer(t, 200, "ok")
+		cfg := testConfig()
+		cfg.HostPorts = map[string][]int{"www.example.com": {port}}
+		cfg.Transport = transportFor(t, cs.srv)
+		_, err := Probe(context.Background(), mustDomain(t, "example.com"),
+			[]asset.Host{mustHost(t, "www.example.com")}, nil, cfg)
+		if err == nil {
+			t.Fatalf("port %d accepted, want whole-call rejection", port)
+		}
+		if got := cs.requestCount(); got != 0 {
+			t.Fatalf("port %d: requests = %d, want 0 (rejected before the pool)", port, got)
+		}
+	}
+}
+
+// TestProbePortsUnknownHostIgnored pins subset probing: ports keyed by a
+// host outside the input list are ignored, never an error.
+func TestProbePortsUnknownHostIgnored(t *testing.T) {
+	cs := newCountingServer(t, 200, "ok")
+	cfg := testConfig()
+	cfg.HostPorts = map[string][]int{"other.example.com": {8443}}
+
+	rep := probeOne(t, cs.srv, []asset.Host{mustHost(t, "www.example.com")}, cfg)
+	hr := hostByName(t, rep, "www.example.com")
+	if len(hr.Probes) != 2 {
+		t.Fatalf("probes = %d, want 2 (unknown-host ports ignored)", len(hr.Probes))
+	}
+}
+
+// TestProbePortCacheDistinct pins cache separation: port targets key by
+// their own URL identity — a warm run serves them with zero requests.
+func TestProbePortCacheDistinct(t *testing.T) {
+	cs := newCountingServer(t, 200, "ok-port")
+	cfg := testConfig()
+	cfg.Cache = openTestCache(t, func() time.Time { return fixedTime }, 0)
+	cfg.HostPorts = map[string][]int{"www.example.com": {8443}}
+	hosts := []asset.Host{mustHost(t, "www.example.com")}
+
+	rep1 := probeOne(t, cs.srv, hosts, cfg)
+	pr1 := probeResultForURL(hostByName(t, rep1, "www.example.com"), "http://www.example.com:8443/")
+	if pr1.Cached || pr1.StatusCode != 200 {
+		t.Fatalf("cold port probe = %+v, want fresh 200", pr1)
+	}
+	if got := cs.requestCount(); got != 2 {
+		t.Fatalf("cold requests = %d, want 2 (http root + http:8443; the https pair hits the plain responder)", got)
+	}
+	rep2 := probeOne(t, cs.srv, hosts, cfg)
+	pr2 := probeResultForURL(hostByName(t, rep2, "www.example.com"), "http://www.example.com:8443/")
+	if !pr2.Cached || pr2.StatusCode != 200 {
+		t.Fatalf("warm port probe = %+v, want a cached 200", pr2)
+	}
+	if got := cs.requestCount(); got != 2 {
+		t.Fatalf("requests = %d, want 2 (warm run performs zero network)", got)
+	}
+}

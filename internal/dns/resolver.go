@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 )
 
 // RecordType identifies the DNS record family a query asks for. The string
@@ -13,8 +15,9 @@ import (
 // must not change.
 type RecordType string
 
-// Supported record types. The package resolves exactly these three; other
-// record families are outside the 5A milestone.
+// Supported record types. The package resolves exactly these seven; CAA and
+// SOA have no standard-library lookup and are deferred (NEW-126 T1 scope) —
+// any other record family reports ErrFailure without touching the network.
 const (
 	// TypeA queries IPv4 (A) records.
 	TypeA RecordType = "A"
@@ -22,6 +25,18 @@ const (
 	TypeAAAA RecordType = "AAAA"
 	// TypeCNAME queries the CNAME chain's final canonical target.
 	TypeCNAME RecordType = "CNAME"
+	// TypeMX queries mail exchanger hostnames (preferences are not
+	// retained: the engine observes routing targets, not mail policy).
+	TypeMX RecordType = "MX"
+	// TypeTXT queries free-text records (SPF, DMARC, verification
+	// strings). Answers are opaque strings, never assets.
+	TypeTXT RecordType = "TXT"
+	// TypeNS queries authoritative nameserver hostnames.
+	TypeNS RecordType = "NS"
+	// TypeSRV queries service-location targets. Answers are encoded
+	// "target:port" wire strings (see formatSRVAnswer); the port is service
+	// data carried alongside the target, never asset-normalized.
+	TypeSRV RecordType = "SRV"
 )
 
 // String returns the stable record-type identifier.
@@ -102,9 +117,11 @@ func KindOf(err error) (ErrorKind, bool) {
 
 // Resolver is the minimal query abstraction the pipeline needs: per-record
 // type queries returning multiple or empty answers. Implementations return
-// raw answer strings (hostnames for CNAME, address strings for A/AAAA); every
-// string is re-validated and normalized through the Phase 2 asset model by
-// the pipeline before it becomes an observation — a resolver can never inject
+// raw answer strings — hostnames for CNAME/MX/NS, "target:port" wire strings
+// for SRV (see formatSRVAnswer), opaque record strings for TXT, address
+// strings for A/AAAA; every string is re-validated and normalized through
+// the Phase 2 asset model (or the documented TXT/SRV rules) by the pipeline
+// before it becomes an observation — a resolver can never inject
 // non-canonical assets.
 //
 // Errors must be typed: a *QueryError classifying NXDOMAIN (ErrNotFound),
@@ -134,6 +151,17 @@ type Resolver interface {
 // documentation). LookupCNAME returns the host itself when it has no CNAME
 // record; the pipeline treats a target identical to the queried host as "no
 // CNAME observation".
+// MX queries use LookupMX and return exchanger hostnames (preferences
+// dropped); NS queries use LookupNS and return nameserver hostnames; TXT
+// queries use LookupTXT and return the record strings verbatim (multi-string
+// records arrive pre-concatenated by the standard library). SRV queries use
+// LookupSRV with empty service and proto, which looks the name up directly
+// (RFC 2782 "_service._proto.name" construction is the caller's concern —
+// the engine queries the host it was given), and return one "target:port"
+// wire string per record (see formatSRVAnswer); priority and weight are not
+// retained. On any lookup error the partial answers the standard library may
+// return alongside the error are discarded: a failed query carries no
+// observation, exactly like the A/AAAA/CNAME branches.
 // The zero value holds no resolver and must not be used directly: construct
 // instances with NewNetResolver.
 type NetResolver struct {
@@ -172,6 +200,42 @@ func (n *NetResolver) Lookup(ctx context.Context, host string, rt RecordType) ([
 			return []string{}, nil
 		}
 		return []string{cname}, nil
+	case TypeMX:
+		mxs, err := n.r.LookupMX(ctx, host)
+		if err != nil {
+			return nil, classifyQueryError(host, rt, err)
+		}
+		out := make([]string, 0, len(mxs))
+		for _, mx := range mxs {
+			out = append(out, mx.Host)
+		}
+		return out, nil
+	case TypeTXT:
+		txts, err := n.r.LookupTXT(ctx, host)
+		if err != nil {
+			return nil, classifyQueryError(host, rt, err)
+		}
+		return txts, nil
+	case TypeNS:
+		nss, err := n.r.LookupNS(ctx, host)
+		if err != nil {
+			return nil, classifyQueryError(host, rt, err)
+		}
+		out := make([]string, 0, len(nss))
+		for _, ns := range nss {
+			out = append(out, ns.Host)
+		}
+		return out, nil
+	case TypeSRV:
+		_, srvs, err := n.r.LookupSRV(ctx, "", "", host)
+		if err != nil {
+			return nil, classifyQueryError(host, rt, err)
+		}
+		out := make([]string, 0, len(srvs))
+		for _, srv := range srvs {
+			out = append(out, formatSRVAnswer(srv.Target, srv.Port))
+		}
+		return out, nil
 	default:
 		return nil, &QueryError{
 			Kind: ErrFailure,
@@ -189,6 +253,35 @@ func netIPsToStrings(addrs []netip.Addr) []string {
 		out[i] = a.String()
 	}
 	return out
+}
+
+// formatSRVAnswer encodes one SRV record as the single wire string the
+// Resolver contract carries: "target:port". Hostnames never contain ':', so
+// splitting on the LAST colon is unambiguous; the target keeps whatever form
+// the resolver returned (typically a trailing-dot FQDN) because the pipeline
+// re-normalizes it through asset.NewHost. This function and parseSRVAnswer
+// are the single authority for the encoding — fakes script the same shape in
+// tests, and no other package constructs or parses it.
+func formatSRVAnswer(target string, port uint16) string {
+	return target + ":" + strconv.FormatUint(uint64(port), 10)
+}
+
+// parseSRVAnswer splits a "target:port" wire string. It reports ok=false for
+// a missing separator, an empty target, or a port outside the u16 range
+// (non-numeric or > 65535). Port 0 passes: it is a legal u16 value and the
+// RFC 2782 "no service" signal — the engine retains it as data and never
+// interprets it. The target itself is NOT validated here; the caller runs it
+// through asset.NewHost (single normalization point).
+func parseSRVAnswer(s string) (target string, port uint16, ok bool) {
+	idx := strings.LastIndexByte(s, ':')
+	if idx <= 0 {
+		return "", 0, false
+	}
+	p, err := strconv.ParseUint(s[idx+1:], 10, 16)
+	if err != nil {
+		return "", 0, false
+	}
+	return s[:idx], uint16(p), true
 }
 
 // classifyQueryError maps a resolver error into a typed QueryError.

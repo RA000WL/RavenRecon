@@ -96,12 +96,12 @@ const (
 	fpContextCap  = 0.45 // documentation/test context: never above Low
 	genericCap    = 0.45 // generic family ("random base64"): never above Low
 	publicKeyCap  = 0.35 // public keys are not secrets: never above Low
+	expiredJWTCap = 0.45 // expired JWT: history, not live access — never above Low
 	structuredCap = 0.59 // a structured match with ZERO supporting factors
 	// stays Medium-or-below: a prefix alone is
 	// not high confidence
 	urlTypeCap = lowThreshold // pure-endpoint URL shapes (S3 bucket,
 	// credential-less database_url, Firebase database URL): never above Low
-
 	// Thresholds.
 	highThreshold   = 0.8
 	mediumThreshold = 0.5
@@ -193,17 +193,30 @@ func deriveConfidence(in confidenceInput) ConfidenceResult {
 		factors = append(factors, Factor{Name: "url_type_cap", Weight: 0, Detail: "endpoint URL shape: capped at Low by contract"})
 	}
 
+	// Expired JWT: an expired-shape token proves the secret existed, not
+	// that it still grants access. The weight-0 jwt_expired marker labels
+	// the clamp honestly (naming expiry in the factor list) without ever
+	// counting as evidence toward the level gates; expiredCapFor holds the
+	// Low ceiling on every confidence path, including pair/repeat
+	// recomputation. Valid (or exp-less) JWTs take no marker and behave
+	// exactly as before.
+	if in.Type == asset.SecretTypeJWT && isJWTExpired(in.Value) {
+		factors = append(factors, Factor{Name: "jwt_expired", Weight: 0, Detail: "token expired (exp in the past): proves history, not live access"})
+	}
+
 	// Supporting-factor count by the canonical rule (countNonPattern): every
-	// factor except "pattern" and the weight-0 "url_type_cap" marker.
+	// factor except "pattern" and the weight-0 markers.
 	nonPattern := countNonPattern(factors)
 
 	score := combineFactors(factors)
 	level := levelForScore(score)
 
-	// Caps, through the single cap-rule source (expectedCapFor): the
-	// tightest bound this candidate's type, family, flags, and factor count
-	// allow.
+	// Caps, through the single cap-rule source (expectedCapFor) plus the
+	// marker-driven expired-JWT companion (expiredCapFor): the tightest
+	// bound this candidate's type, family, flags, factor count, and expiry
+	// marker allow.
 	score = math.Min(score, expectedCapFor(in.Type, in.Family, in.FPFlags, nonPattern))
+	score = math.Min(score, expiredCapFor(factors))
 	score = round4(score)
 	level = levelForScore(score)
 
@@ -250,6 +263,23 @@ func expectedCapFor(typ asset.SecretType, family string, fpFlags []string, nonPa
 		c = math.Min(c, urlTypeCap)
 	}
 	return c
+}
+
+// expiredCapFor is the marker-driven companion to expectedCapFor: it
+// returns expiredJWTCap when the factor list carries the weight-0
+// jwt_expired marker, else 1.0 (no opinion). It stays separate because the
+// marker is value-derived and clock-dependent — a token valid at scan time
+// may expire before its cached record is re-decoded — so the stored-record
+// path enforces the cap from the marker alone (decode-tolerant) instead of
+// re-deriving expiry from the value. Like url_type_cap, the marker weighs
+// 0 and never counts as evidence toward the level gates.
+func expiredCapFor(factors []Factor) float64 {
+	for _, f := range factors {
+		if f.Name == "jwt_expired" {
+			return expiredJWTCap
+		}
+	}
+	return 1.0
 }
 
 // urlTypeCapped reports whether typ is a pure-endpoint URL shape whose
@@ -331,21 +361,22 @@ func applyRepeatFactor(c ConfidenceResult, typ asset.SecretType, family string, 
 // count comes from the factor list itself (countNonPattern), so any future
 // factor-model change stays consistent automatically.
 func recomputeCapped(factors []Factor, typ asset.SecretType, family string, fpFlags []string) float64 {
-	return math.Min(combineFactors(factors), expectedCapFor(typ, family, fpFlags, countNonPattern(factors)))
+	return math.Min(math.Min(combineFactors(factors), expectedCapFor(typ, family, fpFlags, countNonPattern(factors))), expiredCapFor(factors))
 }
 
 // countNonPattern returns the number of supporting (non-pattern) factors in
 // a factor list, by the canonical counting rule shared by every confidence
-// path: every factor EXCEPT "pattern" and the weight-0 "url_type_cap"
-// marker. The marker records a clamp (never evidence); the pattern factor is
-// the candidate's existence condition (always present, never evidence).
+// path: every factor EXCEPT "pattern" and the weight-0 markers
+// ("url_type_cap", "jwt_expired"). The markers record clamps (never
+// evidence); the pattern factor is the candidate's existence condition
+// (always present, never evidence).
 // deriveConfidence, applyGates, recomputeCapped, and decodeStoredScan all
 // count through this one helper, so the cap/gate factor accounting can never
 // drift between paths.
 func countNonPattern(factors []Factor) int {
 	n := 0
 	for _, f := range factors {
-		if f.Name != "pattern" && f.Name != "url_type_cap" {
+		if f.Name != "pattern" && f.Name != "url_type_cap" && f.Name != "jwt_expired" {
 			n++
 		}
 	}

@@ -47,6 +47,16 @@
 // PriorFindings/GraphView are the ONLY read-only inter-rule dataflow
 // (SDK v2). See Context.PriorFindings and Context.GraphView for the
 // contract.
+//
+// SDK v2.1 minor (APIMajor 2, APIMinor 0→1 — NEW-118): ADDITIVE retained-
+// script-body channel — Snapshot.JavaScriptContent / Context.
+// JavaScriptContent plus the MaxSnapshotJSContents/MaxSnapshotJSContentBytes
+// caller bounds. Additive means backward compatible: no existing field,
+// signature, or behavior changes, so packs compiled against 2.0
+// (CheckAPIVersion(2,0)) keep loading unchanged, and snapshots without
+// contents behave byte-identically to v2.0 runs. A minor bump is the
+// documented vehicle for exactly this (this build understands every pack
+// compiled against its own minor or lower) — never a silent alteration.
 package detect
 
 import "fmt"
@@ -60,9 +70,12 @@ import "fmt"
 // SDK v2 is APIMajor 2, APIMinor 0 — the first breaking reopening since
 // the v1.2.5 freeze. Packs compiled against v1 (CheckAPIVersion(1,0))
 // must be recompiled against v2.
+//
+// SDK v2.1 is APIMinor 0→1: the additive JavaScriptContent channel. Minor
+// bumps are backward compatible by contract (see the package doc).
 const (
 	APIMajor = 2
-	APIMinor = 0
+	APIMinor = 1
 )
 
 // CheckAPIVersion reports whether a pack compiled against version

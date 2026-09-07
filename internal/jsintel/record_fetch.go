@@ -31,19 +31,27 @@ const (
 // observation.
 //
 // The key contains every input that materially changes the result: the
-// operation ("js.fetch") and the canonical Phase 2 URL identity. Nothing
-// else: the request shape is fixed (GET, canonical URL, fixed user agent,
-// no cookies), so there is no result-relevant configuration today, and
-// timings, retries, caps, and concurrency NEVER enter a key. In particular
-// MaxJSBytes is deliberately absent: cap changes never invalidate entries —
-// a completed record stays a complete record under any cap (a lowered cap
-// simply means the re-fetch path truncates again), and truncated records are
-// never served as hits anyway.
-func fetchKey(u asset.URL) (cache.Key, error) {
-	return cache.NewKey(cache.KeyParts{
+// operation ("js.fetch"), the canonical Phase 2 URL identity, and —
+// when operator session headers are configured — their digest (NEW-125):
+// authed and anonymous runs (and distinct sessions) must never share
+// records. The digest is omitted when empty so anonymous keys stay
+// byte-identical across the upgrade. Nothing else: the request shape is
+// otherwise fixed (GET, canonical URL, fixed user agent), so there is no
+// other result-relevant configuration, and timings, retries, caps, and
+// concurrency NEVER enter a key. In particular MaxJSBytes is deliberately
+// absent: cap changes never invalidate entries — a completed record stays
+// a complete record under any cap (a lowered cap simply means the
+// re-fetch path truncates again), and truncated records are never served
+// as hits anyway.
+func fetchKey(u asset.URL, session string) (cache.Key, error) {
+	parts := cache.KeyParts{
 		Operation: FetchOperation,
 		Target:    u.Identity().String(),
-	})
+	}
+	if session != "" {
+		parts.Config = map[string]string{"session": session}
+	}
+	return cache.NewKey(parts)
 }
 
 // storedFetch is the structured Data payload of one js.fetch cache record.
@@ -84,6 +92,20 @@ type storedFetch struct {
 	// records are stored under StatusIncomplete (never served as a hit);
 	// a completed record never carries Truncated.
 	Truncated bool `json:"truncated,omitempty"`
+	// TilingTag names the tiling that produced the retained windows
+	// (NEW-129 Slice 1, fetchTilingTag). Only cap-truncated records carry
+	// it; completed and read-error records never do.
+	TilingTag string `json:"tiling_tag,omitempty"`
+	// PrefixLen is the retained prefix length of a cap-truncated record.
+	PrefixLen int64 `json:"prefix_len,omitempty"`
+	// Chunks holds one entry per retained window in index order (cap-
+	// truncated only).
+	Chunks []storedChunk `json:"chunks,omitempty"`
+	// TruncCause names the truncation cause: "cap" (content cap, manifest
+	// required) or "read" (mid-body read failure, manifest forbidden).
+	// Completed records never carry it; legacy truncated records without it
+	// are rejected (delete+recompute).
+	TruncCause string `json:"trunc_cause,omitempty"`
 	// Redirects is the number of redirect hops followed (0..MaxRedirects).
 	Redirects int `json:"redirects,omitempty"`
 	// Reason is the completed-negative cause: "conn_refused" or "tls".
@@ -94,6 +116,18 @@ type storedFetch struct {
 	// FirstSeen is the earliest and LastSeen the latest observation time.
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
+}
+
+// storedChunk is one window's manifest entry in a stored fetch record.
+type storedChunk struct {
+	// Index is the window index in tiling order.
+	Index int `json:"index"`
+	// Start is the byte offset in the retained prefix.
+	Start int64 `json:"start"`
+	// End is the exclusive end offset.
+	End int64 `json:"end"`
+	// SHA256Hex is the lowercase hex SHA-256 of the window bytes (64 hex).
+	SHA256Hex string `json:"sha256hex"`
 }
 
 // decodeStoredFetch validates and decodes a stored js.fetch payload before
@@ -186,6 +220,14 @@ func decodeStoredFetch(raw json.RawMessage, u asset.URL) (storedFetch, error) {
 			return s, fmt.Errorf("jsintel: stored fetch carries a hash without content")
 		}
 	}
+	// Manifest invariants (NEW-129 Slice 1): a cap-truncated record
+	// REQUIRES a well-formed manifest (else delete+recompute); a read-error
+	// truncated record carries NONE; a completed record never carries one;
+	// a tag mismatch recomputes. The key never contains the manifest (same
+	// js.fetch key — shrink-recovery overwrites it away via Put).
+	if err := validateStoredManifest(s); err != nil {
+		return s, err
+	}
 	// Completed-negative records (conn_refused / tls) carry no response
 	// observation; any other reason is unknown.
 	switch s.Reason {
@@ -219,6 +261,59 @@ func decodeStoredFetch(raw json.RawMessage, u asset.URL) (storedFetch, error) {
 		return s, fmt.Errorf("jsintel: stored fetch redirects %d out of range", s.Redirects)
 	}
 	return s, nil
+}
+
+// validateStoredManifest enforces the Slice 1 manifest contract.
+func validateStoredManifest(s storedFetch) error {
+	if !s.Truncated {
+		if s.TilingTag != "" || s.PrefixLen != 0 || len(s.Chunks) != 0 || s.TruncCause != "" {
+			return fmt.Errorf("jsintel: completed stored fetch carries a truncation manifest")
+		}
+		return nil
+	}
+	switch s.TruncCause {
+	case truncCauseCap:
+		if s.TilingTag != fetchTilingTag {
+			return fmt.Errorf("jsintel: stored fetch tiling tag %q mismatches %q", truncateStored(s.TilingTag), fetchTilingTag)
+		}
+		if s.PrefixLen <= 0 || s.PrefixLen > maxStoredContent {
+			return fmt.Errorf("jsintel: stored fetch prefix length %d out of range", s.PrefixLen)
+		}
+		if len(s.Chunks) == 0 || len(s.Chunks) > maxWindowedChunks {
+			return fmt.Errorf("jsintel: stored fetch carries %d chunks (bound %d)", len(s.Chunks), maxWindowedChunks)
+		}
+		for i, c := range s.Chunks {
+			if c.Index != i {
+				return fmt.Errorf("jsintel: stored fetch chunk %d has index %d", i, c.Index)
+			}
+			if c.Start < 0 || c.End <= c.Start || c.End > s.PrefixLen {
+				return fmt.Errorf("jsintel: stored fetch chunk %d has span %d-%d outside prefix %d", i, c.Start, c.End, s.PrefixLen)
+			}
+			if c.End-c.Start > int64(maxFetchWindowBytes) {
+				return fmt.Errorf("jsintel: stored fetch chunk %d spans %d bytes over window %d", i, c.End-c.Start, maxFetchWindowBytes)
+			}
+			if len(c.SHA256Hex) != 64 || !lowerHex(c.SHA256Hex) {
+				return fmt.Errorf("jsintel: stored fetch chunk %d hash is not 64 lowercase hex", i)
+			}
+			if i > 0 && c.Start < s.Chunks[i-1].Start {
+				return fmt.Errorf("jsintel: stored fetch chunks are not in span order")
+			}
+		}
+		if s.Chunks[0].Start != 0 {
+			return fmt.Errorf("jsintel: stored fetch first chunk must start at 0")
+		}
+		if s.Chunks[len(s.Chunks)-1].End != s.PrefixLen {
+			return fmt.Errorf("jsintel: stored fetch last chunk must end at prefix %d", s.PrefixLen)
+		}
+		return nil
+	case truncCauseRead:
+		if s.TilingTag != "" || s.PrefixLen != 0 || len(s.Chunks) != 0 {
+			return fmt.Errorf("jsintel: read-error truncated stored fetch carries a manifest")
+		}
+		return nil
+	default:
+		return fmt.Errorf("jsintel: truncated stored fetch carries unknown cause %q", truncateStored(s.TruncCause))
+	}
 }
 
 // printableASCII reports whether s contains only printable ASCII bytes.
@@ -291,7 +386,7 @@ type fetchLookup struct {
 // convention and future use; the lookup itself does not consult them — its
 // inputs are the URL, the cache, and the context only.
 func lookupFetch(ctx context.Context, u asset.URL, cfg FetchConfig, c cache.Cache, clock runtime.Clock, source string) fetchLookup {
-	key, err := fetchKey(u)
+	key, err := fetchKey(u, sessionDigest(cfg.RequestHeaders))
 	if err != nil {
 		return fetchLookup{Err: fmt.Errorf("jsintel: %s: build cache key: %w", u.String(), err)}
 	}
@@ -425,13 +520,81 @@ func storeFetch(ctx context.Context, cfg FetchConfig, c cache.Cache, clock runti
 		sum := sha256.Sum256(res.Content)
 		st.Hash = hex.EncodeToString(sum[:])
 	}
+	// Manifest (Slice 1): cap-truncated carries its window manifest (stored
+	// incomplete, never served); read-error truncated carries none; a
+	// complete Put carries none, so shrink-recovery overwrites any prior
+	// manifest away via the cache's replace-whole Put under the same key.
+	if res.Truncated && res.Manifest != nil {
+		st.TruncCause = truncCauseCap
+		st.TilingTag = res.Manifest.TilingTag
+		st.PrefixLen = res.Manifest.PrefixLen
+		for _, c := range res.Manifest.Chunks {
+			st.Chunks = append(st.Chunks, storedChunk{
+				Index: c.Index, Start: c.Start, End: c.End, SHA256Hex: c.SHA256Hex,
+			})
+		}
+	} else if res.Truncated {
+		st.TruncCause = truncCauseRead
+	}
 	if res.Status == FetchCompleted && res.Reason != ReasonNone {
 		st.Reason = string(res.Reason)
 	}
 
-	key, err := fetchKey(res.URL)
+	key, err := fetchKey(res.URL, sessionDigest(cfg.RequestHeaders))
 	if err != nil {
 		return fmt.Errorf("jsintel: store fetch %s: build cache key: %w", res.URL.String(), err)
+	}
+	storeCtx := ctx
+	if ctx.Err() != nil {
+		var scancel context.CancelFunc
+		storeCtx, scancel = context.WithTimeout(context.Background(), storeTimeout)
+		defer scancel()
+	}
+	// OD-3a (NEW-129 Slice 2): when a complete fetch stores over a prior
+	// cap-truncated manifest, the listed per-chunk analyses are
+	// unreachable (the file is no longer windowed — the engine takes the
+	// complete path and never looks chunk keys up). Delete exactly those
+	// chunk keys best-effort under the detached store context so a
+	// shrink-to-complete run heals in one run instead of orphaning up to
+	// maxWindowedChunks findings-only records (tens of KiB) until TTL/Clear.
+	// Truncated-over-truncated (big→big content change with different
+	// chunk hashes) still orphans the old keys by construction (keys cite
+	// the hash prefix) — bounded per file version, reclaimed by TTL/Clear
+	// (see doc.go). A missing/invalid prior record, a read-error prior
+	// (no manifest), or a session change (old keys live in another
+	// namespace) deletes nothing — never an error. Deletes are best-effort
+	// and never block the complete Put: the first non-cancellation Delete
+	// failure is stashed and reported only AFTER the complete record is
+	// stored, so a transient Delete IO error heals the manifest instead of
+	// leaving it stale behind a skipped Put.
+	var orphanDelErr error
+	if !res.Truncated && res.Status == FetchCompleted {
+		if out := c.Get(ctx, key); out.State == cache.StateIncomplete && out.Record != nil {
+			if old, derr := decodeStoredFetch(out.Record.Data, res.URL); derr == nil &&
+				old.Truncated && old.TruncCause == truncCauseCap && len(old.Chunks) > 0 {
+				sess := sessionDigest(cfg.RequestHeaders)
+				total := len(old.Chunks)
+				for _, ch := range old.Chunks {
+					if len(ch.SHA256Hex) < 8 {
+						continue
+					}
+					cid, cerr := asset.ChunkJavaScriptIdentity(res.URL, ch.Index, total, ch.Start, ch.End, ch.SHA256Hex[:8], old.TilingTag)
+					if cerr != nil {
+						continue
+					}
+					ckey, kerr := chunkAnalyzeKey(cid, sess)
+					if kerr != nil {
+						continue
+					}
+					if derr := c.Delete(storeCtx, ckey); derr != nil &&
+						!errors.Is(derr, context.Canceled) && !errors.Is(derr, context.DeadlineExceeded) {
+						if orphanDelErr == nil {
+							orphanDelErr = derr
+						}
+					}
+				}
+			}
+		}
 	}
 	data, err := json.Marshal(st)
 	if err != nil {
@@ -448,14 +611,11 @@ func storeFetch(ctx context.Context, cfg FetchConfig, c cache.Cache, clock runti
 		Meta:      map[string]string{"source": sources[0]},
 		Data:      data,
 	}
-	storeCtx := ctx
-	if ctx.Err() != nil {
-		var scancel context.CancelFunc
-		storeCtx, scancel = context.WithTimeout(context.Background(), storeTimeout)
-		defer scancel()
-	}
 	if perr := c.Put(storeCtx, key, rec); perr != nil {
 		return fmt.Errorf("jsintel: store fetch %s: cache put: %w", res.URL.String(), perr)
+	}
+	if orphanDelErr != nil {
+		return fmt.Errorf("jsintel: store fetch %s: delete orphaned chunk analyze: %w", res.URL.String(), orphanDelErr)
 	}
 	return nil
 }

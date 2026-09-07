@@ -21,6 +21,14 @@ import (
 // previously stored analysis record by construction.
 const AnalyzeOperation = "js.analyze"
 
+// ChunkAnalyzeOperation is the stable cache operation name for per-chunk
+// analysis of windowed (over-cap) files (NEW-129 Slice 2). Fresh namespace,
+// zero legacy: no record written before Slice 2 carries this operation, so
+// every chunk lookup before Slice 2 is a clean miss by construction. It is
+// part of the key payload; changing it invalidates every previously stored
+// chunk-analysis record.
+const ChunkAnalyzeOperation = "js.analyze.chunk"
+
 // JSParserSchemaVersion versions the analysis payload semantics (the
 // analysisData shape and the D1/D2 extraction contract). It enters the
 // cache key, so a record written by a different parser-schema build is
@@ -102,8 +110,10 @@ type analysisData struct {
 // observation.
 //
 // The key contains every input that materially changes the result: the
-// operation ("js.analyze"), the canonical URL identity, and the parser
-// schema version + family mask ("1:eimst"). The parser version and mask
+// operation ("js.analyze"), the canonical URL identity, the parser
+// schema version + family mask ("1:eimst"), and — when operator session
+// headers are configured — their digest (NEW-125; omitted when empty so
+// anonymous keys stay byte-identical). The parser version and mask
 // enter the key so a record produced by a different analysis contract is
 // unreachable by construction, and a future build that changes either
 // derives different keys without ever misreading old records. Per-file
@@ -120,11 +130,62 @@ type analysisData struct {
 // self-healing: a record bound to different content is deleted and
 // recomputed under the SAME key, so a changed script heals in one run
 // and never accumulates orphaned entries.
-func analyzeKey(u asset.URL) (cache.Key, error) {
+func analyzeKey(u asset.URL, session string) (cache.Key, error) {
+	cfg := map[string]string{"parser": fmt.Sprintf("%d:%s", JSParserSchemaVersion, analyzeMask)}
+	if session != "" {
+		// Authed and anonymous analyses (and distinct sessions) must
+		// never share records; anonymous keys stay byte-identical
+		// (NEW-125). The content hash cross-check remains the primary
+		// freshness guard — the session component prevents cross-mode
+		// eviction churn on top of it.
+		cfg["session"] = session
+	}
 	return cache.NewKey(cache.KeyParts{
 		Operation: AnalyzeOperation,
 		Target:    u.Identity().String(),
-		Config:    map[string]string{"parser": fmt.Sprintf("%d:%s", JSParserSchemaVersion, analyzeMask)},
+		Config:    cfg,
+	})
+}
+
+// chunkAnalyzeKey derives the cache key for one chunk-analysis observation
+// (NEW-129 Slice 2).
+//
+// The key contains every input that materially changes the result: the
+// operation ("js.analyze.chunk", fresh namespace), the chunk identity
+// string (javascript:<file>#rr-chunk=i/n/span/ph/t, built ONLY through
+// asset.ChunkJavaScriptIdentity), the parser schema version + family mask
+// (same contract versioning as analyzeKey: "1:eimst"), the tiling tag
+// (fetchTilingTag "w512-o8-v1" — a different tiling tiled differently, so
+// its windows are never served under this key), and — when operator session
+// headers are configured — their digest (NEW-125 parity; omitted when empty
+// so anonymous keys stay byte-identical). Per-file caps, timings, retries,
+// and concurrency NEVER enter the key: a completed chunk record stays a
+// complete record under any cap configuration (caps apply once at the
+// entry boundary via applyAnalysis, never per chunk).
+//
+// The content hash is deliberately NOT part of the key beyond the 8-hex
+// prefix already cited inside the chunk identity: the full SHA-256 lives in
+// the record payload (storedAnalyze.AnalyzedHash, the chunk bytes' hash)
+// and is cross-validated at lookup time against the CURRENT chunk's hash.
+// A record bound to different chunk content is deleted and recomputed under
+// the SAME key (self-healing, mirroring lookupAnalyze) — except when the
+// file content change itself moves the chunk identity (different span or
+// hash prefix): then the key differs by construction and the old record is
+// a bounded orphan (≤ maxWindowedChunks per file version, findings-only,
+// tens of KiB) reclaimed by TTL/Clear, plus eager shrink-to-complete
+// deletion in storeFetch (OD-3a).
+func chunkAnalyzeKey(chunkID asset.Identity, session string) (cache.Key, error) {
+	cfg := map[string]string{
+		"parser": fmt.Sprintf("%d:%s", JSParserSchemaVersion, analyzeMask),
+		"tiling": fetchTilingTag,
+	}
+	if session != "" {
+		cfg["session"] = session
+	}
+	return cache.NewKey(cache.KeyParts{
+		Operation: ChunkAnalyzeOperation,
+		Target:    chunkID.String(),
+		Config:    cfg,
 	})
 }
 
@@ -253,28 +314,49 @@ func storedToAnalysis(st storedAnalyze) analysisData {
 // identity; entry.Imports is the subset of relationships of kind
 // javascript_to_javascript (the expansion view), mirroring the pre-D2
 // entry shape.
-func applyAnalysis(entry JSEntry, js asset.JavaScript, data analysisData, cfg Config) JSEntry {
+//
+// The returned cut count is the number of payload items dropped by the
+// entry-boundary caps (per family: payload length minus retained length,
+// plus import edges cut at the cap). The fresh path always yields 0 —
+// extraction already capped the payload under the same caps — while a
+// cache-hit path under lowered caps yields the honest cut size; the caller
+// reports it through the Skipped metric, so a warm-hit cut is as visible
+// as a fresh-path extraction drop and never a silent completed prefix.
+func applyAnalysis(entry JSEntry, js asset.JavaScript, data analysisData, cfg Config) (JSEntry, int) {
+	cut := 0
 	entry.BareImports = capStrings(data.BareImports, cfg.MaxImportsPerFile)
+	cut += len(data.BareImports) - len(entry.BareImports)
 	entry.Exports = append([]string(nil), data.Exports...)
 	entry.SourceMaps = capSourceMaps(data.SourceMaps, cfg.MaxSourceMapsPerFile)
+	cut += len(data.SourceMaps) - len(entry.SourceMaps)
 	entry.Endpoints = capEndpoints(data.Endpoints, cfg.MaxEndpointsPerFile)
+	cut += len(data.Endpoints) - len(entry.Endpoints)
 	entry.URLs = capURLs(data.URLs, cfg.MaxEndpointsPerFile)
+	cut += len(data.URLs) - len(entry.URLs)
 	entry.Secrets = capSecrets(data.Secrets, cfg.MaxSecretsPerFile)
+	cut += len(data.Secrets) - len(entry.Secrets)
 	entry.Technologies = capTechnologies(data.Technologies, cfg.MaxTechPerFile)
+	cut += len(data.Technologies) - len(entry.Technologies)
 	entry.Evidence = capEvidence(data.Evidence, cfg.MaxEvidencePerFile)
+	cut += len(data.Evidence) - len(entry.Evidence)
 
 	// D1 edges: imports and source maps, derived from the payload so both
-	// paths agree.
-	var rels []asset.Relationship
+	// paths agree. Import edges are built in order, then cut at the cap —
+	// identical to the previous break-at-cap loop, with a precise cut
+	// count (build failures are skipped, never cut).
+	var importEdges []asset.Relationship
 	for _, imp := range data.Imports {
-		if len(rels) >= cfg.MaxImportsPerFile {
-			break
-		}
 		to := asset.Identity{Kind: asset.KindJavaScript, Value: imp.URL.String()}
 		if r, err := asset.NewRelationship(js.Identity(), asset.RelationshipJavaScriptToJavaScript, to); err == nil {
-			rels = append(rels, r)
+			importEdges = append(importEdges, r)
 		}
 	}
+	if len(importEdges) > cfg.MaxImportsPerFile {
+		cut += len(importEdges) - cfg.MaxImportsPerFile
+		importEdges = importEdges[:cfg.MaxImportsPerFile]
+	}
+	var rels []asset.Relationship
+	rels = append(rels, importEdges...)
 	for _, m := range entry.SourceMaps {
 		if r, err := asset.NewRelationship(js.Identity(), asset.RelationshipJavaScriptToSourceMap, m.Identity()); err == nil {
 			rels = append(rels, r)
@@ -320,7 +402,7 @@ func applyAnalysis(entry JSEntry, js asset.JavaScript, data analysisData, cfg Co
 			entry.Imports = append(entry.Imports, r)
 		}
 	}
-	return entry
+	return entry, cut
 }
 
 // analysisResolved returns the resolved import URLs of a validated analysis
@@ -429,6 +511,11 @@ func decodeStoredAnalyze(raw json.RawMessage, u asset.URL) (storedAnalyze, error
 	}
 	if len(s.AnalyzedHash) != 64 || !lowerHex(s.AnalyzedHash) {
 		return s, fmt.Errorf("jsintel: stored analyze analyzed_hash %q is not 64 lowercase hex digits", truncateStored(s.AnalyzedHash))
+	}
+	// A truncated analysis is stored incomplete and never served as a hit;
+	// a completed record carrying Truncated could only be tampered with.
+	if s.Truncated {
+		return s, fmt.Errorf("jsintel: stored analyze is truncated (never served as a hit)")
 	}
 	// Every URL-bearing entry must re-parse canonically to its own
 	// identity: a non-canonical or non-reparseable URL could only be
@@ -765,7 +852,7 @@ type analyzeLookup struct {
 // convention and future use; the lookup itself does not consult them — its
 // inputs are the URL, the content hash, the cache, and the context only.
 func lookupAnalyze(ctx context.Context, u asset.URL, contentHash string, cfg Config, c cache.Cache, clock runtime.Clock) analyzeLookup {
-	key, err := analyzeKey(u)
+	key, err := analyzeKey(u, sessionDigest(cfg.RequestHeaders))
 	if err != nil {
 		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: build cache key: %w", u.String(), err)}
 	}
@@ -777,7 +864,9 @@ func lookupAnalyze(ctx context.Context, u asset.URL, contentHash string, cfg Con
 		// carries a diagnosis; it is surfaced as a warning, never as a
 		// failure — the run falls through to a fresh analysis. Cache
 		// failures that wrap context cancellation are suppressed: they are
-		// not diagnostics, the caller's context is simply done.
+		// not diagnostics, the caller's context is simply done. The session
+		// digest (NEW-125) scopes the lookup to the run's session: authed and
+		// anonymous analyses never share records and never evict each other.
 		if out.State == cache.StateError && out.Err != nil &&
 			!errors.Is(out.Err, context.Canceled) && !errors.Is(out.Err, context.DeadlineExceeded) {
 			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: cache get: %w", u.String(), out.Err)}
@@ -899,7 +988,7 @@ func storeAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.
 	st.FirstSeen = firstSeen
 	st.LastSeen = lastSeen
 
-	key, err := analyzeKey(u)
+	key, err := analyzeKey(u, sessionDigest(cfg.RequestHeaders))
 	if err != nil {
 		return fmt.Errorf("jsintel: store analyze %s: build cache key: %w", u.String(), err)
 	}
@@ -926,6 +1015,386 @@ func storeAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.
 	}
 	if perr := c.Put(storeCtx, key, rec); perr != nil {
 		return fmt.Errorf("jsintel: store analyze %s: cache put: %w", u.String(), perr)
+	}
+	return nil
+}
+
+// decodeStoredChunkAnalyze validates and decodes a stored js.analyze.chunk
+// payload before it may be served as a hit (NEW-129 Slice 2). Gates mirror
+// decodeStoredAnalyze verbatim: the chunk Target must equal the queried
+// chunk identity (which itself must parse through ParseChunkIdentity and
+// cite the file URL with the current tiling tag), the parser version and
+// family mask must match this build's contract, the content binding
+// (AnalyzedHash, the SHA-256 of the CHUNK bytes — never the file hash)
+// must be present and canonical (the lookup separately cross-validates it
+// against the CURRENT chunk's hash), every URL-bearing entry must re-parse
+// canonically, secrets/technologies/evidence must re-derive their identities
+// (secret and evidence sources are the FILE's JavaScript identity — chunk
+// extraction runs under the file JS asset, which stays sizeless Size 0 and
+// empty hash — never the chunk identity), lists must respect the fixed
+// stored-analysis bounds and carry no duplicate identities, and timestamps
+// must order. On any error the caller deletes the record and falls through
+// to a fresh chunk analysis (self-healing), never serving it as a hit.
+func decodeStoredChunkAnalyze(raw json.RawMessage, chunkID asset.Identity, fileURL asset.URL) (storedAnalyze, error) {
+	var s storedAnalyze
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return s, fmt.Errorf("jsintel: parse stored chunk analyze: %w", err)
+	}
+	if s.Target != chunkID.String() {
+		return s, fmt.Errorf("jsintel: stored chunk analyze target %q does not match %q", truncateStored(s.Target), chunkID.String())
+	}
+	// The chunk identity itself must parse and must cite this file with
+	// the current tiling: a record whose identity cites another file (or
+	// a stale tiling) could only be tampered with or mis-stored.
+	file, _, _, _, _, _, tag, perr := asset.ParseChunkIdentity(chunkID)
+	if perr != nil {
+		return s, fmt.Errorf("jsintel: stored chunk analyze identity does not parse: %w", perr)
+	}
+	if file.String() != fileURL.String() {
+		return s, fmt.Errorf("jsintel: stored chunk analyze file %q does not match %q", truncateStored(file.String()), fileURL.String())
+	}
+	if tag != fetchTilingTag {
+		return s, fmt.Errorf("jsintel: stored chunk analyze tiling tag %q mismatches %q", truncateStored(tag), fetchTilingTag)
+	}
+	if s.ParserVersion != JSParserSchemaVersion {
+		return s, fmt.Errorf("jsintel: stored chunk analyze parser version %d does not match %d", s.ParserVersion, JSParserSchemaVersion)
+	}
+	if s.Mask != analyzeMask {
+		return s, fmt.Errorf("jsintel: stored chunk analyze mask %q does not match %q", truncateStored(s.Mask), analyzeMask)
+	}
+	if s.AnalyzedHash == "" {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has no analyzed_hash")
+	}
+	if len(s.AnalyzedHash) != 64 || !lowerHex(s.AnalyzedHash) {
+		return s, fmt.Errorf("jsintel: stored chunk analyze analyzed_hash %q is not 64 lowercase hex digits", truncateStored(s.AnalyzedHash))
+	}
+	// A truncated chunk analysis is stored incomplete and never served as a
+	// hit; a completed record carrying Truncated could only be tampered with.
+	if s.Truncated {
+		return s, fmt.Errorf("jsintel: stored chunk analyze is truncated (never served as a hit)")
+	}
+	checkURL := func(field string, i int, u asset.URL) error {
+		got, err := asset.ParseURL(u.String(), u.Prov)
+		if err != nil {
+			return fmt.Errorf("jsintel: stored chunk analyze %s[%d] url %q does not parse: %w", field, i, truncateStored(u.String()), err)
+		}
+		if got.String() != u.String() {
+			return fmt.Errorf("jsintel: stored chunk analyze %s[%d] url %q is not in canonical form (normalized %q)", field, i, truncateStored(u.String()), got.String())
+		}
+		return nil
+	}
+	for i, u := range s.URLs {
+		if err := checkURL("urls", i, u); err != nil {
+			return s, err
+		}
+	}
+	for i, imp := range s.Imports {
+		if err := checkURL("imports", i, imp.URL); err != nil {
+			return s, err
+		}
+		if imp.Kind != "static" && imp.Kind != "dynamic" {
+			return s, fmt.Errorf("jsintel: stored chunk analyze import[%d] kind %q is unknown", i, truncateStored(imp.Kind))
+		}
+		if err := checkStoredString("import specifier", imp.Specifier, maxStoredSpecifierBytes); err != nil {
+			return s, fmt.Errorf("jsintel: stored chunk analyze import[%d]: %w", i, err)
+		}
+	}
+	for i, b := range s.BareImports {
+		if len(b) > maxStoredSpecifierBytes {
+			return s, fmt.Errorf("jsintel: stored chunk analyze bare import[%d] is %d bytes, longer than the %d maximum", i, len(b), maxStoredSpecifierBytes)
+		}
+	}
+	for i, m := range s.SourceMaps {
+		if err := checkURL("source_maps", i, m.URL); err != nil {
+			return s, err
+		}
+	}
+	for i, ep := range s.Endpoints {
+		got, err := asset.NewEndpoint(ep.Method, ep.URL.String(), ep.URL.Prov)
+		if err != nil {
+			return s, fmt.Errorf("jsintel: stored chunk analyze endpoint[%d] %q does not re-parse: %w", i, truncateStored(ep.String()), err)
+		}
+		if !got.Identity().Equal(ep.Identity()) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze endpoint[%d] %q is not in canonical form (re-derived %q)", i, truncateStored(ep.String()), got.Identity().String())
+		}
+	}
+	// Chunk extraction runs under the FILE JS asset (sizeless Size 0 /
+	// empty hash — never the prefix), so secret and evidence sources are
+	// the file's JavaScript identity, never the chunk identity.
+	jsID := asset.Identity{Kind: asset.KindJavaScript, Value: fileURL.String()}
+	for i, sec := range s.Secrets {
+		if !sec.Type.Valid() {
+			return s, fmt.Errorf("jsintel: stored chunk analyze secret[%d] type %q is unknown", i, truncateStored(string(sec.Type)))
+		}
+		if sec.Value == "" {
+			return s, fmt.Errorf("jsintel: stored chunk analyze secret[%d] value is empty", i)
+		}
+		if !sec.Source.Equal(jsID) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze secret[%d] source %q does not match %q", i, truncateStored(sec.Source.String()), jsID.String())
+		}
+		got, err := asset.NewSecretCandidate(sec.Type, sec.Value, sec.Source, sec.Prov)
+		if err != nil {
+			return s, fmt.Errorf("jsintel: stored chunk analyze secret[%d]: %w", i, err)
+		}
+		if !got.Identity().Equal(sec.Identity()) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze secret[%d] is not in canonical form (re-derived %q)", i, got.Identity().String())
+		}
+	}
+	for i, tech := range s.Technologies {
+		got, err := asset.NewTechnology(tech.Name, tech.Category, tech.Prov)
+		if err != nil {
+			return s, fmt.Errorf("jsintel: stored chunk analyze technology[%d]: %w", i, err)
+		}
+		if !got.Identity().Equal(tech.Identity()) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze technology[%d] %q is not in canonical form (re-derived %q)", i, truncateStored(tech.String()), got.Identity().String())
+		}
+	}
+	for i, ev := range s.Evidence {
+		if ev.Method != asset.MethodJS {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d] method %q is not js", i, truncateStored(ev.Method.String()))
+		}
+		if !ev.Source.Equal(jsID) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d] source %q does not match %q", i, truncateStored(ev.Source.String()), jsID.String())
+		}
+		needle, ok := strings.CutPrefix(ev.Indicator, "js_content:")
+		if !ok || needle == "" {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d] indicator %q is not a js_content marker", i, truncateStored(ev.Indicator))
+		}
+		if ev.Value != needle {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d] value %q does not match marker %q", i, truncateStored(ev.Value), truncateStored(needle))
+		}
+		got, err := asset.NewEvidence(ev.Method, ev.Indicator, ev.Value, ev.Source, ev.Prov)
+		if err != nil {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d]: %w", i, err)
+		}
+		if !got.Identity().Equal(ev.Identity()) {
+			return s, fmt.Errorf("jsintel: stored chunk analyze evidence[%d] is not in canonical form (re-derived %q)", i, got.Identity().String())
+		}
+	}
+	if n := len(s.Imports); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d imports (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.BareImports); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d bare imports (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.Exports); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d exports (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.Endpoints); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d endpoints (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.URLs); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d urls (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.Secrets); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d secrets (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.Technologies); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d technologies (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.Evidence); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d evidence records (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if n := len(s.SourceMaps); n > maxStoredAnalysisItems {
+		return s, fmt.Errorf("jsintel: stored chunk analyze has %d source maps (cap %d)", n, maxStoredAnalysisItems)
+	}
+	if err := checkStringDedup("bare imports", s.BareImports); err != nil {
+		return s, err
+	}
+	if err := checkStringDedup("exports", s.Exports); err != nil {
+		return s, err
+	}
+	checkListDedup := func(field string, ids []string) error {
+		seen := make(map[string]struct{}, len(ids))
+		for i, id := range ids {
+			if _, ok := seen[id]; ok {
+				return fmt.Errorf("jsintel: stored chunk analyze %s[%d] duplicates identity %q", field, i, truncateStored(id))
+			}
+			seen[id] = struct{}{}
+		}
+		return nil
+	}
+	if err := checkListDedup("imports", importIDs(s.Imports)); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("urls", urlIDs(s.URLs)); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("source_maps", urlIDs(sourceMapURLs(s.SourceMaps))); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("endpoints", endpointIDs(s.Endpoints)); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("secrets", secretIDs(s.Secrets)); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("technologies", technologyIDs(s.Technologies)); err != nil {
+		return s, err
+	}
+	if err := checkListDedup("evidence", evidenceIDs(s.Evidence)); err != nil {
+		return s, err
+	}
+	if s.FirstSeen.IsZero() || s.LastSeen.IsZero() {
+		return s, fmt.Errorf("jsintel: stored chunk analyze timestamps are incomplete")
+	}
+	if s.LastSeen.Before(s.FirstSeen) {
+		return s, fmt.Errorf("jsintel: stored chunk analyze last_seen %v is before first_seen %v", s.LastSeen, s.FirstSeen)
+	}
+	return s, nil
+}
+
+// lookupChunkAnalyze is the cache-before-execute read side for one chunk
+// analysis observation (NEW-129 Slice 2). It mirrors lookupAnalyze: a usable
+// hit (completed, validated record for the exact chunk key) serves the
+// stored payload with zero parse, or the caller falls through to a fresh
+// chunk analysis with an optional diagnostic.
+//
+// chunkID is the chunk identity (key Target and record Target); fileURL is
+// the file the chunk was tiled from (secret/evidence source validation);
+// chunkHash is the CURRENT chunk bytes' SHA-256 (lowercase hex, recomputed
+// from the fresh window bytes — the windowed fetch is never served, so the
+// bytes are always available). The stored record is cross-validated against
+// it: a record whose AnalyzedHash differs was derived from DIFFERENT chunk
+// content and is never served — it is deleted so the fresh analysis
+// overwrites the same key (self-healing), and the lookup falls through as a
+// routine MISS with no diagnostic (a content change is a normal lifecycle
+// event, not an anomaly). Records failing identity or decode validation
+// (tampering or corruption) are deleted and carry a diagnostic. cfg and
+// clock are accepted for the engine's calling convention; the lookup
+// consults cfg only for the session digest (NEW-125 parity).
+func lookupChunkAnalyze(ctx context.Context, chunkID asset.Identity, fileURL asset.URL, chunkHash string, cfg Config, c cache.Cache, clock runtime.Clock) analyzeLookup {
+	key, err := chunkAnalyzeKey(chunkID, sessionDigest(cfg.RequestHeaders))
+	if err != nil {
+		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: build chunk cache key: %w", chunkID.String(), err)}
+	}
+	// A malformed fresh hash can never match a well-formed stored binding:
+	// refuse without deleting (the stored record may be legitimate — the
+	// caller, not the record, is at fault).
+	if len(chunkHash) != 64 || !lowerHex(chunkHash) {
+		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: chunk hash %q is not 64 lowercase hex digits", chunkID.String(), truncateStored(chunkHash))}
+	}
+	out := c.Get(ctx, key)
+	if !out.IsHit() {
+		if out.State == cache.StateError && out.Err != nil &&
+			!errors.Is(out.Err, context.Canceled) && !errors.Is(out.Err, context.DeadlineExceeded) {
+			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: cache get: %w", chunkID.String(), out.Err)}
+		}
+		return analyzeLookup{}
+	}
+	if out.Record.Operation != ChunkAnalyzeOperation || out.Record.Target != chunkID.String() {
+		if delerr := c.Delete(ctx, key); delerr != nil {
+			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: delete mismatched cached chunk record: %w", chunkID.String(), delerr)}
+		}
+		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: discarded cached chunk record with mismatched identity %q/%q",
+			chunkID.String(), out.Record.Operation, out.Record.Target)}
+	}
+	st, derr := decodeStoredChunkAnalyze(out.Record.Data, chunkID, fileURL)
+	if derr != nil {
+		if delerr := c.Delete(ctx, key); delerr != nil {
+			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: delete unusable cached chunk record: %w", chunkID.String(), delerr)}
+		}
+		return analyzeLookup{Err: fmt.Errorf("jsintel: %s: discarded unusable cached chunk analyze: %w", chunkID.String(), derr)}
+	}
+	// Content binding: the record's analysis is only valid for the chunk
+	// content it was derived from. A hash mismatch deletes the stale
+	// record so the fresh analysis overwrites the same key (self-healing)
+	// and falls through as a routine silent miss — mirroring lookupAnalyze.
+	if st.AnalyzedHash != chunkHash {
+		if delerr := c.Delete(ctx, key); delerr != nil {
+			return analyzeLookup{Err: fmt.Errorf("jsintel: %s: delete stale cached chunk analyze: %w", chunkID.String(), delerr)}
+		}
+		return analyzeLookup{}
+	}
+	return analyzeLookup{
+		Result:    storedToAnalysis(st),
+		FirstSeen: st.FirstSeen,
+		LastSeen:  st.LastSeen,
+		Hit:       true,
+	}
+}
+
+// storeChunkAnalyze is the cache write side for one chunk analysis
+// observation (NEW-129 Slice 2). It mirrors storeAnalyze: only completed
+// analyses — including truncated ones, persisted as INCOMPLETE records
+// (never served as a hit; a later run re-analyzes the chunk) — are stored.
+// chunkHash is the SHA-256 of the CHUNK bytes the analysis was derived
+// from (never the file hash; the file JS asset stays sizeless Size 0 and
+// empty hash). An EMPTY hash is a deliberate no-op (never cached), and a
+// malformed hash is a store error, so a record this layer writes always
+// satisfies its own decode. Zero provenance timestamps default to the
+// clock; a cancelled run still persists via a detached bounded context.
+// Put failures are diagnostics, never fatal.
+func storeChunkAnalyze(ctx context.Context, cfg Config, c cache.Cache, clock runtime.Clock, chunkID asset.Identity, fileURL asset.URL, chunkHash string, data analysisData, truncated bool, sources []string, firstSeen, lastSeen time.Time) error {
+	if chunkHash == "" {
+		return nil
+	}
+	if len(chunkHash) != 64 || !lowerHex(chunkHash) {
+		return fmt.Errorf("jsintel: store chunk analyze %s: chunk hash %q is not 64 lowercase hex digits", chunkID.String(), truncateStored(chunkHash))
+	}
+	if _, _, _, _, _, _, tag, perr := asset.ParseChunkIdentity(chunkID); perr != nil {
+		return fmt.Errorf("jsintel: store chunk analyze %s: chunk identity does not parse: %w", chunkID.String(), perr)
+	} else if tag != fetchTilingTag {
+		return fmt.Errorf("jsintel: store chunk analyze %s: tiling tag %q mismatches %q", chunkID.String(), truncateStored(tag), fetchTilingTag)
+	}
+	if clock == nil {
+		clock = wallClock{}
+	}
+	if firstSeen.IsZero() {
+		firstSeen = clock.Now().UTC()
+	}
+	if lastSeen.IsZero() {
+		lastSeen = firstSeen
+	}
+	if lastSeen.Before(firstSeen) {
+		lastSeen = firstSeen
+	}
+	if len(sources) == 0 {
+		return fmt.Errorf("jsintel: store chunk analyze %s: no sources", chunkID.String())
+	}
+	for _, src := range sources {
+		if src == "" {
+			return fmt.Errorf("jsintel: store chunk analyze %s: empty source", chunkID.String())
+		}
+		if len(src) > maxStoredSourceBytes {
+			return fmt.Errorf("jsintel: store chunk analyze %s: source longer than %d bytes", chunkID.String(), maxStoredSourceBytes)
+		}
+	}
+
+	st := analysisToStored(data)
+	st.Target = chunkID.String()
+	st.AnalyzedHash = chunkHash
+	st.Truncated = truncated
+	st.FirstSeen = firstSeen
+	st.LastSeen = lastSeen
+
+	key, err := chunkAnalyzeKey(chunkID, sessionDigest(cfg.RequestHeaders))
+	if err != nil {
+		return fmt.Errorf("jsintel: store chunk analyze %s: build cache key: %w", chunkID.String(), err)
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("jsintel: store chunk analyze %s: encode result: %w", chunkID.String(), err)
+	}
+	status := cache.StatusCompleted
+	if truncated {
+		status = cache.StatusIncomplete
+	}
+	rec := cache.Record{
+		Operation: ChunkAnalyzeOperation,
+		Target:    chunkID.String(),
+		Status:    status,
+		Meta:      map[string]string{"source": sources[0]},
+		Data:      raw,
+	}
+	storeCtx := ctx
+	if ctx.Err() != nil {
+		var scancel context.CancelFunc
+		storeCtx, scancel = context.WithTimeout(context.Background(), storeTimeout)
+		defer scancel()
+	}
+	if perr := c.Put(storeCtx, key, rec); perr != nil {
+		return fmt.Errorf("jsintel: store chunk analyze %s: cache put: %w", chunkID.String(), perr)
 	}
 	return nil
 }

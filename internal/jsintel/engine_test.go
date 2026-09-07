@@ -329,6 +329,217 @@ func TestEngineTimeoutFails(t *testing.T) {
 	}
 }
 
+// windowedBody builds a deterministic over-cap JS body: totalLines of
+// 48-byte filler comment lines with marker literal lines INSERTED at the
+// given line indexes (insertion shifts later offsets — callers assert
+// ranges, and finding a marker past 512 KiB proves multi-window
+// analysis). Markers must end with "\n".
+func windowedBody(t testing.TB, totalLines int, markers map[int]string) []byte {
+	t.Helper()
+	const filler = "// filler padding line for deterministic offset\n"
+	if len(filler) != 48 {
+		t.Fatalf("filler line = %d bytes, want 48 (offset math depends on it)", len(filler))
+	}
+	var b strings.Builder
+	for i := 0; i < totalLines; i++ {
+		if lit, ok := markers[i]; ok {
+			if !strings.HasSuffix(lit, "\n") {
+				t.Fatalf("marker at line %d lacks trailing newline", i)
+			}
+			b.WriteString(lit)
+			continue
+		}
+		b.WriteString(filler)
+	}
+	return []byte(b.String())
+}
+
+// windowedServer serves one JS body chunked (no Content-Length), forcing
+// the streamed bound.
+func windowedServer(t *testing.T, body []byte) *recordingServer {
+	t.Helper()
+	return newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		rest := body
+		for len(rest) > 0 {
+			n := 32 << 10
+			if n > len(rest) {
+				n = len(rest)
+			}
+			w.Write(rest[:n])
+			w.(http.Flusher).Flush()
+			rest = rest[n:]
+		}
+	})
+}
+
+// endpointsOf extracts endpoint URL strings from a report entry.
+func endpointsOf(e JSEntry) []string {
+	var out []string
+	for _, ep := range e.Endpoints {
+		out = append(out, ep.URL.String())
+	}
+	return out
+}
+
+// TestEngineWindowedAnalysis pins NEW-124 Phase 1: an over-cap bundle is
+// analyzed per window and merged — literals deep in the prefix (far past
+// the first window) are found, where yesterday nothing was.
+func TestEngineWindowedAnalysis(t *testing.T) {
+	// 65536 lines × 48 B = exactly 3 MiB. Early marker at line 100
+	// (~4.8 KiB, window 0); deep marker at line 22000 (~1.03 MiB,
+	// past window 1's end at 1016 KiB — only multi-window analysis
+	// finds it).
+	body := windowedBody(t, 65536, map[int]string{
+		100:   "var early = \"/api/early\";\n",
+		22000: "var deep = \"/api/deep\";\n",
+	})
+	srv := windowedServer(t, body)
+	cfg := testEngineConfig(t, srv.srv)
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: srv.url() + "/big.js"}})
+
+	e := entryByURL(t, rep, srv.url()+"/big.js")
+	if e.Status != StatusIncomplete {
+		t.Errorf("status = %s, want incomplete (truncated file, analyzed prefix)", e.Status)
+	}
+	got := endpointsOf(e)
+	want := map[string]bool{
+		srv.url() + "/api/early": false,
+		srv.url() + "/api/deep":  false,
+	}
+	for _, u := range got {
+		if _, ok := want[u]; ok {
+			want[u] = true
+		}
+	}
+	for u, found := range want {
+		if !found {
+			t.Errorf("endpoint %s missing (want early + deep literals, got %v)", u, got)
+		}
+	}
+	if e.JS == nil {
+		t.Error("JS asset missing (the file IS a JS file)")
+	} else {
+		// Windowed (truncated) observations never propagate the prefix
+		// length/hash as the file observation: zero/empty mean "not
+		// observed" in the asset model.
+		if e.JS.Size != 0 {
+			t.Errorf("JS size = %d, want 0 (not observed on a truncated file)", e.JS.Size)
+		}
+		if e.JS.ContentHash != "" {
+			t.Errorf("JS content hash = %q, want empty (not observed on a truncated file)", e.JS.ContentHash)
+		}
+	}
+	if got := rep.Metrics().Parses; got != 5 {
+		t.Errorf("parses = %d, want 5 (one per window over the 2 MiB prefix)", got)
+	}
+}
+
+func TestAnalyzeWindowsCancelled(t *testing.T) {
+	// Cancellation between windows stops the merge, keeping the retained
+	// union with the entry Incomplete: a pre-cancelled context analyzes
+	// zero windows and yields no endpoints, never a failure.
+	body := windowedBody(t, 65536, map[int]string{
+		100: "var a = \"/api/a\";\n",
+	})
+	windows := splitWindows(body, maxFetchWindowBytes, fetchWindowOverlapBytes)
+	if len(windows) < 2 {
+		t.Fatalf("windows = %d, want >= 2 for a cancellation cut", len(windows))
+	}
+	js, err := asset.NewJavaScript("https://example.com/big.js", asset.Provenance{})
+	if err != nil {
+		t.Fatalf("NewJavaScript: %v", err)
+	}
+	e := &env{parser: NewParser(), cfg: DefaultConfig(), metrics: &Metrics{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	data, _ := e.analyzeWindows(ctx, js, FetchResult{Windows: windows})
+	if len(data.Endpoints) != 0 {
+		t.Fatalf("endpoints = %d, want 0 (cancelled before the first window)", len(data.Endpoints))
+	}
+}
+
+// TestEngineWindowedDedup pins cross-window dedup: a literal inside the
+// 8 KiB overlap appears in two windows but merges to one endpoint.
+// Window 0 covers [0,512K), window 1 starts at 504K: line 10752
+// (offset 516096) sits in both.
+func TestEngineWindowedDedup(t *testing.T) {
+	body := windowedBody(t, 65536, map[int]string{
+		10752: "var dup = \"/api/dup\";\n",
+	})
+	srv := windowedServer(t, body)
+	cfg := testEngineConfig(t, srv.srv)
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: srv.url() + "/dup.js"}})
+
+	e := entryByURL(t, rep, srv.url()+"/dup.js")
+	got := endpointsOf(e)
+	if len(got) != 1 || got[0] != srv.url()+"/api/dup" {
+		t.Errorf("endpoints = %v, want exactly one /api/dup (overlap deduped)", got)
+	}
+}
+
+// TestEngineWindowedCacheNeverServed pins the honesty invariant: windowed
+// (truncated) analyses are recomputed every run, never served stale.
+func TestEngineWindowedCacheNeverServed(t *testing.T) {
+	body := windowedBody(t, 65536, map[int]string{
+		100: "var a = \"/api/a\";\n",
+	})
+	srv := windowedServer(t, body)
+	counting := countingRT{inner: transportFor(t, srv.srv)}
+	shared := openTestCache(t)
+	mkcfg := func() Config {
+		cfg := testEngineConfig(t, srv.srv)
+		cfg.Transport = &counting
+		cfg.Cache = shared
+		return cfg
+	}
+	items := []Item{{Kind: ItemLine, Line: srv.url() + "/big.js"}}
+	rep1 := runEngine(t, mkcfg(), items)
+	rep2 := runEngine(t, mkcfg(), items)
+	if counting.calls() != 2 {
+		t.Fatalf("round trips = %d, want 2 (truncated fetch re-fetched every run)", counting.calls())
+	}
+	if len(endpointsOf(entryByURL(t, rep1, srv.url()+"/big.js"))) != 1 ||
+		len(endpointsOf(entryByURL(t, rep2, srv.url()+"/big.js"))) != 1 {
+		t.Fatalf("both runs must analyze the prefix identically")
+	}
+}
+
+// TestEngineWindowedNonJS pins the JS gate: over-cap non-JS bodies keep
+// windows unparsed (no analysis, no endpoints, no parses).
+func TestEngineWindowedNonJS(t *testing.T) {
+	body := windowedBody(t, 65536, map[int]string{
+		100: "var a = \"/api/a\";\n",
+	})
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		for len(body) > 0 {
+			n := 32 << 10
+			if n > len(body) {
+				n = len(body)
+			}
+			w.Write(body[:n])
+			w.(http.Flusher).Flush()
+			body = body[n:]
+		}
+	})
+	cfg := testEngineConfig(t, srv.srv)
+	rep := runEngine(t, cfg, []Item{{Kind: ItemLine, Line: srv.url() + "/page"}})
+	e := entryByURL(t, rep, srv.url()+"/page")
+	if e.Status != StatusIncomplete {
+		t.Errorf("status = %s, want incomplete", e.Status)
+	}
+	if e.JS != nil {
+		t.Error("JS asset present for text/html at /page (no content sniffing)")
+	}
+	if len(e.Endpoints) != 0 {
+		t.Errorf("endpoints = %d, want 0 (non-JS windows never analyzed)", len(e.Endpoints))
+	}
+	if got := rep.Metrics().Parses; got != 0 {
+		t.Errorf("parses = %d, want 0 (no analysis without a JS asset)", got)
+	}
+}
+
 func TestEngineTruncatedFetch(t *testing.T) {
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
@@ -345,8 +556,15 @@ func TestEngineTruncatedFetch(t *testing.T) {
 	if e.Status != StatusIncomplete {
 		t.Errorf("status = %s, want incomplete (truncated fetch)", e.Status)
 	}
-	if e.JS != nil {
-		t.Error("a truncated fetch must not produce a JS asset (no content was retained)")
+	// Windowed (NEW-124 Phase 1): an over-cap JS body retains a windowed
+	// asset for prefix analysis (the file IS a JS file) with Size/Hash
+	// unset — never the prefix length/hash. Non-JS truncations carry no
+	// asset (see TestEngineWindowedNonJS).
+	if e.JS == nil {
+		t.Fatal("windowed JS asset missing (over-cap JS is analyzed per window)")
+	}
+	if e.JS.Size != 0 || e.JS.ContentHash != "" {
+		t.Errorf("windowed JS size/hash = %d/%q, want 0/empty (not observed)", e.JS.Size, e.JS.ContentHash)
 	}
 	if e.Cached {
 		t.Error("a truncated fetch must never be served from cache")
@@ -354,18 +572,21 @@ func TestEngineTruncatedFetch(t *testing.T) {
 	if got := rep.Metrics().Truncated; got != 1 {
 		t.Errorf("truncated = %d, want 1", got)
 	}
-	if got := rep.Metrics().Stores; got != 1 {
-		t.Errorf("stores = %d, want 1 (truncated stored as incomplete)", got)
+	// Slice 2: the truncated fetch stores incomplete (1) plus one
+	// js.analyze.chunk record per window (64 KiB prefix = 1 window).
+	if got := rep.Metrics().Stores; got != 2 {
+		t.Errorf("stores = %d, want 2 (fetch incomplete + 1 chunk analyze)", got)
 	}
 
-	// The truncated record is stored incomplete: a second run re-fetches.
+	// The truncated record is stored incomplete: a second run re-fetches
+	// (the fetch is never served) but skips parsing via the chunk hit.
 	rep2 := runEngine(t, cfg, items)
 	e2 := rep2.Entries[0]
 	if e2.Cached {
 		t.Error("run 2 must not be a cache hit for a truncated record")
 	}
-	if rep2.Metrics().Fetches != 1 || rep2.Metrics().Reads != 1 {
-		t.Errorf("run 2 metrics = %+v, want 1 fetch and 1 read", rep2.Metrics())
+	if m := rep2.Metrics(); m.Fetches != 1 || m.Reads != 2 || m.Parses != 0 || m.Stores != 1 {
+		t.Errorf("run 2 metrics = %+v, want 1 fetch (re-fetch) + 2 reads (fetch + chunk hit) + 0 parses + 1 store (fetch overwrite, no chunk re-store)", m)
 	}
 }
 
@@ -412,6 +633,52 @@ func TestEngineCacheHit(t *testing.T) {
 	}
 	if !reflect.DeepEqual(rep1.Entries[0].JS, e2.JS) {
 		t.Errorf("cached JS asset differs from the fresh one:\n%+v\nvs\n%+v", *rep1.Entries[0].JS, *e2.JS)
+	}
+}
+
+func TestEngineAnalyzeWarmCutCountedSkipped(t *testing.T) {
+	// A stored analysis served under LOWERED per-file caps is tail-cut at
+	// the entry boundary (caps deliberately stay out of cache keys, so the
+	// record is still a hit). The cut must be VISIBLE in the run's Skipped
+	// metric — the same counter the fresh path uses for extraction drops —
+	// never a silent completed prefix.
+	var body strings.Builder
+	body.WriteString("var routes = [\n")
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&body, "\"/api/item%02d\",\n", i)
+	}
+	body.WriteString("];\nconsole.log(routes.length);\n")
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte(body.String()))
+	})
+	shared := openTestCache(t)
+	items := []Item{{Kind: ItemLine, Line: "http://js.test/routes.js"}}
+
+	cold := testEngineConfig(t, srv.srv)
+	cold.Cache = shared
+	repCold := runEngine(t, cold, items)
+	eCold := entryByURL(t, repCold, "http://js.test/routes.js")
+	if len(eCold.Endpoints) != 10 {
+		t.Fatalf("cold endpoints = %d, want 10 (test body must extract cleanly under default caps)", len(eCold.Endpoints))
+	}
+	if got := repCold.Metrics().Skipped; got != 0 {
+		t.Fatalf("cold skipped = %d, want 0 (clean baseline before the cap change)", got)
+	}
+
+	warm := testEngineConfig(t, srv.srv)
+	warm.Cache = shared
+	warm.MaxEndpointsPerFile = 4
+	repWarm := runEngine(t, warm, items)
+	eWarm := entryByURL(t, repWarm, "http://js.test/routes.js")
+	if !eWarm.Cached {
+		t.Fatal("warm run must be served from the completed cache records (caps never invalidate entries)")
+	}
+	if len(eWarm.Endpoints) != 4 {
+		t.Fatalf("warm endpoints = %d, want 4 (tail-cut to the lowered cap)", len(eWarm.Endpoints))
+	}
+	if got := repWarm.Metrics().Skipped; got < 6 {
+		t.Fatalf("warm skipped = %d, want >= 6 (the 10→4 entry-boundary cut must be counted, mirroring fresh-path drops)", got)
 	}
 }
 
@@ -1142,7 +1409,7 @@ window.__REACT_DEVTOOLS_GLOBAL_HOOK__ = true;
 	// Self-healing fall-through: deleting the analyze record makes the
 	// next run re-analyze (parse) while the fetch is still served from
 	// cache — zero network, one parse.
-	key, err := analyzeKey(mustURL(t, "http://js.test/app.js"))
+	key, err := analyzeKey(mustURL(t, "http://js.test/app.js"), "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
@@ -1237,7 +1504,7 @@ func TestEngineOverlongSpecifierNoChurn(t *testing.T) {
 	}
 	// The analyze record is stored COMPLETED (served as a hit on run 2):
 	// a single store, nothing deleted or recomputed.
-	key, err := analyzeKey(mustURL(t, "http://js.test/app.js"))
+	key, err := analyzeKey(mustURL(t, "http://js.test/app.js"), "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
@@ -1339,7 +1606,7 @@ func TestEngineAnalyzeRebindsOnContentChange(t *testing.T) {
 
 	// Refresh the fetch with NEW content: delete the js.fetch record (the
 	// js.analyze record stays) and switch the server to content B.
-	fkey, err := fetchKey(u)
+	fkey, err := fetchKey(u, "")
 	if err != nil {
 		t.Fatalf("fetchKey: %v", err)
 	}
@@ -1370,7 +1637,7 @@ func TestEngineAnalyzeRebindsOnContentChange(t *testing.T) {
 	}
 
 	// The rebound record carries B's hash under the SAME key.
-	akey, err := analyzeKey(u)
+	akey, err := analyzeKey(u, "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}

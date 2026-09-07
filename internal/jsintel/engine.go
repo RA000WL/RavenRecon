@@ -6,6 +6,8 @@ package jsintel
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -193,10 +196,14 @@ type Config struct {
 	// does not abort the pipeline; a panicking hook is contained and
 	// likewise surfaced as a diagnostic.
 	Emit func(context.Context, JSEntry) error
-
 	// Metrics, when non-nil, collects run counters. Tests and benchmarks
 	// use it to assert zero work on cache hits.
 	Metrics *Metrics
+	// Observer is the optional pool-event sink (an internal/event
+	// Observer; the Bus satisfies it). When non-nil, the run's worker
+	// pool emits canonical task events; nil (the default) disables
+	// emission with zero behavior change.
+	Observer event.Observer
 
 	// Transport is the fetch seam. Nil means the bounded production
 	// transport (see FetchConfig.Transport).
@@ -206,6 +213,15 @@ type Config struct {
 	// default). It is clamped to the job deadline when the job deadline is
 	// shorter, so the budget chain request ⊆ job always holds.
 	RequestTimeout time.Duration
+
+	// RequestHeaders carries operator-supplied session headers (NEW-125):
+	// added to in-scope fetches. Nil or empty means anonymous fetching.
+	// Cross-host redirect hops NEVER inherit them — only hops on the
+	// fetch target's own host do (fail-closed direction: credentials
+	// stay where the operator aimed them). Values never enter logs,
+	// errors, reports, or cache records — only the session digest enters
+	// cache keys (see FetchConfig).
+	RequestHeaders http.Header
 
 	// MaxJSBytes is the retained-content cap per fetch (0 means the 2 MiB
 	// default; clamped to [64 KiB, 8 MiB]).
@@ -361,6 +377,16 @@ func (c Config) validated() (Config, error) {
 	}
 	if c.Clock == nil {
 		c.Clock = wallClock{}
+	}
+	if len(c.RequestHeaders) > 0 {
+		// Fail-closed validation + canonicalization before any pool or
+		// fetch exists (mirrors httpprobe buildEnv): a half-authed run
+		// is worse than none.
+		normalized, _, err := normalizeRequestHeaders(c.RequestHeaders)
+		if err != nil {
+			return Config{}, err
+		}
+		c.RequestHeaders = normalized
 	}
 	return normalizeCaps(c), nil
 }
@@ -548,17 +574,16 @@ func RunInto(ctx context.Context, cfg Config, src Source, acc *Accumulator) erro
 			Retries:        cfg.Retries,
 			Limiter:        limiter,
 			Clock:          cfg.Clock,
+			RequestHeaders: cfg.RequestHeaders,
 		},
 	}
-
-	// The pool is NOT paced: job-start pacing would double the rate limit
-	// (every fetch already waits on the central limiter inside Fetch) and
-	// would pace cache-hit jobs that perform zero network work.
 	pool, err := runtime.NewPool(ctx, runtime.Config{
 		Concurrency: cfg.Concurrency,
 		QueueSize:   cfg.QueueSize,
 		Timeout:     cfg.Timeout,
 		Clock:       cfg.Clock,
+		Observer:    cfg.Observer,
+		Deriver:     Deriver{},
 	})
 	if err != nil {
 		return fmt.Errorf("jsintel: create worker pool: %w", err)
@@ -1003,8 +1028,7 @@ func (rs *runState) submitJob(ctx context.Context, u asset.URL, depth int) {
 	rs.pend.add()
 	if _, serr := rs.pool.Submit(ctx, runtime.Job{Func: func(jctx context.Context) (any, error) {
 		defer rs.pend.done()
-		rs.processJob(jctx, u, depth)
-		return nil, nil
+		return rs.processJob(jctx, u, depth), nil
 	}}); serr != nil {
 		// The run context is done or the pool is closing: the candidate
 		// keeps its pre-registered cancelled entry (it was never executed).
@@ -1019,11 +1043,11 @@ func (rs *runState) submitJob(ctx context.Context, u asset.URL, depth int) {
 // short-circuits jobs that start after the gate triggered: they are counted
 // Skipped, their placeholder is removed, and no fetch is performed. The gate
 // itself is evaluated after each fetch (recordHealth).
-func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
+func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) JSEntry {
 	if rs.isHealthAborted() {
 		rs.env.metricsSkipped(1)
 		rs.acc.remove(u.Identity())
-		return
+		return JSEntry{}
 	}
 	entry, resolved := rs.env.process(ctx, u)
 	rs.recordHealth(entry)
@@ -1038,7 +1062,7 @@ func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
 			}
 		}
 		rs.env.metricsSkipped(len(resolved))
-		return
+		return entry
 	}
 	rs.acc.merge(entry)
 	if rs.cfg.Emit != nil {
@@ -1056,11 +1080,11 @@ func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
 	// URL must still be able to fetch it.
 	if rs.isHealthAborted() {
 		rs.env.metricsSkipped(len(resolved))
-		return
+		return entry
 	}
 	if depth >= rs.cfg.MaxImportDepth {
 		rs.env.metricsSkipped(len(resolved))
-		return
+		return entry
 	}
 	for _, child := range resolved {
 		if rs.isHealthAborted() {
@@ -1079,6 +1103,7 @@ func (rs *runState) processJob(ctx context.Context, u asset.URL, depth int) {
 			rs.env.metricsSkipped(1)
 		}
 	}
+	return entry
 }
 
 // process runs the per-candidate work and returns the merged entry plus the
@@ -1154,6 +1179,10 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 		FirstSeen: firstSeen,
 		LastSeen:  lastSeen,
 	}
+	// windowedFile marks an over-cap bundle with retained analysis
+	// windows (NEW-124 Phase 1): analyzed per window below instead of
+	// discarded, staying Incomplete.
+	windowedFile := false
 	if e.cfg.RetainContent && res.Content != nil {
 		// Retention: only fully-retained content is ever retained (a
 		// truncated fetch's Content is nil by contract), so a retained
@@ -1166,6 +1195,20 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 	}
 	switch res.Status {
 	case FetchTruncated:
+		if len(res.Windows) > 0 && isJSAsset(res, u) {
+			// Windowed analysis (NEW-124 Phase 1): an over-cap bundle
+			// discovered while streaming retains deterministic
+			// overlapped windows over the bounded prefix. The file is
+			// truncated (tail dropped) so the entry stays Incomplete —
+			// but the prefix is analyzed instead of discarded. Lookup
+			// and store are skipped: truncated analyses are never
+			// served (and an empty content hash stores nothing), so a
+			// lookup could only evict a shrink-recovery record from an
+			// earlier complete run.
+			windowedFile = true
+			e.metricsTruncated()
+			break
+		}
 		entry.Status = StatusIncomplete
 		entry.Err = res.Err
 		e.metricsTruncated()
@@ -1200,7 +1243,42 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 		entry.Err = fmt.Errorf("jsintel: build asset %s: %w", u.String(), jerr)
 		return entry, nil
 	}
+	if windowedFile {
+		// Windowed (truncated) observation: Size and ContentHash stay
+		// unset — zero/empty mean "not observed" in the asset model.
+		// The retained prefix length/hash are never propagated as the
+		// file observation (a partial prefix is not the file).
+		js.Size = 0
+		js.ContentHash = ""
+	}
 	entry.JS = &js
+
+	if windowedFile {
+		// Windowed analysis (NEW-124 Phase 1, chunk retention NEW-129
+		// Slice 1, per-chunk analyze cache NEW-129 Slice 2): analyze
+		// every retained window and union the candidates
+		// (identity-deduped — cross-window duplicates from the overlap
+		// collapse), then cap ONCE at the entry boundary via
+		// applyAnalysis (never cap-per-chunk then re-cap). The entry
+		// stays Incomplete (the file tail was dropped); the file JS
+		// asset stays sizeless (Size 0 / empty hash — never the prefix).
+		// When retention is on, the aliased windows ride the entry for
+		// chunk-document production (Slice 1 lights up secrentel). With
+		// a cache, each window runs cache-before-execute under
+		// js.analyze.chunk (a hit skips parsing entirely); warm runs
+		// re-fetch (the windowed fetch is never served) and re-tile
+		// every run, then skip parsing via hits. Without a cache, every
+		// window parses as before.
+		entry.Status = StatusIncomplete
+		if e.cfg.RetainContent && len(res.Windows) > 0 && res.Manifest != nil {
+			entry.Chunks = res.Windows
+			entry.ChunkManifest = res.Manifest
+		}
+		data, resolved := e.analyzeWindows(ctx, js, res)
+		entry, cut := applyAnalysis(entry, js, data, e.cfg)
+		e.metricsSkipped(cut)
+		return entry, resolved
+	}
 
 	// Analysis: cache-before-execute. A usable js.analyze record serves
 	// the stored payload — zero parse — and the entry is built through the
@@ -1227,7 +1305,13 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 		}
 		if lookup.Hit {
 			data := lookup.Result
-			return applyAnalysis(entry, js, data, e.cfg), analysisResolved(data)
+			entry, cut := applyAnalysis(entry, js, data, e.cfg)
+			// A stored record may carry more than the CURRENT per-file
+			// caps (caps never enter cache keys): the entry-boundary cut
+			// is reported through Skipped, mirroring fresh-path
+			// extraction drops, so a warm-hit cut is never silent.
+			e.metricsSkipped(cut)
+			return entry, analysisResolved(data)
 		}
 	}
 
@@ -1272,7 +1356,11 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 		Technologies: td.techs,
 		Evidence:     td.evidence,
 	}
-	entry = applyAnalysis(entry, js, data, e.cfg)
+	entry, cut := applyAnalysis(entry, js, data, e.cfg)
+	// Always 0 on the fresh path — extraction already capped the payload
+	// under the same caps — counted for symmetry so both paths stay honest
+	// by construction if extraction ever outgrows the entry boundary.
+	e.metricsSkipped(cut)
 	if e.cache != nil {
 		if serr := storeAnalyze(ctx, e.cfg, e.cache, e.clock, u, js.ContentHash, data, parsed.Truncated, entry.Sources, entry.FirstSeen, entry.LastSeen); serr != nil {
 			e.recordErr(serr)
@@ -1283,8 +1371,263 @@ func (e *env) classify(ctx context.Context, u asset.URL, res FetchResult, cached
 	return entry, ie.resolved
 }
 
+// analyzeWindows analyzes every retained window of an over-cap bundle
+// and unions the candidates (NEW-124 Phase 1, per-chunk analyze cache
+// NEW-129 Slice 2). Per-window extraction runs the identical bounded
+// extractors as the single-content path — per-file caps apply per window,
+// so one dense window cannot starve the others — and the union
+// deduplicates by canonical identity (overlap duplicates collapse) in
+// index order, then the caller caps ONCE via applyAnalysis (never
+// cap-per-chunk then re-cap). Malformed/skipped/dropped counters sum
+// across FRESH windows only (cache hits contribute no extraction
+// counters — their drops were counted on the cold run that stored them;
+// the final entry-boundary cut is counted once by the caller). Parse
+// errors are impossible in practice (512 KiB windows vs the 8 MiB parser
+// hard cap): one is recorded as a diagnostic and stops the merge, keeping
+// the retained union (the entry is Incomplete either way). Cancellation
+// between windows stops the merge, keeping the retained union with the
+// entry Incomplete. With a cache and a well-formed manifest, each window
+// runs cache-before-execute under js.analyze.chunk (a hit skips parsing);
+// without a cache (or with a missing/mismatched manifest, e.g.
+// hand-built results in tests) every window parses as before. It returns
+// the merged payload and the unioned expansion candidates.
+func (e *env) analyzeWindows(ctx context.Context, js asset.JavaScript, res FetchResult) (analysisData, []asset.URL) {
+	if e.cache != nil && res.Manifest != nil &&
+		len(res.Manifest.Chunks) == len(res.Windows) && len(res.Windows) > 0 &&
+		res.Manifest.TilingTag == fetchTilingTag {
+		return e.analyzeWindowsCached(ctx, js, res)
+	}
+	var merged analysisData
+	var malformed, skipped int
+	for _, w := range res.Windows {
+		if ctx.Err() != nil {
+			// Cancelled mid-merge: keep the retained union, entry
+			// stays Incomplete (set by the caller).
+			break
+		}
+		parsed, perr := e.parser.Parse(w)
+		e.metricsParse()
+		if perr != nil {
+			e.recordErr(perr)
+			break
+		}
+		ie := extractImports(js, parsed, e.cfg)
+		sm := extractSourceMaps(js, res, parsed, e.cfg)
+		ep := extractEndpoints(js, parsed, e.cfg)
+		sc := extractSecrets(js, parsed, e.cfg)
+		td := detectTechnologies(js, w, e.cfg)
+		malformed += ie.skipped + sm.skipped + ep.skipped + sc.skipped
+		skipped += ie.dropped + sm.dropped + ep.dropped + sc.dropped + td.dropped
+		merged.Imports = unionAnalysisImports(merged.Imports, ie.imports)
+		merged.BareImports = unionStrings(merged.BareImports, ie.external)
+		merged.Exports = unionStrings(merged.Exports, parsed.Exports)
+		merged.SourceMaps = unionSourceMaps(merged.SourceMaps, sm.maps)
+		merged.Endpoints = unionEndpoints(merged.Endpoints, ep.endpoints)
+		merged.URLs = unionURLs(merged.URLs, ep.urls)
+		merged.Secrets = unionSecrets(merged.Secrets, sc.secrets)
+		merged.Technologies = unionTechnologies(merged.Technologies, td.techs)
+		merged.Evidence = unionEvidence(merged.Evidence, td.evidence)
+	}
+	e.metricsMalformed(malformed)
+	e.metricsSkipped(skipped)
+	return merged, analysisResolved(merged)
+}
+
+// analyzeWindowsCached is the cache-before-execute windowed path: one
+// js.analyze.chunk lookup per window in index order (a hit unions the
+// stored payload with zero parse), parse + extract + store on a miss,
+// then union in index order. The union uses the existing union* helpers
+// (no caps); the caller applies applyAnalysis caps ONCE. A per-window
+// parser cap hit stores the partial prefix as INCOMPLETE (never served;
+// a later run re-analyzes that chunk) but still unions it — mirroring the
+// file-level truncated path, and the entry stays Incomplete either way
+// (the fetch truncation dominates). Chunk bytes are always available (the
+// windowed fetch is never served — every run re-fetches and re-tiles),
+// so the lookup always cross-validates the fresh chunk hash; a mismatch
+// deletes under the same key and recomputes (self-healing). The file JS
+// asset stays sizeless; chunk stores bind the CHUNK hash, never the file
+// hash. Memory stays bounded: at most maxWindowedChunks windows (pipeline
+// path 5 for the default cap), one lookup/store per window, no unbounded
+// queues.
+func (e *env) analyzeWindowsCached(ctx context.Context, js asset.JavaScript, res FetchResult) (analysisData, []asset.URL) {
+	var merged analysisData
+	var malformed, skipped int
+	total := len(res.Windows)
+	manifest := res.Manifest
+	for i, w := range res.Windows {
+		if ctx.Err() != nil {
+			break
+		}
+		// Fresh chunk hash from the re-fetched window bytes (never the
+		// manifest's stored copy — the bytes are authoritative).
+		sum := sha256.Sum256(w)
+		freshHash := hex.EncodeToString(sum[:])
+		// Chunk identity cites the manifest span with the fresh hash
+		// prefix (they agree by construction — the manifest was built
+		// from these windows at fetch time — but the bytes rule).
+		var chunkID asset.Identity
+		chunkOK := false
+		if i < len(manifest.Chunks) && manifest.Chunks[i].Index == i {
+			mi := manifest.Chunks[i]
+			if cid, cerr := asset.ChunkJavaScriptIdentity(js.URL, mi.Index, total, mi.Start, mi.End, freshHash[:8], manifest.TilingTag); cerr == nil {
+				chunkID = cid
+				chunkOK = true
+			}
+		}
+		if chunkOK {
+			lookup := lookupChunkAnalyze(ctx, chunkID, js.URL, freshHash, e.cfg, e.cache, e.clock)
+			e.metricsRead()
+			if lookup.Err != nil {
+				e.recordErr(lookup.Err)
+			}
+			if lookup.Hit {
+				data := lookup.Result
+				merged.Imports = unionAnalysisImports(merged.Imports, data.Imports)
+				merged.BareImports = unionStrings(merged.BareImports, data.BareImports)
+				merged.Exports = unionStrings(merged.Exports, data.Exports)
+				merged.SourceMaps = unionSourceMaps(merged.SourceMaps, data.SourceMaps)
+				merged.Endpoints = unionEndpoints(merged.Endpoints, data.Endpoints)
+				merged.URLs = unionURLs(merged.URLs, data.URLs)
+				merged.Secrets = unionSecrets(merged.Secrets, data.Secrets)
+				merged.Technologies = unionTechnologies(merged.Technologies, data.Technologies)
+				merged.Evidence = unionEvidence(merged.Evidence, data.Evidence)
+				continue
+			}
+		}
+		// Miss (or unidentifiable chunk — defensive, manifest spans
+		// disagree): fresh parse + extract, union, and store when the
+		// chunk identity is usable.
+		parsed, perr := e.parser.Parse(w)
+		e.metricsParse()
+		if perr != nil {
+			e.recordErr(perr)
+			break
+		}
+		ie := extractImports(js, parsed, e.cfg)
+		sm := extractSourceMaps(js, res, parsed, e.cfg)
+		ep := extractEndpoints(js, parsed, e.cfg)
+		sc := extractSecrets(js, parsed, e.cfg)
+		td := detectTechnologies(js, w, e.cfg)
+		malformed += ie.skipped + sm.skipped + ep.skipped + sc.skipped
+		skipped += ie.dropped + sm.dropped + ep.dropped + sc.dropped + td.dropped
+		merged.Imports = unionAnalysisImports(merged.Imports, ie.imports)
+		merged.BareImports = unionStrings(merged.BareImports, ie.external)
+		merged.Exports = unionStrings(merged.Exports, parsed.Exports)
+		merged.SourceMaps = unionSourceMaps(merged.SourceMaps, sm.maps)
+		merged.Endpoints = unionEndpoints(merged.Endpoints, ep.endpoints)
+		merged.URLs = unionURLs(merged.URLs, ep.urls)
+		merged.Secrets = unionSecrets(merged.Secrets, sc.secrets)
+		merged.Technologies = unionTechnologies(merged.Technologies, td.techs)
+		merged.Evidence = unionEvidence(merged.Evidence, td.evidence)
+		if chunkOK {
+			data := analysisData{
+				Imports:      ie.imports,
+				BareImports:  ie.external,
+				Exports:      parsed.Exports,
+				SourceMaps:   sm.maps,
+				Endpoints:    ep.endpoints,
+				URLs:         ep.urls,
+				Secrets:      sc.secrets,
+				Technologies: td.techs,
+				Evidence:     td.evidence,
+			}
+			now := e.clock.Now().UTC()
+			if serr := storeChunkAnalyze(ctx, e.cfg, e.cache, e.clock, chunkID, js.URL, freshHash, data, parsed.Truncated, []string{e.source}, now, now); serr != nil {
+				e.recordErr(serr)
+			} else {
+				e.metricsStore()
+			}
+		}
+	}
+	e.metricsMalformed(malformed)
+	e.metricsSkipped(skipped)
+	return merged, analysisResolved(merged)
+}
+
+// Union helpers for windowed analysis: append-then-dedupe by canonical
+// identity (first-seen wins, deterministic — windows are processed in
+// order). No caps here: the entry boundary (applyAnalysis) caps once
+// with cut counting, so capping here too would double-cut silently.
+
+func unionAnalysisImports(dst []analysisImport, src []analysisImport) []analysisImport {
+	seen := make(map[string]bool, len(dst)+len(src))
+	out := append([]analysisImport(nil), dst...)
+	for _, d := range dst {
+		seen[d.Specifier+"\x00"+d.URL.String()+"\x00"+d.Kind.String()] = true
+	}
+	for _, s := range src {
+		k := s.Specifier + "\x00" + s.URL.String() + "\x00" + s.Kind.String()
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func unionStrings(dst []string, src []string) []string {
+	seen := make(map[string]bool, len(dst)+len(src))
+	out := append([]string(nil), dst...)
+	for _, d := range dst {
+		seen[d] = true
+	}
+	for _, s := range src {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func unionSourceMaps(dst []asset.SourceMap, src []asset.SourceMap) []asset.SourceMap {
+	return unionByIdentity(dst, src,
+		func(m asset.SourceMap) string { return m.Identity().String() })
+}
+
+func unionEndpoints(dst []asset.Endpoint, src []asset.Endpoint) []asset.Endpoint {
+	return unionByIdentity(dst, src,
+		func(e asset.Endpoint) string { return e.Identity().String() })
+}
+
+func unionURLs(dst []asset.URL, src []asset.URL) []asset.URL {
+	return unionByIdentity(dst, src,
+		func(u asset.URL) string { return u.Identity().String() })
+}
+
+func unionSecrets(dst []asset.SecretCandidate, src []asset.SecretCandidate) []asset.SecretCandidate {
+	return unionByIdentity(dst, src,
+		func(s asset.SecretCandidate) string { return s.Identity().String() })
+}
+
+func unionTechnologies(dst []asset.Technology, src []asset.Technology) []asset.Technology {
+	return unionByIdentity(dst, src,
+		func(t asset.Technology) string { return t.Identity().String() })
+}
+
+func unionEvidence(dst []asset.Evidence, src []asset.Evidence) []asset.Evidence {
+	return unionByIdentity(dst, src,
+		func(e asset.Evidence) string { return e.Identity().String() })
+}
+
+// unionByIdentity appends src elements whose key is unseen, preserving
+// first-seen order deterministically.
+func unionByIdentity[T any](dst []T, src []T, key func(T) string) []T {
+	seen := make(map[string]bool, len(dst)+len(src))
+	out := append([]T(nil), dst...)
+	for _, d := range dst {
+		seen[key(d)] = true
+	}
+	for _, s := range src {
+		if k := key(s); !seen[k] {
+			seen[k] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // isJSAsset applies the fixed JS classification rule: a completed positive
-// observation is a JS asset when the final Content-Type is a JS media type
 // or the canonical URL path ends with .js/.mjs/.cjs (case-insensitive).
 // There is NO content sniffing: a text/plain body at /app.js IS a JS asset
 // (the URL says so), and an application/javascript body at /page IS one

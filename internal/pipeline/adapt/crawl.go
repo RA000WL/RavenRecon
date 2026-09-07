@@ -38,6 +38,9 @@ func NewCrawlStage(src crawl.Source) pipeline.Stage {
 // Name implements pipeline.Stage.
 func (s *crawlStage) Name() pipeline.StageName { return pipeline.StageCrawl }
 
+// Level implements pipeline.LeveledStage: crawling needs probe and archive URLs.
+func (s *crawlStage) Level() int { return 3 }
+
 // Run implements pipeline.Stage.
 func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.StageResult, error) {
 	if ctx == nil {
@@ -83,6 +86,14 @@ func (s *crawlStage) Run(ctx context.Context, in pipeline.StageInput) (pipeline.
 
 	// StageParams: crawl_depth, crawl_timeout, crawl_concurrency, crawl_rate_limit,
 	// crawl_per_tool_timeout (alias for crawl_timeout). Unknown keys ignored.
+	//
+	// NEW-125 scope note: this stage deliberately does NOT consume the
+	// "session_headers" param. Katana is an external binary reached via
+	// argv, and its only header channel (-H) would expose session secrets
+	// in the process table — violating the session redaction contract.
+	// Crawl output stays anonymous (and cache-shared with anonymous runs)
+	// even when probing runs authenticated; the CLI help scopes
+	// --session-headers fan-out to httpprobe/jsintel/urllive accordingly.
 	depth, err := crawlDepthParam(in.Config)
 	if err != nil {
 		return pipeline.StageResult{Outcome: pipeline.OutcomeFailed},

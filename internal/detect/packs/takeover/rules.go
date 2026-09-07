@@ -28,13 +28,13 @@ func Rules() ([]detect.Rule, error) {
 	}
 	rules := []detect.Rule{
 		newTakeoverRule(ruleCNAMEUnclaimed, "Takeover CNAME Unclaimed",
-			"Detects dangling CNAME to unclaimed provider fingerprint (curated suffix list: github.io, herokuapp.com, amazonaws.com, azurewebsites.net, cloudfront.net, etc) with no A/AAAA for the CNAME target at depth 1. Per-host informational observation — never claims exploitability (AGENTS §0.1).",
+			"Detects dangling CNAME to unclaimed provider fingerprint (curated suffix list: github.io, herokuapp.com, amazonaws.com, azurewebsites.net, cloudfront.net, etc) with no A/AAAA for the CNAME target at depth 1. Per-host informational observation — never claims exploitability (AGENTS §0.1). Subjects with HTTP-confirmation evidence cite confirmed=true plus the confirmed provider.",
 			[]detect.RuleInput{detect.InputAssets, detect.InputRelationships},
-			cnameUnclaimedDetector, "1.0.0"),
+			cnameUnclaimedDetector, "1.1.0"),
 		newTakeoverRule(ruleCNAMEDangling, "Takeover CNAME Dangling",
-			"Detects dangling CNAME generically (any target with no A/AAAA) excluding provider-matched hosts handled by cname.unclaimed. Per-host informational orphan signal — never claims exploitability.",
+			"Detects dangling CNAME generically (any target with no A/AAAA) excluding provider-matched hosts handled by cname.unclaimed. Per-host informational orphan signal — never claims exploitability. Subjects with HTTP-confirmation evidence cite confirmed=true plus the confirmed provider.",
 			[]detect.RuleInput{detect.InputAssets, detect.InputRelationships},
-			cnameDanglingDetector, "1.0.0"),
+			cnameDanglingDetector, "1.1.0"),
 		newTakeoverRule(ruleS3Bucket, "Takeover S3 Bucket",
 			"Detects S3 bucket endpoint via URL host shape (.s3.amazonaws.com, s3.amazonaws.com, .s3-website variants). Per-endpoint informational indicator via techintel endpoint shape — never claims bucket existence or exploitability.",
 			[]detect.RuleInput{detect.InputEndpoints},

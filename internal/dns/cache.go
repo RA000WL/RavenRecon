@@ -53,9 +53,17 @@ type storedType struct {
 	Truncated bool `json:"truncated,omitempty"`
 	// IPs are the typed A/AAAA answers (canonical, sorted, deduplicated).
 	IPs []asset.IP `json:"ips,omitempty"`
-	// Hosts are the typed CNAME-target answers (canonical, sorted,
-	// deduplicated).
+	// Hosts are the typed host-target answers (CNAME/MX/NS/SRV: canonical,
+	// sorted, deduplicated).
 	Hosts []asset.Host `json:"hosts,omitempty"`
+	// Strings are the TXT answers (deduplicated, sorted, each within
+	// MaxTXTStringBytes). Only ever set for TXT.
+	Strings []string `json:"strings,omitempty"`
+	// Ports parallels Hosts for SRV answers: Ports[i] is the service port
+	// of Hosts[i] (u16 range only — ports are service data, never
+	// asset-normalized). Only ever set for SRV, always the same length as
+	// Hosts.
+	Ports []uint16 `json:"ports,omitempty"`
 	// Malformed counts raw answers dropped at normalization time
 	// (diagnostics).
 	Malformed int `json:"malformed,omitempty"`
@@ -63,13 +71,15 @@ type storedType struct {
 
 // decodeStoredType validates and decodes a stored per-type payload before it
 // may be served as a hit. It re-validates every answer through the Phase 2
-// asset model (canonical form required), refuses payloads whose target does
-// not match the queried host, whose record type does not match the query,
-// whose answers carry the wrong kind for the type (addresses for A/AAAA,
-// hostnames for CNAME), and whose NXDOMAIN flag contradicts non-empty
-// answers — so a corrupt, tampered, or legacy completed record can never
-// produce bogus assets. On any error the caller deletes the record and falls
-// through to a fresh resolution (self-healing), never serving it as a hit.
+// asset model (canonical form required) and the TXT/SRV rules (byte cap,
+// port/target alignment), refuses payloads whose target does not match the
+// queried host, whose record type does not match the query, whose answers
+// carry the wrong kind for the type (addresses iff A/AAAA, hostnames iff
+// CNAME/MX/NS/SRV, strings iff TXT, ports iff SRV and aligned with the
+// targets), and whose NXDOMAIN flag contradicts non-empty answers — so a
+// corrupt, tampered, or legacy completed record can never produce bogus
+// assets. On any error the caller deletes the record and falls through to a
+// fresh resolution (self-healing), never serving it as a hit.
 func decodeStoredType(raw json.RawMessage, host asset.Host, rt RecordType) (storedType, error) {
 	var s storedType
 	if err := json.Unmarshal(raw, &s); err != nil {
@@ -81,13 +91,26 @@ func decodeStoredType(raw json.RawMessage, host asset.Host, rt RecordType) (stor
 	if s.Type != rt {
 		return s, fmt.Errorf("stored result type %q does not match queried type %q", s.Type, rt)
 	}
-	if len(s.Hosts) > 0 && rt != TypeCNAME {
+	// Kind gates: each payload field is served only for its own record
+	// family — hostnames iff CNAME/MX/NS/SRV, strings iff TXT, addresses
+	// iff A/AAAA, ports iff SRV. Pre-T1 payloads carry only IPs/Hosts (and
+	// Hosts only under CNAME), so they pass these gates unchanged.
+	if len(s.Hosts) > 0 && !isHostTargetType(rt) {
 		return s, fmt.Errorf("stored %s result contains hostname answers", rt)
 	}
-	if len(s.IPs) > 0 && rt == TypeCNAME {
-		return s, fmt.Errorf("stored CNAME result contains address answers")
+	if len(s.IPs) > 0 && rt != TypeA && rt != TypeAAAA {
+		return s, fmt.Errorf("stored %s result contains address answers", rt)
 	}
-	if s.NXDOMAIN && (len(s.IPs) > 0 || len(s.Hosts) > 0) {
+	if len(s.Strings) > 0 && rt != TypeTXT {
+		return s, fmt.Errorf("stored %s result contains text answers", rt)
+	}
+	if len(s.Ports) > 0 && rt != TypeSRV {
+		return s, fmt.Errorf("stored %s result contains port answers", rt)
+	}
+	if rt == TypeSRV && len(s.Ports) != len(s.Hosts) {
+		return s, fmt.Errorf("stored SRV result has %d ports for %d targets: parallel arrays misaligned", len(s.Ports), len(s.Hosts))
+	}
+	if s.NXDOMAIN && (len(s.IPs) > 0 || len(s.Hosts) > 0 || len(s.Strings) > 0) {
 		return s, fmt.Errorf("stored result is both NXDOMAIN and answer-bearing")
 	}
 	if s.Truncated {
@@ -114,6 +137,14 @@ func decodeStoredType(raw json.RawMessage, host asset.Host, rt RecordType) (stor
 		// differs from its normalization would break dedup and formatting.
 		if nh.Name != h.Name {
 			return s, fmt.Errorf("stored result host %q is not in canonical form (normalized %q)", h.Name, nh.Name)
+		}
+	}
+	for _, str := range s.Strings {
+		// The TXT byte cap is re-checked so a tampered record cannot smuggle
+		// an unbounded string into a served hit (normalizeAnswers would
+		// never have retained it).
+		if len(str) > MaxTXTStringBytes {
+			return s, fmt.Errorf("stored TXT result contains over-long string (%d bytes)", len(str))
 		}
 	}
 	return s, nil
@@ -157,6 +188,8 @@ func typeResultFromStored(s storedType, host asset.Host, rt RecordType) TypeResu
 		NXDOMAIN:  s.NXDOMAIN,
 		IPs:       s.IPs,
 		Hosts:     s.Hosts,
+		Strings:   s.Strings,
+		Ports:     s.Ports,
 		Malformed: s.Malformed,
 	}
 }

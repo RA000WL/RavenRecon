@@ -244,6 +244,8 @@ func Ingest(ctx context.Context, cfg Config, src DocumentSource) (Report, error)
 		Timeout:     c.Timeout,
 		Rate:        c.Rate,
 		Burst:       c.Burst,
+		Observer:    c.Observer,
+		Deriver:     Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("secrentel: pool: %w", err)
@@ -295,7 +297,7 @@ func Ingest(ctx context.Context, cfg Config, src DocumentSource) (Report, error)
 							e.recordErr(fmt.Errorf("secrentel: emit: %w", err))
 						}
 					}
-					return nil, nil
+					return entry, nil
 				},
 			}); err != nil {
 				if errors.Is(err, runtime.ErrPoolClosed) || ctx.Err() != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
 	"github.com/RA000WL/RavenRecon/internal/discovery"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 	"github.com/RA000WL/RavenRecon/internal/urlintel"
 )
@@ -133,6 +134,13 @@ type Config struct {
 	// per-tool entries fall back to this default, and when both are zero
 	// the built-in default applies.
 	ToolTimeoutDefault time.Duration
+
+	// Observer is the optional instrumentation sink (internal/event Observer;
+	// the Bus satisfies it). When non-nil, the run's outer worker pool emits
+	// canonical pool-boundary events, and it is threaded through to each
+	// inner ingest pool. A nil observer (the default) means zero behavior
+	// change.
+	Observer event.Observer
 }
 
 // DefaultToolTimeout is the built-in default per-tool execution timeout
@@ -421,6 +429,13 @@ func Run(ctx context.Context, cfg Config) (RunReport, error) {
 		Rate:        cfg.Rate,
 		Burst:       cfg.Burst,
 		Clock:       cfg.Clock,
+		// The run's shared instrumentation sink (nil = off, zero behavior
+		// change): task/cache/progress events reach the live TUI frame.
+		Observer: cfg.Observer,
+		// No Deriver here by design: outer jobs yield ToolResult execution
+		// records (tool, target, status — no discovered assets), so there
+		// is nothing canonical to derive. Asset derivation lives in the
+		// engine IngestInto pool, which observes URLEntry results.
 	})
 	if err != nil {
 		return RunReport{}, fmt.Errorf("adapt: create worker pool: %w", err)
@@ -618,6 +633,9 @@ func runOne(ctx context.Context, cfg Config, e env, t Tool, target asset.Host, a
 		Cache:           cfg.Cache,
 		Clock:           cfg.Clock,
 		Metrics:         cfg.Metrics,
+		// Thread the run's shared instrumentation sink into the inner
+		// ingest pool (nil = off, zero behavior change).
+		Observer: cfg.Observer,
 	}, src, acc)
 	res.Lines = src.lineCount()
 

@@ -126,7 +126,7 @@ func TestAnalyzeCacheTamperTable(t *testing.T) {
 	u := mustURL(t, "https://example.com/app.js")
 	c := openTestCache(t)
 	clock := newFakeClock(fixedTime)
-	key, err := analyzeKey(u)
+	key, err := analyzeKey(u, "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
@@ -224,11 +224,11 @@ func TestAnalyzeKeyStability(t *testing.T) {
 	ub := mustURL(t, "http://example.com/other.js")
 	uc := mustURL(t, "https://example.com/app.js")
 
-	ka1, err := analyzeKey(ua)
+	ka1, err := analyzeKey(ua, "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
-	ka2, err := analyzeKey(mustURL(t, "http://example.com/app.js"))
+	ka2, err := analyzeKey(mustURL(t, "http://example.com/app.js"), "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
@@ -252,10 +252,10 @@ func TestAnalyzeKeyStability(t *testing.T) {
 		t.Errorf("key %s != canonical construction %s", ka1, canon)
 	}
 	// Distinct URLs produce distinct keys.
-	if kb, _ := analyzeKey(ub); kb == ka1 {
+	if kb, _ := analyzeKey(ub, ""); kb == ka1 {
 		t.Error("different path produced the same key")
 	}
-	if kc, _ := analyzeKey(uc); kc == ka1 {
+	if kc, _ := analyzeKey(uc, ""); kc == ka1 {
 		t.Error("different scheme produced the same key")
 	}
 	// Per-file caps are not part of the key by construction: analyzeKey
@@ -304,7 +304,7 @@ func TestAnalyzeHashMismatchHeals(t *testing.T) {
 	if lu.Err != nil {
 		t.Fatalf("lookup err = %v, want nil (a content change is a routine miss, not a diagnostic)", lu.Err)
 	}
-	key, err := analyzeKey(u)
+	key, err := analyzeKey(u, "")
 	if err != nil {
 		t.Fatalf("analyzeKey: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestAnalyzeStoreHashValidation(t *testing.T) {
 		if err := storeAnalyze(context.Background(), Config{}, c, clock, u, "", data, false, []string{"test-src"}, fixedTime, fixedTime); err != nil {
 			t.Fatalf("storeAnalyze(empty hash): %v", err)
 		}
-		key, err := analyzeKey(u)
+		key, err := analyzeKey(u, "")
 		if err != nil {
 			t.Fatalf("analyzeKey: %v", err)
 		}

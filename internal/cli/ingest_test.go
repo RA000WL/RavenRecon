@@ -84,6 +84,11 @@ func TestParseIngestArgs(t *testing.T) {
 			},
 		},
 		{
+			name:     "config flag",
+			args:     []string{"--config", "/tmp/r.json", "example.com", "/tmp/urls.txt"},
+			wantOpts: ingestOptions{target: "example.com", paths: []string{"/tmp/urls.txt"}, outputDir: defaultOutputDir, configPath: "/tmp/r.json"},
+		},
+		{
 			name:     "raw target preserved for normalization",
 			args:     []string{" EXAMPLE.COM. ", "/tmp/urls.txt"},
 			wantOpts: ingestOptions{target: " EXAMPLE.COM. ", paths: []string{"/tmp/urls.txt"}, outputDir: defaultOutputDir},

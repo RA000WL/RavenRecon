@@ -38,6 +38,10 @@
 //     rules (no caching, no scheduling); not part of the pack-loading
 //     contract packs depend on.
 //   - BenchResult — the benchmark's measurement result; same reason.
+//   - ChunkIdentityOfScript — chunk-identity recovery shared with the
+//     pipeline adapter (NEW-129 Slice 3 twin dedup, review F1):
+//     engine/adapter plumbing, not a rule-author contract. Level-2:
+//     its presence is tolerated and its shape may evolve freely.
 //
 // Any exported symbol that is neither in the Level-1 golden nor named in
 // excludedSurface FAILS the snapshot: a new experimental helper must be
@@ -79,11 +83,12 @@ const goldenFile = "testdata/api_v2.golden"
 // file header for the per-symbol reasons). Lookup only — iteration order is
 // irrelevant to the serializer.
 var excludedSurface = map[string]string{
-	"Metrics":           "Level-2: run-internal execution metrics, not a rule-author contract",
-	"MetricsSnapshot":   "Level-2: point-in-time copy of the internal metrics",
-	"RuleStats":         "Level-2: per-rule counter accumulation inside Metrics",
-	"BenchmarkDetector": "Level-3: developer-only benchmarking helper, not a pack-loading contract",
-	"BenchResult":       "Level-3: benchmark measurement result",
+	"Metrics":               "Level-2: run-internal execution metrics, not a rule-author contract",
+	"MetricsSnapshot":       "Level-2: point-in-time copy of the internal metrics",
+	"RuleStats":             "Level-2: per-rule counter accumulation inside Metrics",
+	"BenchmarkDetector":     "Level-3: developer-only benchmarking helper, not a pack-loading contract",
+	"BenchResult":           "Level-3: benchmark measurement result",
+	"ChunkIdentityOfScript": "Level-2: chunk-identity recovery shared with the pipeline adapter (NEW-129 Slice 3), not a rule-author contract",
 }
 
 // surfaceGoldenHeader is the fixed, deterministic header of the golden file:

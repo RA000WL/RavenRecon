@@ -290,8 +290,13 @@ func TestInteractionStickyTruncationColdWarm(t *testing.T) {
 		manyA = append(manyA, "192.0.2."+itoa(i))
 	}
 	resolver.set("trunc.example.com", dns.TypeA, manyA...)
-	// Host that fails (all types error)
-	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME} {
+	// Host that fails (all types error).
+	// NEW-126 T1: the engine queries 7 types/host (A/AAAA/CNAME/MX/TXT/NS/SRV);
+	// fail all 7 so the host has no completed type and classifyHost
+	// (failed without completed → failed, internal/dns/run.go) keeps it a
+	// fully-failed host (otherwise the 4 unscripted types complete-empty and
+	// failed+completed → incomplete, flipping ItemsFailed 1→0).
+	for _, rt := range []dns.RecordType{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeTXT, dns.TypeNS, dns.TypeSRV} {
 		resolver.setErr("fail.example.com", rt, &dns.QueryError{Kind: dns.ErrFailure, Host: "fail.example.com", Type: rt, Err: errors.New("synthetic failure")})
 	}
 	// Host normal
@@ -350,8 +355,9 @@ func TestInteractionStickyTruncationColdWarm(t *testing.T) {
 	// For DNS, truncated and failed entries are NOT served as hits (stored
 	// incomplete/failed), so warm should re-execute them and again produce same
 	// flags. Completed host should be a cache hit. The fakeResolver's
-	// seenCount per host counts total lookups (A+AAAA+CNAME), so we can
-	// detect recompute: trunc and fail should each have +3 lookups, www
+	// seenCount per host counts total lookups (NEW-126 T1: 7 types/host —
+	// A/AAAA/CNAME/MX/TXT/NS/SRV), so we can
+	// detect recompute: trunc and fail should each have +7 lookups, www
 	// should stay.
 	truncBefore := resolver.seenCount("trunc.example.com")
 	failBefore := resolver.seenCount("fail.example.com")

@@ -151,9 +151,9 @@ func TestResolveDeduplicatesAndSortsInputs(t *testing.T) {
 			t.Fatalf("results not sorted canonically: %v", hostNames([]asset.Host{rep.Results[0].Host, rep.Results[1].Host}))
 		}
 	})
-	// 2 hosts x 3 types = 6 queries; duplicates must not re-query.
-	if got := f.callCount(); got != 6 {
-		t.Fatalf("calls = %d, want 6", got)
+	// 2 hosts x 7 types = 14 queries; duplicates must not re-query.
+	if got := f.callCount(); got != 14 {
+		t.Fatalf("calls = %d, want 14", got)
 	}
 }
 

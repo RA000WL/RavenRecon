@@ -173,6 +173,11 @@ func ProbeURLs(ctx context.Context, domain asset.Domain, urls []asset.URL, cfg C
 		Timeout:     cfg.Timeout,
 		Rate:        0,
 		Burst:       0,
+		// Forward the instrumentation sink; nil disables pool events.
+		// The stateless Deriver converts completed job results into
+		// canonical derived events at the pool-job boundary.
+		Observer: cfg.Observer,
+		Deriver:  Deriver{},
 	})
 	if err != nil {
 		return LiveReport{}, fmt.Errorf("httpprobe: create worker pool: %w", err)
@@ -188,7 +193,7 @@ func ProbeURLs(ctx context.Context, domain asset.Domain, urls []asset.URL, cfg C
 		u := u
 		if _, err := pool.Submit(ctx, runtime.Job{Func: func(jctx context.Context) (any, error) {
 			results[i] = probeOneURL(jctx, u, domain, e)
-			return nil, nil
+			return results[i], nil
 		}}); err != nil {
 			results[i] = LiveRecord{URL: u, Err: fmt.Errorf("httpprobe: submit %s: %w", u.String(), err)}
 			for j := i + 1; j < len(norm); j++ {
@@ -289,6 +294,7 @@ func doLiveProbe(ctx context.Context, target asset.URL, domain asset.Domain, e e
 		return rec
 	}
 	req.Header.Set("User-Agent", userAgent)
+	applySessionHeaders(req, e.reqHeaders)
 	resp, err := e.transport.RoundTrip(req)
 	if err != nil {
 		st, _ := classifyProbeError(reqCtx, err)
@@ -351,11 +357,15 @@ func doLiveProbe(ctx context.Context, target asset.URL, domain asset.Domain, e e
 }
 
 // liveKey derives the cache key for one live URL.
-func liveKey(target asset.URL, domain asset.Domain) (cache.Key, error) {
+func liveKey(target asset.URL, domain asset.Domain, session string) (cache.Key, error) {
+	cfg := map[string]string{"domain": domain.Name}
+	if session != "" {
+		cfg["session"] = session
+	}
 	return cache.NewKey(cache.KeyParts{
 		Operation: LiveOperation,
 		Target:    target.Identity().String(),
-		Config:    map[string]string{"domain": domain.Name},
+		Config:    cfg,
 	})
 }
 
@@ -473,7 +483,7 @@ func liveRecordFromStored(s storedLive, target asset.URL) LiveRecord {
 
 // lookupLive is the cache-before-execute read side for one live URL.
 func lookupLive(ctx context.Context, target asset.URL, domain asset.Domain, e env) (LiveRecord, bool) {
-	key, err := liveKey(target, domain)
+	key, err := liveKey(target, domain, e.session)
 	if err != nil {
 		return LiveRecord{URL: target, Err: fmt.Errorf("httpprobe: build cache key: %w", err)}, false
 	}
@@ -495,7 +505,7 @@ func lookupLive(ctx context.Context, target asset.URL, domain asset.Domain, e en
 
 // storeLive is the cache write side for one live URL.
 func storeLive(ctx context.Context, target asset.URL, domain asset.Domain, rec LiveRecord, e env) LiveRecord {
-	key, err := liveKey(target, domain)
+	key, err := liveKey(target, domain, e.session)
 	if err != nil {
 		rec.Err = errors.Join(rec.Err, fmt.Errorf("httpprobe: build cache key for %s: %w", target.String(), err))
 		if rec.Err != nil {

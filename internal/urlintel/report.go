@@ -331,9 +331,7 @@ func (e *URLEntry) normalize() {
 	sort.Slice(e.Parameters, func(i, j int) bool {
 		return e.Parameters[i].Identity().String() < e.Parameters[j].Identity().String()
 	})
-	sort.Slice(e.Relationships, func(i, j int) bool {
-		return e.Relationships[i].ID() < e.Relationships[j].ID()
-	})
+	e.Relationships = sortRelationships(e.Relationships)
 }
 
 // Accumulator is the merge-at-emit state of one or more Ingest runs. It is
@@ -556,7 +554,27 @@ func mergeParametersAll(params []asset.Parameter) []asset.Parameter {
 }
 
 // sortRelationships orders relationships deterministically by identity.
+// Edge IDs are precomputed once per element: the comparator never
+// re-encodes identities mid-sort, so sorting costs O(n) encodings instead
+// of O(n log n). Output is byte-identical to the naive comparator — the
+// sort's decisions depend only on comparison outcomes, which are unchanged
+// for identical keys, so the unstable permutation is unchanged too. Keys
+// ride alongside their elements (never an index into the mutating slice).
 func sortRelationships(rs []asset.Relationship) []asset.Relationship {
-	sort.Slice(rs, func(i, j int) bool { return rs[i].ID() < rs[j].ID() })
+	keyed := make([]keyedRelationship, len(rs))
+	for i := range rs {
+		keyed[i] = keyedRelationship{id: rs[i].ID(), rel: rs[i]}
+	}
+	sort.Slice(keyed, func(i, j int) bool { return keyed[i].id < keyed[j].id })
+	for i := range keyed {
+		rs[i] = keyed[i].rel
+	}
 	return rs
+}
+
+// keyedRelationship pairs a relationship with its precomputed edge ID for
+// sortRelationships.
+type keyedRelationship struct {
+	id  string
+	rel asset.Relationship
 }

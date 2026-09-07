@@ -11,6 +11,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -159,6 +160,22 @@ type Config struct {
 
 	// Now returns the timestamp used for provenance. Nil means time.Now.
 	Now func() time.Time
+
+	// OnSource, when non-nil, receives each executed source's result as
+	// its job finalizes (completion order, on a worker goroutine — the
+	// callback must be thread-safe and non-blocking; it must never
+	// mutate the result). Skipped sources never execute and are not
+	// reported here; they appear in the final report. Results are
+	// pre-quality-gate: the gate may cap retained sets at the join
+	// point, so streamed counts are provisional and the returned report
+	OnSource func(SourceResult)
+
+	// Observer is the optional instrumentation sink (internal/event Observer;
+	// the Bus satisfies it). When non-nil, the run's worker pool emits
+	// canonical pool-boundary events (task submitted/started/running/terminal,
+	// worker lifecycle, progress). A nil observer (the default) means zero
+	// behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns a Config with documented defaults.
@@ -396,6 +413,13 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 		Timeout:     cfg.Timeout,
 		Rate:        cfg.Rate,
 		Burst:       cfg.Burst,
+		// The run's shared instrumentation sink (nil = off, zero behavior
+		// change): task/cache/progress events reach the live TUI frame.
+		// Sources are external binaries; pool task events still flow.
+		Observer: cfg.Observer,
+		// The stateless Deriver converts completed per-source results into
+		// canonical host-discovered events at the pool-job boundary.
+		Deriver: Deriver{},
 	})
 	if err != nil {
 		return Report{}, fmt.Errorf("discovery: create worker pool: %w", err)
@@ -428,10 +452,16 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 						Status:    OutFailed,
 						Err:       fmt.Errorf("discovery: %s panicked during execution", s.Name()),
 					}
+					if cfg.OnSource != nil {
+						cfg.OnSource(results[i])
+					}
 				}
 			}()
 			results[i], keys[i], stores[i] = runSource(jctx, target, s, results[i].Detection, cfg)
-			return nil, nil
+			if cfg.OnSource != nil {
+				cfg.OnSource(results[i])
+			}
+			return results[i], nil
 		}}); err != nil {
 			results[i] = SourceResult{
 				Source:    s.Name(),

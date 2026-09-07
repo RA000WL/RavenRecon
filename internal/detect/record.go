@@ -82,6 +82,17 @@ type fingerprintSecret struct {
 	Confidence float64 `json:"confidence,omitempty"`
 }
 
+// fingerprintContent is the canonical per-entry form retained script
+// bodies take in the run fingerprint (SDK v2.1, NEW-118): the script
+// identity plus the hex SHA-256 of the exact body bytes the rules
+// observe. Two corpora whose fingerprints differ can never share a
+// cached rule result — a changed body always misses and re-analyzes —
+// while identical corpora share normally.
+type fingerprintContent struct {
+	Identity string `json:"id"`
+	Hash     string `json:"hash"`
+}
+
 type fingerprintScript struct {
 	Identity        string  `json:"id"`
 	Hash            string  `json:"hash,omitempty"`
@@ -123,8 +134,14 @@ type snapshotFingerprint struct {
 	Technologies  []fingerprintTech     `json:"technologies,omitempty"`
 	Secrets       []fingerprintSecret   `json:"secrets,omitempty"`
 	JavaScript    []fingerprintScript   `json:"javascript,omitempty"`
-	Endpoints     []fingerprintEndp     `json:"endpoints,omitempty"`
-	GraphDigest   string                `json:"graph_digest,omitempty"`
+	// JSContents carries the retained-body digests (SDK v2.1, NEW-118):
+	// rules observe body bytes, so bodies enter the fingerprint or
+	// changed content would serve stale findings. Entries are
+	// identity-sorted by normalizeSnapshot; the empty set digests
+	// deterministically like every other empty domain.
+	JSContents  []fingerprintContent `json:"js_contents,omitempty"`
+	Endpoints   []fingerprintEndp    `json:"endpoints,omitempty"`
+	GraphDigest string               `json:"graph_digest,omitempty"`
 }
 
 // fingerprintSnapshot digests the normalized corpus: every result-relevant
@@ -208,6 +225,13 @@ func fingerprintSnapshot(c *corpus) (string, error) {
 			Source:     e.Prov.Source,
 			Reference:  e.Prov.Reference,
 			Confidence: e.Prov.Confidence,
+		})
+	}
+	for _, jc := range c.context.JavaScriptContent {
+		sum := sha256.Sum256([]byte(jc.Body))
+		fp.JSContents = append(fp.JSContents, fingerprintContent{
+			Identity: jc.Identity.String(),
+			Hash:     hex.EncodeToString(sum[:]),
 		})
 	}
 	// SDK v2: graph_digest — stable hash of the sorted Relationship.ID()

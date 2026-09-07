@@ -252,7 +252,7 @@ func validateSurfaceInvariants(s SurfaceAsset, sig Signal) error {
 	if math.Abs(s.Confidence-confidence) > scoreTolerance {
 		return fmt.Errorf("confidence %.4f does not match the recomposed %.4f", s.Confidence, confidence)
 	}
-	if lv := levelFor(score, categories); s.Level != lv {
+	if lv := levelFor(score, categories, structuralConfidence(s.Factors)); s.Level != lv {
 		return fmt.Errorf("level %s does not match the re-gated level %s for score %.4f with %d indicator categories",
 			s.Level, lv, score, categories)
 	}

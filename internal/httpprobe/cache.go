@@ -50,11 +50,18 @@ const Operation = "http.probe"
 // key shape and are simply re-probed. That is acceptable at release: stale
 // scope-truncated records must never be served, and a re-probe is the safe
 // outcome.
-func probeKey(target asset.URL, domain asset.Domain) (cache.Key, error) {
+func probeKey(target asset.URL, domain asset.Domain, session string) (cache.Key, error) {
+	cfg := map[string]string{"domain": domain.Name}
+	if session != "" {
+		// Authed runs key distinctly from anonymous ones (and from
+		// each other); anonymous runs omit the component so their keys
+		// stay byte-identical across the upgrade.
+		cfg["session"] = session
+	}
 	return cache.NewKey(cache.KeyParts{
 		Operation: Operation,
 		Target:    target.Identity().String(),
-		Config:    map[string]string{"domain": domain.Name},
+		Config:    cfg,
 	})
 }
 
@@ -351,7 +358,7 @@ func probeResultFromStored(s storedProbe, host asset.Host, target asset.URL, sch
 // unusable records — any diagnosis is joined into Err), or already
 // classified failed when the key cannot be built.
 func lookupProbe(ctx context.Context, host asset.Host, target asset.URL, domain asset.Domain, pr ProbeResult, e env) ProbeResult {
-	key, err := probeKey(target, domain)
+	key, err := probeKey(target, domain, e.session)
 	if err != nil {
 		pr.Status = ProbeFailed
 		pr.FailureReason = ReasonOther
@@ -405,7 +412,7 @@ func lookupProbe(ctx context.Context, host asset.Host, target asset.URL, domain 
 // its terminal record using a detached, bounded context so the write cannot
 // wedge shutdown (Phase 4 convention).
 func storeProbe(ctx context.Context, host asset.Host, target asset.URL, domain asset.Domain, pr ProbeResult, e env) ProbeResult {
-	key, err := probeKey(target, domain)
+	key, err := probeKey(target, domain, e.session)
 	if err != nil {
 		pr.Err = errors.Join(pr.Err, fmt.Errorf("httpprobe: %s %s: build cache key: %w", host.Name, target, err))
 		return pr

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/httpprobe"
 	"github.com/RA000WL/RavenRecon/internal/pipeline"
 	"github.com/RA000WL/RavenRecon/internal/priority"
 )
@@ -598,4 +601,268 @@ func TestPriorityStageParamOverflowTruncatesNotFails(t *testing.T) {
 	if names[0] != "p00" || names[len(names)-1] != "p63" {
 		t.Errorf("retained names not the first bound-many in canonical order: %q..%q", names[0], names[len(names)-1])
 	}
+}
+
+// enrichFixtures builds one URL's enrichment results: a technology, a
+// secret, two endpoints (GET + GQL), a JavaScript asset, a live record
+// with headers, and the url→technology / url→secret_candidate edges.
+func enrichFixtures(t testing.TB, rawURL string) (asset.URL, pipeline.Results) {
+	t.Helper()
+	u := mustURL(t, rawURL)
+	tech, err := asset.NewTechnology("synthetic-tech", asset.CategoryFramework, asset.Provenance{Source: "test", Confidence: 0.9})
+	if err != nil {
+		t.Fatalf("NewTechnology: %v", err)
+	}
+	secret, err := asset.NewSecretCandidate(asset.SecretTypeAWS, "AKIAIOSFODNN7EXAMPLE", u.Identity(), asset.Provenance{Source: "test", Confidence: 0.8})
+	if err != nil {
+		t.Fatalf("NewSecretCandidate: %v", err)
+	}
+	epGet, err := asset.NewEndpoint("GET", rawURL, asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEndpoint GET: %v", err)
+	}
+	epGQL, err := asset.NewEndpoint("GQL", rawURL, asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEndpoint GQL: %v", err)
+	}
+	js, err := asset.NewJavaScript(rawURL, asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewJavaScript: %v", err)
+	}
+	js, err = asset.WithSize(js, 2048)
+	if err != nil {
+		t.Fatalf("WithSize: %v", err)
+	}
+	relTech, err := asset.NewRelationship(u.Identity(), asset.RelationshipURLToTechnology, tech.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship tech: %v", err)
+	}
+	relSecret, err := asset.NewRelationship(u.Identity(), asset.RelationshipURLToSecretCandidate, secret.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship secret: %v", err)
+	}
+	res := pipeline.Results{
+		Technologies: []asset.Technology{tech},
+		Secrets:      []asset.SecretCandidate{secret},
+		Endpoints:    []asset.Endpoint{epGet, epGQL},
+		JavaScript:   []asset.JavaScript{js},
+		LiveRecords: []httpprobe.LiveRecord{{
+			URL:     u,
+			Status:  200,
+			Headers: http.Header{"X-Powered-By": {"Express"}, "Server": {"nginx"}},
+		}},
+		Relationships: []asset.Relationship{relTech, relSecret},
+	}
+	return u, res
+}
+
+func findURLSignal(t testing.TB, sigs []priority.Signal, id asset.Identity) priority.Signal {
+	t.Helper()
+	for _, s := range sigs {
+		if s.Identity == id {
+			return s
+		}
+	}
+	t.Fatalf("no signal for %s", id)
+	return priority.Signal{}
+}
+
+// TestPrioritySignalsURLEnrichment pins NEW-119: URL signals carry the
+// observed technologies, secrets, headers, JS bundle size, and endpoint
+// method resolved from the results channel by URL identity —
+// deterministically ordered, with the most specific endpoint method
+// winning over plain GET.
+func TestPrioritySignalsURLEnrichment(t *testing.T) {
+	u, res := enrichFixtures(t, "https://www.example.com/app.js")
+	sigs, paramsTruncated, signalsTruncated := buildPrioritySignals(nil, nil, []asset.URL{u}, res)
+	if paramsTruncated || signalsTruncated {
+		t.Fatalf("truncation = %v/%v, want false/false (well under every bound)", paramsTruncated, signalsTruncated)
+	}
+	if len(sigs) != 1 {
+		t.Fatalf("signals = %d, want 1", len(sigs))
+	}
+	sig := sigs[0]
+	if len(sig.Technologies) != 1 || sig.Technologies[0].Name != "synthetic-tech" ||
+		sig.Technologies[0].Category != "framework" || sig.Technologies[0].Confidence != 0.9 ||
+		sig.Technologies[0].Identity != "framework/synthetic%2Dtech" {
+		t.Errorf("technologies = %+v, want [{synthetic-tech framework 0.9 framework/synthetic%%2Dtech}] (canonical identity value, hyphen percent-encoded)", sig.Technologies)
+	}
+	if len(sig.Secrets) != 1 || sig.Secrets[0].Type != asset.SecretTypeAWS || sig.Secrets[0].Confidence != 0.8 {
+		t.Errorf("secrets = %+v, want the bound AWS candidate at 0.8", sig.Secrets)
+	}
+	wantHeaders := []string{"server: nginx", "x-powered-by: Express"}
+	if len(sig.Headers) != len(wantHeaders) {
+		t.Fatalf("headers = %q, want %q (sorted lowercased key: value lines)", sig.Headers, wantHeaders)
+	}
+	for i := range wantHeaders {
+		if sig.Headers[i] != wantHeaders[i] {
+			t.Errorf("headers = %q, want %q", sig.Headers, wantHeaders)
+			break
+		}
+	}
+	if sig.JSBundleBytes != 2048 {
+		t.Errorf("jsBundleBytes = %d, want 2048", sig.JSBundleBytes)
+	}
+	if sig.EndpointMethod != "GQL" {
+		t.Errorf("endpointMethod = %q, want GQL (most specific method wins over GET)", sig.EndpointMethod)
+	}
+	if sig.Path != "/app.js" || sig.Hostname != "www.example.com" {
+		t.Errorf("path/hostname = %q/%q, want /app.js/www.example.com (existing fields intact)", sig.Path, sig.Hostname)
+	}
+}
+
+// TestPrioritySignalsCaps pins the derivation bounds: over-bound families
+// retain a deterministic sorted head and report the cut — an asset never
+// fails engine validation for bounded upstream data.
+func TestPrioritySignalsCaps(t *testing.T) {
+	u := mustURL(t, "https://www.example.com/app.js")
+	var techs []asset.Technology
+	var rels []asset.Relationship
+	for i := 0; i < 33; i++ {
+		tech, err := asset.NewTechnology(fmt.Sprintf("tech-%02d", i), asset.CategoryFramework, asset.Provenance{Confidence: 0.5})
+		if err != nil {
+			t.Fatalf("NewTechnology: %v", err)
+		}
+		techs = append(techs, tech)
+		r, err := asset.NewRelationship(u.Identity(), asset.RelationshipURLToTechnology, tech.Identity())
+		if err != nil {
+			t.Fatalf("NewRelationship: %v", err)
+		}
+		rels = append(rels, r)
+	}
+	headers := http.Header{}
+	for i := 0; i < 129; i++ {
+		headers[fmt.Sprintf("X-Test-%03d", i)] = []string{"v"}
+	}
+	headers["X-Big"] = []string{strings.Repeat("v", 600)}
+	res := pipeline.Results{
+		Technologies:  techs,
+		Relationships: rels,
+		LiveRecords:   []httpprobe.LiveRecord{{URL: u, Status: 200, Headers: headers}},
+	}
+	sigs, _, truncated := buildPrioritySignals(nil, nil, []asset.URL{u}, res)
+	if !truncated {
+		t.Fatal("truncated = false, want true (techs 33>32, headers 130>128, one overlong line)")
+	}
+	sig := findURLSignal(t, sigs, u.Identity())
+	if len(sig.Technologies) != 32 {
+		t.Errorf("technologies = %d, want 32 (sorted head)", len(sig.Technologies))
+	}
+	if sig.Technologies[0].Name != "tech-00" || sig.Technologies[31].Name != "tech-31" {
+		t.Errorf("technology head not the sorted-first 32: %q..%q", sig.Technologies[0].Name, sig.Technologies[31].Name)
+	}
+	if len(sig.Headers) != 128 {
+		t.Errorf("headers = %d, want 128", len(sig.Headers))
+	}
+	for _, h := range sig.Headers {
+		if len(h) > 512 {
+			t.Errorf("header line %d bytes, want ≤512 (truncated)", len(h))
+		}
+	}
+}
+
+// TestPrioritySignalsInvalidFiltered pins defensive filtering: corrupt
+// upstream entries (empty names, NaN/out-of-range confidences, unknown
+// secret types) are skipped without failing the asset or flagging a cut.
+func TestPrioritySignalsInvalidFiltered(t *testing.T) {
+	u := mustURL(t, "https://www.example.com/app.js")
+	badTech := asset.Technology{Name: "", Category: asset.CategoryFramework, Prov: asset.Provenance{Confidence: 0.5}}
+	nanTech, _ := asset.NewTechnology("nan-tech", asset.CategoryFramework, asset.Provenance{Confidence: math.NaN()})
+	badSecret := asset.SecretCandidate{Type: asset.SecretType("bogus"), Prov: asset.Provenance{Confidence: 0.5}}
+	rels := []asset.Relationship{}
+	for _, id := range []asset.Identity{badTech.Identity(), nanTech.Identity(), badSecret.Identity()} {
+		kind := asset.RelationshipURLToTechnology
+		if id.Kind == asset.KindSecretCandidate {
+			kind = asset.RelationshipURLToSecretCandidate
+		}
+		r, err := asset.NewRelationship(u.Identity(), kind, id)
+		if err != nil {
+			t.Fatalf("NewRelationship: %v", err)
+		}
+		rels = append(rels, r)
+	}
+	res := pipeline.Results{
+		Technologies:  []asset.Technology{badTech, nanTech},
+		Secrets:       []asset.SecretCandidate{badSecret},
+		Relationships: rels,
+	}
+	sigs, _, truncated := buildPrioritySignals(nil, nil, []asset.URL{u}, res)
+	if truncated {
+		t.Error("truncated = true, want false (filtering corrupt entries is not a cut)")
+	}
+	sig := findURLSignal(t, sigs, u.Identity())
+	if len(sig.Technologies) != 0 || len(sig.Secrets) != 0 {
+		t.Errorf("technologies/secrets = %+v/%+v, want both empty (corrupt entries filtered)", sig.Technologies, sig.Secrets)
+	}
+}
+
+// TestPriorityStageEnrichedScoring pins the end-to-end effect: the same
+// corpus scores higher with enrichment than without, and warm runs replay
+// it identically (signal-fingerprint cache keys cover every enriched
+// field by construction).
+func TestPriorityStageEnrichedScoring(t *testing.T) {
+	interesting, err := priority.CompileForTest("interestingness", []priority.Indicator{
+		{ID: "test-tech", Category: "interestingness", Weight: 0.9,
+			Field: priority.FieldTechName, Terms: []string{"synthetic-tech"},
+			Reason: "tech %s", Recommendation: "test guidance %s"},
+	})
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	risk, err := priority.CompileForTest("risk", []priority.Indicator{
+		{ID: "test-header", Category: "risk", Weight: 0.7,
+			Field: priority.FieldHeader, Terms: []string{"x-powered-by: express"},
+			Reason: "header %s", Recommendation: "test guidance %s"},
+	})
+	if err != nil {
+		t.Fatalf("CompileForTest: %v", err)
+	}
+	u, res := enrichFixtures(t, "https://www.example.com/app.js")
+	target := mustDomain(t, "example.com")
+	c := &recordingCache{}
+
+	bare, err := NewPriorityStage(interesting, risk).Run(context.Background(), priorityInput(target, nil, nil, []asset.URL{u}, c))
+	if err != nil {
+		t.Fatalf("bare Run: %v", err)
+	}
+	enrichedIn := priorityInput(target, nil, nil, []asset.URL{u}, c)
+	enrichedIn.Results = res
+	enriched, err := NewPriorityStage(interesting, risk).Run(context.Background(), enrichedIn)
+	if err != nil {
+		t.Fatalf("enriched Run: %v", err)
+	}
+	if enriched.Outcome != pipeline.OutcomeCompleted || bare.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("outcomes = %q/%q, want completed/completed", enriched.Outcome, bare.Outcome)
+	}
+	bareScore := surfaceScoreFor(t, bare, u.Identity())
+	enrichedScore := surfaceScoreFor(t, enriched, u.Identity())
+	if !(enrichedScore > bareScore) {
+		t.Errorf("enriched score %v <= bare score %v (enrichment must add factors)", enrichedScore, bareScore)
+	}
+	// Warm parity: identical inputs replay identical surfaces.
+	warmIn := priorityInput(target, nil, nil, []asset.URL{u}, c)
+	warmIn.Results = res
+	warm, err := NewPriorityStage(interesting, risk).Run(context.Background(), warmIn)
+	if err != nil {
+		t.Fatalf("warm Run: %v", err)
+	}
+	if len(warm.Results.Surfaces) != len(enriched.Results.Surfaces) {
+		t.Fatalf("warm surfaces = %d, enriched = %d", len(warm.Results.Surfaces), len(enriched.Results.Surfaces))
+	}
+	for i := range enriched.Results.Surfaces {
+		if warm.Results.Surfaces[i].Score != enriched.Results.Surfaces[i].Score {
+			t.Errorf("warm surface[%d] score %v != enriched %v", i, warm.Results.Surfaces[i].Score, enriched.Results.Surfaces[i].Score)
+		}
+	}
+}
+
+func surfaceScoreFor(t testing.TB, res pipeline.StageResult, id asset.Identity) float64 {
+	t.Helper()
+	for _, s := range res.Results.Surfaces {
+		if s.Identity == id {
+			return s.Score
+		}
+	}
+	t.Fatalf("no surface for %s", id)
+	return 0
 }

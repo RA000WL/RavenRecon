@@ -1,1 +1,1 @@
-{"Duration":"","Err":null,"ItemsFailed":0,"ItemsProcessed":1,"Name":"detect","Outcome":"completed","StickyFlags":null,"Truncated":false}
+{"Duration":"","Err":null,"ItemsFailed":0,"ItemsProcessed":1,"Name":"detect","Outcome":"completed","StickyFlags":{"detect_js_contents_incomplete_input":true},"Truncated":true}

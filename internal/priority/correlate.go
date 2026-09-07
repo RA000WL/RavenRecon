@@ -78,6 +78,11 @@ type Group struct {
 //     "b.api.example.com" therefore group together under example.com's
 //     child "api.example.com", while "www.example.com" and
 //     "api.example.com" both group under "example.com";
+//   - EXCEPTION: a name under a curated shared-infrastructure suffix
+//     (sharedInfraSuffixes — multi-tenant hosts like herokuapp.com)
+//     anchors at one label above the longest matching suffix
+//     (a.herokuapp.com stays a.herokuapp.com), so unrelated tenants
+//     never merge into one group;
 //   - host and domain surfaces anchor through the same parent-domain rule,
 //     so a host and the URLs observed on it land in ONE group;
 //   - IP surfaces anchor at themselves (asset.NewIP);
@@ -96,7 +101,7 @@ type Group struct {
 //	group.confidence = round4(1 − ∏_f (1 − w_f))    over the union's
 //	                   confidence factors (uncapped, mirroring
 //	                   SurfaceAsset.Confidence)
-//	group.level      = levelFor(group.score, distinct indicator categories)
+//	group.level      = levelFor(group.score, distinct indicator categories, strongest recorded detection)
 //
 // Repeated factors (two members carrying the same indicator) combine
 // within their group exactly as multiple factors of one category do in
@@ -176,7 +181,7 @@ func Correlate(surfaces []SurfaceAsset) ([]Group, bool) {
 		score, _, confidence, categories := compose(union)
 		g.Score = score
 		g.Confidence = confidence
-		g.Level = levelFor(score, categories)
+		g.Level = levelFor(score, categories, structuralConfidence(union))
 		groups = append(groups, g)
 	}
 
@@ -227,10 +232,65 @@ func correlationAnchor(id asset.Identity) asset.Identity {
 	return anchor
 }
 
+// sharedInfraSuffixes is the curated set of multi-tenant hosting suffixes
+// whose registrants are unrelated tenants, not one organization: blindly
+// dropping the first label would merge every tenant on the suffix into one
+// group (a.herokuapp.com + b.herokuapp.com under "herokuapp.com"). The set
+// is curated alongside the takeover pack's unclaimedProviderSuffixes
+// (internal/detect/packs/takeover/helpers.go) — same curation posture
+// (lowercased, dot-boundary match), scoped here to correlation grouping
+// rather than takeover fingerprints, so it additionally covers app-hosting
+// suffixes (vercel.app, netlify.app, pages.dev, web.app, firebaseapp.com,
+// appspot.com, azurefd.net, s3.amazonaws.com) that are shared
+// infrastructure for grouping purposes whether or not they are takeover
+// signals.
+var sharedInfraSuffixes = map[string]struct{}{
+	"amazonaws.com":      {},
+	"appspot.com":        {},
+	"azurefd.net":        {},
+	"azurewebsites.net":  {},
+	"cloudapp.azure.com": {},
+	"cloudfront.net":     {},
+	"elb.amazonaws.com":  {},
+	"firebaseapp.com":    {},
+	"github.io":          {},
+	"herokuapp.com":      {},
+	"netlify.app":        {},
+	"pages.dev":          {},
+	"s3.amazonaws.com":   {},
+	"vercel.app":         {},
+	"web.app":            {},
+}
+
+// sharedInfraAnchor maps a canonical name to its tenant anchor when the
+// name sits under a curated shared-infrastructure suffix: one label above
+// the LONGEST matching suffix (a.herokuapp.com → a.herokuapp.com;
+// a.b.herokuapp.com → b.herokuapp.com), so each tenant anchors alone.
+// ok is false when no curated suffix matches (the caller keeps today's
+// first-label-drop rule exactly) or when the name IS the suffix itself
+// (no tenant label to anchor — the normal rule already anchors it at
+// itself). Matching is longest-suffix so nested entries resolve to the
+// tightest tenant scope (x.s3.amazonaws.com stays under s3.amazonaws.com,
+// not amazonaws.com).
+func sharedInfraAnchor(name string) (anchor string, ok bool) {
+	labels := strings.Split(strings.ToLower(name), ".")
+	for i := range labels {
+		suffix := strings.Join(labels[i:], ".")
+		if _, found := sharedInfraSuffixes[suffix]; found {
+			if i == 0 {
+				return "", false
+			}
+			return labels[i-1] + "." + suffix, true
+		}
+	}
+	return "", false
+}
+
 // hostAnchor maps one canonical host (possibly with a port, possibly a
 // bracketed IPv6 literal — the forms asset.URL.HostPort produces) to its
-// grouping anchor: the IP identity for address literals, or the
-// first-label-dropped parent domain for names.
+// grouping anchor: the IP identity for address literals, the tenant anchor
+// for names under a curated shared-infrastructure suffix, or the
+// first-label-dropped parent domain for all other names.
 func hostAnchor(hostPort string) asset.Identity {
 	host := hostOfHostPort(hostPort)
 	if addr, err := netip.ParseAddr(host); err == nil {
@@ -244,7 +304,9 @@ func hostAnchor(hostPort string) asset.Identity {
 		return asset.Identity{}
 	}
 	parent := h.Name
-	if labels := strings.Split(h.Name, "."); len(labels) > 2 {
+	if anchor, ok := sharedInfraAnchor(h.Name); ok {
+		parent = anchor
+	} else if labels := strings.Split(h.Name, "."); len(labels) > 2 {
 		parent = strings.Join(labels[1:], ".")
 	}
 	if d, err := asset.NewDomain(parent, asset.Provenance{}); err == nil {

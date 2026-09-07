@@ -607,7 +607,7 @@ func TestLiveProbeDeepChainTLSDiagnosticKeepsCompletedAndCached(t *testing.T) {
 	}
 	// The stored record must carry no failure reason: the response was
 	// observed, so ReasonOther must never be stamped.
-	key, err := liveKey(u, domain)
+	key, err := liveKey(u, domain, "")
 	if err != nil {
 		t.Fatalf("liveKey: %v", err)
 	}

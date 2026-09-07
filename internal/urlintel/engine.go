@@ -10,6 +10,7 @@ import (
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/cache"
+	"github.com/RA000WL/RavenRecon/internal/event"
 	"github.com/RA000WL/RavenRecon/internal/runtime"
 )
 
@@ -152,6 +153,13 @@ type Config struct {
 	// Metrics, when non-nil, collects run counters (parse/extract/store
 	// work). Tests and benchmarks use it to assert zero work on cache hits.
 	Metrics *Metrics
+
+	// Observer is the optional instrumentation sink (internal/event Observer;
+	// the Bus satisfies it). When non-nil, the run's worker pool emits
+	// canonical pool-boundary events (task submitted/started/running/terminal,
+	// worker lifecycle, progress). A nil observer (the default) means zero
+	// behavior change.
+	Observer event.Observer
 }
 
 // DefaultConfig returns a Config with documented defaults. Concurrency and
@@ -420,6 +428,14 @@ func IngestInto(ctx context.Context, cfg Config, src LineSource, acc *Accumulato
 		// pacing is deterministic under an injected clock and always agrees
 		// with the observation timestamps the run records.
 		Clock: cfg.Clock,
+		// The run's shared instrumentation sink (nil = off, zero behavior
+		// change): task/cache/progress events reach the live TUI frame.
+		Observer: cfg.Observer,
+		// Pool-job-boundary derivation (nil observer = inert bridge, zero
+		// behavior change): completed per-URL results derive canonical
+		// asset/relationship events for the live feed. Reports never read
+		// the bus; the accumulator below stays the complete record.
+		Deriver: Deriver{},
 	})
 	if err != nil {
 		return fmt.Errorf("urlintel: create worker pool: %w", err)
@@ -491,7 +507,11 @@ func IngestInto(ctx context.Context, cfg Config, src LineSource, acc *Accumulato
 					e.recordErr(fmt.Errorf("urlintel: emit %s: %w", u.String(), eerr))
 				}
 			}
-			return nil, nil
+			// The completed entry is the job result: the Deriving bridge
+			// hands it to Deriver for canonical event derivation (the
+			// accumulator above stays the complete record; the bus is an
+			// observation aid only).
+			return entry, nil
 		}}); serr != nil {
 			// The run context is done or the pool is closing: the current
 			// line keeps its pre-registered cancelled entry (it was never

@@ -199,7 +199,7 @@ func TestCorrelateAggregateFormulaPinned(t *testing.T) {
 	if g.Score != score || g.Confidence != confidence {
 		t.Errorf("aggregate (%v,%v) != compose(union) (%v,%v)", g.Score, g.Confidence, score, confidence)
 	}
-	if lv := levelFor(score, categories); g.Level != lv {
+	if lv := levelFor(score, categories, structuralConfidence(union)); g.Level != lv {
 		t.Errorf("aggregate level %s != recomputed %s", g.Level, lv)
 	}
 
@@ -400,5 +400,74 @@ func TestCorrelateScoresAreFinite(t *testing.T) {
 		if math.IsNaN(g.Confidence) || g.Confidence < 0 || g.Confidence > 1 {
 			t.Errorf("group confidence %v out of [0,1]", g.Confidence)
 		}
+	}
+}
+
+// TestCorrelateSharedInfraSplit pins the shared-infrastructure exception to
+// the first-label-drop rule: unrelated tenants on a curated suffix anchor
+// alone (one label above the longest matching suffix) instead of merging
+// under the suffix, while non-listed names keep today's rule exactly.
+func TestCorrelateSharedInfraSplit(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	hostSig := func(name string) SurfaceAsset {
+		return scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: name},
+			Kind:     asset.KindHost, Hostname: name,
+		})
+	}
+	anchors := func(groups []Group) map[string]int {
+		m := make(map[string]int, len(groups))
+		for _, g := range groups {
+			m[g.Anchor.String()] = len(g.Members)
+		}
+		return m
+	}
+
+	// Two tenants on herokuapp.com must NOT merge (the blind
+	// first-label-drop would group both under "herokuapp.com"), and a URL
+	// observed on one tenant joins that tenant's group through the same
+	// anchor rule.
+	groups, truncated := Correlate([]SurfaceAsset{
+		hostSig("a.herokuapp.com"),
+		hostSig("b.herokuapp.com"),
+		scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindURL, Value: "https://a.herokuapp.com/a"},
+			Kind:     asset.KindURL, Path: "/a", Hostname: "a.herokuapp.com",
+		}),
+	})
+	if truncated {
+		t.Error("three surfaces under two anchors are under the cap; Truncated must be false")
+	}
+	got := anchors(groups)
+	if len(got) != 2 || got["domain:a.herokuapp.com"] != 2 || got["domain:b.herokuapp.com"] != 1 {
+		t.Errorf("heroku tenants must split 2+1, got %v", got)
+	}
+
+	// One label above the LONGEST suffix: a nested tenant anchors at its
+	// parent tenant, and nested suffix entries resolve tightest-first
+	// (x.s3.amazonaws.com stays a tenant of s3.amazonaws.com, while
+	// y.s3.amazonaws.com is a different tenant — never one merged group).
+	groups, _ = Correlate([]SurfaceAsset{
+		hostSig("a.b.herokuapp.com"),
+		hostSig("x.s3.amazonaws.com"),
+		hostSig("y.s3.amazonaws.com"),
+	})
+	got = anchors(groups)
+	if len(got) != 3 ||
+		got["domain:b.herokuapp.com"] != 1 ||
+		got["domain:x.s3.amazonaws.com"] != 1 ||
+		got["domain:y.s3.amazonaws.com"] != 1 {
+		t.Errorf("nested/shared anchors = %v, want b.herokuapp.com + x/y.s3.amazonaws.com split", got)
+	}
+
+	// Non-listed names keep today's first-label-drop exactly: sibling
+	// subdomains of one organization still group together.
+	groups, _ = Correlate([]SurfaceAsset{
+		hostSig("www.example.com"),
+		hostSig("api.example.com"),
+	})
+	got = anchors(groups)
+	if len(got) != 1 || got["domain:example.com"] != 2 {
+		t.Errorf("normal domains must still merge under example.com, got %v", got)
 	}
 }

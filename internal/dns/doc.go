@@ -12,25 +12,37 @@
 // re-validated canonically through the Phase 2 asset model and must be the
 // target domain itself or a subdomain of it; anything non-canonical or
 // out-of-domain is rejected before a single query is issued. A queried host's
-// CNAME target is a DNS observation and may legitimately point outside the
-// target domain; its addresses are resolved at depth exactly 1 (see
-// "Records and relationships") and never deeper. The package is a boundary,
-// not an arbitrary-scanning feature.
+// host-target observation (CNAME/MX/NS/SRV target) is a DNS observation and
+// may legitimately point outside the target domain; its addresses are
+// resolved at depth exactly 1 (see "Records and relationships") and never
+// deeper. The package is a boundary, not an arbitrary-scanning feature.
 //
 // # Records and relationships
 //
-// A, AAAA, and CNAME records are supported. Every observation is normalized
-// into a Phase 2 asset (asset.IP for addresses, asset.Host for CNAME targets)
-// — infrastructure is never represented as ad-hoc strings — and every host
-// result carries typed asset.Relationship edges (host->address via
-// RelationshipHostToIP, host->CNAME-target via RelationshipHostToCNAME).
+// A, AAAA, CNAME, MX, TXT, NS, and SRV records are supported. Address
+// observations normalize into Phase 2 assets (asset.IP for A/AAAA) and
+// host-target observations into asset.Host (CNAME/MX/NS targets, SRV targets
+// with their ports carried alongside as service data, never as assets) —
+// infrastructure is never represented as ad-hoc strings — while TXT answers
+// ride a strings payload (free text, never assets). Every host result carries
+// typed asset.Relationship edges for A/AAAA (host->address via
+// RelationshipHostToIP), CNAME (host->CNAME-target via
+// RelationshipHostToCNAME), MX (host->exchanger via RelationshipHostToMX),
+// NS (host->nameserver via RelationshipHostToNS), and SRV (host->target via
+// RelationshipHostToSRV, one edge per distinct target host). TXT strings and
+// SRV (target, port) pairs carry no engine edges: the pipeline adapter
+// (internal/pipeline/adapt NewDNSStage) publishes them as dns:txt / dns:srv
+// Evidence sourced at the queried host (NEW-126 T2). CAA and SOA are
+// deferred (no standard-library lookup exists; no hand-rolled DNS client in
+// this slice).
 // CNAME queries use the stdlib's LookupCNAME, which follows the chain to the
 // final canonical target (multi-hop chains are flattened; see "Known
-// limitations"). When a host's CNAME query completes with a target, the
-// direct target's A and AAAA records are additionally resolved at depth
-// exactly 1 so the canonical target becomes a first-class host asset with its
-// own address relationships; no deeper recursion ever happens, so CNAME loops
-// are impossible by construction.
+// limitations"). When a host-target query (CNAME/MX/NS/SRV alike) completes
+// with a non-self target, the distinct targets' A and AAAA records are
+// additionally resolved at depth exactly 1 so a dangling exchanger or
+// nameserver is decidable from its addresses (or their NXDOMAIN absence); no
+// deeper recursion ever happens, so alias loops are impossible by
+// construction.
 //
 // # Concurrency and rate limiting
 //
@@ -81,7 +93,9 @@
 // Per-query answers are deduplicated by Phase 2 identity, sorted, and capped
 // at MaxAnswersPerType (a fixed constant, never configuration); oversized
 // answer sets are retained truncated and reported (and stored) as incomplete,
-// never as complete. CNAME depth is ≤ 1 by construction, per-job deadlines
+// never as complete. Single TXT strings are additionally bounded by
+// MaxTXTStringBytes (over-long strings are dropped as malformed, never
+// retained). Host-target depth is ≤ 1 by construction, per-job deadlines
 // default to 30 s, and answer content is retained only as normalized
 // netip.Addr/string values with bounded counts.
 //

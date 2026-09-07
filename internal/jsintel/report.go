@@ -3,6 +3,8 @@
 package jsintel
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -107,6 +109,17 @@ type JSEntry struct {
 	// the earliest observation's body is the retained one (mirrors the JS
 	// asset's earliest-observation-wins rule).
 	Content []byte
+
+	// Chunks holds the retained windowed prefix windows of an over-cap file
+	// (NEW-129 Slice 1): aliased sub-slices of the bounded prefix (no copy,
+	// read-only downstream), nil unless Config.RetainContent enabled
+	// retention AND the fetch was cap-truncated with windows. Bounded by
+	// MaxJSBytes total per entry (same ceiling as Content). Merged
+	// first-seen-wins like Content. ChunkManifest describes them (tiling
+	// tag, prefix length, spans and hashes) for chunk-identity
+	// construction; nil exactly when Chunks is nil.
+	Chunks        [][]byte
+	ChunkManifest *FetchManifest
 
 	// Imports are the javascript_to_javascript edges FROM this file to the
 	// canonical URLs of its resolved imports, deduplicated by edge identity
@@ -253,6 +266,13 @@ func mergeEntries(dst *JSEntry, src JSEntry, cfg Config) {
 		// the placeholder-replacement path above already keeps the real
 		// observation's content wholesale).
 		dst.Content = src.Content
+	}
+	if dst.Chunks == nil && src.Chunks != nil {
+		// Windowed retention merges first-seen-wins like Content: the
+		// earliest windowed observation's aliased windows are the entry's
+		// (the merge copies the entry struct, never the window bytes).
+		dst.Chunks = src.Chunks
+		dst.ChunkManifest = src.ChunkManifest
 	}
 	dst.Cached = dst.Cached || src.Cached
 	dst.Err = joinEntryErrors(dst.Err, src.Err)
@@ -679,17 +699,19 @@ func (m *Metrics) addSecretLine() {
 // observations, MaxSecretsPerFile secrets, MaxTechPerFile technologies,
 // MaxEvidencePerFile evidence, the parser's per-parse export cap, and the
 // edge caps of extraction). With Config.RetainContent set, each entry
-// additionally carries its fully-retained body bytes (JSEntry.Content),
-// bounded by MaxJSBytes per entry — the opt-in retention surface
-// (Report.RetainedContent). Run-wide, retained content is bounded twice:
-// per entry by MaxJSBytes (2 MiB by default) AND in count by the run's
-// script caps (MaxScripts, 500 by default — over-cap candidates are
-// dropped, never retained), so the worst case is ~1 GiB held by reference
-// per run (the merge copies the entry struct, never the body bytes). Off
-// by default, so the default memory profile is unchanged: entries carry
-// observations only. Consumers that must stream arbitrarily many distinct
-// URLs without retention use the Config.Emit hook instead and never
-// materialize a Report.
+// additionally carries its fully-retained body bytes (JSEntry.Content for
+// complete files, JSEntry.Chunks for windowed files) — the opt-in retention
+// surfaces (Report.RetainedContent, Report.RetainedChunks). Run-wide,
+// retained bytes are bounded twice: per entry by the effective cap
+// (MaxJSBytes for complete bodies, the same MaxJSBytes total for a
+// windowed prefix's aliased windows — 2 MiB by default, 5 windows on the
+// pipeline path) AND in count by the run's script caps (MaxScripts, 500 by
+// default — over-cap candidates are dropped, never retained), so the worst
+// case is ~1 GiB held by reference per run (the merge copies the entry
+// struct, never the body bytes). Off by default, so the default memory
+// profile is unchanged: entries carry observations only. Consumers that
+// must stream arbitrarily many distinct URLs without retention use the
+// Config.Emit hook instead and never materialize a Report.
 type Accumulator struct {
 	mu            sync.Mutex
 	cfg           Config
@@ -879,6 +901,83 @@ func (r Report) RetainedContent() []RetainedContent {
 	return out
 }
 
+// RetainedChunk is one retained window of a truncated file's prefix: the
+// canonical file URL it was fetched from, the window's index/total/span,
+// the tiling tag, and the exact window bytes (an aliased sub-slice of the
+// bounded prefix — no copy, read-only downstream).
+type RetainedChunk struct {
+	// URL is the canonical file URL the window was tiled from.
+	URL asset.URL
+	// Index is the window index in tiling order; Total is the window count.
+	Index int
+	Total int
+	// Start is the byte offset in the retained prefix; End is exclusive.
+	Start int64
+	End   int64
+	// HashPrefix is the first 8 lowercase hex digits of the window SHA-256.
+	HashPrefix string
+	// TilingTag names the tiling (fetchTilingTag).
+	TilingTag string
+	// Content is the window bytes (bounded by maxFetchWindowBytes).
+	Content []byte
+}
+
+// RetainedChunks returns the run's retained windows in canonical-URL order,
+// index order within a file — the windowed companion to RetainedContent.
+// Only entries with non-nil Chunks appear (Config.RetainContent + a
+// cap-truncated file); complete files appear in RetainedContent instead, so
+// the two accessors never overlap on one URL. Content aliases the entry's
+// windows; consumers must not mutate it.
+func (r Report) RetainedChunks() []RetainedChunk {
+	seenURL := make(map[asset.Identity]struct{}, len(r.Entries))
+	var out []RetainedChunk
+	for _, e := range r.Entries {
+		if len(e.Chunks) == 0 {
+			continue
+		}
+		if _, dup := seenURL[e.URL.Identity()]; dup {
+			continue
+		}
+		seenURL[e.URL.Identity()] = struct{}{}
+		total := len(e.Chunks)
+		for i, w := range e.Chunks {
+			var s, en int64
+			var prefix, tag string
+			if e.ChunkManifest != nil && i < len(e.ChunkManifest.Chunks) {
+				c := e.ChunkManifest.Chunks[i]
+				s, en = c.Start, c.End
+				if len(c.SHA256Hex) >= 8 {
+					prefix = c.SHA256Hex[:8]
+				}
+				tag = e.ChunkManifest.TilingTag
+			} else {
+				// Defensive, test-only (hand-built entries without a manifest —
+				// production entries always carry one: the engine sets Chunks
+				// and ChunkManifest together): hash the window here so the
+				// chunk identity still cites content. Span is length-only
+				// (no prefix offset known).
+				tag = fetchTilingTag
+				sum := sha256.Sum256(w)
+				prefix = hex.EncodeToString(sum[:])[:8]
+				s = 0
+				en = int64(len(w))
+			}
+			out = append(out, RetainedChunk{
+				URL: e.URL, Index: i, Total: total,
+				Start: s, End: en, HashPrefix: prefix, TilingTag: tag,
+				Content: w,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].URL.String() != out[j].URL.String() {
+			return out[i].URL.String() < out[j].URL.String()
+		}
+		return out[i].Index < out[j].Index
+	})
+	return out
+}
+
 // StatusCounts returns the number of entries per status. Every status key
 // is always present, so consumers can rely on stable keys.
 func (r Report) StatusCounts() map[Status]int {
@@ -897,6 +996,11 @@ func (r Report) StatusCounts() map[Status]int {
 // AllJavaScript merges every entry's JS asset across the report,
 // deduplicated by asset identity via asset.MergeJavaScripts (earliest
 // observation wins conflicts) and sorted by canonical URL.
+//
+// File assets only: windowed entries' per-window chunk observations are
+// NOT folded in here (their Identity() is the file identity — merging
+// them would collapse the windows into one asset). Chunk observations
+// ride AllChunkJavaScript instead.
 func (r Report) AllJavaScript() []asset.JavaScript {
 	var list []asset.JavaScript
 	for _, e := range r.Entries {
@@ -905,6 +1009,87 @@ func (r Report) AllJavaScript() []asset.JavaScript {
 		}
 	}
 	return mergeJavaScripts(list)
+}
+
+// AllChunkJavaScript exposes one JavaScript asset per retained window of
+// every windowed entry (NEW-129 Slice 3): the chunk observations withheld
+// from AllJavaScript until the snapshot/detect mapping existed.
+//
+// Each asset is sizeless (Size 0, empty hashes — "not observed", exactly
+// like the windowed file asset: a window is never the file) and carries
+// the chunk URL parsed from the constructor-built chunk identity through
+// asset.ParseURL (the single normalization point — this accessor never
+// formats chunk strings itself): the fragment cites the window
+// (rr-chunk=i/n/span/ph/t) while Identity() stays the FILE identity, so a
+// chunk asset links to its file by Identity and to its window by fragment
+// (recoverable through asset.ParseChunkIdentity). Prov mirrors the
+// entry's file asset (same observation moment, same source).
+//
+// Order is deterministic: sorted by parsed (file, window index)
+// NUMERIC (string order would misorder multi-digit windows),
+// deduplicated by chunk identity (hand-built reports may repeat an
+// entry). Entries without chunks contribute nothing; entries without a
+// file asset still contribute their windows (with zero provenance —
+// production entries always carry the file asset to mirror). Windows
+// whose identity fails to construct (defensive — engine-produced
+// windows always construct, mirroring RetainedChunks) are skipped,
+// never emitted with a zero identity.
+func (r Report) AllChunkJavaScript() []asset.JavaScript {
+	provByFile := make(map[string]asset.Provenance, len(r.Entries))
+	for _, e := range r.Entries {
+		if e.JS == nil {
+			continue
+		}
+		if _, ok := provByFile[e.URL.String()]; !ok {
+			provByFile[e.URL.String()] = e.JS.Prov
+		}
+	}
+	type chunkAsset struct {
+		id string
+		// Numeric order key (NEW-129 Slice 3 review F2), parsed once
+		// through asset.ParseChunkIdentity: string order would
+		// misorder multi-digit windows ("10/.." before "2/..").
+		file  string
+		index int
+		js    asset.JavaScript
+	}
+	var assets []chunkAsset
+	seen := make(map[string]struct{})
+	for _, c := range r.RetainedChunks() {
+		cid, cerr := asset.ChunkJavaScriptIdentity(c.URL, c.Index, c.Total, c.Start, c.End, c.HashPrefix, c.TilingTag)
+		if cerr != nil {
+			continue
+		}
+		key := cid.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		file, index, _, _, _, _, _, perr := asset.ParseChunkIdentity(cid)
+		if perr != nil {
+			continue
+		}
+		prov := provByFile[c.URL.String()]
+		curl, perr := asset.ParseURL(cid.Value, prov)
+		if perr != nil {
+			continue
+		}
+		assets = append(assets, chunkAsset{id: key, file: file.String(), index: index, js: asset.JavaScript{URL: curl, Prov: prov}})
+	}
+	sort.Slice(assets, func(i, j int) bool {
+		if assets[i].file != assets[j].file {
+			return assets[i].file < assets[j].file
+		}
+		if assets[i].index != assets[j].index {
+			return assets[i].index < assets[j].index
+		}
+		return assets[i].id < assets[j].id
+	})
+	out := make([]asset.JavaScript, 0, len(assets))
+	for _, a := range assets {
+		out = append(out, a.js)
+	}
+	return out
 }
 
 // mergeJavaScripts deduplicates JS assets by identity via

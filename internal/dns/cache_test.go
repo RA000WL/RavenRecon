@@ -54,8 +54,8 @@ func TestCacheMissThenHit(t *testing.T) {
 	hosts := []asset.Host{mustHost(t, "www.example.com")}
 
 	rep1 := runOne(t, f, cfg, hosts)
-	if got := f.callCount(); got != 5 {
-		t.Fatalf("first run calls = %d, want 5", got)
+	if got := f.callCount(); got != 9 {
+		t.Fatalf("first run calls = %d, want 9", got)
 	}
 	hr1 := hostByName(t, rep1, "www.example.com")
 	if cacheHits(hr1) != 0 {
@@ -88,12 +88,12 @@ func TestCacheMissThenHit(t *testing.T) {
 
 	// Second run: a cache hit must not perform any DNS request.
 	rep2 := runOne(t, f, cfg, hosts)
-	if got := f.callCount(); got != 5 {
-		t.Fatalf("second run calls = %d, want 5 (unchanged: zero queries on hits)", got)
+	if got := f.callCount(); got != 9 {
+		t.Fatalf("second run calls = %d, want 9 (unchanged: zero queries on hits)", got)
 	}
 	hr2 := hostByName(t, rep2, "www.example.com")
-	if cacheHits(hr2) != 5 {
-		t.Fatalf("second run served %d/5 types from cache", cacheHits(hr2))
+	if cacheHits(hr2) != 9 {
+		t.Fatalf("second run served %d/9 types from cache", cacheHits(hr2))
 	}
 	if hr2.Status != StatusCompleted {
 		t.Fatalf("second run status = %s, want completed", hr2.Status)
@@ -103,7 +103,7 @@ func TestCacheMissThenHit(t *testing.T) {
 	c2 := typeResultFor(hr2, hr2.Host, TypeCNAME)
 	requireEqualStrings(t, "cached CNAME targets", hostNames(c2.Hosts), []string{"origin.example.net"})
 	// The target's addresses also came from cache: no new queries occurred.
-	if got := f.callCount(); got != 5 {
+	if got := f.callCount(); got != 9 {
 		t.Fatalf("cached target resolution issued queries: calls = %d", got)
 	}
 }
@@ -205,12 +205,14 @@ func TestCacheFailedTypeNeverSucceeds(t *testing.T) {
 	}
 
 	// Second run: every completed type is a hit; every non-completed type is
-	// re-executed. The successful observations are never discarded.
+	// re-executed. Closure targets resolve A/AAAA only, so the origin has
+	// no MX/TXT/NS/SRV records at all — completed or otherwise. The
+	// successful observations are never discarded.
 	before := f.callCount()
 	rep2 := runOne(t, f, cfg, []asset.Host{mustHost(t, "www.example.com")})
 	hr2 := hostByName(t, rep2, "www.example.com")
-	if cacheHits(hr2) != 3 { // www A, www CNAME, origin A
-		t.Fatalf("cache hits = %d, want 3", cacheHits(hr2))
+	if cacheHits(hr2) != 7 { // www A/CNAME/MX/TXT/NS/SRV + origin A
+		t.Fatalf("cache hits = %d, want 7", cacheHits(hr2))
 	}
 	if got := f.callCount(); got != before+2 {
 		t.Fatalf("second run calls = %d -> %d, want exactly the two failed types re-queried", before, got)
@@ -264,8 +266,8 @@ func TestCacheNXDOMAINCompleted(t *testing.T) {
 		t.Fatalf("cache hit issued %d queries; want zero", got-before)
 	}
 	hr2 := hostByName(t, rep2, "gone.example.com")
-	if hr2.Status != StatusCompleted || cacheHits(hr2) != 3 {
-		t.Fatalf("second run status = %s (hits %d), want completed with 3 cache hits", hr2.Status, cacheHits(hr2))
+	if hr2.Status != StatusCompleted || cacheHits(hr2) != 7 {
+		t.Fatalf("second run status = %s (hits %d), want completed with 7 cache hits", hr2.Status, cacheHits(hr2))
 	}
 	for _, rt := range hostTypes {
 		tr := typeResultFor(hr2, hr2.Host, rt)
@@ -293,8 +295,8 @@ func TestCacheExpiry(t *testing.T) {
 
 	runOne(t, f, cfg, hosts)
 	first := f.callCount()
-	if first != 5 {
-		t.Fatalf("first run calls = %d, want 5", first)
+	if first != 9 {
+		t.Fatalf("first run calls = %d, want 9", first)
 	}
 
 	// A cache hit before expiry serves without queries.
@@ -303,8 +305,8 @@ func TestCacheExpiry(t *testing.T) {
 		t.Fatalf("unexpired hit issued %d queries; want zero", got-first)
 	}
 	hr2 := hostByName(t, rep2, "www.example.com")
-	if cacheHits(hr2) != 5 {
-		t.Fatalf("unexpired run hits = %d, want 5", cacheHits(hr2))
+	if cacheHits(hr2) != 9 {
+		t.Fatalf("unexpired run hits = %d, want 9", cacheHits(hr2))
 	}
 
 	// Advance the clock past the TTL: everything is re-executed.
@@ -369,7 +371,7 @@ func TestCacheTruncatedNeverCompletes(t *testing.T) {
 	before := f.callCount()
 	rep2 := runOne(t, f, cfg, []asset.Host{host})
 	if got := f.callCount(); got != before+1 {
-		t.Fatalf("second run calls = %d -> %d, want exactly the truncated A type re-executed (AAAA/CNAME completed-empty are cache hits)", before, got)
+		t.Fatalf("second run calls = %d -> %d, want exactly the truncated A type re-executed (AAAA/CNAME/MX/TXT/NS/SRV completed-empty are cache hits)", before, got)
 	}
 	hr2 := hostByName(t, rep2, "big.example.com")
 	tr := typeResultFor(hr2, hr2.Host, TypeA)

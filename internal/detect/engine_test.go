@@ -985,11 +985,73 @@ func TestResultAccumulatorRunCap(t *testing.T) {
 	if !truncated {
 		t.Fatalf("truncation not flagged")
 	}
-	// The findings kept are the earliest by submission order and are
-	// sorted deterministically by identity.
-	for i := 1; i < len(kept); i++ {
-		if kept[i-1].Identity().String() >= kept[i].Identity().String() {
-			t.Fatalf("snapshot findings not sorted by identity")
+	// The findings kept are the deterministic top by finding rank
+	// (findingRankLess) and are sorted by identity for the snapshot.
+}
+func TestResultAccumulatorRankRetention(t *testing.T) {
+	mk := func(rule string, conf float64, i int) asset.Finding {
+		subj := asset.Identity{Kind: asset.KindURL, Value: fmt.Sprintf("https://example.com/%s/%04d", rule, i)}
+		f, err := subjectFinding(nil, rule, "Rule "+rule, CategoryInformation, subj, i)
+		if err != nil {
+			t.Fatalf("subjectFinding: %v", err)
+		}
+		f.Confidence = conf
+		return f
+	}
+	low := make([]asset.Finding, 0, maxFindingsPerRun)
+	for i := range maxFindingsPerRun {
+		low = append(low, mk("low.x", 0.1, i))
+	}
+	high := make([]asset.Finding, 0, 100)
+	for i := range 100 {
+		high = append(high, mk("high.x", 0.9, i))
+	}
+	keptSet := func(acc *resultAccumulator) map[string]bool {
+		_, kept, truncated := acc.snapshot()
+		if len(kept) != maxFindingsPerRun {
+			t.Fatalf("kept = %d, want the %d cap", len(kept), maxFindingsPerRun)
+		}
+		if !truncated {
+			t.Fatalf("truncation not flagged")
+		}
+		set := make(map[string]bool, len(kept))
+		for _, f := range kept {
+			set[f.Identity().String()] = true
+		}
+		return set
+	}
+	// Low batch first, then the high-confidence batch overflows the cap.
+	late := newResultAccumulator()
+	late.addFindings(low)
+	late.addFindings(high)
+	lateSet := keptSet(late)
+	// Every high-confidence finding survives the cut.
+	for _, f := range high {
+		if !lateSet[f.Identity().String()] {
+			t.Fatalf("high-confidence finding %s dropped over cap", f.Identity())
+		}
+	}
+	// The surviving low findings are the rank-top: ties break by subject,
+	// so the lowest subject strings stay and the tail is cut.
+	for i := 3996; i < maxFindingsPerRun; i++ {
+		if lateSet[mk("low.x", 0.1, i).Identity().String()] {
+			t.Fatalf("low finding %04d kept, want the rank tail cut", i)
+		}
+	}
+	// Reverse submission order keeps the identical set: retention never
+	// depends on completion order.
+	early := newResultAccumulator()
+	early.addFindings(high)
+	early.addFindings(low)
+	earlySet := keptSet(early)
+	for id := range lateSet {
+		if !earlySet[id] {
+			t.Fatalf("order-dependent retention: %s kept late-first but not early-first", id)
+		}
+	}
+	for id := range earlySet {
+		if !lateSet[id] {
+			t.Fatalf("order-dependent retention: %s kept early-first but not late-first", id)
 		}
 	}
 }
