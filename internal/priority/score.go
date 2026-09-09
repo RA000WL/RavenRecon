@@ -14,6 +14,15 @@ import (
 // TechSignal is one technology detection attached to a scored asset:
 // techintel/jsintel observations mapped by the Round-2 engine. Confidence
 // is the technology asset's Prov.Confidence — never invented here.
+//
+// Structural attests that the emitting detection phase backed this
+// detection with non-spoofable evidence — the inversion of that phase's
+// own spoofable-only determination (techintel: at least one
+// structural-tier fingerprint indicator fired, the same fact its
+// spoofable-only 0.59 cap inverts). It records the tier fact; Confidence
+// records the strength. The zero value (false) is the honest
+// closed-world default: unattested detections never promote through the
+// single-structural-high escape, however confident.
 type TechSignal struct {
 	Name       string  `json:"name"`
 	Category   string  `json:"category"`
@@ -22,17 +31,31 @@ type TechSignal struct {
 	// ("category/name"); empty falls back to the scored asset's identity
 	// in factor evidence.
 	Identity string `json:"identity,omitempty"`
+	// Structural marks emitting-phase-attested non-spoofable backing
+	// (see the type doc). Omitted when false.
+	Structural bool `json:"structural,omitempty"`
 }
 
 // SecretSignal is one secret candidate attached to a scored asset:
 // secrentel/jsintel candidates mapped by the Round-2 engine. Confidence is
 // the candidate's Prov.Confidence — never invented here.
+//
+// Structural attests that the emitting detection phase backed this
+// candidate with non-spoofable evidence — the inversion of that phase's
+// own unattributed-shape caps (secrentel: an attributed, structurally
+// validated shape with supporting factors, the same fact its generic
+// 0.45 / zero-support 0.59 caps invert). The zero value (false) is the
+// honest closed-world default: unattested candidates never promote
+// through the single-structural-high escape, however confident.
 type SecretSignal struct {
 	Type       asset.SecretType `json:"type"`
 	Confidence float64          `json:"confidence"`
 	// Identity is the candidate's canonical identity string; empty falls
 	// back to the scored asset's identity in factor evidence.
 	Identity string `json:"identity,omitempty"`
+	// Structural marks emitting-phase-attested non-spoofable backing
+	// (see the type doc). Omitted when false.
+	Structural bool `json:"structural,omitempty"`
 }
 
 // Signal is the scoring input: one canonical Phase 2 asset reduced to the
@@ -118,16 +141,20 @@ const (
 
 	// Level gates: high needs >= 2 independent indicator categories,
 	// medium >= 1 — except the single-structural-high escape: one category
-	// at score >= highThreshold backed by a recorded high-confidence
-	// detection (a confidence:secret or confidence:technology factor at or
-	// above singleHighStructuralConfidence) also reaches high. One leaked
+	// at score >= highThreshold backed by a structural-backed recorded
+	// detection (a confidence:secret or confidence:technology factor
+	// attested structural by the emitting phase, at or above
+	// singleHighStructuralConfidence) also reaches high. One leaked
 	// credential must page the hunter without needing a second category.
 	highCategoryGate   = 2
 	mediumCategoryGate = 1
-	// singleHighStructuralConfidence is the minimum recorded-detection
-	// confidence that lifts a single-category surface to high. It sits
-	// above the secrentel high bar so only strongly attributed detections
-	// (never header keywords, never counts) can trigger the escape.
+	// singleHighStructuralConfidence is the minimum structural-backed
+	// recorded-detection confidence that lifts a single-category surface
+	// to high. It sits above the secrentel high bar so only strongly
+	// attributed detections (never header keywords, never counts) can
+	// trigger the escape — and only when the emitting phase attested
+	// non-spoofable backing (the Structural bit on the signal): confidence
+	// alone never suffices.
 	singleHighStructuralConfidence = 0.9
 
 	// maxFactors bounds the emitted factor list; a pathological signal
@@ -203,10 +230,10 @@ type match struct {
 // with perCategoryCap on indicator categories, confidenceGroupCap on the
 // confidence group, and level gates: high requires score >= 0.8 AND at
 // least two distinct indicator categories, OR score >= 0.8 with exactly
-// one category backed by recorded detection confidence at or above
-// singleHighStructuralConfidence (the single-structural-high escape);
-// medium requires score >= 0.5 AND at least one; low >= 0.2; else
-// unknown.
+// one category backed by a structural-backed recorded detection at or
+// above singleHighStructuralConfidence (the single-structural-high
+// escape); medium requires score >= 0.5 AND at least one; low >= 0.2;
+// else unknown.
 func ScoreSurface(sig Signal, interesting, risk *Catalog) (SurfaceAsset, error) {
 	if interesting == nil || risk == nil {
 		return SurfaceAsset{}, fmt.Errorf("priority: both catalogs are required")
@@ -296,11 +323,14 @@ func compose(factors []Factor) (score, interestingness, confidence float64, indi
 
 // levelFor applies the threshold and gate rules. The single-structural
 // exception lets one high-value category (a leaked credential type, an
-// internal-exposure label) reach high when a recorded detection —
-// confidence:secret or confidence:technology at or above
-// singleHighStructuralConfidence — backs it. Header keywords, service
-// names, and observation counts can never trigger the escape: they are
-// not recorded detections.
+// internal-exposure label) reach high when a structural-backed recorded
+// detection — a confidence:secret or confidence:technology factor whose
+// emitting phase attested non-spoofable backing (Factor.Structural), at
+// or above singleHighStructuralConfidence — backs it. A merely confident
+// but unattested detection never triggers the escape: spoofable evidence
+// promotes nothing, however strong. Header keywords, service names, and
+// observation counts can never trigger the escape either: they are not
+// recorded detections at all.
 func levelFor(score float64, indicatorCategories int, structural float64) PriorityLevel {
 	switch {
 	case score >= highThreshold && indicatorCategories >= highCategoryGate:
@@ -316,15 +346,21 @@ func levelFor(score float64, indicatorCategories int, structural float64) Priori
 	}
 }
 
-// structuralConfidence is the strongest recorded-detection confidence in a
-// factor list: the maximum weight among confidence:secret and
-// confidence:technology factors. Confidence from observation counts and
-// technology factors below the bar contribute nothing here — the escape
-// hatch opens only for detections the intel phases attributed strongly.
+// structuralConfidence is the strongest structural-backed
+// recorded-detection confidence in a factor list: the maximum weight
+// among confidence:secret and confidence:technology factors attested
+// structural by the emitting phase (Factor.Structural). Unattested
+// confidence factors — however strong — contribute nothing here, nor do
+// observation counts or sub-bar technology factors: the escape hatch
+// opens only for detections the intel phases both scored strongly AND
+// attested non-spoofable.
 func structuralConfidence(factors []Factor) float64 {
 	best := 0.0
 	for _, f := range factors {
 		if f.Name != "confidence:secret" && f.Name != "confidence:technology" {
+			continue
+		}
+		if !f.Structural {
 			continue
 		}
 		if f.Weight > best {
@@ -534,7 +570,12 @@ func matchBetter(a, b *match) bool {
 
 // confidenceFactors builds the confidence group from signals the earlier
 // phases actually recorded — technology and secret Prov.Confidence and the
-// cross-source observation count. Never invented.
+// cross-source observation count. Never invented. Each technology/secret
+// factor carries its signal's Structural attestation verbatim (see
+// TechSignal/SecretSignal): the bit rides the factor into levelFor's
+// single-structural-high escape and the correlation aggregate, and never
+// enters the score — compose ignores it, so attested and unattested
+// signals with equal confidences score bit-for-bit identically.
 func confidenceFactors(sig Signal) []Factor {
 	var out []Factor
 
@@ -562,10 +603,11 @@ func confidenceFactors(sig Signal) []Factor {
 			ev = sig.Identity.String()
 		}
 		out = append(out, Factor{
-			Name:     "confidence:technology",
-			Weight:   clamp01(t.Confidence),
-			Evidence: []string{ev},
-			Reason:   fmt.Sprintf("technology observation confidence %.2f recorded by the detection phase", t.Confidence),
+			Name:       "confidence:technology",
+			Weight:     clamp01(t.Confidence),
+			Evidence:   []string{ev},
+			Reason:     fmt.Sprintf("technology observation confidence %.2f recorded by the detection phase", t.Confidence),
+			Structural: t.Structural,
 		})
 		techFactors++
 	}
@@ -590,10 +632,11 @@ func confidenceFactors(sig Signal) []Factor {
 			ev = sig.Identity.String()
 		}
 		out = append(out, Factor{
-			Name:     "confidence:secret",
-			Weight:   clamp01(s.Confidence),
-			Evidence: []string{ev},
-			Reason:   fmt.Sprintf("secret candidate observation confidence %.2f recorded by the detection phase", s.Confidence),
+			Name:       "confidence:secret",
+			Weight:     clamp01(s.Confidence),
+			Evidence:   []string{ev},
+			Reason:     fmt.Sprintf("secret candidate observation confidence %.2f recorded by the detection phase", s.Confidence),
+			Structural: s.Structural,
 		})
 		secretFactors++
 	}

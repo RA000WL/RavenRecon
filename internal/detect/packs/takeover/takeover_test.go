@@ -159,8 +159,8 @@ func TestTakeoverPackCheckAPIVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rules: %v", err)
 	}
-	if len(rules) != 3 {
-		t.Fatalf("pack carries %d rules, want 3", len(rules))
+	if len(rules) != 4 {
+		t.Fatalf("pack carries %d rules, want 4", len(rules))
 	}
 }
 
@@ -237,15 +237,21 @@ func TestTakeoverPackMetadataDepsCompat(t *testing.T) {
 		if !strings.HasPrefix(r.ID, "takeover.") {
 			t.Fatalf("rule %q ID policy violation", r.ID)
 		}
-		if len(r.Dependencies) > 0 {
-			t.Fatalf("takeover pack should have no dependencies for now (found on %q)", r.ID)
+		if len(r.Dependencies) > 0 && r.ID != ruleCNAMEProviderConfirmed {
+			t.Fatalf("only the provider-confirmed enrichment may carry dependencies (found on %q)", r.ID)
+		}
+		if r.ID == ruleCNAMEProviderConfirmed {
+			if len(r.Dependencies) != 1 || r.Dependencies[0] != ruleCNAMEUnclaimed {
+				t.Fatalf("enrichment dependencies %v, want [%s]", r.Dependencies, ruleCNAMEUnclaimed)
+			}
 		}
 	}
 	// Check required kinds.
 	m := map[string]asset.Kind{
-		ruleCNAMEUnclaimed: asset.KindHost,
-		ruleCNAMEDangling:  asset.KindHost,
-		ruleS3Bucket:       asset.KindEndpoint,
+		ruleCNAMEUnclaimed:         asset.KindHost,
+		ruleCNAMEDangling:          asset.KindHost,
+		ruleS3Bucket:               asset.KindEndpoint,
+		ruleCNAMEProviderConfirmed: asset.KindHost,
 	}
 	for _, r := range rules {
 		want, ok := m[r.ID]
@@ -267,8 +273,8 @@ func TestTakeoverPackRequiredAssetTypesSkipHonestly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run empty: %v", err)
 	}
-	if rep.Skipped != 3 {
-		t.Fatalf("empty corpus: skipped %d, want 3", rep.Skipped)
+	if rep.Skipped != 4 {
+		t.Fatalf("empty corpus: skipped %d, want 4", rep.Skipped)
 	}
 	if rep.Completed != 0 || rep.Failed != 0 {
 		t.Fatalf("empty corpus: completed %d failed %d", rep.Completed, rep.Failed)
@@ -302,6 +308,9 @@ func TestTakeoverPackRequiredAssetTypesSkipHonestly(t *testing.T) {
 	}
 	if statuses[ruleS3Bucket] != detect.RuleStatusSkipped {
 		t.Fatalf("s3.bucket status %s, want skipped (no endpoint)", statuses[ruleS3Bucket])
+	}
+	if statuses[ruleCNAMEProviderConfirmed] != detect.RuleStatusCompleted {
+		t.Fatalf("provider-confirmed status %s, want completed (has host, silent without priors)", statuses[ruleCNAMEProviderConfirmed])
 	}
 	if len(rep2.Findings) != 0 {
 		t.Fatalf("safe findings %d, want 0", len(rep2.Findings))
@@ -613,6 +622,9 @@ func TestTakeoverMixedPerRule(t *testing.T) {
 	if counts[ruleS3Bucket] != 1 {
 		t.Fatalf("s3 %d, want 1", counts[ruleS3Bucket])
 	}
+	if counts[ruleCNAMEProviderConfirmed] != 1 {
+		t.Fatalf("provider-confirmed %d, want 1 (sibling unclaimed + CNAME→provider graph edge)", counts[ruleCNAMEProviderConfirmed])
+	}
 }
 
 func TestTakeoverConfigDeterministic(t *testing.T) {
@@ -812,9 +824,10 @@ func TestTakeoverCNAMEVersions(t *testing.T) {
 		t.Fatalf("Rules: %v", err)
 	}
 	want := map[string]string{
-		ruleCNAMEUnclaimed: "1.1.0",
-		ruleCNAMEDangling:  "1.1.0",
-		ruleS3Bucket:       "1.0.0",
+		ruleCNAMEUnclaimed:         "1.1.0",
+		ruleCNAMEDangling:          "1.1.0",
+		ruleS3Bucket:               "1.0.0",
+		ruleCNAMEProviderConfirmed: "1.0.0",
 	}
 	if len(rules) != len(want) {
 		t.Fatalf("pack carries %d rules, want %d", len(rules), len(want))
@@ -823,5 +836,33 @@ func TestTakeoverCNAMEVersions(t *testing.T) {
 		if want[r.ID] != r.Version {
 			t.Errorf("rule %q version %q, want %q", r.ID, r.Version, want[r.ID])
 		}
+	}
+}
+
+// TestCapSubjectsContract pins the pack's NEW-135 cap helper: 300
+// uniform-score subjects in reverse input order keep the 256 lowest
+// identities with 44 dropped, and under-cap input passes through with
+// zero dropped. Input order never decides the retained set.
+func TestCapSubjectsContract(t *testing.T) {
+	var subs []asset.Identity
+	for i := 0; i < 300; i++ {
+		subs = append(subs, asset.Identity{Kind: asset.KindHost, Value: fmt.Sprintf("host-%03d.example.test", i)})
+	}
+	rev := append([]asset.Identity(nil), subs...)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	kept, dropped := capSubjects(rev, nil)
+	if len(kept) != 256 || dropped != 44 {
+		t.Fatalf("kept %d dropped %d, want 256/44", len(kept), dropped)
+	}
+	for i := range kept {
+		if kept[i] != subs[i] {
+			t.Fatalf("kept[%d] = %s, want %s (identity-ordered head)", i, kept[i], subs[i])
+		}
+	}
+	kept, dropped = capSubjects(append([]asset.Identity(nil), subs[:10]...), nil)
+	if len(kept) != 10 || dropped != 0 {
+		t.Fatalf("under-cap kept %d dropped %d, want 10/0", len(kept), dropped)
 	}
 }

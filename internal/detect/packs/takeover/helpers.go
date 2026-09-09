@@ -53,6 +53,30 @@ func formatConfigKeys(dctx *detect.Context, ruleID string) {
 	dctx.Logger.Log(detect.LevelInfo, ruleID, msg)
 }
 
+// capSubjects retains at most 256 subjects under the NEW-135 score-ordered
+// truncation contract: score descending, then subject identity ascending
+// (single-detector invocation, so the rule is fixed; nil scorer ⇒ pure
+// identity order, byte-identical to the pre-NEW-135 prefix cut). It returns the
+// kept subjects and the dropped count (0 when under the bound); callers
+// surface a nonzero dropped via subjects_dropped + truncated metadata on
+// every retained finding and a LevelWarn log — never silent.
+func capSubjects(subjects []asset.Identity, scoreFor func(asset.Identity) float64) (kept []asset.Identity, dropped int) {
+	sort.Slice(subjects, func(i, j int) bool {
+		si, sj := 0.0, 0.0
+		if scoreFor != nil {
+			si, sj = scoreFor(subjects[i]), scoreFor(subjects[j])
+		}
+		if si != sj {
+			return si > sj
+		}
+		return subjects[i].String() < subjects[j].String()
+	})
+	if len(subjects) > 256 {
+		return subjects[:256], len(subjects) - 256
+	}
+	return subjects, 0
+}
+
 // hostsWithIP returns the set of host identities that have a host->IP relationship.
 func hostsWithIP(dctx *detect.Context) map[asset.Identity]struct{} {
 	m := make(map[asset.Identity]struct{})

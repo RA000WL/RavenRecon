@@ -71,18 +71,25 @@ type Group struct {
 //     canonical host;
 //   - the host is canonicalized through asset.NewHost (or asset.NewIP for
 //     address literals, which asset.NewHost rejects by design);
-//   - a name host with three or more labels anchors at its first-label-
-//     dropped parent (label arithmetic on an already-canonical name, then
-//     re-validated through asset.NewDomain); a two-label or shorter name
-//     anchors at itself (as a domain). "a.api.example.com" and
-//     "b.api.example.com" therefore group together under example.com's
-//     child "api.example.com", while "www.example.com" and
-//     "api.example.com" both group under "example.com";
-//   - EXCEPTION: a name under a curated shared-infrastructure suffix
-//     (sharedInfraSuffixes — multi-tenant hosts like herokuapp.com)
-//     anchors at one label above the longest matching suffix
-//     (a.herokuapp.com stays a.herokuapp.com), so unrelated tenants
-//     never merge into one group;
+//   - a name host with three or more labels anchors at the LONGER (by
+//     label count) of its first-label-dropped parent and its registrable
+//     domain (effective TLD+1 per the embedded public-suffix table):
+//     within one registrable domain this is exactly the old parent rule
+//     ("a.api.example.com" and "b.api.example.com" group under
+//     "api.example.com"; "www.example.com" and "api.example.com" group
+//     under "example.com"), while names under one public suffix but in
+//     DIFFERENT registrable domains anchor apart ("a.herokuapp.com" stays
+//     "a.herokuapp.com", never merging with "b.herokuapp.com"; "foo.co.uk"
+//     never merges with "bar.co.uk"). Correlate observes identity values
+//     only — no resolved-IP sets — so the split direction is fail-closed:
+//     different registrable domains under a shared suffix always split
+//     (unknown/disjoint IPs assumed); same-registrable-domain names group
+//     as before, as do surfaces on one IP literal (which anchor at the
+//     address itself). See registrableDomain for the exact rule;
+//   - EXCEPTION: none remaining — the former curated shared-infrastructure
+//     suffix list is subsumed by the embedded public-suffix table (every
+//     curated entry is a table entry), so tenant anchoring falls out of
+//     the general rule instead of a special case;
 //   - host and domain surfaces anchor through the same parent-domain rule,
 //     so a host and the URLs observed on it land in ONE group;
 //   - IP surfaces anchor at themselves (asset.NewIP);
@@ -232,19 +239,35 @@ func correlationAnchor(id asset.Identity) asset.Identity {
 	return anchor
 }
 
-// sharedInfraSuffixes is the curated set of multi-tenant hosting suffixes
-// whose registrants are unrelated tenants, not one organization: blindly
-// dropping the first label would merge every tenant on the suffix into one
-// group (a.herokuapp.com + b.herokuapp.com under "herokuapp.com"). The set
-// is curated alongside the takeover pack's unclaimedProviderSuffixes
-// (internal/detect/packs/takeover/helpers.go) — same curation posture
-// (lowercased, dot-boundary match), scoped here to correlation grouping
-// rather than takeover fingerprints, so it additionally covers app-hosting
-// suffixes (vercel.app, netlify.app, pages.dev, web.app, firebaseapp.com,
-// appspot.com, azurefd.net, s3.amazonaws.com) that are shared
-// infrastructure for grouping purposes whether or not they are takeover
-// signals.
-var sharedInfraSuffixes = map[string]struct{}{
+// publicSuffixTable is a minimal embedded public-suffix list (NEW-137):
+// exact-match multi-label suffixes only — no wildcard or exception rules.
+// It subsumes the former curated shared-infrastructure list (every curated
+// entry — herokuapp.com, azurewebsites.net, cloudapp.azure.com,
+// azurefd.net, cloudfront.net, amazonaws.com and its nested elb/s3
+// entries, appspot.com, firebaseapp.com, github.io, netlify.app,
+// pages.dev, vercel.app, web.app — is a table entry, so all previously
+// pinned tenant splits behave identically) and adds the common multi-label
+// public suffixes (co.uk, org.uk, me.uk, com.au, net.au, org.au, co.jp,
+// ne.jp, co.nz, com.br) that the old first-label-drop rule merged blindly
+// ("foo.co.uk" + "bar.co.uk" grouped under "co.uk").
+//
+// PSL CHOICE (stdlib-only, no golang.org/x/net/publicsuffix import):
+// exact rules were chosen OVER wildcard rules deliberately. A wildcard
+// encoding (*.herokuapp.com — "every direct child is itself a suffix")
+// would scope deeper tenants wrong: a.b.herokuapp.com would resolve its
+// suffix to b.herokuapp.com and anchor at a.b.herokuapp.com, breaking the
+// pinned tenant scope (a.b.herokuapp.com belongs to tenant
+// b.herokuapp.com). Exact rules keep tenant scope at exactly one label
+// above the suffix for every depth. Single-label TLDs (com, io, app, …)
+// are deliberately ABSENT: the anchor rule only diverges from the old
+// behavior when a multi-label suffix is involved (a parent of two or more
+// labels can only equal a multi-label suffix), so single-label entries
+// would be inert data — unknown single-label TLDs fall through to the
+// documented last-label heuristic in publicSuffix, which agrees with an
+// exact entry wherever one could matter. Punycode (xn--…) labels pass
+// through as ordinary labels; the asset layer already rejected non-ASCII.
+var publicSuffixTable = map[string]struct{}{
+	// Multi-tenant hosting suffixes (the former curated list, preserved).
 	"amazonaws.com":      {},
 	"appspot.com":        {},
 	"azurefd.net":        {},
@@ -260,37 +283,102 @@ var sharedInfraSuffixes = map[string]struct{}{
 	"s3.amazonaws.com":   {},
 	"vercel.app":         {},
 	"web.app":            {},
+	// Common multi-label public suffixes (general PSL-awareness).
+	"co.uk":  {},
+	"com.au": {},
+	"com.br": {},
+	"co.in":  {},
+	"co.jp":  {},
+	"co.nz":  {},
+	"me.uk":  {},
+	"ne.jp":  {},
+	"net.au": {},
+	"org.au": {},
+	"org.uk": {},
 }
 
-// sharedInfraAnchor maps a canonical name to its tenant anchor when the
-// name sits under a curated shared-infrastructure suffix: one label above
-// the LONGEST matching suffix (a.herokuapp.com → a.herokuapp.com;
-// a.b.herokuapp.com → b.herokuapp.com), so each tenant anchors alone.
-// ok is false when no curated suffix matches (the caller keeps today's
-// first-label-drop rule exactly) or when the name IS the suffix itself
-// (no tenant label to anchor — the normal rule already anchors it at
-// itself). Matching is longest-suffix so nested entries resolve to the
-// tightest tenant scope (x.s3.amazonaws.com stays under s3.amazonaws.com,
+// publicSuffix resolves the public suffix of a canonical lowercase name
+// (callers pass h.Name; the strings.ToLower below is a no-op defense on
+// that canonical input): the LONGEST exact table match, so nested entries
+// resolve tightest-first (x.s3.amazonaws.com matches s3.amazonaws.com,
 // not amazonaws.com).
-func sharedInfraAnchor(name string) (anchor string, ok bool) {
-	labels := strings.Split(strings.ToLower(name), ".")
+// UNKNOWN-SUFFIX POLICY (pinned): no match means the suffix is
+// unknown, and the rule falls back to the last-label heuristic — the
+// suffix is treated as the final label alone, i.e. the registrable
+// domain is the last two labels. That is exactly the old behavior for
+// unknown suffixes (documented approximation: a genuinely multi-label
+// unknown suffix such as b.newtld merges a.b.newtld with c.b.newtld
+// under b.newtld), so unlisted infrastructure fails CLOSED toward the
+// old grouping, never toward a novel split.
+func publicSuffix(name string) string {
+	name = strings.ToLower(name)
+	labels := strings.Split(name, ".")
 	for i := range labels {
-		suffix := strings.Join(labels[i:], ".")
-		if _, found := sharedInfraSuffixes[suffix]; found {
-			if i == 0 {
-				return "", false
-			}
-			return labels[i-1] + "." + suffix, true
+		if _, found := publicSuffixTable[strings.Join(labels[i:], ".")]; found {
+			return strings.Join(labels[i:], ".")
 		}
 	}
-	return "", false
+	return labels[len(labels)-1]
+}
+
+// registrableDomain returns the registrable domain (effective TLD+1) of a
+// canonical lowercase name: one label above the public suffix. When the
+// name IS the suffix itself (or a bare single label), it is its own
+// registrable domain.
+//
+// GROUPING RULE (NEW-137) — PSL gate with fail-closed IP-diversity
+// posture, with examples:
+//
+//   - a.herokuapp.com + b.herokuapp.com (different registrable domains
+//     under the shared suffix herokuapp.com) → SEPARATE groups. Correlate
+//     observes identity values only — no resolved-IP sets — so the rule
+//     assumes disjoint IPs (fail-closed toward split): any two names in
+//     different registrable domains under one public suffix always split.
+//   - Same names sharing one address (IP-literal surfaces on one address,
+//     e.g. a URL on 192.0.2.10 plus the ip:192.0.2.10 surface) → TOGETHER
+//     via the address anchor. Distinct names that happen to resolve to one
+//     IP still split: overlap is not observable at this layer, so the
+//     split assumes the disjoint case rather than merging unrelated
+//     tenants on shared evidence.
+//   - sub.example.com + example.com (one registrable domain,
+//     example.com) → TOGETHER, as do www.example.com + api.example.com.
+//
+// PLACEMENT (why priority-local, not internal/asset): the asset builders
+// own per-name canonicalization and identity (normalizeHost, NewHost,
+// NewDomain) and every grouping key here re-validates through them —
+// there is no second normalizer. The suffix table is correlation grouping
+// policy over already-canonical names (which tenants count as unrelated),
+// needed by no other package, so it lives with its only consumer.
+func registrableDomain(name string) string {
+	suffix := publicSuffix(name)
+	if name == suffix {
+		return name
+	}
+	rest := strings.TrimSuffix(name, "."+suffix)
+	if i := strings.LastIndex(rest, "."); i >= 0 {
+		rest = rest[i+1:]
+	}
+	return rest + "." + suffix
 }
 
 // hostAnchor maps one canonical host (possibly with a port, possibly a
 // bracketed IPv6 literal — the forms asset.URL.HostPort produces) to its
-// grouping anchor: the IP identity for address literals, the tenant anchor
-// for names under a curated shared-infrastructure suffix, or the
-// first-label-dropped parent domain for all other names.
+// grouping anchor: the IP identity for address literals, otherwise the
+// LONGER (by label count, ties to the registrable domain) of the
+// first-label-dropped parent and the registrable domain (re-validated
+// through asset.NewDomain, falling back to the host identity).
+//
+// Within one registrable domain this is exactly the old parent rule
+// ("a.api.example.com" → "api.example.com"; "www.example.com" →
+// "example.com"); across registrable domains under one public suffix the
+// registrable domain wins the length contest ("a.herokuapp.com" stays
+// itself; "foo.co.uk" stays itself, never merging with "bar.co.uk" under
+// "co.uk"; "x.s3.amazonaws.com" stays itself — the registrable domain
+// wins the length contest 4-vs-3 over its parent "s3.amazonaws.com").
+// Deep-tenant chains follow the parent rule within the tenant
+// ("a.b.c.herokuapp.com" → "b.c.herokuapp.com", "b.c.herokuapp.com" →
+// "c.herokuapp.com"). A name that IS its suffix
+// anchors at itself.
 func hostAnchor(hostPort string) asset.Identity {
 	host := hostOfHostPort(hostPort)
 	if addr, err := netip.ParseAddr(host); err == nil {
@@ -304,12 +392,14 @@ func hostAnchor(hostPort string) asset.Identity {
 		return asset.Identity{}
 	}
 	parent := h.Name
-	if anchor, ok := sharedInfraAnchor(h.Name); ok {
-		parent = anchor
-	} else if labels := strings.Split(h.Name, "."); len(labels) > 2 {
+	if labels := strings.Split(h.Name, "."); len(labels) > 2 {
 		parent = strings.Join(labels[1:], ".")
 	}
-	if d, err := asset.NewDomain(parent, asset.Provenance{}); err == nil {
+	anchor := parent
+	if reg := registrableDomain(h.Name); len(strings.Split(reg, ".")) >= len(strings.Split(parent, ".")) {
+		anchor = reg
+	}
+	if d, err := asset.NewDomain(anchor, asset.Provenance{}); err == nil {
 		return d.Identity()
 	}
 	return h.Identity()

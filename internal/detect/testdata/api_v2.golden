@@ -74,7 +74,7 @@ const RuleStatusCancelled RuleStatus = "cancelled"
 const RuleStatusCompleted RuleStatus = "completed"
 const RuleStatusFailed RuleStatus = "failed"
 const RuleStatusSkipped RuleStatus = "skipped"
-const SchemaVersion = 3
+const SchemaVersion = 4
 const StatusDismissed FindingStatus = "dismissed"
 const StatusOpen FindingStatus = "open"
 

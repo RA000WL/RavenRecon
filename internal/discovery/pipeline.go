@@ -170,6 +170,37 @@ type Config struct {
 	// point, so streamed counts are provisional and the returned report
 	OnSource func(SourceResult)
 
+	// OnHost, when non-nil, receives one HostEvent per host of each
+	// executed source's result as its job finalizes (NEW-138 streaming):
+	// the source's hosts in result order (per-source sorted), across
+	// sources in job-completion (arrival) order. It is emitted from the
+	// same finalization point as OnSource — before it — so streaming
+	// rides the existing merge path and never bypasses the pool's
+	// concurrency, cancellation, or deadline bounds (no new goroutines,
+	// no queues). The streaming contract, pinned by tests:
+	//
+	//   - Arrival order: the stream reflects job-completion order, which
+	//     is non-deterministic across runs at concurrency > 1. The
+	//     merged summary (Report.All) stays sorted and deterministic.
+	//   - Repeats: a host seen by N sources streams N times (once per
+	//     observing source, with that source's attribution). The final
+	//     merge dedups by Phase 2 identity as before.
+	//   - Provisional: events are pre-quality-gate, like OnSource — the
+	//     gate may cap retained sets at the join point, so streamed sets
+	//     are provisional and the returned report is authoritative.
+	//   - Non-blocking: invoked synchronously on the completing job's
+	//     worker goroutine, so the callback must be thread-safe and
+	//     non-blocking (bounded O(line) work only), exactly like
+	//     OnSource. There is nothing to drop and nothing to drain, but
+	//     the write itself is synchronous: a blocked write delays that
+	//     job's finalizing worker, and pool Shutdown joins workers even
+	//     on the forced path, so a non-interruptible write can delay
+	//     Shutdown past its drain budget. The sink's bounded O(line)
+	//     fail-fast writes keep this a pathological-filesystems-only
+	//     case (a wedged filesystem, not a slow consumer); at the CLI a
+	//     second signal still force-exits immediately.
+	OnHost func(HostEvent)
+
 	// Observer is the optional instrumentation sink (internal/event Observer;
 	// the Bus satisfies it). When non-nil, the run's worker pool emits
 	// canonical pool-boundary events (task submitted/started/running/terminal,
@@ -370,6 +401,24 @@ func validateTarget(target asset.Domain) error {
 	return nil
 }
 
+// emitResult streams one finalized source result to the optional
+// observers: one HostEvent per host in result order, then the per-source
+// OnSource callback. Both share the non-blocking contract documented on
+// Config; a result with no hosts (the panic and submit-failure paths)
+// emits no host events. Skipped sources never reach a job and never emit;
+// sources never submitted after a submit failure (the loop breaks) appear
+// only in the final report.
+func emitResult(cfg Config, res SourceResult) {
+	if cfg.OnHost != nil {
+		for _, h := range res.Hosts {
+			cfg.OnHost(HostEvent{Source: res.Source, Host: h, Status: res.Status, Cached: res.Cached})
+		}
+	}
+	if cfg.OnSource != nil {
+		cfg.OnSource(res)
+	}
+}
+
 // Run executes passive discovery for target. It returns a structured report
 // and an error; when the run context is cancelled or the pool had to be
 // forced down, the report still carries whatever each job observed —
@@ -452,15 +501,11 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 						Status:    OutFailed,
 						Err:       fmt.Errorf("discovery: %s panicked during execution", s.Name()),
 					}
-					if cfg.OnSource != nil {
-						cfg.OnSource(results[i])
-					}
+					emitResult(cfg, results[i])
 				}
 			}()
 			results[i], keys[i], stores[i] = runSource(jctx, target, s, results[i].Detection, cfg)
-			if cfg.OnSource != nil {
-				cfg.OnSource(results[i])
-			}
+			emitResult(cfg, results[i])
 			return results[i], nil
 		}}); err != nil {
 			results[i] = SourceResult{
@@ -469,8 +514,13 @@ func Run(ctx context.Context, target asset.Domain, cfg Config) (Report, error) {
 				Status:    OutCancelled,
 				Err:       fmt.Errorf("discovery: submit %s: %w", s.Name(), err),
 			}
-			// The run context is done or the pool is closing; the remaining
-			// sources keep their initialized cancelled status.
+			// A submit failure still finalizes through the shared merge
+			// path: observers see the cancelled source exactly like any
+			// other finalized result (it carries no hosts, so only
+			// OnSource fires). The run context is done or the pool is
+			// closing; the remaining sources keep their initialized
+			// cancelled status and appear only in the final report.
+			emitResult(cfg, results[i])
 			break
 		}
 		submitted++

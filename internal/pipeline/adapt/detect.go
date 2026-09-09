@@ -10,6 +10,8 @@ import (
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/apis"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/authz"
+	"github.com/RA000WL/RavenRecon/internal/detect/packs/bizlogic"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/cloud"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/js"
 	"github.com/RA000WL/RavenRecon/internal/detect/packs/takeover"
@@ -374,8 +376,10 @@ func NewDetectStageWithTakeoverPack(registry *detect.Registry) (pipeline.Stage, 
 
 // NewDetectStageWithAllPacks returns a detect stage pre-loaded with the web
 // pack (Batch 2), the JS pack (Batch 3), the APIs pack (Batch 4), the cloud
-// pack (Batch 5), the triage pack (Batch 6), and the takeover pack (Batch
-// v2.1). If registry is nil a fresh registry is created; otherwise the
+// pack (Batch 5), the triage pack (Batch 6), the takeover pack (Batch
+// v2.1), the authz pack (NEW-142 Task 1 — depends on triage.idor, so
+// triage loads first), and the bizlogic pack (NEW-144 Rule 1 — depends on
+// authz.idor.insecure-direct-object, so authz loads first). If registry is nil a fresh registry is created; otherwise the
 // provided registry is reused. All packs are loaded via ValidateRule →
 // Register → Validate → Seal (startup confinement). AllStages is unchanged —
 // packs are explicit opt-in. The original NewDetectStageWithPacks (web-only),
@@ -388,7 +392,7 @@ func NewDetectStageWithAllPacks(registry *detect.Registry) (pipeline.Stage, erro
 	if registry == nil {
 		registry = detect.NewRegistry()
 	}
-	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules, triage.Rules, takeover.Rules} {
+	for _, load := range []func() ([]detect.Rule, error){web.Rules, js.Rules, apis.Rules, cloud.Rules, triage.Rules, takeover.Rules, authz.Rules, bizlogic.Rules} {
 		rules, err := load()
 		if err != nil {
 			return nil, err

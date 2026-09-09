@@ -10,7 +10,8 @@ RavenRecon has a normalized asset model (`internal/asset`), a persistent,
 filesystem-backed cache and resume foundation (`internal/cache`), a bounded,
 cancellable, rate-limited runtime engine (`internal/runtime`), and its first
 consumer: passive subdomain discovery (`internal/discovery`) with adapters
-for subfinder, assetfinder, and amass (passive mode only).
+for subfinder, assetfinder, amass, and chaos by default (passive mode only),
+plus opt-in crtsh (certificate transparency) and asnmap via `--sources`.
 
 An end-to-end pipeline (`internal/pipeline`, `AllStages()` = 12 via `internal/pipeline/config.go:64`) composes
 discover → dns → httpprobe → urlintel → crawl → techintel → jsintel → secrentel → urllive →
@@ -78,7 +79,11 @@ below). v2.0 adds five built-in detection packs under
 Cloud (3, informational-only indicator shapes per the recon-only
 boundary), and Triage (8 endpoint-triage rules via curated param lists
 — XSS 52, SQLi 29, SSRF 62, LFI 33, Redirect 62, IDOR 37, RCE 32, SSTI 68 —
-precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS; `AllPacks` 22,
+precedence RCE>SSRF>LFI>IDOR>SQLi>Redirect>SSTI>XSS); v2.1 adds Takeover (4),
+plus authz (2) and bizlogic (1), and the dnsrec (5) and auth (1, SDK v2 probe)
+packs ship alongside — 35 rules across ten packs, of which `AllPacks`
+(`NewDetectStageWithAllPacks`) loads 29 across the eight pipeline-wired
+packs (dnsrec and auth have no pipeline loader and stay unwired;
 `AllStages` 12) — loading through the frozen SDK v1 via the pipeline seam
 (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `AllPacks`) with no
 core edits; per-rule `Context` clones (`cloneContextForRule`) and
@@ -204,13 +209,19 @@ configuration; `--no-cache` forces it off for a single run.
 ## Passive discovery
 
 `ravenrecon discover <domain>` runs passive subdomain enumeration through
-installed external tools:
+installed external tools (default: subfinder, assetfinder, amass, chaos):
 
 ```text
 subfinder -d <domain> -silent
 assetfinder <domain>
 amass enum -passive -d <domain>
+chaos -d <domain> -silent -json       (requires PDCP_API_KEY; skipped when unkeyed)
 ```
+
+Two more sources are opt-in via `--sources` (never in the default set):
+`asnmap -d <domain> -silent`, and crt.sh certificate transparency
+(`GET https://crt.sh/?q=%25.<domain>&output=json`, 1 MiB / 30 s bounds,
+`crtsh-json-v1` cache identity).
 
 Only passive modes are ever invoked; no active enumeration, brute force, or
 intel modes are reachable from RavenRecon. Output is normalized through the
@@ -230,7 +241,15 @@ Run with cache (when enabled in configuration):
 ravenrecon discover example.com
 ravenrecon discover example.com --sources subfinder,amass
 ravenrecon discover example.com --no-cache
+ravenrecon discover example.com --output hosts.jsonl
 ```
+
+Hosts stream as found — one JSON line per host (`host`, `source`,
+`discovered_at`, `status`, `cached`) to stdout, or to `--output <file>`
+when set (the file carries only the stream, never the summary; stdout then
+prints the summary only). The stream is arrival-order and may repeat a host
+seen by two sources; the final merged summary stays sorted, deduplicated,
+and deterministic.
 
 Results are cached per source with keys covering the operation, the canonical
 target identity, the passive mode, and the tool name/version; only completed,
@@ -241,10 +260,13 @@ partial-result semantics, and known limitations.
 ## DNS pipeline (library)
 
 `internal/dns` (roadmap v0.6, sub-milestone 5A) resolves host assets into
-typed, cached DNS observations: A, AAAA, and CNAME records normalized
-through the Phase 2 asset model, with typed host→address and host→CNAME
-relationships, a bounded pool with a central query limiter, per-(host,
-record type) cache-before-execute, and hermetic tests (no public Internet).
+typed, cached DNS observations across seven record families — A, AAAA,
+CNAME, MX, TXT, NS, and SRV — normalized through the Phase 2 asset model,
+with typed host→address, host→CNAME/MX/NS/SRV-target relationships (plus
+depth-1 address closure over non-self targets), TXT/SRV evidence sourced
+at the queried host, a bounded pool with a central query limiter,
+per-(host, record type) cache-before-execute, and hermetic tests (no
+public Internet). CAA and SOA are deferred (no standard-library lookup).
 NXDOMAIN and legitimate empty answers are completed observations; truncated,
 failed, and cancelled types are never served as success. It is a library
 capability only — there is no `ravenrecon dns` command yet. TLS metadata
@@ -486,7 +508,7 @@ before loading any rule. Milestone v2.2 reopened the surface as "SDK v2
 `testdata/api_v2.golden`); pack loaders for the new surface gate on
 `CheckAPIVersion(2, 0)`.
 
-Detection packs: since v2.0 the module ships five built-in packs under
+Detection packs: since v2.0 the module ships eight built-in packs under
 `internal/detect/packs/` — `web` (5 rules: CSP missing, HSTS missing,
 CORS wildcard, robots exposed, source maps exposed), `js` (3 rules: DOM
 XSS indicators, postMessage without origin check, prototype-pollution
@@ -509,11 +531,12 @@ not the `Finding.Truncated` sticky flag via
 `adapt/buildDetectResult`) — plus the `examples` demonstration pack
 (explicitly loaded, never auto-loaded). The framework package still
 contains no rule definitions: every pack enters only through the
-exported SDK (`Rules()` → `CheckAPIVersion(1, 0)` →
+ exported SDK (`Rules()` → `CheckAPIVersion(2, 0)` (js gates `CheckAPIVersion(2, 1)`) →
 `ValidateRule` → `Register` → `Validate` → `Seal`, registration confined
 to startup) via the pipeline seam in `internal/pipeline/adapt/detect.go`
 (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`
-loads all 22 built-in rules; `AllStages()` stays 12). A minimal `auth`
+loads 28 across the eight pipeline-wired packs — dnsrec and auth have no
+pipeline loader and stay unwired; `AllStages()` stays 12). A minimal `auth`
 probe pack (`auth.jwt.none-alg`) demonstrates the SDK v2 dataflow
 (`PriorFindings`/`GraphView`) and is intentionally not wired into the
 pipeline (`AllPacks` unchanged). Pack output is
@@ -859,8 +882,9 @@ go run ./cmd/ravenrecon discover example.com --sources subfinder,amass
 ```
 
 `discover` options (after the domain): `--sources <a,b>` restricts the
-sources, `--no-cache` disables the cache for the run, `--config <file>`
-overlays a JSON config file (flags > env > file > defaults).
+sources, `--output <file>` writes the streamed host lines to a file
+instead of stdout, `--no-cache` disables the cache for the run,
+`--config <file>` overlays a JSON config file (flags > env > file > defaults).
 
 Run the full end-to-end pipeline:
 
@@ -873,12 +897,18 @@ go run ./cmd/ravenrecon scan example.com --stages discover,dns,httpprobe --outpu
 writes the report into the output directory (default `ravenrecon-report`),
 and exits 0 on completed and partial runs and 1 on failed, cancelled, and
 incomplete runs. Options (after the domain): `--stages <a,b>`, `--sources
-<a,b>` (discovery sources), `--request-timeout <d>`, `--concurrency <n>`,
+<a,b>` (discovery sources), `--request-timeout <d>`,
+`--session-headers <f>` (operator session-headers file for
+authenticated-surface probing), `--concurrency <n>`,
 `--stage-timeout <d>` (`--timeout` is its deprecated alias),
 `--cache <dir>`, `--no-cache`, `--output <dir>`, `--config <file>`,
+`--dry-run` (print the effective configuration and exit without running),
 `--verbose` (one line per stage event on stderr), `--tui` (live
-observability frame on stderr — mutually exclusive with `--verbose`), and
-`--tui-compact` (condensed `--tui` frame; requires `--tui`). Multi-target
+observability frame on stderr — mutually exclusive with `--verbose`),
+`--tui-compact` (condensed `--tui` frame; requires `--tui`),
+`--targets <file>` (read target domains from file, one per line),
+`--target-parallel <n>` (maximum targets scanned concurrently, 1-8),
+and `--strict` (exit 1 unless every target produced data). Multi-target
 runs exit 0 when at least one target produced data (`--strict` exits 1
 unless every target did — use in CI); spellings that normalize to the
 same canonical target collapse to the first occurrence (no double scan).

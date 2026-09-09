@@ -118,6 +118,27 @@
 // incomplete by definition. Tool execution failures are never cached as
 // successful discoveries.
 //
+// # Streaming output
+//
+// Each executed source's hosts stream as they finalize (NEW-138): Config.OnHost
+// receives one HostEvent per host — in that source's result order across
+// sources in job-completion (arrival) order — from the same finalization point
+// as Config.OnSource, so streaming rides the existing merge path and never
+// bypasses pool bounds (no new goroutines, no queues). The stream is
+// arrival-order and therefore non-deterministic across runs at concurrency > 1;
+// the merged summary (Report.All) stays sorted and deterministic. A host seen
+// by N sources streams N times (once per observing source); the merge dedups
+// by Phase 2 identity. Events are pre-quality-gate and therefore provisional.
+// The callback must be thread-safe and non-blocking (bounded O(line) work
+// only), exactly like OnSource: there is nothing to drop and nothing to
+// drain, but the write itself is synchronous — a blocked write delays that
+// job's finalizing worker, and pool Shutdown joins workers even on the
+// forced path, so a non-interruptible write can delay Shutdown past its
+// drain budget. Bounded O(line) fail-fast writes keep this a
+// pathological-filesystems-only case; at the CLI a second signal still
+// force-exits immediately. Each event renders as one JSON line (HostEvent.Line) with exactly
+// the keys host, source, discovered_at (RFC 3339, UTC), status, cached.
+//
 // # Runtime integration and rate limiting
 //
 // The runtime pool rate-limits job STARTS only. RavenRecon's limiter does

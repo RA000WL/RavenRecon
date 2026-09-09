@@ -3,6 +3,7 @@ package apis
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -604,4 +605,32 @@ func TestApisPackConfigDeterministic(t *testing.T) {
 		t.Fatalf("same config should be cache hit")
 	}
 	_ = repCold
+}
+
+// TestCapSubjectsContract pins the pack's NEW-135 cap helper: 300
+// uniform-score subjects in reverse input order keep the 256 lowest
+// identities with 44 dropped, and under-cap input passes through with
+// zero dropped. Input order never decides the retained set.
+func TestCapSubjectsContract(t *testing.T) {
+	var subs []asset.Identity
+	for i := 0; i < 300; i++ {
+		subs = append(subs, asset.Identity{Kind: asset.KindHost, Value: fmt.Sprintf("host-%03d.example.test", i)})
+	}
+	rev := append([]asset.Identity(nil), subs...)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	kept, dropped := capSubjects(rev, nil)
+	if len(kept) != 256 || dropped != 44 {
+		t.Fatalf("kept %d dropped %d, want 256/44", len(kept), dropped)
+	}
+	for i := range kept {
+		if kept[i] != subs[i] {
+			t.Fatalf("kept[%d] = %s, want %s (identity-ordered head)", i, kept[i], subs[i])
+		}
+	}
+	kept, dropped = capSubjects(append([]asset.Identity(nil), subs[:10]...), nil)
+	if len(kept) != 10 || dropped != 0 {
+		t.Fatalf("under-cap kept %d dropped %d, want 10/0", len(kept), dropped)
+	}
 }

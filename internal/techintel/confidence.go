@@ -23,6 +23,7 @@ const (
 	// can reach High; the cap pins such technologies at Medium even when the
 	// raw combination would clear the High threshold.
 	spoofableScoreCap = 0.59
+	// Back-pointer: internal/pipeline/adapt/priority.go techSignal inverts this cap (score > 0.59 attests structural-tier backing).
 
 	// weakIndicatorWeight is the lone-weak-indicator boundary: a technology
 	// that fired on exactly ONE independent indicator with a weight below

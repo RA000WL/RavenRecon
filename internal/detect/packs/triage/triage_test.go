@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -735,6 +736,142 @@ func TestTriagePackBoundedAt256(t *testing.T) {
 	}
 	if !foundTrunc {
 		t.Fatalf("no truncated metadata found for bounded test")
+	}
+}
+
+// TestTriageCapKeepsBackedFirst pins the NEW-135 score-ordered rule cap:
+// with 300 flagged subjects (100 reflection-backed at confidence 0.8, 200
+// name-only at 0.6) the 256-cap keeps every backed finding first, then the
+// lowest-identity unbacked ones — not the identity prefix. The backed
+// subjects are chosen as the HIGHEST endpoint identities, so the old
+// prefix cut would have dropped 44 of them. Honesty metadata is
+// preserved: every retained finding carries truncated + subjects_dropped
+// ("44"), and the LevelWarn log fires. Both input orders produce
+// byte-identical reports.
+func TestTriageCapKeepsBackedFirst(t *testing.T) {
+	const total = 300
+	var eps []asset.Endpoint
+	for i := 0; i < total; i++ {
+		eps = append(eps, mustEndpoint(t, "GET", fmt.Sprintf("https://www.example.com/search%d?q=%d", i, i)))
+	}
+	// Rank endpoints by subject identity; back the highest 100.
+	ordered := append([]asset.Endpoint(nil), eps...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Identity().String() < ordered[j].Identity().String()
+	})
+	var evs []asset.Evidence
+	for _, ep := range ordered[total-100:] {
+		evs = append(evs, mustReflectEvidence(t, ep, "q", httpprobe.ReflectUnencoded))
+	}
+	run := func(reverse bool) []byte {
+		in := append([]asset.Endpoint(nil), eps...)
+		if reverse {
+			for i, j := 0, len(in)-1; i < j; i, j = i+1, j-1 {
+				in[i], in[j] = in[j], in[i]
+			}
+		}
+		reg := registerTriagePack(t)
+		cfg := detect.DefaultEngineConfig(reg)
+		cfg.Clock = testClock
+		rep, err := detect.Run(context.Background(), cfg, detect.Snapshot{Endpoints: in, Evidence: evs})
+		if err != nil {
+			t.Fatalf("Run(reverse=%v): %v", reverse, err)
+		}
+		var xss []asset.Finding
+		for _, f := range rep.Findings {
+			if f.RuleID == ruleXSSReflected {
+				xss = append(xss, f)
+			}
+		}
+		if len(xss) != 256 {
+			t.Fatalf("reverse=%v: xss findings %d, want 256 capped", reverse, len(xss))
+		}
+		backedKept := 0
+		for _, f := range xss {
+			if f.Metadata["truncated"] != "true" || f.Metadata["subjects_dropped"] != "44" {
+				t.Fatalf("reverse=%v: finding %s meta truncated=%q subjects_dropped=%q, want true/44",
+					reverse, f.Subject, f.Metadata["truncated"], f.Metadata["subjects_dropped"])
+			}
+			if f.Metadata["reflection_backed"] == "true" {
+				backedKept++
+				if f.Confidence != 0.8 {
+					t.Fatalf("reverse=%v: backed finding %s confidence %v, want 0.8", reverse, f.Subject, f.Confidence)
+				}
+			} else if f.Confidence != 0.6 {
+				t.Fatalf("reverse=%v: unbacked finding %s confidence %v, want 0.6", reverse, f.Subject, f.Confidence)
+			}
+		}
+		if backedKept != 100 {
+			t.Fatalf("reverse=%v: backed findings kept %d, want all 100", reverse, backedKept)
+		}
+		// Every backed subject survives the cut, whatever its identity.
+		kept := make(map[string]bool, len(xss))
+		for _, f := range xss {
+			kept[f.Subject.String()] = true
+		}
+		for _, ep := range ordered[total-100:] {
+			if !kept[ep.Identity().String()] {
+				t.Fatalf("reverse=%v: backed subject %s dropped over cap", reverse, ep.Identity())
+			}
+		}
+		// The warn log fires exactly as before.
+		foundWarn := false
+		for _, l := range rep.Logs {
+			if l.Level == detect.LevelWarn && l.Rule == ruleXSSReflected {
+				foundWarn = true
+			}
+		}
+		if !foundWarn {
+			t.Fatalf("reverse=%v: missing LevelWarn truncation log for %s", reverse, ruleXSSReflected)
+		}
+		b, err := json.Marshal(rep)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+	b1, b2 := run(false), run(true)
+	if string(b1) != string(b2) {
+		t.Fatalf("over-cap triage runs with reversed input order diverged")
+	}
+}
+
+// TestCapSubjectsScoreOrder pins the pack's NEW-135 cap helper ordering:
+// score descending first, then subject identity. The 100 high-score
+// subjects carry the HIGHEST identities, so a pure identity prefix would
+// drop 44 of them; the helper must keep all 100, then the lowest-identity
+// low-score head. Arrival order (odds-then-evens) never decides.
+func TestCapSubjectsScoreOrder(t *testing.T) {
+	var subs []asset.Identity
+	for i := 0; i < 300; i++ {
+		subs = append(subs, asset.Identity{Kind: asset.KindHost, Value: fmt.Sprintf("host-%03d.example.test", i)})
+	}
+	score := func(id asset.Identity) float64 {
+		if id.Value >= "host-200.example.test" {
+			return 0.8
+		}
+		return 0.6
+	}
+	var in []asset.Identity
+	for i := 1; i < 300; i += 2 {
+		in = append(in, subs[i])
+	}
+	for i := 0; i < 300; i += 2 {
+		in = append(in, subs[i])
+	}
+	kept, dropped := capSubjects(in, score)
+	if len(kept) != 256 || dropped != 44 {
+		t.Fatalf("kept %d dropped %d, want 256/44", len(kept), dropped)
+	}
+	for i := 0; i < 100; i++ {
+		if kept[i] != subs[200+i] {
+			t.Fatalf("kept[%d] = %s, want high-score %s first", i, kept[i], subs[200+i])
+		}
+	}
+	for i := 0; i < 156; i++ {
+		if kept[100+i] != subs[i] {
+			t.Fatalf("kept[%d] = %s, want low-score %s", 100+i, kept[100+i], subs[i])
+		}
 	}
 }
 

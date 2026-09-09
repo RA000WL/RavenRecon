@@ -114,12 +114,7 @@ func spfWeakDetector(ctx context.Context, dctx *detect.Context) ([]asset.Finding
 			"category": "weak_spf",
 		}
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
@@ -205,12 +200,7 @@ func dmarcMissingDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fi
 			"txt_records": fmt.Sprintf("%d", len(vals)),
 		}
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
@@ -300,12 +290,7 @@ func srvExposureDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fin
 			"service_count": fmt.Sprintf("%d", len(vals)),
 		}
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {

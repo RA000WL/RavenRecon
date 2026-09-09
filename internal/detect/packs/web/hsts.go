@@ -33,11 +33,7 @@ func hstsMissingDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fin
 		}
 		subjects = append(subjects, h)
 	}
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, h := range subjects {
 		if err := ctx.Err(); err != nil {

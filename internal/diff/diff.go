@@ -49,6 +49,12 @@ type Snapshot struct {
 	Digest   string
 	Sets     map[string][]string
 	Surfaces map[string]SurfaceState
+	// Takeover is the (rule, provider) histogram of the snapshot's
+	// takeover findings (see takeover.go buildTakeoverCounts): nil when
+	// the snapshot tracks no takeover findings. Hand-rolled test
+	// snapshots leave it nil (bloom absent); SnapshotOf always
+	// populates it (nil-or-valued, never a partial histogram).
+	Takeover map[string]int
 }
 
 // SurfaceState is one scored surface's attention position.
@@ -78,6 +84,12 @@ type Delta struct {
 	Added          map[string][]string `json:"added"`
 	Removed        map[string][]string `json:"removed"`
 	Changed        []SurfaceChange     `json:"changed_surfaces"`
+	// Takeover is the derived takeover bloom (see takeover.go): nil iff
+	// neither snapshot tracks takeover findings. A non-nil bloom with
+	// empty cells means takeover is tracked with no count change. The
+	// bloom never affects Empty, AddedCount, or RemovedCount — it
+	// projects the findings axis, it is not a new axis.
+	Takeover *TakeoverBloom `json:"takeover,omitempty"`
 }
 
 // LoadReport reads and decodes one report JSON export. Files over
@@ -225,6 +237,7 @@ func SnapshotOf(m *report.Model) (Snapshot, error) {
 	for _, sf := range nm.Surfaces {
 		s.Surfaces[sf.Identity.String()] = SurfaceState{Level: sf.Level, Score: sf.Score}
 	}
+	s.Takeover = buildTakeoverCounts(nm.Findings)
 	return s, nil
 }
 
@@ -263,6 +276,7 @@ func Diff(baseline, current Snapshot) (*Delta, error) {
 		}
 	}
 	sort.Slice(d.Changed, func(i, j int) bool { return d.Changed[i].Identity < d.Changed[j].Identity })
+	d.Takeover = diffTakeover(baseline.Takeover, current.Takeover)
 	return d, nil
 }
 

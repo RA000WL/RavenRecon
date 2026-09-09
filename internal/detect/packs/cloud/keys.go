@@ -3,7 +3,6 @@ package cloud
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
 	"github.com/RA000WL/RavenRecon/internal/detect"
@@ -67,12 +66,7 @@ func awsKeyIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]asset
 		subjects = append(subjects, id)
 		carrier[id] = "evidence"
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > maxFindingsPerRule {
-		dropped = len(subjects) - maxFindingsPerRule
-		subjects = subjects[:maxFindingsPerRule]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {

@@ -15,11 +15,12 @@
 // reuses those already-emitted relationships + evidence without new I/O,
 // new asset kinds, or SDK surface changes.
 //
-// Rules (3, each <100 lines, deterministic fixtures, informational per §0.1):
+// Rules (4, each <100 lines, deterministic fixtures, informational per §0.1):
 //
-//	takeover.cname.unclaimed — information — relationships+assets — per-host dangling CNAME to unclaimed provider fingerprint (github.io, herokuapp.com, amazonaws.com, azurewebsites.net, cloudfront.net, etc) with no A/AAAA for the CNAME target — informational, never claims exploitability
-//	takeover.cname.dangling   — information — relationships+assets — per-host dangling CNAME (any target with no A/AAAA) excluding provider-matched hosts — informational orphan signal
-//	takeover.s3.bucket        — information — endpoints — per-endpoint S3 bucket endpoint observed (host shape .s3.amazonaws.com) — informational indicator via techintel endpoint shape
+//	takeover.cname.unclaimed          — information — relationships+assets — per-host dangling CNAME to unclaimed provider fingerprint (github.io, herokuapp.com, amazonaws.com, azurewebsites.net, cloudfront.net, etc) with no A/AAAA for the CNAME target — informational, never claims exploitability
+//	takeover.cname.dangling           — information — relationships+assets — per-host dangling CNAME (any target with no A/AAAA) excluding provider-matched hosts — informational orphan signal
+//	takeover.s3.bucket                — information — endpoints — per-endpoint S3 bucket endpoint observed (host shape .s3.amazonaws.com) — informational indicator via techintel endpoint shape
+//	takeover.cname.provider-confirmed — information — relationships+assets+priors — per-host corroboration of a completed takeover.cname.unclaimed sibling finding with the observed host→CNAME graph edge to the curated provider suffix — a SECOND finding (never a mutation of the unclaimed identity), silent without priors/graph (fail-open)
 //
 // Each rule honors context.Context, uses Detector
 // func(context.Context,*Context)([]asset.Finding,error), builds findings

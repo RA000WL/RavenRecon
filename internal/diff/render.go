@@ -56,6 +56,24 @@ func (d *Delta) Summary() string {
 		fmt.Fprintf(&b, "surface %s: %s (%.4f) -> %s (%.4f)\n",
 			c.Identity, c.OldLevel, c.OldScore, c.NewLevel, c.NewScore)
 	}
+	if d.Takeover != nil {
+		// TODO(diff-bloom-cap): takeover cells render uncapped in both
+		// human outputs (here and WriteMarkdown below) while every other
+		// identity list stops at maxRenderIdentities with a "+N more"
+		// marker. Accepted asymmetry, pinned by
+		// TestTakeoverBloomRenderUncapped: one cell per distinct (rule,
+		// provider) keeps shipped-pack cardinality in the single digits
+		// against the 1000-item bound, and delta.json carries the
+		// complete bloom either way. Revisit with a cap + marker if the
+		// rule×provider space ever approaches maxRenderIdentities.
+		fmt.Fprintf(&b, "takeover: +%d/-%d\n", d.Takeover.AddedTotal(), d.Takeover.RemovedTotal())
+		for _, c := range d.Takeover.Added {
+			fmt.Fprintf(&b, "takeover added: %s\n", formatTakeoverCell(c))
+		}
+		for _, c := range d.Takeover.Removed {
+			fmt.Fprintf(&b, "takeover removed: %s\n", formatTakeoverCell(c))
+		}
+	}
 	return b.String()
 }
 
@@ -102,6 +120,7 @@ func orderedDelta(d *Delta) map[string]any {
 		"added":            added,
 		"removed":          removed,
 		"changed_surfaces": d.Changed,
+		"takeover":         d.Takeover,
 	}
 }
 
@@ -166,6 +185,20 @@ func WriteMarkdown(path string, d *Delta) error {
 				fmt.Fprintf(&b, "- … +%d more (complete list in delta.json)\n", len(d.Changed)-maxRenderIdentities)
 			}
 			b.WriteByte('\n')
+		}
+		if d.Takeover != nil {
+			b.WriteString("## Takeover\n\n")
+			if d.Takeover.Empty() {
+				b.WriteString("Takeover tracked, no count change.\n\n")
+			} else {
+				for _, c := range d.Takeover.Added {
+					fmt.Fprintf(&b, "- added `%s`\n", formatTakeoverCell(c))
+				}
+				for _, c := range d.Takeover.Removed {
+					fmt.Fprintf(&b, "- removed `%s`\n", formatTakeoverCell(c))
+				}
+				b.WriteByte('\n')
+			}
 		}
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {

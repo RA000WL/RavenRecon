@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
+	"github.com/RA000WL/RavenRecon/internal/secrentel/patterns"
 )
 
 func baseSignal() Signal {
@@ -245,12 +246,13 @@ func TestCapsAndGates(t *testing.T) {
 func TestSingleStructuralHigh(t *testing.T) {
 	ic, rc := mustCatalogs(t)
 
-	// One leaked AWS credential at 0.95: high_value_secret fires at the
-	// 0.6 cap, the confidence group caps at 0.5, score = 1−0.4·0.5 = 0.8
-	// with exactly one indicator category — the escape lifts it to high.
+	// One leaked AWS credential at 0.95, attested structural by the
+	// emitting phase: high_value_secret fires at the 0.6 cap, the
+	// confidence group caps at 0.5, score = 1−0.4·0.5 = 0.8 with exactly
+	// one indicator category — the escape lifts it to high.
 	leak := Signal{
 		Identity: testIdentity(), Kind: asset.KindURL,
-		Secrets:   []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Identity: "secret_candidate:aws/key/1"}},
+		Secrets:   []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Structural: true, Identity: "secret_candidate:aws/key/1"}},
 		FirstSeen: fixedTime(1), ScoredAt: fixedTime(2),
 	}
 	out, err := ScoreSurface(leak, ic, rc)
@@ -263,10 +265,70 @@ func TestSingleStructuralHigh(t *testing.T) {
 	if out.Level != LevelHigh {
 		t.Errorf("leak level = %s, want high (single-structural-high escape)", out.Level)
 	}
+	// The promoting factor is cited verbatim: the structural-backed
+	// confidence:secret factor carrying the recorded confidence, the
+	// candidate identity, and the attestation bit.
+	var promoters []Factor
+	for _, f := range out.Factors {
+		if f.Name == "confidence:secret" && f.Structural {
+			promoters = append(promoters, f)
+		}
+	}
+	if len(promoters) != 1 {
+		t.Fatalf("structural confidence:secret factors = %d, want exactly 1 (the promoter): %+v", len(promoters), out.Factors)
+	}
+	p := promoters[0]
+	if p.Weight != 0.95 {
+		t.Errorf("promoter weight = %v, want the recorded 0.95", p.Weight)
+	}
+	if want := "secret candidate observation confidence 0.95 recorded by the detection phase"; p.Reason != want {
+		t.Errorf("promoter reason = %q, want verbatim %q", p.Reason, want)
+	}
+	if len(p.Evidence) != 1 || p.Evidence[0] != "secret_candidate:aws/key/1" {
+		t.Errorf("promoter evidence = %v, want exactly [secret_candidate:aws/key/1]", p.Evidence)
+	}
+	// The promotion survives the cache record round trip bit-for-bit
+	// (the attestation bit rides the factor through the stored surface).
+	rec, err := encodeStoredSurface(out, fixedTime(99))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeStoredSurface(rec, leak)
+	if err != nil {
+		t.Fatalf("promoted surface must re-validate from its own record: %v", err)
+	}
+	if !reflect.DeepEqual(*got, out) {
+		t.Errorf("promoted surface diverged across the record round trip:\n%+v\n%+v", *got, out)
+	}
 
-	// Same shape at 0.85: below the structural bar, stays medium.
+	// The exact threshold boundary, both sides: 0.89 stays medium, 0.90
+	// promotes. Both score exactly 0.8 (the confidence group caps at
+	// 0.5 either way), so the level differs purely on the bar.
+	for _, tc := range []struct {
+		confidence float64
+		want       PriorityLevel
+	}{
+		{0.89, LevelMedium},
+		{0.90, LevelHigh},
+	} {
+		sig := leak
+		sig.Secrets = []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: tc.confidence, Structural: true, Identity: "secret_candidate:aws/key/1"}}
+		out, err := ScoreSurface(sig, ic, rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Score != 0.8 {
+			t.Errorf("confidence %.2f score = %v, want 0.8 (bar is gating-only, never score math)", tc.confidence, out.Score)
+		}
+		if out.Level != tc.want {
+			t.Errorf("confidence %.2f level = %s, want %s (threshold boundary)", tc.confidence, out.Level, tc.want)
+		}
+	}
+
+	// Same shape at 0.85, attested structural: below the bar, stays
+	// medium — attestation without strength promotes nothing.
 	weak := leak
-	weak.Secrets = []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.85, Identity: "secret_candidate:aws/key/1"}}
+	weak.Secrets = []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.85, Structural: true, Identity: "secret_candidate:aws/key/1"}}
 	out, err = ScoreSurface(weak, ic, rc)
 	if err != nil {
 		t.Fatal(err)
@@ -275,11 +337,29 @@ func TestSingleStructuralHigh(t *testing.T) {
 		t.Errorf("sub-bar leak level = %s, want medium", out.Level)
 	}
 
-	// Generic unattributed shape at 0.95: the catalog deliberately
-	// excludes it from high-value terms, so no indicator category at cap
-	// forms — the escape has nothing to lift.
+	// Same shape at 0.95 but UNATTESTED (spoofable by default): the score
+	// is still 0.8, but the escape stays shut — confidence alone never
+	// promotes. This is the spoofable-cap regression pin at priority
+	// level (the emitting engines' own spoofable-only/lone-weak pins in
+	// techintel and secrentel stay green untouched).
+	unattested := leak
+	unattested.Secrets = []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Identity: "secret_candidate:aws/key/1"}}
+	out, err = ScoreSurface(unattested, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Score != 0.8 {
+		t.Errorf("unattested leak score = %v, want 0.8 (attestation gates the level, never the score)", out.Score)
+	}
+	if out.Level != LevelMedium {
+		t.Errorf("unattested leak level = %s, want medium (no attestation, no escape)", out.Level)
+	}
+
+	// Generic unattributed shape at 0.95, even attested: the catalog
+	// deliberately excludes it from high-value terms, so no indicator
+	// category at cap forms — the escape has nothing to lift.
 	generic := leak
-	generic.Secrets = []SecretSignal{{Type: asset.SecretTypeGeneric, Confidence: 0.95, Identity: "secret_candidate:generic/x"}}
+	generic.Secrets = []SecretSignal{{Type: asset.SecretTypeGeneric, Confidence: 0.95, Structural: true, Identity: "secret_candidate:generic/x"}}
 	out, err = ScoreSurface(generic, ic, rc)
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +382,178 @@ func TestSingleStructuralHigh(t *testing.T) {
 	if out.Score >= highThreshold && out.Level == LevelHigh {
 		t.Errorf("header-only level = %s at score %v, spoofable evidence must never escape to high", out.Level, out.Score)
 	}
+}
+
+// TestSingleStructuralHighTech pins the NEW-134 escape for the technology
+// half: one attested structural-backed technology detection at 0.95 lifts a
+// single indicator category at score 0.8 to high. The payment category
+// forms at the 0.6 cap from two same-category observations (the "stripe"
+// technology name and the "/checkout/stripe" path — one group, so exactly
+// one indicator category); the confidence group caps at 0.5; score =
+// 1−0.4·0.5 = 0.8; the attested 0.95 confidence:technology factor opens
+// the escape.
+func TestSingleStructuralHighTech(t *testing.T) {
+	ic, rc := mustCatalogs(t)
+
+	tech := Signal{
+		Identity: testIdentity(), Kind: asset.KindURL,
+		Path:         "/checkout/stripe",
+		Technologies: []TechSignal{{Name: "stripe", Category: "framework", Confidence: 0.95, Structural: true, Identity: "framework/stripe"}},
+		FirstSeen:    fixedTime(1), ScoredAt: fixedTime(2),
+	}
+	out, err := ScoreSurface(tech, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Score != 0.8 {
+		t.Errorf("tech score = %v, want 0.8 (0.6 category cap × 0.5 confidence cap)", out.Score)
+	}
+	if got := indicatorCategoriesOf(out); got != 1 {
+		t.Fatalf("indicator categories = %d, want exactly 1 (the escape under test needs a single category): %v", got, factorNames(out))
+	}
+	if out.Level != LevelHigh {
+		t.Errorf("tech level = %s, want high (single-structural-high escape via confidence:technology)", out.Level)
+	}
+	// The promoting factor is cited verbatim: the structural-backed
+	// confidence:technology factor carrying the recorded confidence, the
+	// technology identity, and the attestation bit.
+	var promoters []Factor
+	for _, f := range out.Factors {
+		if f.Name == "confidence:technology" && f.Structural {
+			promoters = append(promoters, f)
+		}
+	}
+	if len(promoters) != 1 {
+		t.Fatalf("structural confidence:technology factors = %d, want exactly 1 (the promoter): %+v", len(promoters), out.Factors)
+	}
+	if promoters[0].Weight != 0.95 {
+		t.Errorf("promoter weight = %v, want the recorded 0.95", promoters[0].Weight)
+	}
+	if len(promoters[0].Evidence) != 1 || promoters[0].Evidence[0] != "framework/stripe" {
+		t.Errorf("promoter evidence = %v, want exactly [framework/stripe]", promoters[0].Evidence)
+	}
+
+	// The bar binds identically for technology: 0.89 stays medium even
+	// attested, and 0.95 unattested stays medium — confidence alone never
+	// promotes. Scores are 0.8 throughout (the bar is gating-only).
+	for _, tc := range []struct {
+		name       string
+		confidence float64
+		structural bool
+		want       PriorityLevel
+	}{
+		{"attested sub-bar", 0.89, true, LevelMedium},
+		{"unattested at strength", 0.95, false, LevelMedium},
+	} {
+		sig := tech
+		sig.Technologies = []TechSignal{{Name: "stripe", Category: "framework", Confidence: tc.confidence, Structural: tc.structural, Identity: "framework/stripe"}}
+		got, err := ScoreSurface(sig, ic, rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Score != 0.8 {
+			t.Errorf("%s: score = %v, want 0.8 (bar is gating-only, never score math)", tc.name, got.Score)
+		}
+		if got.Level != tc.want {
+			t.Errorf("%s: level = %s, want %s", tc.name, got.Level, tc.want)
+		}
+	}
+}
+
+// TestStructuralScoreIdentity pins the NEW-139 score-identity contract:
+// the Structural bit never enters the score. Four twins of one
+// multi-signal surface — attested secret + attested tech, each mixed
+// single-attested variant, and the fully unattested twin — score
+// bit-for-bit identically (Score, Interestingness, Confidence), carry the
+// same factor-name set, and gate to the same level. The bit rides the
+// factors into the level gate only.
+func TestStructuralScoreIdentity(t *testing.T) {
+	ic, rc := mustCatalogs(t)
+
+	base := Signal{
+		Identity: testIdentity(), Kind: asset.KindURL,
+		Technologies: []TechSignal{{Name: "stripe", Category: "framework", Confidence: 0.95, Identity: "framework/stripe"}},
+		Secrets:      []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Identity: "secret_candidate:aws/key/1"}},
+		FirstSeen:    fixedTime(1), ScoredAt: fixedTime(2),
+	}
+	variants := []struct {
+		name           string
+		techAttested   bool
+		secretAttested bool
+	}{
+		{"both attested", true, true},
+		{"secret attested only", false, true},
+		{"tech attested only", true, false},
+		{"neither attested", false, false},
+	}
+	type triple struct {
+		score, interestingness, confidence float64
+		level                              PriorityLevel
+		factors                            []string
+	}
+	var want *triple
+	for _, v := range variants {
+		sig := base
+		sig.Technologies[0].Structural = v.techAttested
+		sig.Secrets[0].Structural = v.secretAttested
+		out, err := ScoreSurface(sig, ic, rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := &triple{out.Score, out.Interestingness, out.Confidence, out.Level, factorNames(out)}
+		if want == nil {
+			want = got
+			continue
+		}
+		if got.score != want.score || got.interestingness != want.interestingness || got.confidence != want.confidence {
+			t.Errorf("%s: (score, interestingness, confidence) = (%v, %v, %v), want the attested twin's (%v, %v, %v) bit-for-bit",
+				v.name, got.score, got.interestingness, got.confidence, want.score, want.interestingness, want.confidence)
+		}
+		if got.level != want.level {
+			t.Errorf("%s: level = %s, want %s (two indicator categories gate high with or without attestation)", v.name, got.level, want.level)
+		}
+		if !reflect.DeepEqual(got.factors, want.factors) {
+			t.Errorf("%s: factor names = %v, want %v (attestation rides the factors, never adds or removes one)", v.name, got.factors, want.factors)
+		}
+	}
+}
+
+// TestContextualStrengthsBelowStructuralEscapeBar pins the escape-safety
+// assumption behind the pipeline adapter's secretSignal inversion (cite:
+// internal/pipeline/adapt/priority.go secretSignal): the contextual
+// family has NO zero-support cap, so a lone contextual candidate scores
+// at its pattern strength and attests Structural above the 0.59 bar —
+// escape-safe ONLY while every contextual strength stays below
+// singleHighStructuralConfidence. A future contextual pattern at or
+// above the bar fails loudly here, forcing a re-examination of the
+// inversion before the escape can fire on unattributed context shapes.
+func TestContextualStrengthsBelowStructuralEscapeBar(t *testing.T) {
+	db, err := patterns.Load()
+	if err != nil {
+		t.Fatalf("patterns.Load: %v", err)
+	}
+	for _, p := range db.Patterns() {
+		if p.Family != patterns.FamilyContextual {
+			continue
+		}
+		if p.Strength >= singleHighStructuralConfidence {
+			t.Errorf("contextual pattern %q strength %v reaches the escape bar %v: a lone zero-support candidate would attest Structural at escape confidence",
+				p.ID, p.Strength, singleHighStructuralConfidence)
+		}
+	}
+}
+
+// indicatorCategoriesOf counts the distinct indicator (non-confidence)
+// factor groups on a scored surface — the category gate input.
+func indicatorCategoriesOf(s SurfaceAsset) int {
+	seen := make(map[string]bool)
+	for _, f := range s.Factors {
+		if strings.HasPrefix(f.Name, "confidence") {
+			continue
+		}
+		seen[f.Name] = true
+	}
+	return len(seen)
 }
 
 func TestOverlapPolicy(t *testing.T) {

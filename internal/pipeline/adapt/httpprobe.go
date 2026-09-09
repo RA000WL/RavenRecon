@@ -39,6 +39,12 @@ const HTTPProbeStickyFlag = "probe_truncated"
 // per-probe redirect/header/body caps), which can fire alongside it.
 const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
 
+// httpprobeSANTargetsTruncatedFlag marks a run whose SAN-derived probe
+// host set exceeded the engine's per-run cap (NEW-136): only the sorted
+// head was probed. It follows the package convention (a sticky flag is
+// <engine>_<what>_truncated) and accumulates with the sibling cut flags.
+const httpprobeSANTargetsTruncatedFlag = "httpprobe_san_targets_truncated"
+
 // HTTPProbeStage adapts the httpprobe engine to the pipeline.Stage contract
 // (internal/pipeline/adapt/doc.go).
 //
@@ -103,6 +109,35 @@ const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
 //	probe_ports without discovery results is an inert no-op (no ports,
 //	no flag).
 //
+//	"probe_san" — optional probing of TLS SAN hosts (default OFF;
+//	NEW-136). Truthy values (same spellings) feed the SAN DNS names of
+//	the certificates the first probe pass captured back as probe targets:
+//	every synthesized host (see httpprobe.SynthesizeSANProbeTargets —
+//	wildcards skipped-and-counted, never expanded; out-of-scope names
+//	dropped, never probed; deduped against the corpus; capped at 16 per
+//	run with an honest cut flag) is probed through a second engine call
+//	with the IDENTICAL config (same pool shape, same per-request budgets,
+//	same HostPorts synthesis map, same mistake-path surface, same session
+//	headers), so SAN targets ride the standard engine path
+//	(cache-before-execute under their own URL identities, redirect
+//	scope, asset/edge derivation) and cert-only hosts join the corpus
+//	and flow downstream like root targets. The two engine reports merge
+//	deterministically (sorted by host) and the outcome refolds over the
+//	union. A dedicated knob — not folded into "tls_san_expansion" —
+//	because passive corpus enrichment (zero extra traffic) and active
+//	probing (up to 32 root requests, plus up to 38 mistake-path requests
+//	per SAN host when mistake_paths is also enabled) are different budgets:
+//	cheap enrichment defaults ON, traffic-multiplying features default OFF
+//	(the probe_ports knob philosophy). Without probe_san, SAN names are
+//	inventory only (the historical behavior, byte-identical).
+//	probe_san with no captured certificates is an inert no-op (no SAN
+//	hosts, no flag). Exactly one feedback round runs: certificates the
+//	SAN pass itself captures are observed (and passively expanded) but
+//	never re-fed, so the phase cannot chain. The cut sets
+//	httpprobe_san_targets_truncated + Truncated; a failed or cancelled SAN pass folds like any engine
+//	error (failed/cancelled with the retained observations merged).
+//	SAN-feedback hosts skip takeover confirmation and port-target synthesis (both derive from the first-pass corpus only).
+//
 //	"takeover_confirm" — optional HTTP confirmation of dangling CNAME
 //	hosts (default ON; NEW-122). The exact value "false"
 //	(case/space-insensitive) disables it. When on, hosts with a CNAME
@@ -115,7 +150,8 @@ const HTTPProbeTLSDNSNamesStickyFlag = "probe_tls_dns_names_truncated"
 //	errors set httpprobe_takeover_truncated + Truncated. The fetch is
 //	deliberately uncached (freshness-critical claims); confirmed matches
 //	flow downstream as evidence, coherent through the snapshot
-//	fingerprint like every other evidence record.
+//	fingerprint like every other evidence record. Hosts synthesized by
+//	SAN feedback are never takeover candidates (selection runs on the first-pass corpus only).
 //
 //	"mistake_paths" — developer-mistake path probing (default OFF).
 //	Truthy values ("true"/"1"/"yes"/"on", case-insensitive — the
@@ -364,8 +400,7 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 	// endpoints, and relationships flow through the results channel.
 	report, err := httpprobe.Probe(ctx, in.Target, hosts, nil, cfg)
 
-	if err != nil && ctx.Err() != nil {
-		// The run was cancelled: the outcome, not the error field, carries
+	if err != nil && ctx.Err() != nil { // The run was cancelled: the outcome, not the error field, carries
 		// cancellation (pipeline contract). The wrapped context error is
 		// attached so the runner keeps the cancelled classification even when
 		// the engine also surfaced a shutdown error; the engine error is
@@ -387,6 +422,44 @@ func (s *HTTPProbeStage) Run(ctx context.Context, in pipeline.StageInput) (pipel
 		// with the context error attached.
 		return buildResult(in.Target, report, pipeline.OutcomeCancelled,
 			fmt.Errorf("stage %s: %w", s.Name(), ctx.Err()), opts), nil
+	}
+
+	// SAN→target feedback (NEW-136): the certificates the first pass
+	// captured may name hosts the corpus never listed. When the operator
+	// opted in, those names become probe targets through a second engine
+	// call with the IDENTICAL cfg — the same pool shape, per-request
+	// budgets, HostPorts synthesis, mistake-path surface, and session
+	// headers — so SAN targets ride the standard engine path
+	// (cache-before-execute under their own URL identities with the
+	// session digest bound, redirect scope, asset/edge derivation). The
+	// reports merge deterministically and the outcome refolds over the
+	// union; the synthesis cut flag rides every path below through opts.
+	// Engine-error paths above skip this phase (existing behavior
+	// preserved); a failed or cancelled SAN pass folds like any engine
+	// error, with the retained observations merged.
+	if probeSANEnabled(in.Config) {
+		sanOut := httpprobe.SynthesizeSANProbeTargets(in.Target, report.AllTLSCertificates(), hosts)
+		opts.sanCut = sanOut.Truncated
+		if len(sanOut.Hosts) > 0 {
+			if ctx.Err() != nil {
+				return buildResult(in.Target, report, pipeline.OutcomeCancelled,
+					fmt.Errorf("stage %s: %w", s.Name(), ctx.Err()), opts), nil
+			}
+			sanReport, sanErr := httpprobe.Probe(ctx, in.Target, sanOut.Hosts, nil, cfg)
+			report = mergeProbeReports(report, sanReport)
+			if sanErr != nil && ctx.Err() != nil {
+				return buildResult(in.Target, report, pipeline.OutcomeCancelled,
+					fmt.Errorf("stage %s: %w", s.Name(), errors.Join(ctx.Err(), sanErr)), opts), nil
+			}
+			if sanErr != nil {
+				werr := fmt.Errorf("stage %s: %w", s.Name(), sanErr)
+				return buildResult(in.Target, report, pipeline.OutcomeFailed, werr, opts), werr
+			}
+			if ctx.Err() != nil {
+				return buildResult(in.Target, report, pipeline.OutcomeCancelled,
+					fmt.Errorf("stage %s: %w", s.Name(), ctx.Err()), opts), nil
+			}
+		}
 	}
 
 	// Outcome fold over the engine's per-host statuses (mapping table
@@ -442,6 +515,9 @@ type probeResultOptions struct {
 	// takeoverCut reports that the takeover candidate set exceeded
 	// maxTakeoverConfirmHosts (NEW-122).
 	takeoverCut bool
+	// sanCut reports that SAN→target synthesis cut the host list at the
+	// engine's per-run cap (NEW-136).
+	sanCut bool
 	// takeoverTruncated reports an incomplete confirmation set: body-cap
 	// hits or a hard-error cut-short (NEW-122).
 	takeoverTruncated bool
@@ -483,6 +559,10 @@ func buildResult(declared asset.Domain, report httpprobe.Report, outcome pipelin
 	if opts.portsCut {
 		res.Truncated = true
 		flags[httpprobePortTargetsTruncatedFlag] = true
+	}
+	if opts.sanCut {
+		res.Truncated = true
+		flags[httpprobeSANTargetsTruncatedFlag] = true
 	}
 	if opts.takeoverCut {
 		res.Truncated = true
@@ -554,7 +634,10 @@ func expandTLSSANHosts(declared asset.Domain, certs []asset.TLSCertificate, addi
 	var found []asset.Host
 	for _, c := range certs {
 		for _, n := range c.DNSNames {
-			h, err := asset.NewHost(n, asset.Provenance{Source: tlsSANProvenance})
+			// Provenance is the engine's single shared literal
+			// (httpprobe.SANProvenance): the passive expansion here and
+			// the engine's SAN-target synthesis never disagree on origin.
+			h, err := asset.NewHost(n, asset.Provenance{Source: httpprobe.SANProvenance})
 			if err != nil {
 				continue // wildcards, IP literals, invalid names: not Host assets
 			}
@@ -575,9 +658,6 @@ func expandTLSSANHosts(declared asset.Domain, certs []asset.TLSCertificate, addi
 	sort.SliceStable(found, func(i, j int) bool { return found[i].Name < found[j].Name })
 	return append(additions, found...)
 }
-
-// tlsSANProvenance marks hosts discovered from certificate SAN names.
-const tlsSANProvenance = "tls-san"
 
 // mergePortDiscovery folds the optional port-discovery output into the stage
 // result: ports and relationships are deduplicated (by identity / edge ID)
@@ -982,6 +1062,53 @@ func mistakePathsEnabled(params map[string]string) bool {
 		return true
 	}
 	return false
+}
+
+// probeSANEnabled reports whether captured TLS SAN hosts are additionally
+// probed as targets (NEW-136), via StageParams["probe_san"]. OFF by
+// default; truthy values follow the probe_ports spelling convention
+// ("true"/"1"/"yes"/"on", case-insensitive). It is a SEPARATE knob from
+// tls_san_expansion on purpose: passive corpus enrichment costs zero
+// extra traffic (default ON), while SAN feedback probing multiplies it
+// (default OFF) — operators opt into budgets, never out of surprises.
+func probeSANEnabled(params map[string]string) bool {
+	if params == nil {
+		return false
+	}
+	v, ok := params["probe_san"]
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// mergeProbeReports unions two engine reports from one stage run (the root
+// pass and the SAN feedback pass, NEW-136): results concatenate and sort
+// by canonical host name for determinism. Both reports share the declared
+// target; the first report's target wins (they are always equal — both
+// calls probe under the same declared domain).
+//
+// Disjoint-precondition: the two result sets must name disjoint hosts —
+// the merge concatenates without dedup. It holds by construction for the
+// NEW-136 call site (SynthesizeSANProbeTargets seeds its seen set from the
+// corpus the first pass probed and dedups synthesized names against each
+// other, and the SAN pass probes only those synthesized hosts), so every
+// host appears exactly once. Future callers must preserve that
+// disjointness or add dedup first: overlapping inputs would double-count
+// hosts in ItemsProcessed.
+func mergeProbeReports(first, second httpprobe.Report) httpprobe.Report {
+	if len(second.Results) == 0 {
+		return first
+	}
+	merged := make([]httpprobe.HostResult, 0, len(first.Results)+len(second.Results))
+	merged = append(merged, first.Results...)
+	merged = append(merged, second.Results...)
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Host.Name < merged[j].Host.Name })
+	return httpprobe.Report{Target: first.Target, Results: merged}
 }
 
 // defaultMistakePaths is the curated well-known set fetched per live host:

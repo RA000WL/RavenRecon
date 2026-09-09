@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -35,12 +34,7 @@ func corsWildcardDetector(ctx context.Context, dctx *detect.Context) ([]asset.Fi
 			}
 		}
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {

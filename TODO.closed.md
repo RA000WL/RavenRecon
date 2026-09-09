@@ -7,6 +7,84 @@ editing this file: file a new NEW-n entry referencing the old one.
 
 ## Recently closed
 
+### NEW-145 (MEDIUM) — PriorFindings digest judgment-set (SchemaVersion 4)
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: metadata+confidence digest fold; SchemaVersion 3→4 (evict+recompute); parity tests; honesty notes refreshed.
+- Verification: design + review APPROVE; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-146 (MEDIUM) — AuthZ Rule 2 path-object
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: orchestrator. Owner: builder.
+- Fix: path-object rule (shared apis export, no fork); counts reconciled (29 wired / 35 disk).
+- Verification: first-gate + fix + verification rounds; golden additions-only; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-144 (HIGH) — Business-logic workflow pack (v2.3 Rule 1)
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: orchestrator. Owner: builder.
+- Fix: bizlogic pack (T1–T4 conjunction, Path-only co-reachability, method+path dissimilarity, kind-correct hosts); AllPacks 27→28.
+- Verification: first-gate + fix + verification rounds (hub dead-code removed, counts prose fixed); 20 tests + golden; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-143 (MEDIUM) — Takeover enrichment + bloom diff
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: orchestrator. Owner: builder.
+- Fix: provider-confirmed second finding (Deps unclaimed, GraphView CNAME→provider); TakeoverBloom in diff summary/Markdown/JSON.
+- Verification: first-gate review APPROVE + follow-ups; golden additions-only; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-142 (HIGH) — AuthZ/IDOR pack via GraphView (v2.3 first pack)
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: research. Owner: builder.
+- Fix: authz pack (Rule 1, authorization/medium-info, Deps triage.idor, 256-cap); AllPacks 25→26; A2 20-form universe pinned.
+- Verification: first-gate review + prose fixes; 17 tests + golden; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-140 (HIGH) — Triage cap version bump
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: 8 triage rules 1.1.0→1.2.0 + stale-eviction proof; golden regen versions-only.
+- Verification: review APPROVE; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-141 (HIGH) — Attestation narrowing + bar pin + CLI nits
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: 25-type structured allowlist (bearer/contextual excluded); behavioral bar-equality pin; single close; submit-failure emission (+ optionals).
+- Verification: review APPROVE; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-138 (MEDIUM) — Streaming discover output
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: per-source-finalization JSON lines + --output routing; arrival-order stream, byte-identical summary; true backpressure contract; joined post-run errors.
+- Verification: review APPROVE + follow-up pins; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-137 (MEDIUM) — PSL-aware correlation grouping
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: longer-of-parent-vs-registrable anchor; exact-match PSL table (no wildcards); last-two-label fallback; fail-closed split.
+- Verification: review APPROVE + polish; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-136 (MEDIUM) — SAN→target feedback
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: probe_san knob (default OFF); InDomain double gate; wildcard skip-and-count; one round; identical bounded second pass; refold + flags.
+- Verification: review APPROVE + polish pins; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-135 (MEDIUM) — Score-ordered cap truncation
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: 21 per-pack cuts to score-order helpers (engine run-cap already ranked); triage pre-cap scoring; truthful 2-key contract wording.
+- Verification: review (substance APPROVE); shuffled-input determinism; orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-139 (MEDIUM) — Structural attestation adapter threading
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: tech/secret Structural mapping (cap-inversion, fail-closed); honest contextual-residual comment + ceiling pin; cap back-pointers.
+- Verification: review + fix round; golden regen reviewed (structural:true additions, zero score/level movement); orchestrator re-ran gofmt/vet/build clean + go test ./... 0 failures.
+
+### NEW-134 (MEDIUM) — Single-signal structural High (external review O8)
+- Status: VERIFIED — orchestrator-verified. Full record in TODO.md.
+- Reporter: reviewer. Owner: builder.
+- Fix: attestation-gated single-signal High (pre-existing escape tightened; closed-world default; stale-High evict+recompute; keys bind bit).
+- Verification: review APPROVE; follow-up NEW-139 landed; orchestrator re-ran gates green.
+
 ### NEW-133 (HIGH) — mistake-path prober review follow-ups
 - Status: VERIFIED — orchestrator-verified 2026-09-05. Full record in TODO.md.
 - Reporter: reviewer. Owner: builder.

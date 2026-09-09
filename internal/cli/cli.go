@@ -70,10 +70,25 @@ Usage:
 
 Options (after the domain):
   --sources <a,b>   Restrict to the given sources (subfinder, assetfinder,
-                    amass). Default: all built-in sources.
+                    amass, chaos, crtsh, asnmap). Default: subfinder,
+                    assetfinder, amass, chaos; crtsh and asnmap run only
+                    when named explicitly (opt-in, never default).
+  --output <file>   Write the streamed host lines to <file> (created or
+                    truncated) instead of stdout. The file carries ONLY the
+                    stream — never the summary. Stdout then prints the final
+                    summary only.
   --no-cache        Disable the cache for this run (default: cache is off
                     unless enabled in configuration).
   --config <file>   JSON config file (flags > env > file > defaults).
+
+Streaming: each host prints as found — one JSON line per host with the keys
+host, source, discovered_at (RFC 3339, UTC), status, cached — to stdout, or
+to --output <file> when set. The stream is arrival-order (non-deterministic
+across runs); a host seen by two sources streams twice (once per source).
+Streamed sets are provisional: events fire pre-quality-gate and cached:true
+lines replay stored results — the final merged summary below is authoritative:
+sorted, deduplicated, and deterministic.
+Per-source completion lines still go to stderr.
 Signals: Ctrl-C or SIGTERM cancels the run gracefully — the partial report
 is still printed and the exit code is 1. A second signal forces an
 immediate exit.
@@ -85,6 +100,10 @@ Discovery invokes only the passive modes above:
   subfinder -d <domain> -silent
   assetfinder <domain>
   amass enum -passive -d <domain>
+  chaos -d <domain> -silent -json       (requires PDCP_API_KEY; skipped when unkeyed)
+asnmap (-d <domain> -silent) and crt.sh certificate transparency
+(GET https://crt.sh/?q=%25.<domain>&output=json) run only when named
+explicitly in --sources (opt-in, never default).
 No crawling, active enumeration, brute force, exploitation, credential
 attacks, or vulnerability verification exists in this command.
 
@@ -204,6 +223,7 @@ func printVersion(w io.Writer) error {
 type discoverOptions struct {
 	domain     string
 	sources    []string // nil or empty means every built-in source
+	output     string   // empty means stream to stdout; otherwise stream to this file
 	noCache    bool
 	configPath string
 }
@@ -225,6 +245,7 @@ func parseDiscoverArgs(args []string) (discoverOptions, error) {
 	fs.SetOutput(io.Discard) // errors are returned, not printed
 	noCache := fs.Bool("no-cache", false, "disable the cache for this run")
 	sources := fs.String("sources", "", "comma-separated source names")
+	output := fs.String("output", "", "write streamed host lines to this file instead of stdout")
 	configPath := fs.String("config", "", "JSON config file (flags > env > file > defaults)")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -253,7 +274,7 @@ func parseDiscoverArgs(args []string) (discoverOptions, error) {
 		}
 	})
 
-	opts := discoverOptions{domain: args[0], noCache: *noCache, configPath: *configPath}
+	opts := discoverOptions{domain: args[0], noCache: *noCache, output: *output, configPath: *configPath}
 	if sourcesSet {
 		for _, s := range strings.Split(*sources, ",") {
 			if s = strings.TrimSpace(s); s != "" {
@@ -310,6 +331,35 @@ func discoverConfig(cfg config.Config, opts discoverOptions) (discovery.Config, 
 	return dc, nil
 }
 
+// discoverStream is the NEW-138 per-host line sink: it serializes OnHost
+// events (which arrive on pool worker goroutines in arrival order) into one
+// JSON line each on its writer. Writes are mutex-guarded and bounded
+// O(line); the first write error is sticky and surfaces after the run. The
+// sink honors the discovery callback contract (thread-safe, non-blocking):
+// it adds no goroutines and no queues, so pool bounds are unchanged.
+type discoverStream struct {
+	mu  sync.Mutex
+	w   io.Writer
+	err error
+}
+
+// write renders one streamed host event as a single line.
+func (s *discoverStream) write(ev discovery.HostEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return
+	}
+	_, s.err = io.WriteString(s.w, ev.Line()+"\n")
+}
+
+// cause returns the first write error, if any.
+func (s *discoverStream) cause() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
 // runDiscover runs passive discovery for the given domain and prints the
 // per-source report. Errors in individual sources are reported per source and
 // do not fail the command; run-level errors (bad arguments, invalid target,
@@ -351,9 +401,37 @@ func runDiscover(ctx context.Context, w io.Writer, args []string) error {
 		defer progressMu.Unlock()
 		fmt.Fprintf(os.Stderr, "discover: %s finished: %s (%d hosts)\n", res.Source, res.Status, len(res.Hosts))
 	}
-	rep, err := discovery.Run(ctx, target, cfg)
-	if err != nil {
-		return fmt.Errorf("discover: %w", err)
+	// NEW-138 host stream: one JSON line per host as its source
+	// finalizes, to stdout — or to --output <file> when set (created or
+	// truncated up front so a bad path fails before any tool runs; the
+	// file carries ONLY the stream, never the summary, and stdout then
+	// prints the summary only). A run error still returns after the
+	// stream is closed, so a partial stream is retained, never silently
+	// completed.
+	streamW := io.Writer(w)
+	var outFile *os.File
+	if opts.output != "" {
+		f, err := os.OpenFile(opts.output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("discover: open --output %q: %w", opts.output, err)
+		}
+		// Single close path: ownership sits with the explicit Close
+		// after the run below, whose error joins the post-run report.
+		// (A deferred Close here would double-close — the deferred
+		// call's error is discarded, but the second Close is still a
+		// real failure surface on some filesystems.)
+		outFile = f
+		streamW = f
+	}
+	stream := &discoverStream{w: streamW}
+	cfg.OnHost = stream.write
+	rep, runErr := discovery.Run(ctx, target, cfg)
+	var closeErr error
+	if outFile != nil {
+		closeErr = outFile.Close()
+	}
+	if postErr := joinDiscoverPostRunErr(opts.output, stream.cause(), closeErr, runErr); postErr != nil {
+		return postErr
 	}
 	if err := printDiscoverReport(w, rep, cfg.Cache != nil); err != nil {
 		return err
@@ -362,6 +440,25 @@ func runDiscover(ctx context.Context, w io.Writer, args []string) error {
 		return fmt.Errorf("discover: run interrupted: %w", ctx.Err())
 	}
 	return nil
+}
+
+// joinDiscoverPostRunErr joins the post-run errors of a streaming discover
+// run — the sticky stream-write cause, the --output close error, and the run
+// error — so no failure masks another (a laddered return would drop every
+// cause after the first). Each cause keeps its message and wrappings; nil
+// causes contribute nothing, and all-nil returns nil.
+func joinDiscoverPostRunErr(output string, streamCause, closeErr, runErr error) error {
+	var joined error
+	if streamCause != nil {
+		joined = errors.Join(joined, fmt.Errorf("discover: stream output: %w", streamCause))
+	}
+	if closeErr != nil {
+		joined = errors.Join(joined, fmt.Errorf("discover: close --output %q: %w", output, closeErr))
+	}
+	if runErr != nil {
+		joined = errors.Join(joined, fmt.Errorf("discover: %w", runErr))
+	}
+	return joined
 }
 
 func printDiscoverUsage(w io.Writer) error {
@@ -471,7 +568,7 @@ func runDoctor(ctx context.Context, w io.Writer) error {
 		}
 	}
 
-	sources := "all built-in (subfinder, assetfinder, amass)"
+	sources := "all built-in (subfinder, assetfinder, amass, chaos; opt-in: crtsh, asnmap)"
 	if len(cfg.Discovery.Sources) > 0 {
 		sources = strings.Join(cfg.Discovery.Sources, ", ")
 	}

@@ -42,7 +42,10 @@ Options (after the target):
                           urlintel, crawl, techintel, jsintel, secrentel, urllive, priority,
                           detect, report. Default: all twelve, in pipeline order.
   --sources <a,b>         Restrict the discovery stage's passive sources
-                          (subfinder, assetfinder, amass).
+                          (subfinder, assetfinder, amass, chaos, crtsh,
+                          asnmap). Default: subfinder, assetfinder, amass,
+                          chaos; crtsh and asnmap run only when named
+                          explicitly (opt-in, never default).
   --request-timeout <d>   Per-request timeout for the httpprobe stage (Go
                           duration, e.g. 10s). 0 = engine default.
   --session-headers <f>   Operator session-headers file ("Name: value"
@@ -132,7 +135,9 @@ opt-in flag: amass runs by default and is excluded via --sources.
 
 Discovery is passive-only. It invokes external tools in their passive modes:
   subfinder -d <domain> -silent, assetfinder <domain>,
-  amass enum -passive -d <domain>.
+  amass enum -passive -d <domain>, chaos -d <domain> -silent -json
+  (requires PDCP_API_KEY; skipped when unkeyed); asnmap and crt.sh
+  certificate transparency run only when named explicitly in --sources.
 Run 'ravenrecon doctor' to check which discovery tools are installed.
 Passive-first reconnaissance only: discovery sources run in their passive
 modes, the crawl stage is same-site link exploration of already-discovered

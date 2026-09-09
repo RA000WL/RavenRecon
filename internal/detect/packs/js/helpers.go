@@ -70,13 +70,20 @@ func fileSubjectOfContent(id asset.Identity) (asset.Identity, int64) {
 	return id, 0
 }
 
-// emitJSCandidates reduces fired pairs to findings: sorted by (subject,
-// offset), identical pairs deduplicated (overlap-identical windows
-// collapse here; the engine's MergeFindings is the backstop), capped at
-// 256 pairs with the pack's overflow pattern preserved
-// (subjects_dropped + truncated metadata on every finding, warn log).
-// Emission order is deterministic for any input multiset.
-func emitJSCandidates(ctx context.Context, dctx *detect.Context, ruleID, ruleName string, cat detect.Category, signal string, cands []jsCandidate) ([]asset.Finding, error) {
+// capCandidates retains at most 256 candidates under the NEW-135
+// score-ordered truncation contract: score descending, then subject
+// identity ascending (single-detector invocation, so the rule is fixed).
+// JS findings carry uniform confidence (0.5) under one detector, so the
+// effective order is the tie-break tail — (subject identity, file offset) ascending —
+// byte-identical to the pre-NEW-135 prefix cut. Identical pairs
+// deduplicate first (overlap-identical windows collapse here; the
+// engine's MergeFindings is the backstop), so dropped counts only
+// distinct candidates. It returns the kept candidates and the dropped
+// count (0 when under the bound); callers surface a nonzero dropped via
+// subjects_dropped + truncated metadata on every retained finding and a
+// LevelWarn log — never silent. Emission order is deterministic for any
+// input multiset.
+func capCandidates(cands []jsCandidate) (kept []jsCandidate, dropped int) {
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].subject.String() != cands[j].subject.String() {
 			return cands[i].subject.String() < cands[j].subject.String()
@@ -91,11 +98,20 @@ func emitJSCandidates(ctx context.Context, dctx *detect.Context, ruleID, ruleNam
 		deduped = append(deduped, c)
 	}
 	cands = deduped
-	dropped := 0
 	if len(cands) > 256 {
-		dropped = len(cands) - 256
-		cands = cands[:256]
+		return cands[:256], len(cands) - 256
 	}
+	return cands, 0
+}
+
+// emitJSCandidates reduces fired pairs to findings: sorted by (subject,
+// offset), identical pairs deduplicated (overlap-identical windows
+// collapse here; the engine's MergeFindings is the backstop), capped at
+// 256 pairs with the pack's overflow pattern preserved
+// (subjects_dropped + truncated metadata on every finding, warn log).
+// Emission order is deterministic for any input multiset.
+func emitJSCandidates(ctx context.Context, dctx *detect.Context, ruleID, ruleName string, cat detect.Category, signal string, cands []jsCandidate) ([]asset.Finding, error) {
+	cands, dropped := capCandidates(cands)
 	var out []asset.Finding
 	for _, c := range cands {
 		if err := ctx.Err(); err != nil {

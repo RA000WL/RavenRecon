@@ -403,10 +403,204 @@ func TestCorrelateScoresAreFinite(t *testing.T) {
 	}
 }
 
-// TestCorrelateSharedInfraSplit pins the shared-infrastructure exception to
-// the first-label-drop rule: unrelated tenants on a curated suffix anchor
-// alone (one label above the longest matching suffix) instead of merging
-// under the suffix, while non-listed names keep today's rule exactly.
+// TestCorrelatePSLGeneralSplit pins the general PSL rule beyond the
+// formerly curated hosting suffixes: names in DIFFERENT registrable
+// domains under one multi-label public suffix never merge (fail-closed:
+// Correlate sees no resolved-IP sets, so disjoint IPs are assumed),
+// while names in ONE registrable domain group as before.
+func TestCorrelatePSLGeneralSplit(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	hostSig := func(name string) SurfaceAsset {
+		return scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: name},
+			Kind:     asset.KindHost, Hostname: name,
+		})
+	}
+	anchors := func(groups []Group) map[string]int {
+		m := make(map[string]int, len(groups))
+		for _, g := range groups {
+			m[g.Anchor.String()] = len(g.Members)
+		}
+		return m
+	}
+
+	// Different registrable domains under co.uk split; siblings under one
+	// foo.co.uk registrable domain stay together under foo.co.uk.
+	groups, truncated := Correlate([]SurfaceAsset{
+		hostSig("foo.co.uk"),
+		hostSig("bar.co.uk"),
+		hostSig("a.foo.co.uk"),
+		hostSig("b.foo.co.uk"),
+	})
+	if truncated {
+		t.Error("four surfaces under two anchors are under the cap; Truncated must be false")
+	}
+	got := anchors(groups)
+	want := map[string]int{"domain:foo.co.uk": 3, "domain:bar.co.uk": 1}
+	if len(got) != len(want) {
+		t.Fatalf("co.uk anchors = %v, want %v", got, want)
+	}
+	for k, n := range want {
+		if got[k] != n {
+			t.Errorf("anchor %s holds %d members, want %d (all %v)", k, got[k], n, got)
+		}
+	}
+
+	// Another shared suffix from the embedded table splits the same way.
+	groups, _ = Correlate([]SurfaceAsset{
+		hostSig("a.azurewebsites.net"),
+		hostSig("b.azurewebsites.net"),
+	})
+	if got := anchors(groups); len(got) != 2 ||
+		got["domain:a.azurewebsites.net"] != 1 || got["domain:b.azurewebsites.net"] != 1 {
+		t.Errorf("azurewebsites tenants must split 1+1, got %v", got)
+	}
+}
+
+// TestCorrelateSameOrgGrouped pins the same-registrable-domain direction:
+// sub.example.com + example.com land together, as do deeper siblings of
+// one branch (a/b.api.example.com under api.example.com) — across host
+// and domain surface kinds.
+func TestCorrelateSameOrgGrouped(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	groups, truncated := Correlate([]SurfaceAsset{
+		scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: "sub.example.com"},
+			Kind:     asset.KindHost, Hostname: "sub.example.com",
+		}),
+		scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindDomain, Value: "example.com"},
+			Kind:     asset.KindDomain, Hostname: "example.com",
+		}),
+		scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: "a.api.example.com"},
+			Kind:     asset.KindHost, Hostname: "a.api.example.com",
+		}),
+		scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: "b.api.example.com"},
+			Kind:     asset.KindHost, Hostname: "b.api.example.com",
+		}),
+	})
+	if truncated {
+		t.Error("four surfaces under two anchors are under the cap; Truncated must be false")
+	}
+	got := map[string]int{}
+	for _, g := range groups {
+		got[g.Anchor.String()] = len(g.Members)
+	}
+	if len(got) != 2 || got["domain:example.com"] != 2 || got["domain:api.example.com"] != 2 {
+		t.Errorf("same-org surfaces must group 2+2, got %v", got)
+	}
+}
+
+// TestCorrelateUnknownSuffixPolicy pins the unknown-suffix fallback:
+// unlisted suffixes resolve to the last-label heuristic — the registrable
+// domain is the last two labels — which is exactly the old behavior, so
+// unlisted infrastructure fails CLOSED toward the old grouping, never
+// toward a novel split.
+func TestCorrelateUnknownSuffixPolicy(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	hostSig := func(name string) SurfaceAsset {
+		return scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: name},
+			Kind:     asset.KindHost, Hostname: name,
+		})
+	}
+	// A genuinely multi-label unknown suffix merges under the shared
+	// parent, as the old first-label-drop rule did.
+	groups, _ := Correlate([]SurfaceAsset{
+		hostSig("a.b.newtld"),
+		hostSig("c.b.newtld"),
+	})
+	if len(groups) != 1 || groups[0].Anchor.String() != "domain:b.newtld" {
+		anchors := []string{}
+		for _, g := range groups {
+			anchors = append(anchors, g.Anchor.String())
+		}
+		t.Errorf("unknown multi-label suffix must keep old grouping under b.newtld, got %v", anchors)
+	}
+	// Unknown single-label TLDs group by last two labels, as before.
+	groups, _ = Correlate([]SurfaceAsset{
+		hostSig("www.example.newtld"),
+		hostSig("api.example.newtld"),
+	})
+	if len(groups) != 1 || groups[0].Anchor.String() != "domain:example.newtld" {
+		anchors := []string{}
+		for _, g := range groups {
+			anchors = append(anchors, g.Anchor.String())
+		}
+		t.Errorf("unknown TLD must group under example.newtld, got %v", anchors)
+	}
+}
+
+// TestCorrelateShuffledDeterminism pins order stability: every permutation
+// of a mixed shared-infra + same-org + IP-literal input produces
+// bit-for-bit identical group bytes (group IDs/anchors stable across input
+// orders).
+func TestCorrelateShuffledDeterminism(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	build := func() []SurfaceAsset {
+		return []SurfaceAsset{
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindHost, Value: "b.herokuapp.com"},
+				Kind:     asset.KindHost, Hostname: "b.herokuapp.com",
+			}),
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindURL, Value: "https://a.herokuapp.com/a"},
+				Kind:     asset.KindURL, Path: "/a", Hostname: "a.herokuapp.com",
+			}),
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindHost, Value: "api.example.com"},
+				Kind:     asset.KindHost, Hostname: "api.example.com",
+			}),
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindURL, Value: "http://192.0.2.10/a"},
+				Kind:     asset.KindURL, Path: "/a", Hostname: "192.0.2.10",
+			}),
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindHost, Value: "www.example.com"},
+				Kind:     asset.KindHost, Hostname: "www.example.com",
+			}),
+			scored(t, ic, rc, Signal{
+				Identity: asset.Identity{Kind: asset.KindHost, Value: "a.herokuapp.com"},
+				Kind:     asset.KindHost, Hostname: "a.herokuapp.com",
+			}),
+		}
+	}
+	marshal := func(order []SurfaceAsset) string {
+		groups, truncated := Correlate(order)
+		if truncated {
+			t.Fatal("six surfaces under four anchors are under the cap; Truncated must be false")
+		}
+		if len(groups) != 4 {
+			t.Fatalf("groups = %d, want 4 (a/b.herokuapp.com split + example.com + ip): %+v", len(groups), groups)
+		}
+		raw, err := json.Marshal(groups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	base := build()
+	want := marshal(base)
+	// Reversed, rotated, and swapped permutations must all agree.
+	perms := [][]SurfaceAsset{
+		{base[5], base[4], base[3], base[2], base[1], base[0]},
+		{base[2], base[3], base[4], base[5], base[0], base[1]},
+		{base[1], base[0], base[3], base[2], base[5], base[4]},
+		{base[4], base[0], base[5], base[1], base[3], base[2]},
+	}
+	for i, p := range perms {
+		if got := marshal(p); got != want {
+			t.Errorf("permutation %d produces different group bytes:\n got: %s\nwant: %s", i, got, want)
+		}
+	}
+}
+
+// TestCorrelateSharedInfraSplit pins the tenant-split direction of the PSL
+// rule: unrelated tenants under one public suffix anchor alone (one label
+// above the longest matching suffix) instead of merging under the suffix,
+// while same-registrable-domain names keep the parent-domain rule exactly.
 func TestCorrelateSharedInfraSplit(t *testing.T) {
 	ic, rc := testCatalogs(t, corrIndicators()...)
 	hostSig := func(name string) SurfaceAsset {
@@ -469,5 +663,40 @@ func TestCorrelateSharedInfraSplit(t *testing.T) {
 	got = anchors(groups)
 	if len(got) != 1 || got["domain:example.com"] != 2 {
 		t.Errorf("normal domains must still merge under example.com, got %v", got)
+	}
+}
+
+// TestCorrelateDeepTenantChain pins the depth≥4 tenant rule: deep-tenant
+// chains follow the parent rule within the tenant — a.b.c.herokuapp.com
+// anchors at b.c.herokuapp.com, while b.c.herokuapp.com and
+// c.herokuapp.com both anchor at c.herokuapp.com.
+func TestCorrelateDeepTenantChain(t *testing.T) {
+	ic, rc := testCatalogs(t, corrIndicators()...)
+	hostSig := func(name string) SurfaceAsset {
+		return scored(t, ic, rc, Signal{
+			Identity: asset.Identity{Kind: asset.KindHost, Value: name},
+			Kind:     asset.KindHost, Hostname: name,
+		})
+	}
+	groups, truncated := Correlate([]SurfaceAsset{
+		hostSig("a.b.c.herokuapp.com"),
+		hostSig("b.c.herokuapp.com"),
+		hostSig("c.herokuapp.com"),
+	})
+	if truncated {
+		t.Error("three surfaces under two anchors are under the cap; Truncated must be false")
+	}
+	got := map[string]int{}
+	for _, g := range groups {
+		got[g.Anchor.String()] = len(g.Members)
+	}
+	want := map[string]int{"domain:b.c.herokuapp.com": 1, "domain:c.herokuapp.com": 2}
+	if len(got) != len(want) {
+		t.Fatalf("deep-tenant anchors = %v, want %v", got, want)
+	}
+	for k, n := range want {
+		if got[k] != n {
+			t.Errorf("anchor %s holds %d members, want %d (all %v)", k, got[k], n, got)
+		}
 	}
 }

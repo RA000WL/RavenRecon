@@ -2,6 +2,8 @@ package detect
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -254,5 +256,146 @@ func TestRunJavaScriptObservationInvalidatesCache(t *testing.T) {
 	run(changed)
 	if atomic.LoadInt32(&executions) != 2 {
 		t.Fatalf("a changed observed status code must invalidate the cached result: %d executions", executions)
+	}
+}
+
+// priorTestFinding builds one synthetic prior finding for the prior-digest
+// units: a fixed subject per index, pinned timestamps, and caller-supplied
+// confidence and metadata. All values are synthetic and hermetic.
+func priorTestFinding(t testing.TB, ruleID string, subjectIdx int, confidence float64, meta map[string]string) asset.Finding {
+	t.Helper()
+	subjects := []string{"https://example.com/a", "https://example.com/b"}
+	u, err := asset.ParseURL(subjects[subjectIdx%len(subjects)], asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	ev, err := asset.NewEvidence(asset.MethodDetection, ruleID, "synthetic prior signal",
+		u.Identity(), asset.Provenance{Source: "test"})
+	if err != nil {
+		t.Fatalf("NewEvidence: %v", err)
+	}
+	at := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	f, err := asset.NewFinding(asset.Finding{
+		RuleID:     ruleID,
+		RuleName:   "Prior " + ruleID,
+		Category:   CategoryInformation.String(),
+		Subject:    u.Identity(),
+		Confidence: confidence,
+		Evidence:   []asset.Evidence{ev},
+		Metadata:   meta,
+		Priority:   PriorityMedium.String(),
+		Status:     StatusOpen.String(),
+		Created:    at,
+	})
+	if err != nil {
+		t.Fatalf("NewFinding: %v", err)
+	}
+	return f
+}
+
+// priorTestBase returns two deterministic synthetic priors: one carrying a
+// takeover-style confirmation citation, one plain.
+func priorTestBase(t testing.TB) []asset.Finding {
+	t.Helper()
+	return []asset.Finding{
+		priorTestFinding(t, "takeover.test.unclaimed", 0, 0.6, map[string]string{
+			"signal": "takeover_cname_unclaimed", "provider": "github.io",
+		}),
+		priorTestFinding(t, "takeover.test.enrich", 1, 0.7, map[string]string{
+			"signal": "takeover_cname_provider_confirmed", "confirmed": "false",
+		}),
+	}
+}
+
+// copyPriors deep-copies the slice and each finding's metadata map so a
+// mutation in one case can never leak into the next.
+func copyPriors(priors []asset.Finding) []asset.Finding {
+	out := make([]asset.Finding, len(priors))
+	for i, f := range priors {
+		out[i] = f
+		if f.Metadata != nil {
+			m := make(map[string]string, len(f.Metadata))
+			for k, v := range f.Metadata {
+				m[k] = v
+			}
+			out[i].Metadata = m
+		}
+	}
+	return out
+}
+
+// TestPriorDigestOrderInvariance pins T4: the prior digest is a function of
+// the judgment multiset, never of input order — and the empty set still
+// hashes to SHA-256 of an empty JSON array, the same empty path as before.
+func TestPriorDigestOrderInvariance(t *testing.T) {
+	base := priorTestBase(t)
+	forward := fingerprintPriorFindings(base)
+	reversed := fingerprintPriorFindings([]asset.Finding{base[1], base[0]})
+	if forward == "" || reversed == "" {
+		t.Fatalf("prior digest must be non-empty")
+	}
+	if forward != reversed {
+		t.Fatalf("prior digest must be order-invariant")
+	}
+
+	emptySum := sha256.Sum256([]byte("[]"))
+	wantEmpty := hex.EncodeToString(emptySum[:])
+	for _, priors := range [][]asset.Finding{nil, {}, {}} {
+		if got := fingerprintPriorFindings(priors); got != wantEmpty {
+			t.Fatalf("empty priors must hash to the empty-array path, got %q want %q", got, wantEmpty)
+		}
+	}
+	if forward == wantEmpty {
+		t.Fatalf("non-empty priors must not collide with the empty digest")
+	}
+}
+
+// TestPriorDigestExcludesTimestamps pins T6: Created/Updated-only edits are
+// wall-clock echo, not judgment changes — they must not move the digest.
+func TestPriorDigestExcludesTimestamps(t *testing.T) {
+	base := priorTestBase(t)
+	want := fingerprintPriorFindings(base)
+
+	shifted := copyPriors(base)
+	shifted[0].Created = shifted[0].Created.Add(time.Hour)
+	shifted[0].Updated = shifted[0].Updated.Add(2 * time.Hour)
+	shifted[1].Created = shifted[1].Created.Add(-time.Hour)
+	shifted[1].Updated = shifted[1].Updated.Add(3 * time.Hour)
+	if got := fingerprintPriorFindings(shifted); got != want {
+		t.Fatalf("Created/Updated-only diff must not change the prior digest")
+	}
+}
+
+// TestPriorDigestCoversJudgment pins T7: any judgment change a dependent
+// reasons over — a metadata value edit, a confirmation flip, or a
+// confidence change — must move the digest, or the dependent would be
+// served stale warm.
+func TestPriorDigestCoversJudgment(t *testing.T) {
+	base := priorTestBase(t)
+	want := fingerprintPriorFindings(base)
+
+	cases := []struct {
+		name   string
+		mutate func([]asset.Finding)
+	}{
+		{"metadata single-key edit", func(p []asset.Finding) {
+			p[0].Metadata["provider"] = "s3"
+		}},
+		{"confirmed flip", func(p []asset.Finding) {
+			p[1].Metadata["confirmed"] = "true"
+		}},
+		{"confidence change", func(p []asset.Finding) {
+			p[0].Confidence = 0.9
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := copyPriors(base)
+			tc.mutate(v)
+			if got := fingerprintPriorFindings(v); got == want {
+				t.Fatalf("prior digest must change when %s", tc.name)
+			}
+		})
 	}
 }

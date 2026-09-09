@@ -3,7 +3,6 @@ package apis
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/RA000WL/RavenRecon/internal/asset"
@@ -32,12 +31,7 @@ func restIDORIndicatorDetector(ctx context.Context, dctx *detect.Context) ([]ass
 			}
 		}
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
-	}
+	subjects, dropped := capSubjects(subjects, nil)
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
@@ -71,6 +65,37 @@ func hasIDORSegment(path string) bool {
 		}
 	}
 	return false
+}
+
+// Exported Rule 2 shared symbols (review fix): thin wrappers over the
+// unexported predicates above — zero behavior change to this pack. The
+// authz path-object rule derives its per-endpoint token set from the SAME
+// symbols (single implementation, drift class eliminated) instead of a
+// forked copy. HasIDORSegment is the boolean gate; IDORSegments returns
+// the qualifying tokens lowercased for deterministic cross-endpoint
+// comparison (UUID hex is case-insensitive; numerics are unaffected).
+func HasIDORSegment(path string) bool { return hasIDORSegment(path) }
+
+// IsNumericSegment reports whether s is a qualifying numeric object id:
+// all digits, excluding year-shaped 4-digit 1900-2100 and short
+// pagination (1-2 digits).
+func IsNumericSegment(s string) bool { return isNumericSegment(s) }
+
+// IsUUIDSegment reports whether s is a hyphenated 8-4-4-4-12 hex UUID.
+func IsUUIDSegment(s string) bool { return isUUIDSegment(s) }
+
+// IDORSegments returns the qualifying IDOR tokens in path, lowercased.
+func IDORSegments(path string) []string {
+	var out []string
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "" {
+			continue
+		}
+		if isNumericSegment(seg) || isUUIDSegment(seg) {
+			out = append(out, strings.ToLower(seg))
+		}
+	}
+	return out
 }
 
 func isNumericSegment(s string) bool {

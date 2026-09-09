@@ -32,7 +32,16 @@ import (
 // identities). Old detect.rule records with version 2 are decode-rejected
 // by construction (see decodeStoredFindings), and old keys are unreachable
 // via the schema part. See api.go SDK v2 reopening note.
-const SchemaVersion = 3
+//
+// Version 4 (NEW-145 Slice 1): fingerprintPriorFindings folds the full
+// sorted prior metadata map and confidence into the prior digest alongside
+// the finding identity (previously identity-only), so a metadata-only prior
+// edit invalidates dependent rule results instead of serving them stale
+// warm. graphDigest's signature is unchanged — only the prior hash it
+// combines changed — and no rule version bumps were needed. Old version-3
+// records are decode-rejected by construction (see decodeStoredFindings),
+// and old keys are unreachable via the schema part.
+const SchemaVersion = 4
 
 // Operation is the stable cache operation name for rule results.
 const Operation = "detect.rule"
@@ -265,16 +274,72 @@ func fingerprintGraph(rels []asset.Relationship) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// fingerprintPriorFindings returns the stable hex SHA-256 of the deterministically
-// sorted PriorFindings identity set. Findings are sorted by Finding.Identity()
-// (the same order Report uses). Empty yields SHA-256 of an empty JSON array.
+// fingerprintPriorMeta is one sorted metadata entry of a prior finding in
+// the prior digest: the map's keys in lexicographic order, so the digest
+// can never depend on Go map iteration order.
+type fingerprintPriorMeta struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// fingerprintPrior is the canonical per-finding form the prior digest
+// covers: the finding identity (ruleID@subject, the same order Report
+// uses), the rule's confidence in the judgment, and the FULL sorted
+// metadata map.
+//
+// Deliberately EXCLUDED, each for cache-coherence reasons:
+//
+//   - Created/Updated: wall-clock observation timestamps that change every
+//     run while the judgment is identical; including them would bust every
+//     dependent's cache on every run for zero difference.
+//   - Truncated: an output-completeness marker owned by MergeFindings
+//     retention accounting (which bounded-list entries were cut), not a
+//     judgment input a dependent rule reasons over.
+//   - Evidence: the full cited evidence records embed per-run provenance
+//     timestamps and observation detail of the prior rule's OWN inputs; the
+//     dependent observes the prior's judgment (identity, confidence,
+//     metadata), not the evidence behind it — including them would both
+//     bust the cache on every run and double-count the prior rule's inputs.
+//   - RelatedAssets: the prior's cited related-asset references are part of
+//     that rule's own graph citation, already covered by the snapshot
+//     fingerprint's asset/relationship domains that enter the same key;
+//     re-entering them here would double-count inputs the dependent's own
+//     snapshot key already covers.
+//   - Relationships: the prior's typed edges are latent-only (no producer
+//     sets them today), excluded like RelatedAssets for the same reason.
+type fingerprintPrior struct {
+	Identity   string                 `json:"id"`
+	Confidence float64                `json:"confidence"`
+	Metadata   []fingerprintPriorMeta `json:"metadata,omitempty"`
+}
+
+// fingerprintPriorFindings returns the stable hex SHA-256 of the
+// deterministically sorted PriorFindings judgment set. Each finding enters
+// by its canonical JSON form (identity, confidence, full sorted metadata);
+// the forms are byte-sorted before hashing, so the digest is a total
+// deterministic function of the multiset — input order can never change it.
+// Empty yields SHA-256 of an empty JSON array (the same empty path as the
+// previous identity-only form, so empty-vs-empty keys are stable).
 func fingerprintPriorFindings(findings []asset.Finding) string {
-	ids := make([]string, 0, len(findings))
+	forms := make([]string, 0, len(findings))
 	for _, f := range findings {
-		ids = append(ids, f.Identity().String())
+		meta := make([]fingerprintPriorMeta, 0, len(f.Metadata))
+		for k, v := range f.Metadata {
+			meta = append(meta, fingerprintPriorMeta{Key: k, Value: v})
+		}
+		sort.Slice(meta, func(i, j int) bool { return meta[i].Key < meta[j].Key })
+		buf, err := json.Marshal(fingerprintPrior{
+			Identity:   f.Identity().String(),
+			Confidence: f.Confidence,
+			Metadata:   meta,
+		})
+		if err != nil {
+			return ""
+		}
+		forms = append(forms, string(buf))
 	}
-	sort.Strings(ids)
-	buf, err := json.Marshal(ids)
+	sort.Strings(forms)
+	buf, err := json.Marshal(forms)
 	if err != nil {
 		return ""
 	}
@@ -348,7 +413,7 @@ func fingerprintRule(r Rule) string {
 //
 //   - the operation constant "detect.rule" and the cache schema version
 //     (inside every cache key by construction);
-//   - the detect SchemaVersion (3 today — old 2 records are unreachable and
+//   - the detect SchemaVersion (4 today — old 3 records are unreachable and
 //     decode-rejected);
 //   - the rule identity: the rule ID (the target) plus the fingerprint of
 //     the rule's full declared metadata, including its version — any edit
@@ -357,7 +422,8 @@ func fingerprintRule(r Rule) string {
 //     including GraphDigest);
 //   - the graph_digest — the stable hash of the read-only GraphView edge
 //     set plus the digest of PriorFindings (deterministically sorted
-//     finding identities) visible to this rule's level. A rule whose prior
+//     finding judgments: identity, confidence, and full sorted metadata)
+//     visible to this rule's level. A rule whose prior
 //     findings change (because a dependency's findings changed) gets a
 //     different graph_digest and misses the cache, so cross-rule reasoning
 //     stays coherent. The part is unconditional — it always enters the key,

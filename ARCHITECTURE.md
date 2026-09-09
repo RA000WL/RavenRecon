@@ -26,7 +26,7 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Cache and resume — concurrency model | 377-393 | bounded cache access under the runtime pool |
 | Cache and resume — instrumentation | 394-427 | observer option: exactly one canonical hit/miss event per Get |
 | Runtime engine | 428-506 | bounded pool, central rate limiter, cancellation/shutdown, observer bridge; cache-independent |
-| Passive discovery | 507-736 | subfinder/assetfinder/amass adapters, tool detection, merge, cache-before-execute |
+| Passive discovery | 507-736 | subfinder/assetfinder/amass/chaos default adapters + opt-in crtsh/asnmap, tool detection, merge, cache-before-execute |
 | DNS pipeline | 737-923 | A/AAAA/CNAME resolution into typed observations; library only |
 | HTTP probing | 924-1264 | root-path probes, TLS metadata capture, observations/relationships; library only |
 | URL intelligence | 1265-1477 | canonical-URL streaming, parameter extraction, endpoint classification; gau/waybackurls/waymore |
@@ -35,7 +35,7 @@ edit shifts them, re-grep the `^#` headings and refresh the table.
 | Secret intelligence | 1879-2105 | evidence & secret-candidate engine: patterns, entropy, context, correlation |
 | Priority engine | 2106-2308 | scoring catalogs, correlation, attack paths, recommendations |
 | Detection framework | 2309-2895 | Finding model, rule registration, dependency scheduling, execution, metrics; v2.0 built-in packs (`internal/detect/packs/<family>`) incl. triage 8-rule table + per-rule triage details |
-| Detection framework — SDK contract | 2529-2804 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs incl. triage (LoadTriagePack, AllPacks 22) |
+| Detection framework — SDK contract | 2529-2804 | v1.2.5 frozen rule-author SDK (API 1.0): lifecycle, rule/finding contracts, pack story + v2.0 built-in packs incl. triage (LoadTriagePack, AllPacks: loader wires 8 packs / 29 rules; 35 rules across 10 packs on disk) |
 | Detection framework — SDK stability policy | 2805-2895 | versioning contract, reopening criteria |
 | Reporting framework | 2896-3086 | report model, JSON/CSV/Markdown/HTML exporters, summaries, atomic writes; per-render Model clone (`cloneModel`) |
 | Event bus | 3087-3231 | canonical event model + bounded non-blocking bus; observer-only |
@@ -507,15 +507,17 @@ cancellation, rate limiting, and event plumbing every stage needs.
 ## Passive discovery
 
 `internal/discovery` (roadmap v0.5) is the runtime's first consumer: passive
-subdomain enumeration through three external tools — subfinder, assetfinder,
-and amass. It was implemented with the phase requirements below.
+subdomain enumeration through four default sources — subfinder, assetfinder,
+amass, and chaos — plus opt-in crtsh (certificate transparency) and asnmap
+via `--sources` (never in the default set). It was implemented with the phase requirements below.
 
 ### Adapter architecture
 
 Every tool is isolated behind the `Source` interface (`Name`, `Detect`,
 `Discover`); the core pipeline contains no `if tool ==` branching. Tool
 differences — flag assembly, detection strategy, name — live inside the
-adapters (`subfinder.go`, `assetfinder.go`, `amass.go`); execution and
+adapters (`subfinder.go`, `assetfinder.go`, `amass.go`, `chaos.go`,
+`crtsh.go`, `asn.go`); execution and
 parsing are shared (`runner.go`, `parse.go`). The pipeline acts only on the
 interface, so a new tool is a new adapter file plus a registry entry.
 
@@ -580,12 +582,42 @@ the adapter tests so the boundary cannot silently drift:
 subfinder:   subfinder -d <domain> -silent
 assetfinder: assetfinder <domain>
 amass:       amass enum -passive -d <domain>
+chaos:       chaos -d <domain> -silent -json       (requires PDCP_API_KEY; skipped when unkeyed)
+asnmap:      asnmap -d <domain> -silent            (opt-in: named explicitly in --sources, never default)
+crtsh:       GET https://crt.sh/?q=%25.<domain>&output=json   (opt-in: named explicitly in --sources, never default)
 ```
 
 amass's default active enumeration, its intel mode, and its brute-force mode
 are never reachable from RavenRecon. Tools that support their own internal
 rate/throttle settings use their defaults; RavenRecon never passes active or
 aggressive options.
+
+### crt.sh certificate transparency (opt-in)
+
+`crtsh` (`crtsh.go`) queries the crt.sh Certificate Transparency search
+endpoint instead of executing a binary:
+
+```text
+GET https://crt.sh/?q=%25.<domain>&output=json   (Accept: application/json)
+```
+
+The `%` is crt.sh's wildcard idiom: one request returns every certificate
+logged for the domain and its subdomains. Each `name_value` may hold several
+newline-separated names and a `*.` wildcard prefix; candidates are stripped,
+split into lines, normalized only through `parseHostLines` (the same path as
+the runner-backed sources), and filtered to in-domain names. Both bounds are
+fixed constants: the response body is capped at 1 MiB (`crtshMaxBody` —
+larger bodies truncate with `Truncated`) and the whole HTTP exchange at 30 s
+(`crtshClientTimeout`), with the caller's context applying pipeline
+cancellation and stage deadlines on top. crt.sh exposes no version, so
+detection is static (`Exists:true`, `StatusOK`, no executable required —
+reachability is proven at `Discover` time) and binds the synthetic stable
+cache identity `crtsh-json-v1` (`crtshVersion`: bump it when the endpoint,
+query shape, consumed fields, or filtering change). The source is opt-in:
+the default set is `builtInNames()` (subfinder, assetfinder, amass, chaos)
+and `crtsh` — like `asnmap` — runs only when named explicitly in
+`--sources` (`resolveSourceNames`: an empty selection resolves to the
+default four; any registry name may be selected explicitly).
 
 ### Parsing, normalization, and deduplication
 
@@ -704,14 +736,46 @@ so no discovery-specific configuration is required.
 the Phase 2 asset model, runs pooled discovery (caching only if enabled in
 configuration), and prints per-source detection `[OK]`/`[WARN]`/`[MISSING]`
 states with reasons, per-source outcomes, hosts with provenance, and the
-merged unique-host list. Options (after the domain): `--sources <a,b>` and
-`--no-cache`. The doctor command prints the same per-source detection states
+merged unique-host list. Options (after the domain): `--sources <a,b>`,
+`--output <file>`, and `--no-cache`. The doctor command prints the same per-source detection states
 through the shared `DetectAll` implementation. Help text documents exactly
 these behaviors. Ctrl-C or SIGTERM cancels a discover run gracefully: the
 partial report is still printed and the command exits 1 with a
 `run interrupted` error (a per-source cancelled outcome caused by a job
 deadline does not change the exit code); a second signal force-exits
 immediately with status 130 (128+SIGINT).
+
+### Streaming output (NEW-138)
+
+`ravenrecon discover` streams hosts as found instead of end-buffering: each
+executed source's hosts emit as one JSON line per host (`HostEvent.Line`,
+exactly the keys `host`, `source`, `discovered_at` in RFC 3339 UTC, `status`,
+`cached`) as that source's job finalizes, from the same finalization point
+as the stderr per-source completion line — streaming rides the existing
+merge path and never bypasses pool bounds (no new goroutines, no queues; the
+callback contract is thread-safe and non-blocking, exactly like `OnSource`).
+The stream contract, pinned by tests:
+
+- Arrival order: the stream reflects job-completion order, which is
+  non-deterministic across runs at concurrency > 1. The merged summary
+  stays sorted, deduplicated, and deterministic.
+- Repeats: a host seen by N sources streams N times (once per observing
+  source, with that source's attribution). The final merge dedups by Phase 2
+  identity as before.
+- Provisional: events are pre-quality-gate; the returned report is
+  authoritative.
+- Backpressure: the callback runs synchronously on the finalizing worker,
+  so a blocked write delays that worker, and pool Shutdown joins workers
+  even on the forced path — a non-interruptible write can delay Shutdown
+  past its drain budget. Bounded O(line) fail-fast writes keep this a
+  pathological-filesystems-only case; a second signal still force-exits
+  immediately.
+- Routing: without `--output` the stream prints to stdout ahead of the
+  (byte-identical) summary; with `--output <file>` the file carries ONLY the
+  stream (created or truncated up front, so a bad path fails before any tool
+  runs — never the summary), and stdout prints the summary only. A run error
+  still returns after the stream closes, so a partial stream is retained,
+  never silently completed.
 
 ### Known limitations
 
@@ -1056,6 +1120,25 @@ probe with `TLS=true`, every bounded field must be within its cap, and the
 embedded certificate asset re-validates through the Phase 2 builders. A
 violating record is refused, deleted, and recomputed by the self-healing
 path — never served.
+
+### SAN→target feedback (NEW-136)
+
+TLS SAN DNS names are observations, but a host named only on a
+certificate never enters the discovery corpus — so the pipeline feeds
+them back as probe targets: `httpprobe.SynthesizeSANProbeTargets` (pure,
+no network) keeps names that parse as canonical `asset.Host`s, are
+in-domain per `asset.InDomain`, and are not already known, skipping
+wildcards without expansion (a wildcard names no probed host; apex
+synthesis would be guessing) and counting every drop by cause; the
+sorted survivors are capped at 16 per run. The httpprobe adapter probes
+them only under the dedicated `probe_san` knob (default OFF — active
+probing is an explicit traffic budget, unlike the default-ON passive
+`tls_san_expansion` inventory) through a second engine call with the
+identical config — same pool shape, per-request budgets, and
+URL-identity cache keys with the session digest bound — merging both
+reports deterministically, refolding the outcome over the union, and
+marking a synthesis cut with `httpprobe_san_targets_truncated` +
+`Truncated`. Exactly one feedback round runs, so the phase cannot chain.
 
 ### Relationship mapping
 
@@ -2297,10 +2380,33 @@ score   = 1 − ∏(1 − w_g)        over groups g
 w_g     = min(cap_g, 1 − ∏(1 − w_f))   over group g's factors f
 cap_g   = 0.6 per indicator category; 0.5 for the confidence group
 level   = gated: high ≥ 0.8 AND ≥ 2 indicator categories, OR ≥ 0.8 with
-          1 category backed by recorded ≥ 0.9 secret/technology detection
-          (single-structural-high escape); medium ≥ 0.5 AND ≥ 1;
-          low ≥ 0.2; else unknown
+          1 category backed by a structural-backed recorded ≥ 0.9
+          secret/technology detection (single-structural-high escape);
+          medium ≥ 0.5 AND ≥ 1; low ≥ 0.2; else unknown
 ```
+
+The escape's "structural" is an explicit emitting-phase attestation, not
+a second scoring judgment: each technology/secret signal carries a
+`Structural` bit meaning the detection was backed by non-spoofable
+evidence — the inversion of that phase's own spoofable-only
+determination (techintel's structural-tier backing, secrentel's
+attributed shape with supporting factors) — and the bit rides its
+confidence factor into the level gate without entering the score, so
+attested and unattested signals with equal confidences score
+bit-for-bit identically while only attested ones can page. Confidence
+alone never promotes; pre-attestation cache records that claimed the
+old confidence-only high fail decode re-gating and are evicted and
+recomputed, never served. The escape is live end to end: the pipeline
+adapter threads the attestation by inverting the engines' own caps — a
+technology scoring strictly above 0.59 (past techintel's spoofable-only
+cap, so structurally backed) and a secret candidate whose type carries at
+least one structured pattern in the emitting phase's database
+(`structuredSecretType` in `internal/pipeline/adapt/priority.go`) scoring
+strictly above 0.59 (past secrentel's structured zero-support cap, so an
+attributed shape with supporting factors) attest; every other type —
+generic, bearer, the purely-contextual types, public_key, custom_token,
+and any unclassified future type — never attests, and everything else
+stays fail-closed unattested.
 
 The single composition point (`compose`) is shared by surface scoring,
 the correlation aggregate, and cache decode re-validation, so every
@@ -2314,12 +2420,19 @@ normalization: URL, endpoint, JavaScript, and source-map identities
 re-parse through `asset.ParseURL` (endpoints drop their `"METHOD "`
 prefix, the shape `asset.Endpoint` itself defines) to the canonical
 host; the host canonicalizes through `asset.NewHost` (or `asset.NewIP`
-for address literals); a name with three or more labels anchors at its
-first-label-dropped parent (re-validated through `asset.NewDomain`),
-shorter names at themselves — except under a curated multi-tenant suffix
-(herokuapp.com, s3.amazonaws.com, github.io, …): there the anchor is one
-label above the shared suffix, so unrelated tenants never merge into one
-group; IP surfaces anchor at themselves; anything
+for address literals); a name anchors at the longer (by label count, ties
+to the registrable domain) of its first-label-dropped parent and its
+registrable domain (effective TLD+1 per a minimal embedded public-suffix
+table — exact-match multi-label suffixes only, stdlib-only, no
+`golang.org/x/net/publicsuffix` import: the former curated hosting
+suffixes plus common multi-label suffixes such as co.uk; unknown suffixes
+fall back to the last-label heuristic, i.e. the old grouping, failing
+closed toward merge rather than a novel split). Within one registrable
+domain this is exactly the old parent rule; across registrable domains
+under one public suffix (a.herokuapp.com vs b.herokuapp.com, foo.co.uk vs
+bar.co.uk) tenants anchor apart — Correlate sees identity values only, no
+resolved-IP sets, so different registrable domains always split (disjoint
+IPs assumed); IP surfaces anchor at themselves; anything
 that does not re-canonicalize forms an honest singleton group at its own
 identity. A group's aggregate score recomputes through `compose` over
 the UNION of its retained members' factors — repeated indicators
@@ -2596,6 +2709,15 @@ injected Clock produce identical reports (pinned by test) — including
 above the findings cap: retention keeps the deterministic top by finding
 rank (confidence, then category/priority/rule/subject), so re-runs keep
 identical findings regardless of rule completion order.
+The same contract governs the per-rule 256-subject emission caps inside
+the built-in packs (NEW-135): an over-cap detector keeps the
+highest-score subjects — score descending, then subject identity ascending
+(single-detector invocation, so the rule is fixed; single-score detectors
+reduce to the identity-ordered head) — and every
+retained finding carries subjects_dropped + truncated metadata with a
+LevelWarn log, never silent. The 256/4096 bounds themselves are
+unchanged; over-cap fixtures produce byte-identical retained sets across
+runs and across input orders (pinned by test).
 Execution timings live in Metrics, never the Report.
 
 The output contract (enforced identically for fresh and cache-served
@@ -2880,8 +3002,9 @@ examples pack proved: its `Rules()` entry point begins with
 startup and a late registration attempt fails. The pipeline seam
 (`internal/pipeline/adapt/detect.go`) owns that sequence per pack
 (`LoadWebPack`, `LoadJsPack`, `LoadApisPack`, `LoadCloudPack`, `LoadTriagePack`) and composes
-them into the detect stage (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`, 22 rules total;
-`AllStages()` stays at 12). The framework package itself remains
+them into the detect stage (`LoadTriagePack`, `NewDetectStageWithTriagePack`, `NewDetectStageWithAllPacks`, 29 rules total
+across the eight pipeline-wired packs — web (5), js (3), apis (3), cloud (3), triage (8), takeover (4), authz (2), bizlogic (1) — dnsrec (5) and auth (1) ship alongside with no pipeline loader and stay
+unwired, 35 rules across ten packs; `AllStages()` stays at 12). The framework package itself remains
 rule-free — the compiler still enforces that a pack can use only what
 `internal/detect` exports.
 
@@ -2938,13 +3061,21 @@ shape without new asset kinds or SDK surface; `LoadTakeoverPack` /
   marker — a flagged param the probe saw return), `RequiredAssetTypes`
   endpoint-gated, stdlib-only, <100 lines per detector
   (`extractParamNames`); deterministic fixtures and `triage_report.golden`.
-- **Takeover** (`internal/detect/packs/takeover`, v2.1 Batch 1) — 3
-  informational recon rules: `takeover.cname.unclaimed` (dangling CNAME to
+- **Takeover** (`internal/detect/packs/takeover`, v2.1 Batch 1; NEW-143
+  enrichment) — 4 informational recon rules: `takeover.cname.unclaimed`
+  (dangling CNAME to
   curated unclaimed provider suffix — github.io, herokuapp.com, amazonaws.com,
   azurewebsites.net, cloudfront.net, etc — with no A/AAAA for the target at
   depth 1), `takeover.cname.dangling` (generic dangling CNAME excluding
   provider-matched hosts), `takeover.s3.bucket` (S3 bucket endpoint shape
-  via endpoint host `.s3.amazonaws.com`); per-host/per-endpoint, Category
+  via endpoint host `.s3.amazonaws.com`), plus `takeover.cname.provider-confirmed`
+  (v1.0.0, `Deps [takeover.cname.unclaimed]`): per-host corroboration of a
+  completed unclaimed sibling finding with the observed host→CNAME graph edge
+  to the curated suffix table (`PriorFindings` + `GraphView.Neighbors` only,
+  fail-open) — a SECOND finding, never a mutation of the unclaimed identity;
+  `ravenrecon diff` projects takeover findings per (rule, provider) in its
+  summary/markdown/JSON bloom (`internal/diff/takeover.go`, nil when neither
+  side tracks takeover); per-host/per-endpoint, Category
   Information, PriorityInfo, confidence 0.6, MethodDetection, RequiredAssetTypes
   host/endpoint-gated, bounded at 256, stdlib-only, <100 lines per detector,
   hermetic fixtures, and `takeover_report.golden`. FP/FN harness for triage
@@ -2952,6 +3083,51 @@ shape without new asset kinds or SDK surface; `LoadTakeoverPack` /
   hosts, rate <1%) lives in `triage_fp_test.go` beside the pack (chosen over
   top-level fixtures/triage-fp for co-location/hermetic/golden-parity
   reasons); no regression on existing triage golden byte-stability.
+- **AuthZ** (`internal/detect/packs/authz`, NEW-142 Task 1 — first honest
+  SDK v2 consumer beyond the auth demo probe) — 1 rule:
+  `authz.idor.insecure-direct-object` (Category authorization, v1.0.0,
+  `Deps [triage.idor]`): correlates triage.idor priors across hosts through
+  the read-only views only (`PriorFindings` for the flagged `params` +
+  `all_classes` idor-token precedence-shadow recovery, `GraphView.Neighbors`
+  for host→technology auth attribution — no `Neighbors(kind,id)`/`EdgesFrom`
+  surface exists or is used), emitting one `candidate-surface` finding per
+  unauthenticated endpoint that shares a triage-flagged param with an
+  authenticated peer on a different host of the same domain. Auth sides come
+  from observed signals only — A1 authentication-category technologies plus
+  the A2 cookie/header indicator universe pinned from
+  `techintel/fingerprints/auth.go` (TLS-CN forms an explicit cut); endpoint
+  URLs are never mined (triage-flagged params only). Priority medium /
+  confidence 0.7 when reflection evidence backs a flagged param, else info /
+   0.5 — never high, never an exploitability claim (§0.1); bounded at 256
+    with the same completed+metadata carve-out; hermetic fixtures and
+   `authz_report.golden`. Rule 2 `authz.idor.path-object` (Category
+   authorization, v1.0.0, `Deps [api.rest.idor-indicator]`) mirrors the
+   same divergence pairing with the shared numeric/UUID path-segment value
+   replacing the query-param token (year/pagination exclusions pinned from
+   the apis semantics), fixed info/0.5 — never medium.
+- **BizLogic** (`internal/detect/packs/bizlogic`, NEW-144 Rule 1) — 1 rule:
+  `bizlogic.workflow.state-transition` (Category business_logic, v1.0.0,
+  `Deps [authz.idor.insecure-direct-object]` — minimal gating: triage T1
+  token signals and apis/web class signals read opportunistically from
+  `PriorFindings`, never declared): correlates same-host endpoints sharing
+  one triage-flagged IDOR param (T1 `triage.idor` plus `all_classes`
+  idor-token precedence-shadow recovery, confirmed present in each step's
+  own query — endpoint URLs never mined) through the read-only views only
+   (`GraphView.Path` host⇝step per step — Path-only co-reachability;
+   JavaScript-hub correlation needs an SDK reverse lookup, step →
+   referencing scripts, deferred, never improvised — exact-host T2, never
+   cross-host), emitting one `candidate-flow` finding per (host, token) step
+   set with an authz IDOR member, dissimilar method+path pairs (GET+POST
+   on one path still counts as two steps; pagination twins collapse and
+   stay quiet), and uniform API grade (graphql-rest mixes stay
+  quiet). Subject is the identity-smallest step; peers ride metadata
+  (`flow_steps` csv sorted ≤256B or the flow is skipped, `flow_len`,
+  `shared_token`, `host`, `edge_basis=correlated-not-traversed`,
+  `authz_member`, `triage_rule`, `verdict=candidate-flow`). Info only —
+  confidence 0.5 (2-step) / 0.6 (3+ steps), never medium+ (§0.1); bounded
+  at 256 with the same completed+metadata carve-out; flows over 8 steps
+  are skipped (documented, never truncated); hermetic fixtures and
+  `bizlogic_report.golden`.
 
 Every pack ships the same hermetic test contract (13 tests each for web/js/apis/cloud; triage extends it with per-class emission, precedence, multi-param, cache parity, determinism golden `triage_report.golden`; takeover adds 3-rule contract with cname/s3 goldens):
 CheckAPIVersion gate, loads-through-SDK with deep-copy + Seal,
@@ -3792,8 +3968,8 @@ Implemented:
   per-rule deadlines with panic isolation, the fixed detection Context
   (since 7956f0d each rule receives its OWN Context copy via `cloneContextForRule` — `slices.Clone`/`maps.Clone` — so a buggy rule cannot leak mutations into sibling rules), a `detect.rule` cache-before-execute record with strict decode
   re-validation, execution metrics, and detector benchmarking
-  (`internal/detect`; framework ships 5 packs via frozen SDK — web, js, apis, cloud, triage (5 packs, 22 rules) under `internal/detect/packs/<family>` and
-  enter only through the frozen SDK `Rules()` → `CheckAPIVersion(2,0)` → `ValidateRule` → `Register` → `Seal`; see "Built-in packs (v2.0)" above)
+    (`internal/detect`; framework ships 10 packs (35 rules) via frozen SDK — web (5), js (3), apis (3), cloud (3), triage (8), takeover (4), dnsrec (5), auth (1), authz (2), bizlogic (1) under `internal/detect/packs/<family>` and
+   enter only through the frozen SDK `Rules()` → `CheckAPIVersion(2,0)` → `ValidateRule` → `Register` → `Seal` (the pipeline `NewDetectStageWithAllPacks` loader wires 8 packs, 29 rules — dnsrec and auth stay unwired); see "Built-in packs (v2.0)" above)
 * event bus (see "Event bus" above; roadmap v1.2): the canonical runtime
   event model and the concurrent, bounded, non-blocking bus — typed,
   validated, clock-stamped events with sealed payloads, per-subscriber

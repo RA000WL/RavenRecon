@@ -3,6 +3,7 @@ package js
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -655,4 +656,41 @@ func TestJSPackConfigDeterministic(t *testing.T) {
 		t.Fatalf("same config should be cache hit")
 	}
 	_ = repCold
+}
+
+// TestCapCandidatesContract pins the pack's NEW-135 cap helper: exact
+// duplicates collapse before the cap (10 dupes over 300 distinct still
+// drop only the 44 distinct overflow), the 256 kept candidates are in
+// (subject, offset) order for any input order, and under-cap input (after
+// dedup) passes through with zero dropped.
+func TestCapCandidatesContract(t *testing.T) {
+	var cands []jsCandidate
+	for i := 0; i < 300; i++ {
+		cands = append(cands, jsCandidate{
+			subject: asset.Identity{Kind: asset.KindJavaScript, Value: fmt.Sprintf("https://www.example.com/f-%03d.js", i)},
+			offset:  int64(i % 7),
+		})
+	}
+	duped := append([]jsCandidate(nil), cands...)
+	duped = append(duped, cands[:10]...)
+	for i, j := 0, len(duped)-1; i < j; i, j = i+1, j-1 {
+		duped[i], duped[j] = duped[j], duped[i]
+	}
+	kept, dropped := capCandidates(duped)
+	if len(kept) != 256 || dropped != 44 {
+		t.Fatalf("kept %d dropped %d, want 256/44", len(kept), dropped)
+	}
+	for i := 1; i < len(kept); i++ {
+		prev, cur := kept[i-1], kept[i]
+		if prev.subject.String() > cur.subject.String() ||
+			(prev.subject == cur.subject && prev.offset >= cur.offset) {
+			t.Fatalf("kept candidates not in (subject, offset) order at %d", i)
+		}
+	}
+	small := append([]jsCandidate(nil), cands[:200]...)
+	small = append(small, cands[:50]...)
+	kept, dropped = capCandidates(small)
+	if len(kept) != 200 || dropped != 0 {
+		t.Fatalf("under-cap kept %d dropped %d, want 200/0", len(kept), dropped)
+	}
 }

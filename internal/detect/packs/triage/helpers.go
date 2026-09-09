@@ -400,6 +400,30 @@ func reflectBacked(params []string, verdicts, postVerdicts map[string]string) bo
 	return false
 }
 
+// capSubjects retains at most 256 subjects under the NEW-135 score-ordered
+// truncation contract: score descending, then subject identity ascending
+// (single-detector invocation, so the rule is fixed; nil scorer ⇒ pure
+// identity order, byte-identical to the pre-NEW-135 prefix cut). It returns the
+// kept subjects and the dropped count (0 when under the bound); callers
+// surface a nonzero dropped via subjects_dropped + truncated metadata on
+// every retained finding and a LevelWarn log — never silent.
+func capSubjects(subjects []asset.Identity, scoreFor func(asset.Identity) float64) (kept []asset.Identity, dropped int) {
+	sort.Slice(subjects, func(i, j int) bool {
+		si, sj := 0.0, 0.0
+		if scoreFor != nil {
+			si, sj = scoreFor(subjects[i]), scoreFor(subjects[j])
+		}
+		if si != sj {
+			return si > sj
+		}
+		return subjects[i].String() < subjects[j].String()
+	})
+	if len(subjects) > 256 {
+		return subjects[:256], len(subjects) - 256
+	}
+	return subjects, 0
+}
+
 // runTriage is the shared bounded, deterministic detector core for all
 // eight triage rules. It extracts param names, applies overlap precedence
 // (primary only), flags multi-class, sorts, caps at 256, and builds
@@ -475,12 +499,26 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 		postScopesBySubject[id] = postScopes[srcKey]
 		subjects = append(subjects, id)
 	}
-	sort.Slice(subjects, func(i, j int) bool { return subjects[i].String() < subjects[j].String() })
-	dropped := 0
-	if len(subjects) > 256 {
-		dropped = len(subjects) - 256
-		subjects = subjects[:256]
+	// Score each subject BEFORE the cap (NEW-135): reflection-backed
+	// subjects (confidence 0.8) outrank name-only matches (0.6) — the same
+	// confidence the emission loop assigns below, so the cap keeps the
+	// highest-score findings instead of the identity prefix.
+	backed := make(map[asset.Identity]bool, len(subjects))
+	for _, s := range subjects {
+		info := seen[s]
+		plist := make([]string, 0, len(info.params))
+		for p := range info.params {
+			plist = append(plist, p)
+		}
+		sort.Strings(plist)
+		backed[s] = reflectBacked(plist, verdictsBySubject[s], postVerdictsBySubject[s])
 	}
+	subjects, dropped := capSubjects(subjects, func(id asset.Identity) float64 {
+		if backed[id] {
+			return 0.8
+		}
+		return 0.6
+	})
 	var out []asset.Finding
 	for _, s := range subjects {
 		if err := ctx.Err(); err != nil {
@@ -532,8 +570,11 @@ func runTriage(ctx context.Context, dctx *detect.Context, ruleID, ruleName strin
 		// Reflection-backed confidence: a flagged param the probe saw
 		// return carries 0.8; unenriched name-only matches stay 0.6.
 		// The marker makes the promotion auditable in the finding itself.
+		// The verdict is read from the pre-cap scoring above (same
+		// predicate, single source), so emission can never disagree
+		// with the order the cap kept.
 		confidence := 0.6
-		if reflectBacked(plist, verdictsBySubject[s], postVerdictsBySubject[s]) {
+		if backed[s] {
 			confidence = 0.8
 			meta["reflection_backed"] = "true"
 		}

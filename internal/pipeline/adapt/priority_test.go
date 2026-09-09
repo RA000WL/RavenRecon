@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 
@@ -865,4 +866,215 @@ func surfaceScoreFor(t testing.TB, res pipeline.StageResult, id asset.Identity) 
 	}
 	t.Fatalf("no surface for %s", id)
 	return 0
+}
+
+// structuralFixtures builds one URL's live-shaped NEW-139 enrichment: a
+// technology and an AWS secret candidate at the given confidences with the
+// url→technology / url→secret_candidate edges. The shapes mirror real
+// engine output (capped scores in Prov.Confidence); the adapter derives
+// the Structural bit from them (cap inversion), never from test-only
+// plumbing.
+func structuralFixtures(t testing.TB, rawURL string, techConf, secretConf float64) (asset.URL, pipeline.Results) {
+	t.Helper()
+	u := mustURL(t, rawURL)
+	tech, err := asset.NewTechnology("synthetic-tech", asset.CategoryFramework, asset.Provenance{Source: "test", Confidence: techConf})
+	if err != nil {
+		t.Fatalf("NewTechnology: %v", err)
+	}
+	secret, err := asset.NewSecretCandidate(asset.SecretTypeAWS, "AKIAIOSFODNN7EXAMPLE", u.Identity(), asset.Provenance{Source: "test", Confidence: secretConf})
+	if err != nil {
+		t.Fatalf("NewSecretCandidate: %v", err)
+	}
+	relTech, err := asset.NewRelationship(u.Identity(), asset.RelationshipURLToTechnology, tech.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship tech: %v", err)
+	}
+	relSecret, err := asset.NewRelationship(u.Identity(), asset.RelationshipURLToSecretCandidate, secret.Identity())
+	if err != nil {
+		t.Fatalf("NewRelationship secret: %v", err)
+	}
+	return u, pipeline.Results{
+		Technologies:  []asset.Technology{tech},
+		Secrets:       []asset.SecretCandidate{secret},
+		Relationships: []asset.Relationship{relTech, relSecret},
+	}
+}
+
+func surfaceFor(t testing.TB, res pipeline.StageResult, id asset.Identity) priority.SurfaceAsset {
+	t.Helper()
+	for _, s := range res.Results.Surfaces {
+		if s.Identity == id {
+			return s
+		}
+	}
+	t.Fatalf("no surface for %s", id)
+	return priority.SurfaceAsset{}
+}
+
+// structuralPromoters returns the structural-backed recorded-detection
+// factors (the single-structural-high escape's promoter set).
+func structuralPromoters(s priority.SurfaceAsset) []priority.Factor {
+	var out []priority.Factor
+	for _, f := range s.Factors {
+		if (f.Name == "confidence:secret" || f.Name == "confidence:technology") && f.Structural {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// indicatorCategoryNames returns the distinct indicator (non-confidence)
+// factor groups on a surface — the level gate's category input.
+func indicatorCategoryNames(s priority.SurfaceAsset) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, f := range s.Factors {
+		if strings.HasPrefix(f.Name, "confidence") {
+			continue
+		}
+		if !seen[f.Name] {
+			seen[f.Name] = true
+			out = append(out, f.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestPriorityStageStructuralAttestation pins NEW-139 end to end through
+// the production tables: live-shaped attested engine outputs (technology
+// at 0.95, AWS secret at 0.95 — both above every emitting-engine
+// spoofable-only cap, hence attested by the adapter's cap inversion)
+// score one single-category surface at 0.8 and page High through the
+// escape, with both structural promoters cited. The unattested twins
+// (same shapes at 0.5 — below the caps, hence unattested) score the same
+// 0.8 shape but cap at Medium: the gate, not the score, carries the
+// attestation.
+func TestPriorityStageStructuralAttestation(t *testing.T) {
+	target := mustDomain(t, "example.com")
+
+	u, res := structuralFixtures(t, "https://www.example.com/app.js", 0.95, 0.95)
+	in := priorityInput(target, nil, nil, []asset.URL{u}, &recordingCache{})
+	in.Results = res
+	attested, err := NewPriorityStage(nil, nil).Run(context.Background(), in)
+	if err != nil {
+		t.Fatalf("attested Run: %v", err)
+	}
+	if attested.Outcome != pipeline.OutcomeCompleted {
+		t.Fatalf("attested outcome = %s, want completed", attested.Outcome)
+	}
+	surf := surfaceFor(t, attested, u.Identity())
+	if surf.Score != 0.8 {
+		t.Errorf("attested score = %v, want 0.8 (0.6 high_value_secret cap × 0.5 confidence cap)", surf.Score)
+	}
+	if cats := indicatorCategoryNames(surf); len(cats) != 1 {
+		t.Fatalf("attested indicator categories = %v, want exactly 1 (the escape under test needs a single category)", cats)
+	}
+	if surf.Level != priority.LevelHigh {
+		t.Errorf("attested level = %s, want high (single-structural-high escape)", surf.Level)
+	}
+	promoters := structuralPromoters(surf)
+	if len(promoters) != 2 {
+		t.Fatalf("structural promoters = %d, want exactly 2 (confidence:secret + confidence:technology): %+v", len(promoters), surf.Factors)
+	}
+	for _, p := range promoters {
+		if p.Weight != 0.95 {
+			t.Errorf("promoter %s weight = %v, want the recorded 0.95", p.Name, p.Weight)
+		}
+		if len(p.Evidence) != 1 {
+			t.Errorf("promoter %s evidence = %v, want exactly one recorded identity", p.Name, p.Evidence)
+		}
+	}
+
+	// The unattested twins: identical shapes at 0.5 — below every
+	// emitting-engine cap, so the adapter leaves both unattested. Same
+	// 0.8 score shape (0.6 category × 0.5 confidence group), capped at
+	// medium: no attestation, no escape.
+	twinURL, twinRes := structuralFixtures(t, "https://www.example.com/app.js", 0.5, 0.5)
+	twinIn := priorityInput(target, nil, nil, []asset.URL{twinURL}, &recordingCache{})
+	twinIn.Results = twinRes
+	unattested, err := NewPriorityStage(nil, nil).Run(context.Background(), twinIn)
+	if err != nil {
+		t.Fatalf("unattested Run: %v", err)
+	}
+	twin := surfaceFor(t, unattested, twinURL.Identity())
+	if twin.Score != 0.8 {
+		t.Errorf("unattested score = %v, want 0.8 (attestation gates the level, never the score)", twin.Score)
+	}
+	if twin.Level != priority.LevelMedium {
+		t.Errorf("unattested level = %s, want medium (no attestation, no escape)", twin.Level)
+	}
+	if got := structuralPromoters(twin); len(got) != 0 {
+		t.Errorf("unattested promoters = %+v, want none", got)
+	}
+}
+
+// TestPriorityStructuralMapping pins the adapter's fail-closed mapping
+// boundaries at the unit level: the bar itself never attests (a 0.59 may
+// be a capped spoofable-only detection), just above it attests, and the
+// generic secret shape never attests however confident (unattributed by
+// definition).
+func TestPriorityStructuralMapping(t *testing.T) {
+	mkTech := func(conf float64) asset.Technology {
+		tech, err := asset.NewTechnology("synthetic-tech", asset.CategoryFramework, asset.Provenance{Source: "test", Confidence: conf})
+		if err != nil {
+			t.Fatalf("NewTechnology: %v", err)
+		}
+		return tech
+	}
+	src := mustURL(t, "https://www.example.com/app.js").Identity()
+	mkSecret := func(typ asset.SecretType, conf float64) asset.SecretCandidate {
+		s, err := asset.NewSecretCandidate(typ, "AKIAIOSFODNN7EXAMPLE", src, asset.Provenance{Source: "test", Confidence: conf})
+		if err != nil {
+			t.Fatalf("NewSecretCandidate: %v", err)
+		}
+		return s
+	}
+
+	for _, tc := range []struct {
+		name  string
+		conf  float64
+		want  bool
+		which string
+	}{
+		{"tech at the bar", 0.59, false, "tech"},
+		{"tech above the bar", 0.591, true, "tech"},
+		{"tech high", 0.95, true, "tech"},
+		{"tech low", 0.5, false, "tech"},
+		{"secret at the bar", 0.59, false, "secret"},
+		{"secret above the bar", 0.591, true, "secret"},
+		{"secret high", 0.95, true, "secret"},
+		{"secret low", 0.5, false, "secret"},
+	} {
+		if tc.which == "tech" {
+			ts, ok := techSignal(mkTech(tc.conf))
+			if !ok {
+				t.Fatalf("%s: techSignal refused a canonical technology", tc.name)
+			}
+			if ts.Structural != tc.want {
+				t.Errorf("%s: Structural = %v, want %v", tc.name, ts.Structural, tc.want)
+			}
+			continue
+		}
+		ss, ok := secretSignal(mkSecret(asset.SecretTypeAWS, tc.conf))
+		if !ok {
+			t.Fatalf("%s: secretSignal refused a canonical candidate", tc.name)
+		}
+		if ss.Structural != tc.want {
+			t.Errorf("%s: Structural = %v, want %v", tc.name, ss.Structural, tc.want)
+		}
+	}
+
+	// Generic shapes never attest, however confident: the shape is
+	// unattributed by definition, so a high generic confidence
+	// contradicts the engine contract and must stay fail-closed.
+	for _, conf := range []float64{0.5, 0.95} {
+		ss, ok := secretSignal(mkSecret(asset.SecretTypeGeneric, conf))
+		if !ok {
+			t.Fatalf("generic secret at %v: secretSignal refused a canonical candidate", conf)
+		}
+		if ss.Structural {
+			t.Errorf("generic secret at %v: Structural = true, want false (unattributed shapes never attest)", conf)
+		}
+	}
 }

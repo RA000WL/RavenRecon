@@ -93,8 +93,8 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks: %v", err)
 	}
-	if reg.Len() != 25 {
-		t.Fatalf("registry len %d, want 25 (5 web + 3 js + 3 apis + 3 cloud + 8 triage + 3 takeover)", reg.Len())
+	if reg.Len() != 29 {
+		t.Fatalf("registry len %d, want 29 (5 web + 3 js + 3 apis + 3 cloud + 8 triage + 4 takeover + 2 authz + 1 bizlogic)", reg.Len())
 	}
 	if _, ok := reg.Get("web.csp.missing"); !ok {
 		t.Fatalf("web.csp.missing missing (web family not loaded)")
@@ -128,6 +128,15 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	}
 	if _, ok := reg.Get("takeover.s3.bucket"); !ok {
 		t.Fatalf("takeover.s3.bucket missing")
+	}
+	if _, ok := reg.Get("authz.idor.insecure-direct-object"); !ok {
+		t.Fatalf("authz.idor.insecure-direct-object missing (authz family not loaded)")
+	}
+	if _, ok := reg.Get("authz.idor.path-object"); !ok {
+		t.Fatalf("authz.idor.path-object missing (authz Rule 2 not loaded)")
+	}
+	if _, ok := reg.Get("bizlogic.workflow.state-transition"); !ok {
+		t.Fatalf("bizlogic.workflow.state-transition missing (bizlogic family not loaded)")
 	}
 	// Validate graph still passes after both packs.
 	if err := reg.Validate(); err != nil {
@@ -188,10 +197,10 @@ func TestDetectStageWithAllPacksLoadsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run with both packs: %v", err)
 	}
-	if res.ItemsProcessed < 25 {
-		t.Fatalf("ItemsProcessed %d, want 25 (all rules from all packs attempted)", res.ItemsProcessed)
+	if res.ItemsProcessed < 29 {
+		t.Fatalf("ItemsProcessed %d, want 29 (all rules from all packs attempted)", res.ItemsProcessed)
 	}
-	// Also verify nil-registry path still yields 22 and is sealed.
+	// Also verify nil-registry path still yields 29 and is sealed.
 	stage2, err := NewDetectStageWithAllPacks(nil)
 	if err != nil {
 		t.Fatalf("NewDetectStageWithAllPacks(nil): %v", err)

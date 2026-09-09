@@ -80,9 +80,11 @@ func TestPriorityKeyComponents(t *testing.T) {
 		"tech name":         func(s *Signal) { s.Technologies[0].Name = "okta" },
 		"tech category":     func(s *Signal) { s.Technologies[0].Category = "cloud_provider" },
 		"tech confidence":   func(s *Signal) { s.Technologies[0].Confidence = 0.4 },
+		"tech structural":   func(s *Signal) { s.Technologies[0].Structural = true },
 		"tech identity":     func(s *Signal) { s.Technologies[0].Identity = "authentication/okta" },
 		"secret type":       func(s *Signal) { s.Secrets[0].Type = asset.SecretTypeJWT },
 		"secret confidence": func(s *Signal) { s.Secrets[0].Confidence = 0.3 },
+		"secret structural": func(s *Signal) { s.Secrets[0].Structural = true },
 		"port":              func(s *Signal) { s.Port = 9090 },
 		"service":           func(s *Signal) { s.Service = "kibana" },
 		"headers":           func(s *Signal) { s.Headers = []string{"x-runtime: 0.1"} },
@@ -253,6 +255,31 @@ func TestValidateSurfaceInvariants(t *testing.T) {
 	tamperedLevel.Level = LevelHigh
 	if err := validateSurfaceInvariants(tamperedLevel, single); err == nil {
 		t.Error("a high level on a single-category medium surface must be rejected")
+	}
+
+	// A pre-attestation escape promotion — a 0.95-confidence but
+	// UNATTESTED secret factor stored as high (the confidence-only rule
+	// that predated the Structural bit) — re-gates to medium under the
+	// current rule and must be rejected: stale highs are evicted and
+	// recomputed, never served. The signal carries no path precisely so
+	// exactly one indicator category fires.
+	staleSig := Signal{
+		Identity: asset.Identity{Kind: asset.KindURL, Value: "https://www.example.com/"},
+		Kind:     asset.KindURL,
+		Secrets:  []SecretSignal{{Type: asset.SecretTypeAWS, Confidence: 0.95, Identity: "secret_candidate:aws/key/1"}},
+		ScoredAt: fixedTime(1),
+	}
+	staleSurface, err := ScoreSurface(staleSig, ic, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleSurface.Level != LevelMedium {
+		t.Fatalf("unattested leak fixture level = %s, want medium", staleSurface.Level)
+	}
+	staleHigh := staleSurface
+	staleHigh.Level = LevelHigh
+	if err := validateSurfaceInvariants(staleHigh, staleSig); err == nil {
+		t.Error("a confidence-only high on an unattested single-category surface must be rejected (stale promotion, never served)")
 	}
 
 	// A confidence factor must not carry a recommendation.

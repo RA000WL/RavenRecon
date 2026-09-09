@@ -16,9 +16,10 @@ type PriorityLevel string
 const (
 	// LevelHigh: score >= 0.8 with at least TWO independent indicator
 	// categories matched — or score >= 0.8 with one category backed by a
-	// recorded high-confidence detection (confidence:secret or
-	// confidence:technology at or above 0.9; the single-structural-high
-	// escape, see score.go).
+	// structural-backed recorded detection (a confidence:secret or
+	// confidence:technology factor attested structural by the emitting
+	// phase, at or above 0.9; the single-structural-high escape, see
+	// score.go).
 	LevelHigh PriorityLevel = "high"
 	// LevelMedium: score >= 0.5 with at least one indicator category.
 	LevelMedium PriorityLevel = "medium"
@@ -110,6 +111,16 @@ type Factor struct {
 	// survives cache round-trips verbatim. Guidance language only: never an
 	// exploitation instruction, never a vulnerability claim.
 	Recommendation string `json:"recommendation,omitempty"`
+
+	// Structural marks a confidence factor whose recorded detection the
+	// emitting phase attested as backed by non-spoofable evidence (see
+	// TechSignal/SecretSignal). Only confidence:secret and
+	// confidence:technology factors ever carry it; it never enters the
+	// score (compose groups by Name and combines by Weight alone), so it
+	// cannot change any score — it gates only the
+	// single-structural-high escape in levelFor. Omitted when false, so
+	// unattested factor lists serialize exactly as before.
+	Structural bool `json:"structural,omitempty"`
 }
 
 // validate checks the factor contract: bounded name and reason, weight in

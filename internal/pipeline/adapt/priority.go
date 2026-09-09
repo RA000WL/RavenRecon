@@ -590,10 +590,30 @@ func indexSignalEnrichment(res pipeline.Results) *signalEnrichment {
 	return e
 }
 
+// structuralConfidenceBar is the shared attestation bar for the
+// Structural bit below: the inversion of the emitting engines' own
+// spoofable-only caps. A score at or below the bar may be a capped
+// spoofable-only detection, so it never attests (fail-closed); a score
+// strictly above it cannot be one. The value is written literally (not
+// imported) because both source constants are unexported; each rule's
+// comment cites its source fact.
+const structuralConfidenceBar = 0.59
+
 // techSignal maps one technology asset onto its signal. Confidence is the
 // asset's own Prov.Confidence — never invented. Invalid entries (empty
 // names, non-[0,1] confidences) are refused: engine-validated data never
 // triggers this, and a corrupt entry must not fail the asset.
+//
+// Structural attests structural-tier backing by inverting the emitting
+// phase's own spoofable-only determination (cite:
+// internal/techintel/confidence.go spoofableScoreCap + deriveConfidence
+// rule 1 — a technology whose every matched indicator is spoofable is
+// capped at 0.59, so a score strictly above 0.59 fired at least one
+// structural-tier fingerprint indicator; jsintel markers are likewise
+// structural by construction, cite: internal/jsintel/detect.go
+// detectTechnologies "Markers are structural: there is no spoofable-only
+// cap"). Fail-closed: a score at or below the bar attests nothing —
+// 0.59 itself may be a capped spoofable-only detection.
 func techSignal(t asset.Technology) (priority.TechSignal, bool) {
 	if t.Name == "" {
 		return priority.TechSignal{}, false
@@ -607,11 +627,55 @@ func techSignal(t asset.Technology) (priority.TechSignal, bool) {
 		Category:   string(t.Category),
 		Confidence: c,
 		Identity:   t.Identity().Value,
+		Structural: c > structuralConfidenceBar,
 	}, true
 }
 
 // secretSignal maps one secret candidate onto its signal, with the same
 // contract as techSignal (unknown types and bad confidences refused).
+//
+// Structural attests an attributed, structurally validated shape, and only
+// for the exact structured family: the candidate's type must carry at
+// least one structured pattern in the emitting phase's database
+// (structuredSecretType), and the score must clear the bar. The bar itself
+// inverts the structured zero-support cap (cite:
+// internal/secrentel/confidence.go structuredCap 0.59 + expectedCapFor —
+// a STRUCTURED match with zero supporting factors is capped at 0.59, so a
+// structured-family score strictly above 0.59 fired with support).
+// Fail-closed throughout:
+//
+//   - generic is unattributed by definition (cite:
+//     internal/priority/table_risk.go high_value_secret), bearer is a
+//     contextual assignment shape, and the purely-contextual types
+//     (database_url, cloudflare, vercel, netlify, railway, api_key) have
+//     NO zero-support cap — contextual strengths span (0.59, 0.9)
+//     (bearer 0.6, database_url 0.7, aws_secret 0.75, twilio-auth-token
+//     0.75, cloudflare 0.8) — so none of them ever attests, however
+//     confident;
+//   - public_key is definitionally not a secret (FamilyPublic, capped at
+//     Low) and custom_token is a user-defined shape the engine cannot
+//     attribute: neither attests;
+//   - any type outside the structured set (including future types the
+//     adapter has not classified) attests nothing until classified;
+//   - a score at or below the bar attests nothing — 0.59 itself may be a
+//     capped zero-support structured detection.
+//
+// Residual over-attestation (documented, not fixed here): the adapter sees
+// only the candidate's type and confidence — never its family or
+// supporting-factor count — so a CONTEXTUAL match of a mixed-family type
+// (aws_secret 0.75, twilio-auth-token 0.75, oauth/api-key assignments)
+// still attests when its score clears the bar. Threading the factor count
+// through would require carrying secrentel's per-candidate evidence across
+// the asset model into this adapter (an architectural change to
+// asset.SecretCandidate and the pipeline result plumbing); until then the
+// bit stays exact for purely-contextual types and conservative for mixed
+// ones. The only escalation the bit enables is the single-structural-high
+// escape at 0.9 (cite: internal/priority/score.go
+// singleHighStructuralConfidence), which exceeds every contextual strength
+// (pinned by TestContextualStrengthsBelowStructuralEscapeBar in
+// internal/priority/score_test.go — a future contextual pattern at or
+// above 0.9 fails loudly there, forcing a re-examination of this
+// inversion).
 func secretSignal(s asset.SecretCandidate) (priority.SecretSignal, bool) {
 	if !s.Type.Valid() {
 		return priority.SecretSignal{}, false
@@ -624,7 +688,52 @@ func secretSignal(s asset.SecretCandidate) (priority.SecretSignal, bool) {
 		Type:       s.Type,
 		Confidence: c,
 		Identity:   s.Identity().String(),
+		Structural: structuredSecretType(s.Type) && c > structuralConfidenceBar,
 	}, true
+}
+
+// structuredSecretType reports whether t carries at least one structured
+// pattern in the emitting phase's database — the exact family whose
+// zero-support cap the attestation bar inverts. The set is derived from
+// the pattern tables (cite: internal/secrentel/patterns aws.go,
+// cloud.go, saas.go, dbweb.go, tokens.go, keys.go): every type with a
+// FamilyStructured entry attests above the bar; every other type —
+// generic, bearer, the purely-contextual types (database_url, cloudflare,
+// vercel, netlify, railway, api_key), public_key, custom_token — never
+// attests. Mixed-family types (aws, twilio, oauth, …) attest above the
+// bar whatever their match family: the adapter cannot see the family (see
+// secretSignal), so this stays conservative for them by construction. A
+// new secret type defaults to unattested until it is classified here.
+func structuredSecretType(t asset.SecretType) bool {
+	switch t {
+	case asset.SecretTypeJWT,
+		asset.SecretTypeAWS,
+		asset.SecretTypeGoogle,
+		asset.SecretTypeFirebase,
+		asset.SecretTypeStripe,
+		asset.SecretTypeGitHub,
+		asset.SecretTypePrivateKey,
+		asset.SecretTypeRSAPrivateKey,
+		asset.SecretTypeSSHPrivateKey,
+		asset.SecretTypeAzure,
+		asset.SecretTypeGitLab,
+		asset.SecretTypeTwilio,
+		asset.SecretTypeSlack,
+		asset.SecretTypeDiscord,
+		asset.SecretTypeOpenAI,
+		asset.SecretTypeAnthropic,
+		asset.SecretTypeOAuth,
+		asset.SecretTypePostgreSQLURL,
+		asset.SecretTypeMySQLURL,
+		asset.SecretTypeMongoDBURL,
+		asset.SecretTypeRedisURL,
+		asset.SecretTypeSMTP,
+		asset.SecretTypeWebhookURL,
+		asset.SecretTypeS3,
+		asset.SecretTypeDigitalOcean:
+		return true
+	}
+	return false
 }
 
 // renderHeaderLines renders one live record's headers as the engine's

@@ -9,7 +9,7 @@ orchestrator; every agent may append or update its own entries.
 
 - **IDs:** continue the existing sequences — audit findings (H-/M-/L-),
   review follow-ups (NEW-n), info/doc skew (NF-n). New entries take the
-  next free `NEW-n` (currently NEW-117).
+  next free `NEW-n` (currently NEW-146).
 - **Statuses:**
   - `OPEN` — needs work; reporter recorded it.
   - `IN PROGRESS` — owner claimed it (owner sets this).
@@ -43,7 +43,7 @@ orchestrator; every agent may append or update its own entries.
 ## Entry template
 
     ### NEW-n (SEVERITY) — short title (package)
-    - Status: OPEN | IN PROGRESS | DEFERRED
+    - Status: OPEN | IN PROGRESS | VERIFIED | DEFERRED | WON'T FIX
     - Reporter: reviewer | builder | tester | researcher | docs
     - Owner: (unassigned) | builder | docs | ...
     - Problem: <one or two lines, file:line evidence>
@@ -51,6 +51,136 @@ orchestrator; every agent may append or update its own entries.
     - Verification: <tests/gates that prove it done>
 
 ## Open items
+
+### NEW-146 (MEDIUM) — AuthZ Rule 2 path-object (v2.3 deferred slice)
+- Status: VERIFIED — orchestrator-verified (first-gate + fix + verification rounds; gates green)
+- Reporter: orchestrator (authz research §6 Rule 2; ASN track blocked — see NEW-147)
+- Owner: builder
+- Problem: numeric/UUID path segments with divergent auth evidence have no rule (Rule 1 covers query-param IDOR only).
+- Fix: `authz.idor.path-object` depending on `api.rest.idor-indicator` (reuse hasIDORSegment semantics incl. year/pagination exclusions; no duplicated normalization); same ceilings/caps/golden discipline as Rule 1.
+- Verification: hermetic segment tests (numeric/UUID fire; year/pagination quiet); ordering; cap; determinism; golden additions-only; gates green.
+- Close-out: first-gate (trio/isolation/A2/subjects/ordering/loader/golden PASS) held on fork-pin/counts/bundling → fix round (fork deleted for shared apis export + agreement via real symbols; ARCH counts reconciled; N4 asymmetric pin; helper prose) → verification APPROVE modulo prose → prose fixed verbatim (Path-only parenthetical, method+path phrase, map row, stub comment) + README counts reconciled (29 wired / 35 on disk). Golden additions-only; Rule 1 byte-identical. Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-147 (HIGH) — ASN track blocked on IP→ASN source (v2.3)
+- Status: OPEN (blocked — needs operator decision)
+- Reporter: explore (recon ses_f7e5b940)
+- Owner: (unassigned)
+- Problem: nothing emits ASN data (asnmap adapter misparses CIDRs as hostnames; DiscoverResult has no ASN/CIDR field; Results.IPs are bare addrs); asnmap needs interactive PDCP key (absent here — verified 2026-09-08: prompts on /dev/tty, aborts); ASN/org lives only in key-gated `-j` JSON or an offline DB (stdlib/sign-off weight).
+- Fix (operator picks one): (a) provide PDCP_API_KEY → adapter JSON mode + scoring slice per recon plan; (b) hand-crafted fixtures from documented shape (lower fidelity); (c) offline ASN DB import (architectural sign-off required per §0.2).
+- Verification: per chosen path; hermetic replay of recorded real output; gates green.
+
+### NEW-145 (MEDIUM) — PriorFindings digest is identity-only (engine-contract follow-up)
+- Status: VERIFIED — orchestrator-verified (design + 3 slices, review-gated; gates green)
+- Reporter: reviewer (NEW-143 gate: documented in-code, deferred out of slice)
+- Owner: builder
+- Problem: `fingerprintPriorFindings` hashes finding identities only — sibling metadata edits (e.g. unclaimed gaining `confirmed`) without identity change don't invalidate dependent rules' (takeover enrichment, authz, bizlogic) cache records; stale enrichment served warm.
+- Fix: (a1) fold full sorted prior metadata + confidence into digest; SchemaVersion 3→4; no rule bumps; no engine changes (research ses_f7972010).
+- Verification: T1 metadata-edit→recompute (red pre-fix), T2 no-change hits, T3 identity recompute, T4 determinism/empty/T6 timestamps/T7 sensitivity units, T5 old-version eviction; gates green.
+- Orchestrator decisions: D1 bump APPROVED; D2 metadata+confidence APPROVED; D3 v2.3 APPROVED; D4 no consumer co-bumps; D5 orphan-linger accepted (2→3 precedent).
+- Close-out: Slice 1 (R1 deterministic-metadata audit PASS; judgment-set digest; SchemaVersion 4; 1-line golden; T4/T6/T7) review-APPROVED; Slice 2 (T1 recompute/T2 hits/T5 evict, engine untouched) green; Slice 3 (4 honesty notes → v4 contract + Relationships bullet) green. Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+- Reporter: reviewer (NEW-143 gate: documented in-code, deferred out of slice)
+- Owner: (unassigned)
+- Problem: `fingerprintPriorFindings` hashes finding identities only — sibling metadata edits (e.g. unclaimed gaining `confirmed`) without identity change don't invalidate dependent rules' (takeover enrichment, authz) cache records; stale enrichment served warm.
+- Fix: shared-contract decision — fold sorted prior metadata (or at least confirmed-class keys) into the digest, or scope metadata-dependent outputs out of cached records. SDK/cache surface change — needs deliberate design, not a drive-by.
+- Verification: two-run warm-cache test (metadata-only sibling edit → recompute); full gates green.
+
+### NEW-143 (MEDIUM) — Takeover enrichment + bloom diff (v2.3)
+- Status: VERIFIED — orchestrator-verified (review APPROVE + follow-ups; gates green)
+- Reporter: orchestrator (ROADMAP v2.3 scope)
+- Owner: builder
+- Problem: takeover.cname.unclaimed/dangling lack provider-confirmed enrichment; `ravenrecon diff` doesn't surface takeover finding deltas.
+- Fix: `takeover.cname.provider-confirmed` using PriorFindings from unclaimed + GraphView CNAME→provider mapping (enrichment is a SECOND finding, never a mutation of unclaimed identity); bloom diff for takeover findings in diff summary.
+- Verification: hermetic enrichment tests (confirmed→second finding; unconfirmed→silent; unclaimed identity untouched); diff-output test with takeover delta; gates green.
+- Close-out: first-gate review APPROVE (deps/provider/second-finding/fail-open/bloom/caps/ordering/golden all PASS) + follow-ups (per-host corroboration doc + pin; 33-rule counts; render-cap TODO). Identity-only digest gap filed as NEW-145 (engine contract, deferred). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures (see below).
+
+### NEW-144 (HIGH) — Business-logic workflow pack (v2.3; design first)
+- Status: VERIFIED — orchestrator-verified (first-gate + fix + verification rounds; gates green)
+- Reporter: orchestrator (ROADMAP v2.3 scope)
+- Owner: builder
+- Problem: no workflow/state-transition mapping across rules (PriorFindings from authz.* + apis.* + web.* via GraphView.PathExists).
+- Fix: per research design ses_f7ea80506 (Rule 1 `bizlogic.workflow.state-transition` ONLY): T1 IDOR-token + T2 exact-host co-reachability (Path host⇝endpoint or JS hub) + T3 auth-divergent membership + T4 step dissimilarity; subject=terminal endpoint; info fixed 0.5/0.6; Category business_logic; 256-cap; Deps [authz.idor.insecure-direct-object]; AllPacks 26→27.
+- Verification: 13-point research test plan; gates green.
+- Orchestrator decisions: D1 — fix PathExists→Path in ROADMAP + TODO (done below); D2 — exact-host confirmed; D3 — IDOR-token only confirmed; D4 — minimal gating ([authz...]) confirmed; D5 — skip long flows (documented); D6 — fixed confidence confirmed.
+- Close-out: first-gate (trio/isolation/A2/subjects/ordering/loader/golden PASS) held on dead-hub-HIGH + counts → fix round (hub dropped for Path-only + engine-real quiet/fire test; IP/method keying; counts fixed) → verification APPROVE modulo stale-hub-prose-HIGH → prose fixed verbatim (Path-only parenthetical, method+path phrase, :38 map row, stub comment). Docs match code; golden valid (1 finding, no hub orphans). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-142 (HIGH) — AuthZ/IDOR pack via GraphView (v2.3 first pack; design: research ses_f7f2bf41)
+- Status: VERIFIED — orchestrator-verified (first-gate + prose fixes; gates green)
+- Reporter: research
+- Owner: builder
+- Problem: SDK v2 (PriorFindings/GraphView/graph_digest) has only the auth demo probe exercising it; cross-host IDOR divergence (triage.idor signals correlated across hosts with divergent auth evidence) is inexpressible without a consumer.
+- Fix: native leaf pack `internal/detect/packs/authz` (Rule 1 `authz.idor.insecure-direct-object` ONLY): PriorFindings filter (triage.idor + precedence-shadow recovery via all_classes), forward host→url→endpoint walk + endpoint_to_parameter identities, operational AuthEvidence (A1 tech-category + A2 header/cookie indicators PINNED from techintel first, else A1-only), R-EMIT/R-QUIET falsifiers, subject=endpoint + file-relative-style metadata, Category authorization + medium(0.7 backed+divergent)/info split, 256-cap NEW-135 contract,Deps [triage.idor], AllPacks 23→24.
+- Verification: 11-point plan (positives, 3 falsifiers, precedence recovery, cap, determinism, cache parity incl. documented identity-only staleness, ordering, golden); gates green.
+- Orchestrator decisions on open questions: O1 — Category authorization APPROVED (first honest use; ceilings hold); O2 — A2 indicator universe must be pinned from techintel fingerprint forms before the filter is written, else ship A1-only with documented cut; O3 — meta keys confirmed as proposed (signal, shared_params, peer_endpoint, peer_host, auth_side, triage_rule, verdict, subjects_dropped, truncated).
+- Close-out: first-gate review (emission trio + isolation + A2 byte-verified + subjects + ordering + loader + golden all PASS) held only on doc counts/comments → prose fixes applied verbatim (26 wired / 32 on disk; peer-emits-nothing; seam 26). O2 outcome: A2 pinned (20-form universe + live + TLS-cut tests). Base-domain naivety contained (pairing-only cost, bounded findings). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-140 (HIGH) — Triage score-order cap needs rule version bump (deep-review catch)
+- Status: VERIFIED — orchestrator-verified (review APPROVE; eviction proof + golden regen; gates green)
+- Reporter: reviewer (post-push deep review: CHANGES-REQUESTED)
+- Owner: builder
+- Problem: NEW-135 triage pre-cap scoring changes emitted finding sets over cap (backed displaces prefix) with rules at 1.1.0 — persisted `detect.rule` records are valid cache hits serving stale prefix-cut sets, violating the record.go content-bump contract. Uniform packs correctly unbumped (byte-identical).
+- Fix: bump 8 triage rules 1.1.0→1.2.0 + version-pin update; cross-pack cap-consistency test (all six capSubjects copies sort one mixed-score fixture identically).
+- Verification: stale-record eviction test (1.1.0 over-cap record → miss/recompute under 1.2.0); gates green.
+
+### NEW-141 (HIGH) — Attestation over-breadth + bar coupling + CLI nits (deep-review catch)
+- Status: VERIFIED — orchestrator-verified (review APPROVE; optionals polished; gates green)
+- Reporter: reviewer (post-push deep review: CHANGES-REQUESTED)
+- Owner: builder
+- Problem: (1) secretSignal attests bearer + lone-contextual (zero-support) despite citing their exclusion — representational dishonesty beyond the escape bar; (2) structuralConfidenceBar 0.59 literal unpinned against its two source caps (silent desync risk); (3) runDiscover double-closes --output; (4) pool-submit failure path never emits OnSource/OnHost.
+- Fix: narrow predicate to exact families (structured; exclude generic+bearer+lone-contextual unless support threaded) or thread explicit attestation; equality pin test vs source caps; single-close; emitResult on submit-failure (or document exclusion).
+- Verification: bearer/lone-contextual → unattested pins; bar-equality pin; error-join still green; gates green.
+
+### NEW-139 (MEDIUM) — Thread Structural attestation through priority adapter (NEW-134 follow-up)
+- Status: VERIFIED — orchestrator-verified (review + fix round; goldens regened additions-only; gates green)
+- Reporter: reviewer (NEW-134 verification: live adapter never attests — escape dead-code live)
+- Owner: builder
+- Problem: `internal/pipeline/adapt/priority.go:597-628` builds TechSignal/SecretSignal without `Structural` — the NEW-134 escape is unreachable in production. Plus 2 test gaps: multi-signal score-identity pin, TechSignal-attested case.
+- Fix: map techintel structural-tier backing + secrentel attributed-shape validation into `Structural:true` (fail-closed: unattested by default); add both test pins.
+- Verification: live-shaped attested signal → High end-to-end (stage test); unattested → capped; full gates green.
+
+### NEW-134 (MEDIUM) — Single-signal structural High (external review O8)
+- Status: VERIFIED — orchestrator-verified (review APPROVE; gates green; live threading follows in NEW-139)
+- Reporter: reviewer (elite-hunter review 2026-09-05, verified against code)
+- Owner: builder
+- Problem: priority High requires ≥0.8 + ≥2 categories (`internal/priority`); one live AWS key (structural, non-spoofable, confidence ≥0.9) caps at Medium. A critical never pages.
+- Fix: allow single-signal High at confidence ≥0.9 + structural (non-spoofable) evidence; keep math, gate inputs.
+- Verification: synthetic live-key signal → High with factor cited; spoofable-only signals unchanged (≤0.59/Low pins hold); goldens reviewed (additions-only promotions).
+- Close-out: review APPROVE (escape pre-existed at HEAD; attestation exact; closed-world stable; stale-High evict+recompute; keys bind bit; live adapter fail-closed). Follow-up NEW-139 (adapter threading) filed per review.
+
+### NEW-135 (MEDIUM) — Score-ordered cap truncation (external review O6)
+- Status: VERIFIED — orchestrator-verified (substance APPROVE; wording fixed; gates green)
+- Reporter: reviewer
+- Owner: builder
+- Problem: finding-cap truncation keeps completion-order prefix — re-runs show different sets above the 4096 cap (only nondeterminism source in detect).
+- Fix: truncate by score order (deterministic); keep 256/rule + 4096/run bounds + subjects_dropped honesty.
+- Verification: over-cap fixture → identical sets across runs + orders; determinism tests.
+- Close-out: review found NEW-135 code sound (engine run-cap pre-existing; 21 cuts switched; triage pre-cap scoring can't disagree with emission; uniform packs byte-identical; determinism traced) with CHANGES driven by tree-scope notes, all resolved: bundled NEW-134/139 hunks are separately VERIFIED items (not this slice); tree golden drift attributed to the Structural regen (no detect-pack golden touched by NEW-135); contract wording corrected to truthful 2-key order (single-detector rule fixed). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-136 (MEDIUM) — SAN→target feedback (external review O10)
+- Status: VERIFIED — orchestrator-verified (review APPROVE + polish; gates green)
+- Reporter: reviewer
+- Owner: builder
+- Problem: TLS SANs captured but never become probe targets; cert-only hosts missed.
+- Fix: feed SAN DNS names as targets (in-scope filtering, dedup vs discovered hosts, bounded count, cached).
+- Verification: hermetic cert-with-SAN fixture → SAN host probed; out-of-scope SANs filtered; no dup probes.
+- Close-out: review APPROVE (scope wall absolute — double gate; wildcards skip-and-count; one round structural; budget/cancellation/cache honest; default-OFF identical; flags ride all paths) + polish (knob-interaction budget sentence, partial/failed refold pins, merge precondition doc). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-137 (MEDIUM) — PSL-aware correlation grouping (external review §5.3)
+- Status: VERIFIED — orchestrator-verified (review APPROVE + polish; gates green)
+- Reporter: reviewer
+- Owner: builder
+- Problem: parent-domain anchor merges unrelated vhosts on shared infra (*.herokuapp.com).
+- Fix: gate grouping on PSL + IP-diversity (shared-PSL-suffix + disjoint IPs → split); stdlib-only (no publicsuffix dep — minimal embedded PSL or suffix heuristic, documented).
+- Verification: shared-infra fixture splits; same-org fixture stays grouped; determinism.
+- Close-out: review APPROVE (rule equivalent-with-intent; fallback identical; fail-closed split safe; every host grouped; no-drift credible; IP-join dropped as unobservable, documented) + polish (4-vs-3 doc, depth≥4 pin, ToLower). Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
+
+### NEW-138 (MEDIUM) — Streaming discover output (external review O13)
+- Status: VERIFIED — orchestrator-verified (review APPROVE + follow-ups; gates green)
+- Reporter: reviewer
+- Owner: builder
+- Problem: discover end-buffers all hosts; long amass runs look hung; no --output.
+- Fix: stream hosts as found (event/line protocol) + --output file; final merged summary unchanged.
+- Verification: hermetic fake-source run asserts incremental lines + identical final merge; ordering/dedup contract documented.
+- Close-out: review APPROVE (backpressure qualified; exactly-once panic path; cached/repeat/--output/mutex sound; summary byte-identical) + follow-ups (true backpressure contract ×3 docs, errors.Join post-run causes, provisional usage sentence, byte-identity pin). Note for future: true per-host-live streaming (vs per-source-finalization bursts) needs adapter-level callbacks — larger arch change, not filed. Final tree gates re-run by orchestrator: gofmt/vet/build clean, go test ./... 0 failures.
 
 ### NEW-133 (HIGH) — mistake-path prober first-review follow-ups (unreviewed-provenance feature)
 - Status: VERIFIED — orchestrator-verified 2026-09-05 (fix round APPROVE; gates green)
@@ -172,8 +302,6 @@ orchestrator; every agent may append or update its own entries.
 - Status: VERIFIED — orchestrator-verified 2026-09-03 (redesign beat every baseline; 2 review rounds + polish all APPROVE; gates green, see close-out)
 - Reporter: reviewer
 - Owner: builder
-- Reporter: reviewer
-- Owner: (unassigned)
 - Problem: `internal/detect/packs/js/domxss.go:81`, `postmessage.go`, `prototypepollution.go` decide by `strings.Contains` on raw bodies — comments/strings/dead code fire; with real 2 MiB bundles hunters will mute the pack and miss real sinks.
 - Fix: use `Parsed` token output (strings vs code, sink LHS, handler scope) — ONLY after FP field measurement pins precision/recall baselines; blind redesign risks regressions. Rule versions bump with the change.
 - Verification: FP harness + before/after precision pins; goldens regen reviewed.

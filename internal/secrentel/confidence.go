@@ -93,13 +93,15 @@ const (
 	repeatWeight         = 0.2  // same (type, value) observed in >= 2 documents
 
 	// Caps.
-	fpContextCap  = 0.45 // documentation/test context: never above Low
-	genericCap    = 0.45 // generic family ("random base64"): never above Low
+	fpContextCap = 0.45 // documentation/test context: never above Low
+	genericCap   = 0.45 // generic family ("random base64"): never above Low
+	// Back-pointer: internal/pipeline/adapt/priority.go secretSignal inverts this cap (non-generic above 0.59 attests structural).
 	publicKeyCap  = 0.35 // public keys are not secrets: never above Low
 	expiredJWTCap = 0.45 // expired JWT: history, not live access — never above Low
 	structuredCap = 0.59 // a structured match with ZERO supporting factors
 	// stays Medium-or-below: a prefix alone is
 	// not high confidence
+	// Back-pointer: internal/pipeline/adapt/priority.go secretSignal inverts this structured-family cap (contextual has no zero-support cap).
 	urlTypeCap = lowThreshold // pure-endpoint URL shapes (S3 bucket,
 	// credential-less database_url, Firebase database URL): never above Low
 	// Thresholds.
